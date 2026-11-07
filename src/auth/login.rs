@@ -170,8 +170,10 @@ pub async fn login(
 
     // The password stage is a success whether or not a second factor follows, so it stops counting
     // toward the lock: otherwise every user with TOTP would lock their own email after ten
-    // sign-ins in 15 minutes. The second factor has its own budget (5 wrong codes, then
-    // `mfa-restart`, which does count as a failure).
+    // sign-ins in 15 minutes. Second-factor guessing is bounded instead by `login_totp`, which
+    // charges EVERY submission to this same limiter as `succeeded = false` before verifying the
+    // code — not by the per-session 5-wrong-codes counter, which an attacker holding the password
+    // sheds by starting a new pending session.
     rate_limit::mark_succeeded(&state.pool, attempt).await?;
 
     if user.totp_enabled {

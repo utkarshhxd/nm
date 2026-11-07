@@ -67,6 +67,12 @@ pub async fn list(
     // Audit ids are UUIDv7, so `id desc` is newest first.
     // LEFT JOINs: the predicate stays `a.workspace_id = $1`, and an entry whose actor has since
     // been deleted — or which has no actor at all — must still be returned, unnamed.
+    //
+    // Both joins are UNSCOPED — no `workspace_id` of their own — and are safe only because the
+    // actor ids come from rows this workspace owns, and nothing writes a foreign actor into a
+    // workspace-scoped audit row. The day something does, this join hands that actor's email to
+    // a different tenant's admins. A new audit writer either keeps that invariant or these joins
+    // need their own workspace predicate.
     let rows = sqlx::query_as!(
         AuditEntry,
         r#"select a.id, a.action, a.actor_user_id, a.actor_api_key_id,

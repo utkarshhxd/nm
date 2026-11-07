@@ -131,7 +131,8 @@ pub fn generate_recovery_codes() -> Vec<String> {
     (0..RECOVERY_CODE_COUNT).map(|_| recovery_code()).collect()
 }
 
-/// Lowercase, hyphen removed: what is hashed, so `ABCDE-FGHJK` and `abcdefghjk` are one code.
+/// Lowercase, hyphens removed: what is hashed, so `ABCDE-FGHJK-MNPQR` and `abcdefghjkmnpqr`
+/// are one code.
 fn recovery_code_hash(code: &str) -> [u8; 32] {
     sha256(code.trim().to_lowercase().replace('-', "").as_bytes())
 }

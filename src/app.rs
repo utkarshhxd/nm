@@ -47,6 +47,12 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     http::routes()
         // Innermost, so a 403 still gets security headers and is counted by the metrics.
+        //
+        // This layer is the CSRF gate AND the place the `Cookie` header is stripped from
+        // bearer-authenticated requests, and a layer only covers the routes BELOW it. Every route
+        // module therefore merges inside `http::routes()`. A `.merge(...)` added here, after this
+        // `.layer()`, would silently get neither — no error, no failing test, just unprotected
+        // unsafe methods. Add routes in `http::routes()`, not here.
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf::require_csrf,
