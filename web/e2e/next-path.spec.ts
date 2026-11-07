@@ -21,17 +21,26 @@ const offsite = [
   "javascript:alert(1)",
   "%2F%2Fevil.example",
   "%2F%5Cevil.example",
-  // The regression this file exists for: the URL parser strips ASCII tab, CR and LF before it
-  // resolves anything, so each of these parses as `//evil.example`.
+  // Round one: the URL parser strips ASCII tab, CR and LF before it resolves anything, so each
+  // of these parses as `//evil.example`.
   "/%09/evil.example",
   "/%0D/evil.example",
   "/%0A/evil.example",
+  // Round two: these pass an origin comparison honestly — the host really is nm.example when
+  // the first parse runs — and still leave a *pathname* of `//evil.example`, which
+  // `location.assign` then reads as protocol-relative. `/..//evil.example` is the dangerous
+  // one: it names no host, so one crafted link works against every deployment.
+  "https://nm.example//evil.example",
+  "//nm.example//evil.example",
+  "/..//evil.example",
 ];
 
 test("an off-site next is refused", () => {
-  for (const next of offsite) {
-    expect(nextPath(signInUrl(next)), next).toBe("/");
-  }
+  // Compared as one object rather than in a loop: a loop stops at the first bad payload, and
+  // the whole point of this file is to see every one that gets through in a single run.
+  const refused = Object.fromEntries(offsite.map((next) => [next, "/"]));
+  const actual = Object.fromEntries(offsite.map((next) => [next, nextPath(signInUrl(next))]));
+  expect(actual).toEqual(refused);
 });
 
 test("a same-origin next is kept whole", () => {
