@@ -2,10 +2,13 @@
 
 use std::time::Duration;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{Json, Router, extract::State, routing::get};
 use serde_json::{Value, json};
 
-use crate::app::AppState;
+use crate::{
+    app::AppState,
+    error::{ApiError, ApiResult},
+};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -22,23 +25,20 @@ async fn healthz() -> &'static str {
 
 /// Readiness: Postgres answers within 2 seconds. The timeout covers acquiring a
 /// connection as well as the query, so an exhausted pool also reads as not ready.
-async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+///
+/// The 200 body stays `{"database":"ok"}` — `web/e2e/support/server.ts` reads it to confirm the
+/// server it reached is ours. The failures are RFC 9457, like every other error body.
+async fn readyz(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let check = sqlx::query_scalar!(r#"SELECT 1 AS "ok!""#).fetch_one(&state.pool);
     match tokio::time::timeout(READY_TIMEOUT, check).await {
-        Ok(Ok(_)) => (StatusCode::OK, Json(json!({"database": "ok"}))),
+        Ok(Ok(_)) => Ok(Json(json!({"database": "ok"}))),
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "readiness check failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"database": "unavailable"})),
-            )
+            Err(ApiError::ServiceUnavailable("database-unavailable"))
         }
         Err(_) => {
             tracing::warn!("readiness check timed out");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"database": "timeout"})),
-            )
+            Err(ApiError::ServiceUnavailable("database-timeout"))
         }
     }
 }

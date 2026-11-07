@@ -52,6 +52,8 @@ pub enum ApiError {
     TooManyRequests { retry_after_secs: u64 },
     /// 415 `unsupported-media-type`: a JSON endpoint got another content type.
     UnsupportedMediaType,
+    /// 503 with the given problem code: the instance cannot serve this request right now.
+    ServiceUnavailable(&'static str),
     /// 500 `internal`. The detail is always `internal error`; the cause is only logged.
     Internal(anyhow::Error),
 }
@@ -112,6 +114,9 @@ impl IntoResponse for ApiError {
                 "unsupported-media-type",
                 "expected a JSON request body".to_owned(),
             ),
+            ApiError::ServiceUnavailable(code) => {
+                (StatusCode::SERVICE_UNAVAILABLE, *code, humanise(code))
+            }
             ApiError::Internal(cause) => {
                 tracing::error!(error = ?cause, "internal error");
                 (

@@ -30,6 +30,12 @@ async fn readyz_503_when_database_down(pool: PgPool) {
     pool.close().await;
     let r = app.server.get("/readyz").await;
     r.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.header("content-type"), "application/problem+json");
     // Also pins that no Postgres error text reaches the body.
-    r.assert_json(&json!({"database": "unavailable"}));
+    r.assert_json(&json!({
+        "type": "urn:nm:problem:database-unavailable",
+        "title": "Service Unavailable",
+        "status": 503,
+        "detail": "database unavailable",
+    }));
 }
