@@ -172,13 +172,16 @@ pub async fn create_workspace(
     })
 }
 
-/// Every workspace the user belongs to, for `/me`.
+/// Every workspace the user belongs to, for `/me`, newest first.
+///
+/// `id desc` matches `list` below, and that ordering is not free to choose there: its cursor
+/// pagination filters on `w.id < cursor`, so the list must descend. Same data, same order.
 pub async fn for_user(db: impl PgExecutor<'_>, user_id: Uuid) -> sqlx::Result<Vec<MeWorkspace>> {
     sqlx::query_as!(
         MeWorkspace,
         r#"select w.id, w.slug, w.name, m.role as "role: Role"
            from memberships m join workspaces w on w.id = m.workspace_id
-           where m.user_id = $1 order by w.id"#,
+           where m.user_id = $1 order by w.id desc"#,
         user_id,
     )
     .fetch_all(db)
