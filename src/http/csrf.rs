@@ -8,7 +8,12 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 
-use crate::{app::AppState, auth::sessions, crypto::tokens::constant_time_eq, error::ApiError};
+use crate::{
+    app::AppState,
+    auth::{self, sessions},
+    crypto::tokens::constant_time_eq,
+    error::ApiError,
+};
 
 /// Sign-in routes: no session exists yet, so there is no token to present. The TOTP and passkey
 /// ones arrive with Tasks 9 and 13.
@@ -23,11 +28,12 @@ const EXEMPT: [&str; 4] = [
 /// `X-CSRF-Token`. No cookie, or one that does not resolve, is not checked here: the request is
 /// simply unauthenticated and the handler rejects it.
 ///
-/// A request with an `Authorization` header is an API-key request: it has no ambient credential
-/// for CSRF to protect, so it is not checked, and its `Cookie` header is dropped before any
-/// handler runs, so no handler can quietly authenticate it by cookie as well.
+/// A request with an `Authorization: Bearer` header is an API-key request: it has no ambient
+/// credential for CSRF to protect, so it is not checked, and its `Cookie` header is dropped before
+/// any handler runs, so no handler can quietly authenticate it by cookie as well. Other schemes
+/// (a proxy's `Basic`) are not ours: cookie authentication and CSRF apply as usual.
 pub async fn require_csrf(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    if req.headers().contains_key(header::AUTHORIZATION) {
+    if auth::bearer(req.headers()).is_some() {
         req.headers_mut().remove(header::COOKIE);
         return next.run(req).await;
     }

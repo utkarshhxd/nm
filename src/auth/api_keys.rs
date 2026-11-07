@@ -93,13 +93,16 @@ pub async fn resolve(db: &PgPool, presented: &str) -> sqlx::Result<Option<Resolv
     }
     // shortcut: last_used_at is written at most once a minute, so it is only accurate to about a
     // minute; write on every request if exact last-use times ever matter.
-    if row.stale {
-        sqlx::query!(
+    // Bookkeeping must never fail the request it rides on.
+    if row.stale
+        && let Err(e) = sqlx::query!(
             "update api_keys set last_used_at = now() where id = $1",
             row.id
         )
         .execute(db)
-        .await?;
+        .await
+    {
+        tracing::warn!(key_id = %row.id, error = %e, "could not record api key last_used_at");
     }
     Ok(Some(ResolvedKey {
         key_id: row.id,

@@ -129,16 +129,21 @@ async fn bad_keys_are_401(pool: PgPool) {
         String::new(),
         "x".repeat(5000),
     ] {
-        app.get(&path)
+        let r = app
+            .get(&path)
             .add_header("authorization", bearer(&bad))
-            .await
-            .assert_status(StatusCode::UNAUTHORIZED);
+            .await;
+        r.assert_status(StatusCode::UNAUTHORIZED);
+        // One code for every way a key can be bad, so the response is no oracle.
+        assert_eq!(problem_type(&r), "urn:nm:problem:invalid-api-key");
     }
-    // Not a Bearer header at all.
-    app.get(&path)
+    // Not our scheme: no key was presented, so this is simply an unauthenticated request.
+    let r = app
+        .get(&path)
         .add_header("authorization", format!("Basic {key}"))
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
+        .await;
+    r.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(problem_type(&r), "urn:nm:problem:unauthenticated");
 
     // Works, then is revoked, then is refused.
     app.get(&path)
@@ -149,10 +154,12 @@ async fn bad_keys_are_401(pool: PgPool) {
         .delete(&format!("/api/v1/workspaces/{ws}/api-keys/{id}"))
         .await
         .assert_status(StatusCode::NO_CONTENT);
-    app.get(&path)
+    let r = app
+        .get(&path)
         .add_header("authorization", bearer(&key))
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
+        .await;
+    r.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(problem_type(&r), "urn:nm:problem:invalid-api-key");
 }
 
 /// A valid session cookie must not rescue a bad Authorization header: with a header present the
@@ -163,17 +170,21 @@ async fn bogus_authorization_never_falls_back_to_the_cookie(pool: PgPool) {
     let path = format!("/api/v1/workspaces/{ws}");
     owner.get(&path).await.assert_status_ok();
 
-    owner
-        .get(&path)
-        .add_header("authorization", "Bearer nm_bad")
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
-    // The cookie-only account routes too.
-    owner
-        .get("/api/v1/me")
-        .add_header("authorization", "Bearer nm_bad")
-        .await
-        .assert_status(StatusCode::UNAUTHORIZED);
+    // Junk, an empty credential, a bare scheme and a differently-cased scheme: all are bearer
+    // attempts, so none may fall back to the cookie.
+    for header in [
+        "Bearer nm_bad",
+        "Bearer",
+        "Bearer ",
+        "bearer junk",
+        "BEARER x",
+    ] {
+        for route in [path.as_str(), "/api/v1/me"] {
+            let r = owner.get(route).add_header("authorization", header).await;
+            r.assert_status(StatusCode::UNAUTHORIZED);
+            assert_eq!(problem_type(&r), "urn:nm:problem:invalid-api-key");
+        }
+    }
 
     // A valid key plus a valid cookie authenticates as the key, never as the user.
     let (_, key) = make_key(&owner, ws, "viewer").await;
@@ -383,4 +394,38 @@ async fn invite_accept_ignores_the_cookie_when_authorization_is_present(pool: Pg
     // The same signed-in request without the header is recognised and accepted (the claim above
     // rolled back with the refusal).
     b.post(&accept).json(&json!({})).await.assert_status_ok();
+}
+
+/// A scheme that is not ours, such as `Basic` from a reverse proxy, leaves the session alone:
+/// the cookie authenticates, and CSRF still applies to it.
+#[sqlx::test]
+async fn non_bearer_authorization_leaves_cookie_auth_working(pool: PgPool) {
+    let (owner, _, ws) = owner_of(&pool, "acme").await;
+    let path = format!("/api/v1/workspaces/{ws}");
+    let basic = "Basic dXNlcjpwYXNz";
+
+    let r = owner.get(&path).add_header("authorization", basic).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["role"], "owner");
+    owner
+        .get("/api/v1/me")
+        .add_header("authorization", basic)
+        .await
+        .assert_status_ok();
+    owner
+        .patch(&path)
+        .add_header("authorization", basic)
+        .json(&json!({"name": "Renamed"}))
+        .await
+        .assert_status_ok();
+
+    // CSRF is not skipped for it: the same write without the token is refused.
+    let r = owner
+        .server
+        .patch(&path)
+        .add_header("authorization", basic)
+        .json(&json!({"name": "Again"}))
+        .await;
+    r.assert_status(StatusCode::FORBIDDEN);
+    assert_eq!(problem_type(&r), "urn:nm:problem:csrf");
 }

@@ -6,7 +6,7 @@
 use axum::{
     Router,
     extract::FromRequestParts,
-    http::{header::AUTHORIZATION, request::Parts},
+    http::{HeaderMap, header::AUTHORIZATION, request::Parts},
 };
 use axum_extra::extract::CookieJar;
 use sqlx::PgExecutor;
@@ -56,31 +56,38 @@ impl Principal {
     }
 }
 
-/// With an `Authorization` header the request is an API-key request and the cookie is not read at
-/// all: a bad or revoked key is `401 invalid-api-key`, never a fall back to a valid session
-/// (that would be a confused deputy). With no header, the session cookie must name a full session
+/// The credential of an `Authorization: Bearer` header (scheme matched case-insensitively), which
+/// may be empty; `None` if there is no such header. Any other scheme, such as a proxy's `Basic`, is
+/// not ours and leaves cookie authentication alone. A header that is not valid text counts as a
+/// bearer attempt with an empty credential, so it fails closed rather than falling back to the
+/// cookie.
+pub fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers.get_all(AUTHORIZATION).iter().find_map(|v| {
+        let Ok(v) = v.to_str() else { return Some("") };
+        let (scheme, credential) = v.split_once(' ').unwrap_or((v, ""));
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| credential.trim())
+    })
+}
+
+/// With an `Authorization: Bearer` header the request is an API-key request and the cookie is not
+/// read at all: a bad or revoked key is `401 invalid-api-key`, never a fall back to a valid
+/// session (that would be a confused deputy). Otherwise the session cookie must name a full session
 /// that is unexpired and not idle; a pending-MFA session, an unknown cookie and no cookie at all
 /// are the same `401 unauthenticated`.
 impl FromRequestParts<AppState> for Principal {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
-        if let Some(header) = parts.headers.get(AUTHORIZATION) {
-            let invalid = || ApiError::Unauthorized("invalid-api-key");
-            let key = header
-                .to_str()
-                .ok()
-                .and_then(|h| h.split_once(' '))
-                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-                .map(|(_, key)| key.trim())
-                .ok_or_else(invalid)?;
+        if let Some(key) = bearer(&parts.headers) {
             return match api_keys::resolve(&state.pool, key).await? {
                 Some(k) => Ok(Principal::ApiKey {
                     key_id: k.key_id,
                     workspace_id: k.workspace_id,
                     role: k.role,
                 }),
-                None => Err(invalid()),
+                None => Err(ApiError::Unauthorized("invalid-api-key")),
             };
         }
         let jar = CookieJar::from_headers(&parts.headers);
