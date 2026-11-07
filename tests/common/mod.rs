@@ -3,6 +3,9 @@
 // Each test binary uses a different subset of the harness.
 #![allow(dead_code)]
 
+use std::net::SocketAddr;
+
+use axum::Router;
 use axum_test::TestServer;
 use nm::{
     app::{self, AppState},
@@ -40,9 +43,7 @@ impl TestApp {
         let mut config = test_config("postgres://unused");
         f(&mut config);
         let state = AppState::new(pool.clone(), config).expect("app state");
-        let server = TestServer::builder()
-            .save_cookies()
-            .build(app::router(state.clone()));
+        let server = test_server(app::router(state.clone()));
         TestApp {
             server,
             pool,
@@ -50,4 +51,13 @@ impl TestApp {
             csrf: None,
         }
     }
+}
+
+/// Serves `router` the way `app::serve` does, with `ConnectInfo<SocketAddr>`.
+/// axum-test must use real HTTP for that, so handlers see the client address
+/// 127.0.0.1 (the port varies per connection). Cookies are kept between requests.
+pub fn test_server(router: Router) -> TestServer {
+    TestServer::builder()
+        .save_cookies()
+        .build(router.into_make_service_with_connect_info::<SocketAddr>())
 }

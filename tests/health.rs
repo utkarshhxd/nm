@@ -28,8 +28,8 @@ async fn readyz_reports_database(pool: PgPool) {
 async fn readyz_503_when_database_down(pool: PgPool) {
     let app = TestApp::new(pool.clone()).await;
     pool.close().await;
-    app.server
-        .get("/readyz")
-        .await
-        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let r = app.server.get("/readyz").await;
+    r.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    // Also pins that no Postgres error text reaches the body.
+    r.assert_json(&json!({"database": "unavailable"}));
 }
