@@ -1,0 +1,18 @@
+[package]
+name = "nm"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nm"
+path = "src/main.rs"
+
+[dependencies]
+
+# Keeps argon2 fast in debug and test builds.
+[profile.dev.package."*"]
+opt-level = 2
