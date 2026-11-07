@@ -2,12 +2,12 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::Router;
+use axum::{Router, middleware};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 
-use crate::{config::Config, db, http, telemetry};
+use crate::{config::Config, db, http, http::security_headers::security_headers, telemetry};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -28,6 +28,8 @@ pub fn router(state: AppState) -> Router {
     http::routes()
         .with_state(state)
         .layer(telemetry::metrics_layer())
+        // Outermost, so every response gets the headers: 404s, errors, metrics-free paths.
+        .layer(middleware::from_fn(security_headers))
 }
 
 /// Connect, migrate (unless disabled), then serve until SIGINT/SIGTERM.

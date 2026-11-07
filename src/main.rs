@@ -13,6 +13,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Keys(KeysCommand::Generate) => {
             println!("{}", nm::config::generate_secret_key());
         }
+        Command::Openapi => {
+            println!("{}", nm::openapi::spec().to_pretty_json()?);
+        }
         Command::Migrate => {
             let cfg = Config::load()?;
             telemetry::init_logging(cfg.log_format);

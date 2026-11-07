@@ -16,6 +16,8 @@ pub enum Command {
     Serve,
     /// Apply pending database migrations and exit
     Migrate,
+    /// Print the OpenAPI spec as JSON and exit
+    Openapi,
     /// Manage the secret key
     #[command(subcommand)]
     Keys(KeysCommand),
