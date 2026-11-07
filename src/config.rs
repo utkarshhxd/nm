@@ -28,7 +28,7 @@ impl fmt::Debug for SecretKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub listen: SocketAddr,
@@ -38,6 +38,22 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub metrics_listen: Option<SocketAddr>,
     pub log_format: LogFormat,
+}
+
+/// Hand-written so the database URL (it carries the password) never reaches logs.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"***")
+            .field("listen", &self.listen)
+            .field("public_url", &self.public_url)
+            .field("secret_key", &self.secret_key)
+            .field("auto_migrate", &self.auto_migrate)
+            .field("trust_proxy_headers", &self.trust_proxy_headers)
+            .field("metrics_listen", &self.metrics_listen)
+            .field("log_format", &self.log_format)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -265,6 +281,18 @@ mod tests {
         p.push(("NM_SECRET_KEY_FILE", "/nonexistent"));
         let e = Config::from_figment(figment_with(&p)).unwrap_err();
         assert!(matches!(e, ConfigError::SecretKeyConflict));
+    }
+
+    #[test]
+    fn config_debug_redacts_database_url() {
+        let c = Config::from_figment(figment_with(&[
+            ("NM_DATABASE_URL", "postgres://u:hunter2@h/db"),
+            ("NM_SECRET_KEY", KEY_B64),
+        ]))
+        .unwrap();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("Config"), "{dbg}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
     }
 
     #[test]
