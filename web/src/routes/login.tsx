@@ -44,9 +44,16 @@ export default function Login() {
     event.preventDefault();
     setError("");
     setBusy(true);
-    const { data, error: problem, response } = await api.POST("/api/v1/auth/login", {
-      body: { email, password },
-    });
+    let result;
+    try {
+      result = await api.POST("/api/v1/auth/login", { body: { email, password } });
+    } catch {
+      // The request never completed — offline, DNS, a dropped connection.
+      setBusy(false);
+      setError("Could not sign in. Check your connection and try again.");
+      return;
+    }
+    const { data, error: problem, response } = result;
     setBusy(false);
     if (response.status === 429) {
       setError(tooManyAttempts(response.headers.get("retry-after")));
@@ -64,9 +71,19 @@ export default function Login() {
     event.preventDefault();
     setError("");
     setBusy(true);
-    const { data, error: problem, response } = await api.POST("/api/v1/auth/login/totp", {
-      body: recovery ? { recovery_code: code } : { code },
-    });
+    let result;
+    try {
+      result = await api.POST("/api/v1/auth/login/totp", {
+        body: recovery ? { recovery_code: code } : { code },
+      });
+    } catch {
+      // The request never completed — offline, DNS, a dropped connection. The pending session
+      // is untouched, so staying on the second-factor form is right.
+      setBusy(false);
+      setError("Could not sign in. Check your connection and try again.");
+      return;
+    }
+    const { data, error: problem, response } = result;
     setBusy(false);
     if (response.status === 429) {
       setError(tooManyAttempts(response.headers.get("retry-after")));

@@ -137,7 +137,16 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
   async function start() {
     setSetupError("");
     setBusy(true);
-    const { data, error: problem } = await api.POST("/api/v1/me/totp/setup");
+    let result;
+    try {
+      result = await api.POST("/api/v1/me/totp/setup");
+    } catch {
+      // The request never completed — offline, DNS, a dropped connection.
+      setBusy(false);
+      setSetupError("Two-factor setup could not be started. Check your connection and try again.");
+      return;
+    }
+    const { data, error: problem } = result;
     setBusy(false);
     if (problem || !data) {
       setSetupError(problemMessage(problem, "Two-factor setup could not be started."));
@@ -150,7 +159,16 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
     event.preventDefault();
     setCodeError("");
     setBusy(true);
-    const { data, error: problem } = await api.POST("/api/v1/me/totp/confirm", { body: { code } });
+    let result;
+    try {
+      result = await api.POST("/api/v1/me/totp/confirm", { body: { code } });
+    } catch {
+      // The request never completed — offline, DNS, a dropped connection.
+      setBusy(false);
+      setCodeError("That code could not be submitted. Check your connection and try again.");
+      return;
+    }
+    const { data, error: problem } = result;
     setBusy(false);
     if (problem || !data) {
       setCodeError(problemMessage(problem, "That code was not accepted."));
@@ -166,7 +184,17 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
     event.preventDefault();
     setPasswordError("");
     setBusy(true);
-    const { error: problem } = await api.DELETE("/api/v1/me/totp", { body: { password } });
+    let problem: unknown;
+    try {
+      ({ error: problem } = await api.DELETE("/api/v1/me/totp", { body: { password } }));
+    } catch {
+      // The request never completed — offline, DNS, a dropped connection.
+      setBusy(false);
+      setPasswordError(
+        "Two-factor sign-in could not be turned off. Check your connection and try again.",
+      );
+      return;
+    }
     setBusy(false);
     if (problem) {
       setPasswordError(problemMessage(problem, "Two-factor sign-in could not be turned off."));
