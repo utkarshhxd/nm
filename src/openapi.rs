@@ -32,6 +32,9 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::workspaces::invites::preview,
         crate::workspaces::invites::accept,
         crate::audit::routes::list,
+        crate::auth::api_keys::create,
+        crate::auth::api_keys::list,
+        crate::auth::api_keys::revoke,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -57,6 +60,9 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::workspaces::invites::AcceptInvite,
         crate::workspaces::invites::Accepted,
         crate::audit::routes::AuditEntry,
+        crate::auth::api_keys::NewApiKey,
+        crate::auth::api_keys::CreatedApiKey,
+        crate::auth::api_keys::ApiKeySummary,
     ))
 )]
 struct ApiDoc;

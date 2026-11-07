@@ -21,19 +21,22 @@ const EXEMPT: [&str; 4] = [
 
 /// Unsafe `/api/v1` requests carrying a cookie for a full session must send that session's
 /// `X-CSRF-Token`. No cookie, or one that does not resolve, is not checked here: the request is
-/// simply unauthenticated and the handler rejects it. Requests with an `Authorization` header
-/// are skipped; Task 12 makes those ignore cookies altogether.
-pub async fn require_csrf(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// simply unauthenticated and the handler rejects it.
+///
+/// A request with an `Authorization` header is an API-key request: it has no ambient credential
+/// for CSRF to protect, so it is not checked, and its `Cookie` header is dropped before any
+/// handler runs, so no handler can quietly authenticate it by cookie as well.
+pub async fn require_csrf(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    if req.headers().contains_key(header::AUTHORIZATION) {
+        req.headers_mut().remove(header::COOKIE);
+        return next.run(req).await;
+    }
     let path = req.uri().path();
     let unsafe_method = matches!(
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
-    if !unsafe_method
-        || !path.starts_with("/api/v1/")
-        || EXEMPT.contains(&path)
-        || req.headers().contains_key(header::AUTHORIZATION)
-    {
+    if !unsafe_method || !path.starts_with("/api/v1/") || EXEMPT.contains(&path) {
         return next.run(req).await;
     }
     let Some(cookie) = CookieJar::from_headers(req.headers())

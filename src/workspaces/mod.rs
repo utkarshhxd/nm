@@ -86,7 +86,7 @@ fn validate_slug(slug: &str) -> Result<(), FieldError> {
 }
 
 /// Trimmed, 1..=100 characters, no control characters (NUL would also fail an audit insert).
-fn validate_name(name: &str) -> Result<String, FieldError> {
+pub(crate) fn validate_name(name: &str) -> Result<String, FieldError> {
     let name = name.trim();
     if (1..=100).contains(&name.chars().count()) && !name.chars().any(char::is_control) {
         return Ok(name.to_owned());
@@ -210,18 +210,33 @@ async fn load(db: impl PgExecutor<'_>, id: Uuid, role: Role) -> ApiResult<Worksp
 )]
 pub async fn list(
     State(state): State<AppState>,
-    user: CurrentUser,
+    principal: Principal,
     ApiQuery(page): ApiQuery<PageParams>,
 ) -> ApiResult<Json<Page<Workspace>>> {
     let limit = page.limit();
+    let after = page.after()?;
+    let user_id = match principal {
+        Principal::User { user_id, .. } => user_id,
+        // A key sees its own workspace and nothing else: a page of one, or none past its cursor.
+        Principal::ApiKey {
+            workspace_id, role, ..
+        } => {
+            let rows = if after.is_none_or(|a| workspace_id < a) {
+                vec![load(&state.pool, workspace_id, role).await?]
+            } else {
+                vec![]
+            };
+            return Ok(Json(Page::from_rows(rows, limit, |w| w.id)));
+        }
+    };
     let rows = sqlx::query_as!(
         Workspace,
         r#"select w.id, w.slug, w.name, w.timezone, m.role as "role: Role"
            from memberships m join workspaces w on w.id = m.workspace_id
            where m.user_id = $1 and ($2::uuid is null or w.id < $2)
            order by w.id desc limit $3"#,
-        user.user_id,
-        page.after()?,
+        user_id,
+        after,
         limit + 1,
     )
     .fetch_all(&state.pool)
@@ -289,11 +304,10 @@ pub async fn show(
 pub async fn update(
     State(state): State<AppState>,
     meta: RequestMeta,
-    user: CurrentUser,
+    principal: Principal,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<UpdateWorkspace>,
 ) -> ApiResult<Json<Workspace>> {
-    let principal = user.principal();
     let mut tx = state.pool.begin().await?;
     let access = authorize(&mut *tx, &principal, id, Role::Admin).await?;
 

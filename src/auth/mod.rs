@@ -3,7 +3,11 @@
 //! Who is calling: the session store, the sign-in handlers, and the `Principal` and
 //! `CurrentUser` extractors that authenticated routes take.
 
-use axum::{Router, extract::FromRequestParts, http::request::Parts};
+use axum::{
+    Router,
+    extract::FromRequestParts,
+    http::{header::AUTHORIZATION, request::Parts},
+};
 use axum_extra::extract::CookieJar;
 use sqlx::PgExecutor;
 use uuid::Uuid;
@@ -15,38 +19,70 @@ use crate::{
     workspaces::roles::Role,
 };
 
+pub mod api_keys;
 pub mod login;
 pub mod rate_limit;
 pub mod sessions;
 pub mod totp;
 
 pub fn routes() -> Router<AppState> {
-    login::routes().merge(totp::routes())
+    login::routes()
+        .merge(totp::routes())
+        .merge(api_keys::routes())
 }
 
-/// An authenticated caller. Task 12 adds an API-key variant.
+/// An authenticated caller: a signed-in user (cookie) or a workspace API key (Bearer).
 pub enum Principal {
     User {
         user_id: Uuid,
         session_hash: [u8; 32],
         csrf_token: String,
     },
+    /// Confined to one workspace, at the role the key was created with.
+    ApiKey {
+        key_id: Uuid,
+        workspace_id: Uuid,
+        role: Role,
+    },
 }
 
 impl Principal {
     /// Who to record in the audit log.
     pub fn actor(&self) -> Actor {
-        let Principal::User { user_id, .. } = self;
-        Actor::User(*user_id)
+        match self {
+            Principal::User { user_id, .. } => Actor::User(*user_id),
+            Principal::ApiKey { key_id, .. } => Actor::ApiKey(*key_id),
+        }
     }
 }
 
-/// The session cookie must name a full session that is unexpired and not idle. A pending-MFA
-/// session, an unknown cookie and no cookie at all are the same `401 unauthenticated`.
+/// With an `Authorization` header the request is an API-key request and the cookie is not read at
+/// all: a bad or revoked key is `401 invalid-api-key`, never a fall back to a valid session
+/// (that would be a confused deputy). With no header, the session cookie must name a full session
+/// that is unexpired and not idle; a pending-MFA session, an unknown cookie and no cookie at all
+/// are the same `401 unauthenticated`.
 impl FromRequestParts<AppState> for Principal {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        if let Some(header) = parts.headers.get(AUTHORIZATION) {
+            let invalid = || ApiError::Unauthorized("invalid-api-key");
+            let key = header
+                .to_str()
+                .ok()
+                .and_then(|h| h.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, key)| key.trim())
+                .ok_or_else(invalid)?;
+            return match api_keys::resolve(&state.pool, key).await? {
+                Some(k) => Ok(Principal::ApiKey {
+                    key_id: k.key_id,
+                    workspace_id: k.workspace_id,
+                    role: k.role,
+                }),
+                None => Err(invalid()),
+            };
+        }
         let jar = CookieJar::from_headers(&parts.headers);
         let Some(cookie) = jar.get(sessions::COOKIE_NAME) else {
             return Err(ApiError::Unauthorized("unauthenticated"));
@@ -62,7 +98,8 @@ impl FromRequestParts<AppState> for Principal {
     }
 }
 
-/// A signed-in human (cookie session). Task 12 makes this reject API keys.
+/// A signed-in human (cookie session). An API key is refused with `403 user-session-required`:
+/// account security, and anything that grants access to the workspace, belong to people.
 pub struct CurrentUser {
     pub user_id: Uuid,
     pub session_hash: [u8; 32],
@@ -83,6 +120,7 @@ impl FromRequestParts<AppState> for CurrentUser {
                 session_hash,
                 csrf_token,
             }),
+            Principal::ApiKey { .. } => Err(ApiError::Forbidden("user-session-required")),
         }
     }
 }
@@ -117,17 +155,27 @@ pub async fn authorize(
     workspace_id: Uuid,
     min: Role,
 ) -> ApiResult<WorkspaceAccess> {
-    // Task 12's API-key variant resolves its workspace and role here; until then this match
-    // is irrefutable and adding a variant is a compile error.
-    let Principal::User { user_id, .. } = principal;
-    let role = sqlx::query_scalar!(
-        r#"select role as "role: Role" from memberships where workspace_id = $1 and user_id = $2"#,
-        workspace_id,
-        user_id,
-    )
-    .fetch_optional(db)
-    .await?
-    .ok_or(ApiError::NotFound)?;
+    let role = match principal {
+        Principal::User { user_id, .. } => sqlx::query_scalar!(
+            r#"select role as "role: Role" from memberships where workspace_id = $1 and user_id = $2"#,
+            workspace_id,
+            user_id,
+        )
+        .fetch_optional(db)
+        .await?
+        .ok_or(ApiError::NotFound)?,
+        // A key belongs to one workspace; any other is a 404, exactly as for a non-member.
+        Principal::ApiKey {
+            workspace_id: key_workspace,
+            role,
+            ..
+        } => {
+            if *key_workspace != workspace_id {
+                return Err(ApiError::NotFound);
+            }
+            *role
+        }
+    };
     if role < min {
         return Err(ApiError::Forbidden("insufficient-role"));
     }
