@@ -13,12 +13,20 @@ name = "nm"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 figment = { version = "0.10.19", features = ["env", "toml"] }
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "macros", "migrate"] }
 thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tower = "0.5.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = { version = "2.5.8", features = ["serde"] }
@@ -26,3 +34,6 @@ url = { version = "2.5.8", features = ["serde"] }
 # Keeps argon2 fast in debug and test builds.
 [profile.dev.package."*"]
 opt-level = 2
+
+[dev-dependencies]
+axum-test = "21.1.0"

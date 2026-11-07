@@ -23,15 +23,20 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://nm:nm@localhost:5432/nm
+      SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+      - run: sqlx migrate run
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - run: cargo sqlx prepare --check -- --all-targets
 
   deny:
     runs-on: ubuntu-latest

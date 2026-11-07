@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::{convert::Infallible, time::Instant};
+
+use axum::{
+    extract::{MatchedPath, Request},
+    middleware::{self, Next},
+    response::Response,
+    routing::Route,
+};
+use tower::{Layer, Service};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::LogFormat;
@@ -24,6 +33,43 @@ fn env_filter(spec: Option<&str>) -> EnvFilter {
         None => EnvFilter::new("info"),
         Some(s) => EnvFilter::try_new(s).unwrap_or_else(|e| panic!("invalid NM_LOG {s:?}: {e}")),
     }
+}
+
+/// Records `http_requests_total` and `http_request_duration_seconds`, labelled by
+/// method, matched route template (never the raw path, to bound cardinality) and
+/// status. Unrouted requests (404s) are labelled `route="unmatched"`.
+pub fn metrics_layer() -> impl Layer<
+    Route,
+    Service = impl Service<Request, Response = Response, Error = Infallible, Future: Send>
+              + Clone
+              + Send
+              + Sync
+              + 'static,
+> + Clone
++ Send
++ Sync
++ 'static {
+    middleware::from_fn(track_metrics)
+}
+
+async fn track_metrics(req: Request, next: Next) -> Response {
+    let start = Instant::now();
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str)
+        .to_owned();
+    let response = next.run(req).await;
+    let labels = [
+        ("method", method),
+        ("route", route),
+        ("status", response.status().as_u16().to_string()),
+    ];
+    metrics::counter!("http_requests_total", &labels).increment(1);
+    metrics::histogram!("http_request_duration_seconds", &labels)
+        .record(start.elapsed().as_secs_f64());
+    response
 }
 
 #[cfg(test)]

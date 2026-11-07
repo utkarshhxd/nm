@@ -5,12 +5,17 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "nm", version, about = "NM email marketing platform")]
 pub struct Cli {
+    /// Defaults to `serve` when omitted.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Run the HTTP server (default)
+    Serve,
+    /// Apply pending database migrations and exit
+    Migrate,
     /// Manage the secret key
     #[command(subcommand)]
     Keys(KeysCommand),
