@@ -7,19 +7,25 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 
-use crate::{config::Config, db, http, http::security_headers::security_headers, telemetry};
+use crate::{
+    config::Config, crypto::secrets::Secrets, db, http, http::security_headers::security_headers,
+    telemetry,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
+    pub secrets: Arc<Secrets>,
 }
 
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> anyhow::Result<AppState> {
+        let secrets = Arc::new(Secrets::new(&config.secret_key));
         Ok(AppState {
             pool,
             config: Arc::new(config),
+            secrets,
         })
     }
 }
