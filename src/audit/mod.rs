@@ -8,6 +8,7 @@ use crate::http::request_meta::{RequestMeta, truncate_user_agent};
 pub mod actions {
     pub const AUTH_LOGIN_SUCCEEDED: &str = "auth.login.succeeded";
     pub const AUTH_LOGIN_FAILED: &str = "auth.login.failed";
+    pub const AUTH_LOGIN_MFA_REQUIRED: &str = "auth.login.mfa_required";
     pub const AUTH_LOGOUT: &str = "auth.logout";
     pub const AUTH_PASSWORD_CHANGED: &str = "auth.password.changed";
     pub const AUTH_TOTP_ENABLED: &str = "auth.totp.enabled";

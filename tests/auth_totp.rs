@@ -26,6 +26,19 @@ struct Enrolled {
     secret: String,
     recovery: Vec<String>,
     user_id: Uuid,
+    /// The code that confirmed enrolment, kept so a test never regenerates it from a later clock.
+    confirming_code: String,
+}
+
+/// A code that is certainly wrong: the first six-digit string that is none of the codes for the
+/// steps around now (two either side, wider than the server's one-step window).
+fn wrong_code(secret: &str) -> String {
+    let t = now();
+    let valid: Vec<String> = (0..5).map(|i| code_for(secret, t + 30 * i - 60)).collect();
+    (0..1_000_000)
+        .map(|n| format!("{n:06}"))
+        .find(|c| !valid.contains(c))
+        .unwrap()
 }
 
 /// Creates the user and turns TOTP on through the API, then signs out. The confirming code is the
@@ -43,9 +56,10 @@ async fn enrol(app: &mut TestApp) -> Enrolled {
             .unwrap()
             .starts_with("otpauth://totp/localhost:ops%40example.com?secret=")
     );
+    let confirming_code = code_for(&secret, now() - 30);
     let confirm = app
         .post("/api/v1/me/totp/confirm")
-        .json(&json!({"code": code_for(&secret, now() - 30)}))
+        .json(&json!({"code": confirming_code}))
         .await;
     confirm.assert_status_ok();
     let recovery: Vec<String> = confirm.json::<Value>()["recovery_codes"]
@@ -55,11 +69,18 @@ async fn enrol(app: &mut TestApp) -> Enrolled {
         .map(|c| c.as_str().unwrap().to_owned())
         .collect();
     assert_eq!(recovery.len(), 10);
+    // Three groups of five.
+    assert!(
+        recovery
+            .iter()
+            .all(|c| c.len() == 17 && c.matches('-').count() == 2)
+    );
     logout(app).await;
     Enrolled {
         secret,
         recovery,
         user_id,
+        confirming_code,
     }
 }
 
@@ -110,6 +131,15 @@ async fn totp_makes_login_require_a_code(pool: PgPool) {
     let r = password_login(&app).await;
     r.assert_status_ok();
     r.assert_json(&json!({"status":"mfa_required","methods":["totp"]}));
+    // The password stage leaves a trace even if no second factor follows.
+    assert_eq!(
+        count(
+            &app.pool,
+            "select count(*) from audit_log where action = 'auth.login.mfa_required'"
+        )
+        .await,
+        1
+    );
     // The pending session lives 10 minutes, and its cookie says so.
     assert_eq!(
         r.cookie("nm_session").max_age().map(|d| d.whole_minutes()),
@@ -161,7 +191,7 @@ async fn the_confirming_code_cannot_sign_in(pool: PgPool) {
     let mut app = TestApp::new(pool).await;
     let e = enrol(&mut app).await;
     password_login(&app).await.assert_status_ok();
-    let r = second_factor(&app, json!({"code": code_for(&e.secret, now() - 30)})).await;
+    let r = second_factor(&app, json!({"code": e.confirming_code})).await;
     assert_problem(&r, StatusCode::UNAUTHORIZED, "invalid-code");
 }
 
@@ -179,25 +209,76 @@ async fn fifth_wrong_code_forces_restart(pool: PgPool) {
     let mut app = TestApp::new(pool).await;
     let e = enrol(&mut app).await;
     password_login(&app).await.assert_status_ok();
+    let wrong = wrong_code(&e.secret);
     for _ in 0..4 {
-        let r = second_factor(&app, json!({"code": "000000"})).await;
+        let r = second_factor(&app, json!({"code": wrong})).await;
         assert_problem(&r, StatusCode::UNAUTHORIZED, "invalid-code");
     }
-    let r = second_factor(&app, json!({"code": "000000"})).await;
+    let r = second_factor(&app, json!({"code": wrong})).await;
     assert_problem(&r, StatusCode::UNAUTHORIZED, "mfa-restart");
     assert_eq!(count(&app.pool, "select count(*) from sessions").await, 0);
     // The session is gone, so even the right code has nothing to complete.
     let r = second_factor(&app, json!({"code": code_for(&e.secret, now())})).await;
     r.assert_status(StatusCode::UNAUTHORIZED);
-    // The restart is also a failed sign-in as far as the limiter is concerned.
+    // Each wrong code is one failed sign-in as far as the limiter is concerned, and is audited
+    // (4 x invalid-code, then the mfa-restart), once each.
     assert_eq!(
         count(
             &app.pool,
             "select count(*) from login_attempts where not succeeded"
         )
         .await,
+        5
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "select count(*) from audit_log where action = 'auth.login.failed' \
+             and metadata->>'reason' = 'invalid-code'"
+        )
+        .await,
+        4
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "select count(*) from audit_log where action = 'auth.login.failed' \
+             and metadata->>'reason' = 'mfa-restart'"
+        )
+        .await,
         1
     );
+}
+
+/// "Sign in, guess four times, repeat": each loop gets a fresh pending session, so the
+/// per-session cap never bites. The limiter must.
+#[sqlx::test]
+async fn guessing_across_fresh_pending_sessions_ends_in_a_429(pool: PgPool) {
+    let mut app = TestApp::new(pool).await;
+    let e = enrol(&mut app).await;
+    let wrong = wrong_code(&e.secret);
+    let mut guesses = 0;
+    let mut locked = false;
+    'rounds: for _ in 0..6 {
+        if password_login(&app).await.status_code() == StatusCode::TOO_MANY_REQUESTS {
+            locked = true;
+            break;
+        }
+        for _ in 0..4 {
+            let r = second_factor(&app, json!({"code": wrong})).await;
+            if r.status_code() == StatusCode::TOO_MANY_REQUESTS {
+                locked = true;
+                break 'rounds;
+            }
+            assert_problem(&r, StatusCode::UNAUTHORIZED, "invalid-code");
+            guesses += 1;
+        }
+    }
+    assert!(locked, "never locked after {guesses} wrong codes");
+    assert_eq!(guesses, 10);
+    // Locked means locked: the right code is refused too.
+    let r = second_factor(&app, json!({"code": code_for(&e.secret, now())})).await;
+    r.assert_status(StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[sqlx::test]
@@ -318,6 +399,10 @@ async fn disabling_totp_requires_password(pool: PgPool) {
         .await
         .assert_status_ok();
     adopt_session(&mut app).await;
+    // A second, pending session of the same user, as another device mid-sign-in would hold.
+    nm::auth::sessions::create(&pool, e.user_id, true, &Default::default())
+        .await
+        .unwrap();
 
     let r = app
         .delete("/api/v1/me/totp")
@@ -328,12 +413,22 @@ async fn disabling_totp_requires_password(pool: PgPool) {
         count(&pool, "select count(*) from recovery_codes").await,
         10
     );
+    assert_eq!(
+        count(&pool, "select count(*) from sessions where mfa_pending").await,
+        1
+    );
 
     app.delete("/api/v1/me/totp")
         .json(&json!({"password": PW}))
         .await
         .assert_status(StatusCode::NO_CONTENT);
     assert_eq!(count(&pool, "select count(*) from recovery_codes").await, 0);
+    // Pending sessions went with it; the caller's own full session did not.
+    assert_eq!(
+        count(&pool, "select count(*) from sessions where mfa_pending").await,
+        0
+    );
+    assert_eq!(count(&pool, "select count(*) from sessions").await, 1);
     assert_eq!(
         count(
             &pool,
@@ -353,9 +448,13 @@ async fn setup_is_refused_once_enabled_and_confirm_needs_a_right_code(pool: PgPo
     app.login(EMAIL, PW).await;
     app.post("/api/v1/me/totp/setup").await.assert_status_ok();
 
+    // A code that is wrong for the pending secret (re-issued here so its secret is in hand);
+    // the secret changes again below, which is fine.
+    let first = app.post("/api/v1/me/totp/setup").await.json::<Value>();
+    let wrong = wrong_code(first["secret"].as_str().unwrap());
     let r = app
         .post("/api/v1/me/totp/confirm")
-        .json(&json!({"code": "000000"}))
+        .json(&json!({"code": wrong}))
         .await;
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(r.json::<Value>()["errors"][0]["field"], "code");

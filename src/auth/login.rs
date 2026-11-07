@@ -174,7 +174,24 @@ pub async fn login(
     rate_limit::mark_succeeded(&state.pool, attempt).await?;
 
     if user.totp_enabled {
-        let pending = sessions::create(&state.pool, user.id, true, &meta).await?;
+        // Audited, so a password that was right but never followed by a second factor leaves a
+        // trace.
+        let mut tx = state.pool.begin().await?;
+        let pending = sessions::create(&mut *tx, user.id, true, &meta).await?;
+        audit::record(
+            &mut *tx,
+            &meta,
+            AuditEvent {
+                workspace_id: None,
+                actor: Actor::User(user.id),
+                action: actions::AUTH_LOGIN_MFA_REQUIRED,
+                target_type: Some("user"),
+                target_id: Some(user.id.to_string()),
+                metadata: json!({ "email": user.email }),
+            },
+        )
+        .await?;
+        tx.commit().await?;
         return Ok((
             jar.add(sessions::cookie(
                 &pending.cookie_value,

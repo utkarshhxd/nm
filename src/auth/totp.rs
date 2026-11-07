@@ -10,7 +10,10 @@
 //! - `totp_last_step` is the highest accepted 30-second step. A code is accepted only for a step
 //!   above it, and accepting one raises it, so the code and every earlier step are spent.
 //! - A recovery code is stored as sha256 of its normalised form and spent by one conditional
-//!   `update`, so concurrent uses of the same code cannot both succeed.
+//!   `update`, so concurrent uses of the same code cannot both succeed. It is 15 random characters
+//!   (31^15, about 2^74), so unsalted sha256 is safe: there is nothing to sweep.
+//! - Every wrong second factor is charged to the sign-in limiter like a wrong password, so the
+//!   password stage cannot be repeated to buy fresh guesses.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,6 +44,8 @@ use crate::{
 
 const SECRET_BYTES: usize = 20;
 const RECOVERY_CODE_COUNT: usize = 10;
+/// Random characters per recovery code, before the two hyphens.
+const RECOVERY_CODE_CHARS: usize = 15;
 /// 31 characters, with the look-alikes `i`, `l`, `o`, `0` and `1` left out.
 const RECOVERY_ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
 /// The largest multiple of 31 that fits in a byte; a random byte at or above it is discarded, so
@@ -80,7 +85,8 @@ pub fn code_for(secret_b32: &str, at_unix: u64) -> String {
 /// refused. It fails closed and the next code works; no replay is possible.
 pub fn verify(secret: &[u8], code: &str, now_unix: u64, last_step: Option<i64>) -> Option<i64> {
     let totp = builder(secret).build().ok()?;
-    let step = i64::try_from(totp.check(code.trim(), now_unix)?).ok()?;
+    // Authenticator apps show `123 456`, and a pasted code carries the space.
+    let step = i64::try_from(totp.check(code.replace(' ', "").trim(), now_unix)?).ok()?;
     last_step.is_none_or(|last| step > last).then_some(step)
 }
 
@@ -103,23 +109,24 @@ fn otpauth_url(secret: &[u8], issuer: &str, email: &str) -> Result<String, TotpE
 }
 
 fn recovery_code() -> String {
-    let mut code = String::with_capacity(11);
+    let mut code = String::with_capacity(RECOVERY_CODE_CHARS + 2);
     let mut random = [0u8; 32];
-    while code.len() < 10 {
+    while code.len() < RECOVERY_CODE_CHARS {
         SysRng
             .try_fill_bytes(&mut random)
             .expect("OS RNG unavailable");
         for byte in random.into_iter().filter(|b| *b < RECOVERY_BYTE_LIMIT) {
-            if code.len() < 10 {
+            if code.len() < RECOVERY_CODE_CHARS {
                 code.push(RECOVERY_ALPHABET[usize::from(byte) % RECOVERY_ALPHABET.len()] as char);
             }
         }
     }
     code.insert(5, '-');
+    code.insert(11, '-');
     code
 }
 
-/// Ten fresh codes shaped `xxxxx-xxxxx`.
+/// Ten fresh codes shaped `xxxxx-xxxxx-xxxxx`.
 pub fn generate_recovery_codes() -> Vec<String> {
     (0..RECOVERY_CODE_COUNT).map(|_| recovery_code()).collect()
 }
@@ -355,6 +362,9 @@ pub async fn disable(
     }
     let mut tx = state.pool.begin().await?;
     users::clear_totp(&mut tx, user.user_id).await?;
+    // A pending session is already unusable without a secret; removing it saves anyone redoing
+    // that reasoning.
+    sessions::revoke_pending_for_user(&mut *tx, user.user_id).await?;
     audit::record(
         &mut *tx,
         &meta,
@@ -372,17 +382,19 @@ pub async fn disable(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Ends the pending session and counts the restart as a failed sign-in for the limiter. Without
-/// that, a caller who knows the password could sign in again for five more guesses, indefinitely:
-/// the password stage is a recorded success, so nothing else would ever add up to a lock.
-async fn restart(
+/// Audits a wrong second factor and builds the 401. With `restart`, the pending session is deleted
+/// first and the answer is `mfa-restart`. The limiter was already charged: `login_totp` records
+/// an attempt before checking, exactly as `login` does for a password.
+async fn reject(
     state: &AppState,
     meta: &RequestMeta,
     pending: &sessions::PendingSession,
     user: &users::User,
+    restart: bool,
 ) -> ApiResult<ApiError> {
-    sessions::delete(&state.pool, &pending.session_hash).await?;
-    rate_limit::record_attempt(&state.pool, Some(&user.email), meta.ip).await?;
+    if restart {
+        sessions::delete(&state.pool, &pending.session_hash).await?;
+    }
     audit::record(
         &state.pool,
         meta,
@@ -392,13 +404,23 @@ async fn restart(
             action: actions::AUTH_LOGIN_FAILED,
             target_type: Some("user"),
             target_id: Some(user.id.to_string()),
-            metadata: json!({ "email": user.email, "reason": "mfa-restart" }),
+            metadata: json!({
+                "email": user.email,
+                "reason": if restart { "mfa-restart" } else { "invalid-code" },
+            }),
         },
     )
     .await?;
-    Ok(ApiError::UnauthorizedDetail {
-        code: "mfa-restart",
-        detail: "Too many wrong codes; sign in again",
+    Ok(if restart {
+        ApiError::UnauthorizedDetail {
+            code: "mfa-restart",
+            detail: "Too many wrong codes; sign in again",
+        }
+    } else {
+        ApiError::UnauthorizedDetail {
+            code: "invalid-code",
+            detail: "Code is incorrect",
+        }
     })
 }
 
@@ -410,6 +432,7 @@ async fn restart(
         (status = 200, description = "Signed in; the pending session is replaced by a full one", body = LoginResponse),
         (status = 401, description = "invalid-code, mfa-restart (5th wrong code), or unauthenticated (no live pending session)"),
         (status = 422, description = "not exactly one of code and recovery_code"),
+        (status = 429, description = "rate-limited: too many failed sign-ins for this email or address"),
     ),
 )]
 pub async fn login_totp(
@@ -435,15 +458,22 @@ pub async fn login_totp(
         }
     };
 
-    // Counted before the check, so guesses in flight cannot outnumber the limit.
-    let attempts = sessions::record_mfa_attempt(&state.pool, &pending.session_hash)
-        .await?
-        .ok_or_else(unauthenticated)?;
     let user = users::find_by_id(&state.pool, pending.user_id)
         .await?
         .ok_or_else(unauthenticated)?;
+    // The same limiter as the password stage, because a pending session is cheap to get for
+    // anyone who knows the password: without this, "sign in, guess four times, repeat" would be
+    // unthrottled, as the password stage is a recorded success each time.
+    rate_limit::check(&state.pool, Some(&user.email), meta.ip).await?;
+    // Both counted before the code is checked, so guesses in flight cannot outnumber the limits.
+    // The limiter row is a failure now and flipped on success; the session counter reaches the
+    // restart at the 5th wrong code.
+    let attempt = rate_limit::record_attempt(&state.pool, Some(&user.email), meta.ip).await?;
+    let attempts = sessions::record_mfa_attempt(&state.pool, &pending.session_hash)
+        .await?
+        .ok_or_else(unauthenticated)?;
     if attempts > MAX_MFA_ATTEMPTS {
-        return Err(restart(&state, &meta, &pending, &user).await?);
+        return Err(reject(&state, &meta, &pending, &user, true).await?);
     }
 
     // Everything below that spends a code runs in the transaction that signs the user in, so a
@@ -476,14 +506,8 @@ pub async fn login_totp(
     };
     let Some(method) = method else {
         drop(tx);
-        return Err(if attempts >= MAX_MFA_ATTEMPTS {
-            restart(&state, &meta, &pending, &user).await?
-        } else {
-            ApiError::UnauthorizedDetail {
-                code: "invalid-code",
-                detail: "Code is incorrect",
-            }
-        });
+        let restart = attempts >= MAX_MFA_ATTEMPTS;
+        return Err(reject(&state, &meta, &pending, &user, restart).await?);
     };
 
     // The pending session is deleted, not upgraded: its id was handed out before the second
@@ -516,6 +540,7 @@ pub async fn login_totp(
         .await?;
     }
     tx.commit().await?;
+    rate_limit::mark_succeeded(&state.pool, attempt).await?;
 
     Ok((
         jar.add(sessions::cookie(
@@ -568,6 +593,15 @@ mod tests {
     }
 
     #[test]
+    fn verify_accepts_the_spaced_form_authenticator_apps_display() {
+        let now = 1_700_000_015;
+        let code = code_for(RFC_SECRET_B32, now);
+        let spaced = format!("{} {}", &code[..3], &code[3..]);
+        assert!(verify(RFC_SECRET, &spaced, now, None).is_some());
+        assert!(verify(RFC_SECRET, &format!(" {spaced} "), now, None).is_some());
+    }
+
+    #[test]
     fn verify_rejects_malformed_codes() {
         let now = 1_700_000_015;
         for bad in ["", "12345", "1234567", "abcdef", "12 456", "١٢٣٤٥٦"] {
@@ -581,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_codes_are_ten_distinct_xxxxx_xxxxx() {
+    fn recovery_codes_are_ten_distinct_xxxxx_xxxxx_xxxxx() {
         assert_eq!(RECOVERY_ALPHABET.len(), 31);
         assert_eq!(
             usize::from(RECOVERY_BYTE_LIMIT),
@@ -590,12 +624,13 @@ mod tests {
         let codes = generate_recovery_codes();
         assert_eq!(codes.len(), 10);
         for c in &codes {
-            assert_eq!(c.len(), 11);
-            assert_eq!(c.as_bytes()[5], b'-');
+            assert_eq!(c.len(), 17);
             assert!(
-                c.bytes()
-                    .enumerate()
-                    .all(|(i, b)| i == 5 || RECOVERY_ALPHABET.contains(&b)),
+                c.bytes().enumerate().all(|(i, b)| if i == 5 || i == 11 {
+                    b == b'-'
+                } else {
+                    RECOVERY_ALPHABET.contains(&b)
+                }),
                 "{c}"
             );
         }
@@ -607,11 +642,11 @@ mod tests {
 
     #[test]
     fn recovery_code_hash_ignores_case_hyphen_and_edge_whitespace() {
-        let h = recovery_code_hash("abcde-fghjk");
-        assert_eq!(h, recovery_code_hash("ABCDE-FGHJK"));
-        assert_eq!(h, recovery_code_hash("abcdefghjk"));
-        assert_eq!(h, recovery_code_hash(" abcde-fghjk\n"));
-        assert_ne!(h, recovery_code_hash("abcde-fghjm"));
+        let h = recovery_code_hash("abcde-fghjk-mnpqr");
+        assert_eq!(h, recovery_code_hash("ABCDE-FGHJK-MNPQR"));
+        assert_eq!(h, recovery_code_hash("abcdefghjkmnpqr"));
+        assert_eq!(h, recovery_code_hash(" abcde-fghjk-mnpqr\n"));
+        assert_ne!(h, recovery_code_hash("abcde-fghjk-mnpqs"));
     }
 
     #[test]

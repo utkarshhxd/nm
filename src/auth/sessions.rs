@@ -157,6 +157,17 @@ pub async fn delete(db: impl PgExecutor<'_>, session_hash: &[u8; 32]) -> sqlx::R
     Ok(())
 }
 
+/// Deletes the user's pending-MFA sessions, leaving their full sessions alone.
+pub async fn revoke_pending_for_user(db: impl PgExecutor<'_>, user_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query!(
+        "delete from sessions where user_id = $1 and mfa_pending",
+        user_id,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Deletes every session of the user, except `except` if given.
 pub async fn revoke_all_for_user(
     db: impl PgExecutor<'_>,
