@@ -10,6 +10,7 @@ use axum::{
 use common::{TestApp, test_server};
 use nm::{
     error::{ApiJson, ApiPath, ApiQuery, ApiResult},
+    http::web_ui::{AssetSource, EmbeddedAssets},
     pagination::PageParams,
 };
 use serde::Deserialize;
@@ -25,12 +26,26 @@ async fn unknown_api_route_is_problem_404(pool: PgPool) {
     assert_eq!(r.json::<Value>()["type"], "urn:nm:problem:not-found");
 }
 
-/// With the UI built this is `index.html`; without it, `web_ui`'s 503. Either way the SPA
-/// handler answered and the API's problem+json 404 did not.
+/// The branch is on the embedded build, not on the response: `web/dist` is a build artifact
+/// that the `rust` CI job never produces, so both arms are reachable and each is exact.
 #[sqlx::test]
 async fn unknown_non_api_route_falls_back_to_spa(pool: PgPool) {
     let r = TestApp::new(pool).await.server.get("/nope").await;
-    assert_ne!(r.status_code(), StatusCode::NOT_FOUND);
+    if EmbeddedAssets.get("index.html").is_some() {
+        r.assert_status_ok();
+        assert!(
+            r.header("content-type")
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{:?}",
+            r.header("content-type")
+        );
+        assert_eq!(r.header("cache-control"), "no-cache");
+    } else {
+        r.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.text(), "web UI not built; run pnpm --dir web build");
+    }
 }
 
 /// Bare `/api` is not under `/api/`, so the wildcard 404 route misses it and it reaches the

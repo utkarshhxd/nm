@@ -16,8 +16,13 @@ async fn labels_are_route_templates_and_bounded_methods(pool: PgPool) {
     let app = TestApp::new(pool).await;
 
     app.server.get("/healthz").await.assert_status_ok();
-    // Reaches the SPA fallback, which has no `MatchedPath`; whether it answers 200 or 503
-    // depends on whether `web/dist` was built, so only the label is asserted below.
+    // An unknown API path is a 404 whatever `web/dist` holds, so its status can be asserted.
+    app.server
+        .get("/api/v1/nope")
+        .await
+        .assert_status_not_found();
+    // The SPA fallback has no `MatchedPath`; its status depends on the build artifact, so
+    // this request is here only to show the raw URI never becomes a label.
     app.server.get("/no/such/route").await;
     for m in ["FOO1", "FOO2"] {
         app.server
@@ -33,6 +38,10 @@ async fn labels_are_route_templates_and_bounded_methods(pool: PgPool) {
     let has = |needle: &str| counters.iter().any(|l| l.contains(needle));
     assert!(
         has(r#"method="GET",route="/healthz",status="200""#),
+        "{out}"
+    );
+    assert!(
+        has(r#"method="GET",route="/api/{*rest}",status="404""#),
         "{out}"
     );
     assert!(has(r#"method="GET",route="unmatched""#), "{out}");
