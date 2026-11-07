@@ -22,6 +22,14 @@ services:
       context: docker
       dockerfile: dev.Dockerfile
     working_dir: /work
+    # `.env` is how NM_SECRET_KEY reaches the container: compose's own `--env-file` only feeds
+    # variable substitution in this file, never the process environment inside the service.
+    # Optional, so a clone that has not run `cp .env.example .env` yet still builds and tests.
+    env_file:
+      - path: .env
+        required: false
+    # Set after `env_file`, so these win: inside the container Postgres is the service `postgres`,
+    # never `localhost`.
     environment:
       DATABASE_URL: postgres://nm:nm@postgres:5432/nm
       NM_DATABASE_URL: postgres://nm:nm@postgres:5432/nm

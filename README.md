@@ -2,15 +2,45 @@
 
 Open-source (AGPL-3.0), self-hosted email marketing platform in Rust and Postgres.
 
+## Quick start
+
+Everything runs in a Linux dev container, so Docker and a POSIX shell are all the host needs:
+every `cargo`, `sqlx`, `cargo deny` and `pnpm` command goes through `bash scripts/dev.sh …`.
+From a fresh clone to a signed-in browser, in order:
+
+```sh
+# 1. Postgres.
+docker compose -f docker-compose.dev.yml -p nm up -d
+
+# 2. `.env`, with a secret key. Compose loads this file into the dev container; without
+#    NM_SECRET_KEY the server exits before it binds a port.
+cp .env.example .env
+printf 'NM_SECRET_KEY=%s\n' "$(bash scripts/dev.sh cargo run -q -- keys generate | tr -d '\r')" >> .env
+
+# 3. Schema.
+bash scripts/dev.sh cargo run -q -- migrate
+
+# 4. The web UI. Without `web/dist` every non-API path answers `503 web UI not built`.
+bash scripts/dev.sh pnpm --dir web install
+bash scripts/dev.sh pnpm --dir web build
+
+# 5. An account to sign in with. The password is the first line of stdin.
+echo 'correct horse battery staple' | bash scripts/dev.sh cargo run -q -- \
+  admin create-user --email you@example.com --instance-admin
+
+# 6. Serve on http://localhost:8080 and sign in with the address and password above.
+bash scripts/dev-serve.sh cargo run -q -- serve
+```
+
 ## Development
 
-Rust builds run in a Linux dev container, so every `cargo`, `sqlx` and `cargo deny` command goes through `bash scripts/dev.sh …`.
-
-1. Start Postgres: `docker compose -f docker-compose.dev.yml -p nm up -d`
-2. Copy the environment file: `cp .env.example .env`
-3. Run the tests: `bash scripts/dev.sh cargo test`
-
-To serve on port 8080, use `bash scripts/dev-serve.sh cargo run -- serve`.
+```sh
+bash scripts/dev.sh cargo test        # the full Rust suite
+bash scripts/dev.sh cargo clippy --all-targets -- -D warnings
+bash scripts/dev.sh cargo fmt --check
+bash scripts/dev.sh cargo deny check
+bash scripts/check-spdx.sh
+```
 
 ## Web UI
 
