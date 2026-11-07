@@ -8,7 +8,21 @@ const SPEC_PATH: &str = "/api/v1/openapi.json";
 const DOCS_PATH: &str = "/api/v1/docs";
 
 #[derive(OpenApi)]
-#[openapi(info(title = "NM API"))]
+#[openapi(
+    info(title = "NM API"),
+    paths(
+        crate::auth::login::login,
+        crate::auth::login::logout,
+        crate::auth::login::me,
+        crate::auth::login::change_password,
+    ),
+    components(schemas(
+        crate::auth::login::LoginRequest,
+        crate::auth::login::LoginResponse,
+        crate::auth::login::MeResponse,
+        crate::auth::login::ChangePasswordRequest,
+    ))
+)]
 struct ApiDoc;
 
 /// The OpenAPI document; `info.version` is this crate's version. Route handlers

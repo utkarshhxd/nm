@@ -37,6 +37,11 @@ pub enum ApiError {
     Validation(Vec<FieldError>),
     /// 401 with the given problem code.
     Unauthorized(&'static str),
+    /// 401 with a problem code and a fixed, user-facing detail (the default detail is the code).
+    UnauthorizedDetail {
+        code: &'static str,
+        detail: &'static str,
+    },
     /// 403 with the given problem code.
     Forbidden(&'static str),
     /// 404 `not-found`. Also the answer for another workspace's resources.
@@ -84,6 +89,9 @@ impl IntoResponse for ApiError {
                 )
             }
             ApiError::Unauthorized(code) => (StatusCode::UNAUTHORIZED, *code, humanise(code)),
+            ApiError::UnauthorizedDetail { code, detail } => {
+                (StatusCode::UNAUTHORIZED, *code, (*detail).to_owned())
+            }
             ApiError::Forbidden(code) => (StatusCode::FORBIDDEN, *code, humanise(code)),
             ApiError::NotFound => (
                 StatusCode::NOT_FOUND,

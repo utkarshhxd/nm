@@ -11,6 +11,10 @@ use crate::error::FieldError;
 const MIN_CHARS: usize = 12;
 const MAX_CHARS: usize = 256;
 
+/// Longest candidate `verify_password` will look at: the UTF-8 size of a maximal valid password.
+/// Callers reject longer input before branching on whether the account exists (see `verify_password`).
+pub const MAX_PASSWORD_BYTES: usize = MAX_CHARS * 4;
+
 /// A real hash of a throwaway password, made with the spec parameters. Used
 /// only by `burn_verify`; it matches nothing anyone can sign in with.
 const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$Re/u29ckp2jwMTCwZyRYvQ$CaJ4cmXyt6NmQ/CYZirkOmTLnBRaKvIg30HJX9BPnPk";
@@ -49,7 +53,7 @@ pub fn hash_password(plain: &str) -> anyhow::Result<String> {
 /// different algorithm, or lacks a salt or digest, runs `burn_verify()` first,
 /// so it costs one argon2 run like a wrong password.
 pub fn verify_password(plain: &str, phc: &str) -> bool {
-    if plain.len() > MAX_CHARS * 4 {
+    if plain.len() > MAX_PASSWORD_BYTES {
         return false;
     }
     match PasswordHash::new(phc) {

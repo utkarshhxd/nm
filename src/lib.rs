@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod audit;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod crypto;
@@ -11,3 +12,4 @@ pub mod http;
 pub mod openapi;
 pub mod pagination;
 pub mod telemetry;
+pub mod users;

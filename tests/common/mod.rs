@@ -6,12 +6,14 @@
 use std::net::SocketAddr;
 
 use axum::Router;
-use axum_test::TestServer;
+use axum_test::{TestRequest, TestServer};
 use nm::{
     app::{self, AppState},
     config::{Config, LogFormat, SecretKey},
 };
+use serde_json::{Value, json};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 pub fn test_config(database_url: &str) -> Config {
     Config {
@@ -60,4 +62,52 @@ pub fn test_server(router: Router) -> TestServer {
     TestServer::builder()
         .save_cookies()
         .build(router.into_make_service_with_connect_info::<SocketAddr>())
+}
+
+pub const PW: &str = "correct horse battery";
+
+pub async fn create_user(pool: &PgPool, email: &str, password: &str, instance_admin: bool) -> Uuid {
+    nm::users::create_user(pool, email, password, instance_admin)
+        .await
+        .expect("create user")
+}
+
+impl TestApp {
+    /// Signs in, then reads the CSRF token from `/me`; later `get`/`post`/... send it.
+    pub async fn login(&mut self, email: &str, password: &str) {
+        let r = self
+            .server
+            .post("/api/v1/auth/login")
+            .json(&json!({"email": email, "password": password}))
+            .await;
+        r.assert_status_ok();
+        let me = self.server.get("/api/v1/me").await;
+        me.assert_status_ok();
+        self.csrf = Some(
+            me.json::<Value>()["csrf_token"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+
+    fn with_csrf(&self, req: TestRequest) -> TestRequest {
+        match &self.csrf {
+            Some(t) => req.add_header("x-csrf-token", t.as_str()),
+            None => req,
+        }
+    }
+
+    pub fn get(&self, p: &str) -> TestRequest {
+        self.with_csrf(self.server.get(p))
+    }
+    pub fn post(&self, p: &str) -> TestRequest {
+        self.with_csrf(self.server.post(p))
+    }
+    pub fn patch(&self, p: &str) -> TestRequest {
+        self.with_csrf(self.server.patch(p))
+    }
+    pub fn delete(&self, p: &str) -> TestRequest {
+        self.with_csrf(self.server.delete(p))
+    }
 }

@@ -21,10 +21,29 @@ pub enum Command {
     /// Manage the secret key
     #[command(subcommand)]
     Keys(KeysCommand),
+    /// Account administration (reads the password from the first line of stdin)
+    #[command(subcommand)]
+    Admin(AdminCommand),
 }
 
 #[derive(Subcommand)]
 pub enum KeysCommand {
     /// Print a new random NM_SECRET_KEY value
     Generate,
+}
+
+#[derive(Subcommand)]
+pub enum AdminCommand {
+    /// Create a user and print its id; the password is the first line of stdin
+    CreateUser {
+        #[arg(long)]
+        email: String,
+        #[arg(long)]
+        instance_admin: bool,
+    },
+    /// Set a user's password from the first line of stdin and sign them out everywhere
+    ResetPassword {
+        #[arg(long)]
+        email: String,
+    },
 }
