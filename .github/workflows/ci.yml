@@ -37,6 +37,30 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo sqlx prepare --check -- --all-targets
+      # The committed spec is what web/src/api/schema.d.ts was generated from.
+      - name: Committed OpenAPI spec is current
+        run: cargo run -q -- openapi | diff - web/src/api/openapi.json
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.11.0
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm check:bundle
+      - run: pnpm check:licenses
 
   deny:
     runs-on: ubuntu-latest

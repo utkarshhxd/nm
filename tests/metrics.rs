@@ -16,10 +16,9 @@ async fn labels_are_route_templates_and_bounded_methods(pool: PgPool) {
     let app = TestApp::new(pool).await;
 
     app.server.get("/healthz").await.assert_status_ok();
-    app.server
-        .get("/no/such/route")
-        .await
-        .assert_status_not_found();
+    // Reaches the SPA fallback, which has no `MatchedPath`; whether it answers 200 or 503
+    // depends on whether `web/dist` was built, so only the label is asserted below.
+    app.server.get("/no/such/route").await;
     for m in ["FOO1", "FOO2"] {
         app.server
             .method(Method::from_bytes(m.as_bytes()).unwrap(), "/healthz")
@@ -36,10 +35,7 @@ async fn labels_are_route_templates_and_bounded_methods(pool: PgPool) {
         has(r#"method="GET",route="/healthz",status="200""#),
         "{out}"
     );
-    assert!(
-        has(r#"method="GET",route="unmatched",status="404""#),
-        "{out}"
-    );
+    assert!(has(r#"method="GET",route="unmatched""#), "{out}");
     assert!(has(r#"method="OTHER""#), "{out}");
     assert!(
         !out.contains("FOO"),

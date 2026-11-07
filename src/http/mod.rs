@@ -8,6 +8,7 @@ pub mod csrf;
 mod health;
 pub mod request_meta;
 pub mod security_headers;
+pub mod web_ui;
 
 /// Every route module adds its `.merge(...)` here.
 pub fn routes() -> Router<AppState> {
@@ -21,6 +22,9 @@ pub fn routes() -> Router<AppState> {
         // so route modules may still be merged freely (only one fallback is allowed),
         // and metrics see the bounded template `/api/{*rest}`, never the raw path.
         .route("/api/{*rest}", any(api_not_found))
+        // The embedded SPA answers whatever the routes above did not claim. Set here, inside
+        // `routes()`, so it is covered by the CSRF layer `app::router` wraps around this.
+        .fallback(web_ui::fallback)
 }
 
 async fn api_not_found() -> ApiError {

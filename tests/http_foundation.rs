@@ -25,11 +25,33 @@ async fn unknown_api_route_is_problem_404(pool: PgPool) {
     assert_eq!(r.json::<Value>()["type"], "urn:nm:problem:not-found");
 }
 
+/// With the UI built this is `index.html`; without it, `web_ui`'s 503. Either way the SPA
+/// handler answered and the API's problem+json 404 did not.
 #[sqlx::test]
-async fn unknown_non_api_route_stays_plain_404(pool: PgPool) {
+async fn unknown_non_api_route_falls_back_to_spa(pool: PgPool) {
     let r = TestApp::new(pool).await.server.get("/nope").await;
-    r.assert_status(StatusCode::NOT_FOUND);
-    assert!(r.headers().get("content-type").is_none());
+    assert_ne!(r.status_code(), StatusCode::NOT_FOUND);
+}
+
+/// Bare `/api` is not under `/api/`, so the wildcard 404 route misses it and it reaches the
+/// SPA fallback. It must still be a problem+json 404, not `index.html` with a 200.
+#[sqlx::test]
+async fn api_paths_never_fall_back_to_index(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    for path in ["/api", "/api/", "/api/v1/nope", "/api/v1/nope/deeper"] {
+        let r = app.server.get(path).await;
+        r.assert_status(StatusCode::NOT_FOUND);
+        assert_eq!(
+            r.header("content-type"),
+            "application/problem+json",
+            "{path}"
+        );
+        assert_eq!(
+            r.json::<Value>()["type"],
+            "urn:nm:problem:not-found",
+            "{path}"
+        );
+    }
 }
 
 #[sqlx::test]

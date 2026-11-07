@@ -1,5 +1,7 @@
 target/
 web/node_modules/
 web/dist/
+# pnpm's content-addressable store, created by installs run in the dev container
+.pnpm-store/
 .env
 *.key

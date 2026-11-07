@@ -26,7 +26,9 @@ cookie = "0.18"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
+mime_guess = "2.0.5"
 rand = "0.10.3"
+rust-embed = "8.13.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
