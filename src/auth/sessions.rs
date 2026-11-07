@@ -7,8 +7,14 @@
 //! - full session: absolute 30 days (`expires_at`) and idle 7 days (`last_seen_at`), both
 //!   enforced by `resolve` on every authenticated request;
 //! - pending-MFA session: 10 minutes (`expires_at`), and `resolve` never returns one.
+//!
+//! `resolve` and `resolve_pending` are the only two reads of the `sessions` table, and between
+//! them they split it cleanly: `resolve` answers only for full sessions, `resolve_pending` only
+//! for pending ones. A pending session therefore never authenticates anything but the second
+//! factor.
 
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use cookie::time::Duration;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
@@ -20,6 +26,10 @@ use crate::{
 
 pub const COOKIE_NAME: &str = "nm_session";
 
+/// Cookie lifetimes, matching the `expires_at` intervals in `create`.
+pub const FULL_MAX_AGE: Duration = Duration::days(30);
+pub const PENDING_MAX_AGE: Duration = Duration::minutes(10);
+
 pub struct NewSession {
     pub cookie_value: String,
     pub csrf_token: String,
@@ -30,6 +40,12 @@ pub struct ActiveSession {
     pub user_id: Uuid,
     pub session_hash: [u8; 32],
     pub csrf_token: String,
+}
+
+/// An unexpired pending-MFA session: the password was right, the second factor is not yet proven.
+pub struct PendingSession {
+    pub user_id: Uuid,
+    pub session_hash: [u8; 32],
 }
 
 pub fn hash_cookie_value(value: &str) -> [u8; 32] {
@@ -100,6 +116,39 @@ pub async fn resolve(db: &PgPool, cookie_value: &str) -> sqlx::Result<Option<Act
     }))
 }
 
+/// The pending-MFA session behind a cookie value, if it is within its 10 minutes. The one read of
+/// a pending session; a full session is not returned.
+pub async fn resolve_pending(
+    db: &PgPool,
+    cookie_value: &str,
+) -> sqlx::Result<Option<PendingSession>> {
+    let session_hash = hash_cookie_value(cookie_value);
+    let user_id = sqlx::query_scalar!(
+        "select user_id from sessions where id_hash = $1 and mfa_pending and expires_at > now()",
+        &session_hash[..],
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(user_id.map(|user_id| PendingSession {
+        user_id,
+        session_hash,
+    }))
+}
+
+/// Counts one second-factor attempt against a pending session and returns the new total, or
+/// `None` if the session is gone. Called BEFORE the code is checked, so guesses already in flight
+/// are counted: the same reasoning as `rate_limit::record_attempt`. A session that survives has
+/// only failed attempts, since a successful one deletes it, so the column reads as failures.
+pub async fn record_mfa_attempt(db: &PgPool, session_hash: &[u8; 32]) -> sqlx::Result<Option<i32>> {
+    sqlx::query_scalar!(
+        "update sessions set mfa_failures = mfa_failures + 1 \
+         where id_hash = $1 and mfa_pending and expires_at > now() returning mfa_failures",
+        &session_hash[..],
+    )
+    .fetch_optional(db)
+    .await
+}
+
 /// Deletes one session by the hash of its cookie value. Deleting a missing one is not an error.
 pub async fn delete(db: impl PgExecutor<'_>, session_hash: &[u8; 32]) -> sqlx::Result<()> {
     sqlx::query!("delete from sessions where id_hash = $1", &session_hash[..])
@@ -132,13 +181,14 @@ fn secure(cfg: &Config) -> bool {
     !local_http
 }
 
-/// The session cookie: HttpOnly, SameSite=Lax, Path=/, Max-Age 30 days.
-pub fn cookie(value: &str, cfg: &Config) -> Cookie<'static> {
+/// The session cookie: HttpOnly, SameSite=Lax, Path=/. `max_age` is `FULL_MAX_AGE` for a full
+/// session and `PENDING_MAX_AGE` for a pending-MFA one.
+pub fn cookie(value: &str, cfg: &Config, max_age: Duration) -> Cookie<'static> {
     let mut c = Cookie::build((COOKIE_NAME, value.to_owned()))
         .http_only(true)
         .same_site(SameSite::Lax)
         .path("/")
-        .max_age(cookie::time::Duration::days(30))
+        .max_age(max_age)
         .build();
     if secure(cfg) {
         c.set_secure(true);

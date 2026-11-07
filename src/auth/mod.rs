@@ -3,7 +3,7 @@
 //! Who is calling: the session store, the sign-in handlers, and the `Principal` and
 //! `CurrentUser` extractors that authenticated routes take.
 
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{Router, extract::FromRequestParts, http::request::Parts};
 use axum_extra::extract::CookieJar;
 use uuid::Uuid;
 
@@ -12,8 +12,11 @@ use crate::{app::AppState, error::ApiError};
 pub mod login;
 pub mod rate_limit;
 pub mod sessions;
+pub mod totp;
 
-pub use login::routes;
+pub fn routes() -> Router<AppState> {
+    login::routes().merge(totp::routes())
+}
 
 /// An authenticated caller. Task 12 adds an API-key variant.
 pub enum Principal {

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select totp_pending_secret_enc from users where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "totp_pending_secret_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "totp_pending_secret_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "3c2669fd620bc2e4609c22e12300919230281b133e8ae054ffd4555ad6b2d70c"
+}

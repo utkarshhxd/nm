@@ -81,6 +81,8 @@ impl TestApp {
             .json(&json!({"email": email, "password": password}))
             .await;
         r.assert_status_ok();
+        // A 200 can also be `mfa_required`, after which `/me` would only answer 401.
+        r.assert_json(&json!({"status":"ok"}));
         let me = self.server.get("/api/v1/me").await;
         me.assert_status_ok();
         self.csrf = Some(

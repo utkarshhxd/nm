@@ -9,6 +9,7 @@ use axum::{
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -38,8 +39,28 @@ pub struct LoginRequest {
 
 #[derive(Serialize, ToSchema)]
 pub struct LoginResponse {
-    /// `ok` once signed in.
+    /// `ok` once signed in; `mfa_required` when a second factor must follow at
+    /// `POST /api/v1/auth/login/totp` (the cookie set is then a 10-minute pending session).
     pub status: &'static str,
+    /// The second factors on offer; present only for `mfa_required`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<&'static str>>,
+}
+
+impl LoginResponse {
+    pub fn ok() -> LoginResponse {
+        LoginResponse {
+            status: "ok",
+            methods: None,
+        }
+    }
+
+    fn mfa_required() -> LoginResponse {
+        LoginResponse {
+            status: "mfa_required",
+            methods: Some(vec!["totp"]),
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -94,7 +115,7 @@ async fn login_failed(
     path = "/api/v1/auth/login",
     request_body = LoginRequest,
     responses(
-        (status = 200, description = "Signed in; sets the nm_session cookie", body = LoginResponse),
+        (status = 200, description = "Signed in, or a second factor is required; sets the nm_session cookie", body = LoginResponse),
         (status = 401, description = "invalid-credentials"),
     ),
 )]
@@ -146,7 +167,23 @@ pub async fn login(
         return Err(login_failed(&state, &meta, email.as_deref()).await?);
     };
 
+    // The password stage is a success whether or not a second factor follows, so it stops counting
+    // toward the lock: otherwise every user with TOTP would lock their own email after ten
+    // sign-ins in 15 minutes. The second factor has its own budget (5 wrong codes, then
+    // `mfa-restart`, which does count as a failure).
     rate_limit::mark_succeeded(&state.pool, attempt).await?;
+
+    if user.totp_enabled {
+        let pending = sessions::create(&state.pool, user.id, true, &meta).await?;
+        return Ok((
+            jar.add(sessions::cookie(
+                &pending.cookie_value,
+                &state.config,
+                sessions::PENDING_MAX_AGE,
+            )),
+            Json(LoginResponse::mfa_required()),
+        ));
+    }
 
     let mut tx = state.pool.begin().await?;
     let session = sessions::create(&mut *tx, user.id, false, &meta).await?;
@@ -166,8 +203,12 @@ pub async fn login(
     tx.commit().await?;
 
     Ok((
-        jar.add(sessions::cookie(&session.cookie_value, &state.config)),
-        Json(LoginResponse { status: "ok" }),
+        jar.add(sessions::cookie(
+            &session.cookie_value,
+            &state.config,
+            sessions::FULL_MAX_AGE,
+        )),
+        Json(LoginResponse::ok()),
     ))
 }
 
@@ -224,12 +265,40 @@ pub async fn me(State(state): State<AppState>, user: CurrentUser) -> ApiResult<J
         email: u.email,
         display_name: u.display_name,
         is_instance_admin: u.is_instance_admin,
+        totp_enabled: u.totp_enabled,
         // Later tasks fill these in.
-        totp_enabled: false,
         passkey_count: 0,
         workspaces: vec![],
         csrf_token: user.csrf_token,
     }))
+}
+
+/// Re-checks the signed-in user's password before a sensitive change, returning their row.
+/// `401 invalid-credentials` when it is wrong.
+pub(super) async fn require_password(
+    db: &PgPool,
+    user_id: Uuid,
+    password: &str,
+) -> ApiResult<users::User> {
+    let wrong = || ApiError::UnauthorizedDetail {
+        code: "invalid-credentials",
+        detail: "Current password is incorrect",
+    };
+    // Over-length first, as in `login`: no lookup and no argon2 for input that cannot match.
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(wrong());
+    }
+    let user = users::find_by_id(db, user_id)
+        .await?
+        .ok_or(ApiError::Unauthorized("unauthenticated"))?;
+    let matches = match user.password_hash.as_deref() {
+        Some(h) => verify_password(password, h),
+        None => {
+            burn_verify();
+            false
+        }
+    };
+    if matches { Ok(user) } else { Err(wrong()) }
 }
 
 #[utoipa::path(
@@ -251,28 +320,7 @@ pub async fn change_password(
     validate_password(&req.new_password)
         .map_err(|e| ApiError::Validation(vec![FieldError::new("new_password", e.message)]))?;
 
-    let wrong = || ApiError::UnauthorizedDetail {
-        code: "invalid-credentials",
-        detail: "Current password is incorrect",
-    };
-    // Over-length first, as in `login`: no lookup and no argon2 for input that cannot match.
-    if req.current_password.len() > MAX_PASSWORD_BYTES {
-        return Err(wrong());
-    }
-    let hash = users::find_by_id(&state.pool, user.user_id)
-        .await?
-        .ok_or(ApiError::Unauthorized("unauthenticated"))?
-        .password_hash;
-    let matches = match hash {
-        Some(h) => verify_password(&req.current_password, &h),
-        None => {
-            burn_verify();
-            false
-        }
-    };
-    if !matches {
-        return Err(wrong());
-    }
+    require_password(&state.pool, user.user_id, &req.current_password).await?;
 
     // One transaction: a new hash with the old sessions still alive would be the worst outcome.
     let mut tx = state.pool.begin().await?;

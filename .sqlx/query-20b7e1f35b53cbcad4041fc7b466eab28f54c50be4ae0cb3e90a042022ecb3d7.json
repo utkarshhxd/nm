@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update sessions set mfa_failures = mfa_failures + 1 where id_hash = $1 and mfa_pending and expires_at > now() returning mfa_failures",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mfa_failures",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "sessions",
+            "name": "mfa_failures"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "20b7e1f35b53cbcad4041fc7b466eab28f54c50be4ae0cb3e90a042022ecb3d7"
+}

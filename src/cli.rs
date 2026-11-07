@@ -46,4 +46,9 @@ pub enum AdminCommand {
         #[arg(long)]
         email: String,
     },
+    /// Turn off a user's TOTP, delete their recovery codes and sign them out everywhere
+    DisableMfa {
+        #[arg(long)]
+        email: String,
+    },
 }

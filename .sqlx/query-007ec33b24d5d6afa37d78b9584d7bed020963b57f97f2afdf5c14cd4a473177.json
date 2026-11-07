@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update users set totp_pending_secret_enc = $2, updated_at = now() where id = $1 and totp_enabled_at is null",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "007ec33b24d5d6afa37d78b9584d7bed020963b57f97f2afdf5c14cd4a473177"
+}

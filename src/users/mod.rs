@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use sqlx::PgExecutor;
+use serde_json::json;
+use sqlx::{PgConnection, PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::{
+    audit::{self, Actor, AuditEvent, actions},
+    auth::sessions,
     crypto::password::{hash_password, validate_password},
     error::{ApiError, ApiResult, FieldError},
+    http::request_meta::RequestMeta,
 };
 
 /// A `users` row. No `Debug`: `password_hash` must never reach a log line.
@@ -15,6 +19,8 @@ pub struct User {
     pub display_name: String,
     pub password_hash: Option<String>,
     pub is_instance_admin: bool,
+    /// Whether a confirmed TOTP secret is set (`totp_enabled_at`).
+    pub totp_enabled: bool,
 }
 
 /// Trim and lowercase; 3..=254 characters; exactly one `@`; non-empty local part; a domain
@@ -89,7 +95,9 @@ pub async fn set_password(db: impl PgExecutor<'_>, user_id: Uuid, password: &str
 pub async fn find_by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Option<User>> {
     sqlx::query_as!(
         User,
-        "select id, email, display_name, password_hash, is_instance_admin from users where email = $1",
+        r#"select id, email, display_name, password_hash, is_instance_admin,
+                  totp_enabled_at is not null as "totp_enabled!"
+           from users where email = $1"#,
         email,
     )
     .fetch_optional(db)
@@ -99,9 +107,54 @@ pub async fn find_by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result
 pub async fn find_by_id(db: impl PgExecutor<'_>, id: Uuid) -> sqlx::Result<Option<User>> {
     sqlx::query_as!(
         User,
-        "select id, email, display_name, password_hash, is_instance_admin from users where id = $1",
+        r#"select id, email, display_name, password_hash, is_instance_admin,
+                  totp_enabled_at is not null as "totp_enabled!"
+           from users where id = $1"#,
         id,
     )
     .fetch_optional(db)
     .await
+}
+
+/// Removes the second factor: the TOTP secrets and every recovery code. Takes the caller's
+/// transaction connection because it is two statements that must land together.
+pub async fn clear_totp(db: &mut PgConnection, user_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query!(
+        "update users set totp_secret_enc = null, totp_pending_secret_enc = null, \
+         totp_enabled_at = null, totp_last_step = null, updated_at = now() where id = $1",
+        user_id,
+    )
+    .execute(&mut *db)
+    .await?;
+    sqlx::query!("delete from recovery_codes where user_id = $1", user_id)
+        .execute(&mut *db)
+        .await?;
+    Ok(())
+}
+
+/// Operator recovery for a user locked out of their second factor (`nm admin disable-mfa`):
+/// clears TOTP and the recovery codes, signs the user out everywhere and audits it as the system.
+/// One transaction, so a crash cannot leave MFA cleared with sessions still live, or the other
+/// way round. 404 if no user has that email.
+pub async fn disable_mfa(db: &PgPool, email: &str) -> ApiResult<()> {
+    let email = normalize_email(email).map_err(|e| ApiError::Validation(vec![e]))?;
+    let user = find_by_email(db, &email).await?.ok_or(ApiError::NotFound)?;
+    let mut tx = db.begin().await?;
+    clear_totp(&mut tx, user.id).await?;
+    sessions::revoke_all_for_user(&mut *tx, user.id, None).await?;
+    audit::record(
+        &mut *tx,
+        &RequestMeta::default(),
+        AuditEvent {
+            workspace_id: None,
+            actor: Actor::System,
+            action: actions::AUTH_TOTP_DISABLED,
+            target_type: Some("user"),
+            target_id: Some(user.id.to_string()),
+            metadata: json!({ "via": "cli" }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }

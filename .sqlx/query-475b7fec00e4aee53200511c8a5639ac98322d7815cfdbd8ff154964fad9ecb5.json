@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select totp_secret_enc, totp_last_step from users where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "totp_secret_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "totp_secret_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "totp_last_step",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "totp_last_step"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "475b7fec00e4aee53200511c8a5639ac98322d7815cfdbd8ff154964fad9ecb5"
+}

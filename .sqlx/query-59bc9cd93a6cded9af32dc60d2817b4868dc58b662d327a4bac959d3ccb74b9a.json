@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, email, display_name, password_hash, is_instance_admin from users where email = $1",
+  "query": "select id, email, display_name, password_hash, is_instance_admin,\n                  totp_enabled_at is not null as \"totp_enabled!\"\n           from users where id = $1",
   "describe": {
     "columns": [
       {
@@ -57,11 +57,17 @@
             "name": "is_instance_admin"
           }
         }
+      },
+      {
+        "ordinal": 5,
+        "name": "totp_enabled!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -69,8 +75,9 @@
       false,
       false,
       true,
-      false
+      false,
+      null
     ]
   },
-  "hash": "69a3e74c98d175fe153954d05df239f99c5d2489368b737ecdbe5c6f4feb515e"
+  "hash": "59bc9cd93a6cded9af32dc60d2817b4868dc58b662d327a4bac959d3ccb74b9a"
 }

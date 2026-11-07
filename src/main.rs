@@ -100,6 +100,10 @@ async fn admin(cmd: AdminCommand, pool: &sqlx::PgPool) -> anyhow::Result<()> {
             tx.commit().await?;
             println!("password reset; all sessions revoked");
         }
+        AdminCommand::DisableMfa { email } => {
+            users::disable_mfa(pool, &email).await.map_err(api_error)?;
+            println!("two-factor sign-in disabled; all sessions revoked");
+        }
     }
     Ok(())
 }

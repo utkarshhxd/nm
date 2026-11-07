@@ -15,12 +15,21 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::auth::login::logout,
         crate::auth::login::me,
         crate::auth::login::change_password,
+        crate::auth::totp::setup,
+        crate::auth::totp::confirm,
+        crate::auth::totp::disable,
+        crate::auth::totp::login_totp,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
         crate::auth::login::LoginResponse,
         crate::auth::login::MeResponse,
         crate::auth::login::ChangePasswordRequest,
+        crate::auth::totp::SetupResponse,
+        crate::auth::totp::ConfirmRequest,
+        crate::auth::totp::ConfirmResponse,
+        crate::auth::totp::DisableRequest,
+        crate::auth::totp::SecondFactorRequest,
     ))
 )]
 struct ApiDoc;
