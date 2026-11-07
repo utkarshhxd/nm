@@ -57,6 +57,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      # The other half of `gen:api`. The `rust` job checks openapi.json against the server;
+      # without this, schema.d.ts could be generated from an older spec and nothing would notice.
+      - name: Generated schema.d.ts is current
+        run: pnpm gen:schema && git diff --exit-code src/api/schema.d.ts
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
