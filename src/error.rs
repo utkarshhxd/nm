@@ -2,8 +2,12 @@
 
 use axum::{
     Json,
-    extract::{FromRequest, Request, rejection::JsonRejection},
-    http::{HeaderValue, StatusCode, header},
+    extract::{
+        FromRequest, FromRequestParts, Path, Query, Request,
+        path::ErrorKind,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
+    },
+    http::{HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -56,8 +60,13 @@ impl From<anyhow::Error> for ApiError {
 }
 
 impl From<sqlx::Error> for ApiError {
+    /// `RowNotFound` is a 404: a `fetch_one` scoped by `workspace_id` on another
+    /// workspace's id must answer not-found. Use `fetch_optional` to decide otherwise.
     fn from(e: sqlx::Error) -> ApiError {
-        ApiError::Internal(e.into())
+        match e {
+            sqlx::Error::RowNotFound => ApiError::NotFound,
+            e => ApiError::Internal(e.into()),
+        }
     }
 }
 
@@ -161,6 +170,68 @@ where
     }
 }
 
+/// A malformed query string is a 422 `validation` problem. Serde's message is not
+/// echoed (it can quote request content) and carries no field name, so it is `query`.
+impl From<QueryRejection> for ApiError {
+    fn from(_: QueryRejection) -> ApiError {
+        ApiError::Validation(vec![FieldError::new("query", "invalid query string")])
+    }
+}
+
+/// A malformed path parameter is a 422 `validation` problem naming the route
+/// template's parameter. A missing parameter is a routing bug, so it is a 500.
+impl From<PathRejection> for ApiError {
+    fn from(rejection: PathRejection) -> ApiError {
+        let field = match &rejection {
+            PathRejection::FailedToDeserializePathParams(e) => match e.kind() {
+                ErrorKind::ParseErrorAtKey { key, .. }
+                | ErrorKind::InvalidUtf8InPathParam { key }
+                | ErrorKind::DeserializeError { key, .. } => key.clone(),
+                _ => "path".to_owned(),
+            },
+            PathRejection::MissingPathParams(_) => {
+                return ApiError::Internal(anyhow::anyhow!(rejection));
+            }
+            _ => "path".to_owned(),
+        };
+        ApiError::Validation(vec![FieldError::new(field, "invalid path parameter")])
+    }
+}
+
+/// `axum::extract::Query` that rejects with `ApiError`.
+pub struct ApiQuery<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        Ok(ApiQuery(
+            Query::<T>::from_request_parts(parts, state).await?.0,
+        ))
+    }
+}
+
+/// `axum::extract::Path` that rejects with `ApiError`.
+pub struct ApiPath<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for ApiPath<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        Ok(ApiPath(
+            Path::<T>::from_request_parts(parts, state).await?.0,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +266,53 @@ mod tests {
         .into_response();
         assert_eq!(res.status(), 429);
         assert_eq!(res.headers()["retry-after"], "7");
+    }
+
+    async fn problem(err: ApiError) -> (StatusCode, Value) {
+        let res = err.into_response();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn coded_errors_map_status_type_and_detail() {
+        for (err, status, code, detail) in [
+            (
+                ApiError::Unauthorized("invalid-credentials"),
+                401,
+                "invalid-credentials",
+                "invalid credentials",
+            ),
+            (
+                ApiError::Forbidden("csrf-failed"),
+                403,
+                "csrf-failed",
+                "csrf failed",
+            ),
+            (
+                ApiError::Conflict("email-taken"),
+                409,
+                "email-taken",
+                "email taken",
+            ),
+        ] {
+            let (s, v) = problem(err).await;
+            assert_eq!(s.as_u16(), status);
+            assert_eq!(v["type"], format!("urn:nm:problem:{code}"));
+            assert_eq!(v["status"], status);
+            assert_eq!(v["detail"], detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn row_not_found_is_404_but_other_sqlx_errors_are_500() {
+        let (s, v) = problem(sqlx::Error::RowNotFound.into()).await;
+        assert_eq!(s, 404);
+        assert_eq!(v["type"], "urn:nm:problem:not-found");
+        let (s, _) = problem(sqlx::Error::PoolClosed.into()).await;
+        assert_eq!(s, 500);
     }
 }

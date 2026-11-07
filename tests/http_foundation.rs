@@ -2,12 +2,20 @@
 
 mod common;
 
-use axum::{Router, http::StatusCode, routing::post};
+use axum::{
+    Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use common::{TestApp, test_server};
-use nm::error::{ApiJson, ApiResult};
+use nm::{
+    error::{ApiJson, ApiPath, ApiQuery, ApiResult},
+    pagination::PageParams,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 #[sqlx::test]
 async fn unknown_api_route_is_problem_404(pool: PgPool) {
@@ -110,9 +118,8 @@ async fn echo(ApiJson(_): ApiJson<Body>) -> ApiResult<&'static str> {
     Ok("ok")
 }
 
-#[sqlx::test]
-async fn json_rejections_are_problems(pool: PgPool) {
-    let _ = pool;
+#[tokio::test]
+async fn json_rejections_are_problems() {
     let server = test_server(Router::new().route("/echo", post(echo)));
 
     let r = server
@@ -142,6 +149,49 @@ async fn json_rejections_are_problems(pool: PgPool) {
     server
         .post("/echo")
         .json(&json!({"name": "ok"}))
+        .await
+        .assert_status_ok();
+}
+
+async fn list(ApiQuery(p): ApiQuery<PageParams>) -> ApiResult<String> {
+    Ok(p.limit().to_string())
+}
+
+async fn one(ApiPath(_): ApiPath<Uuid>) -> ApiResult<&'static str> {
+    Ok("ok")
+}
+
+#[tokio::test]
+async fn query_and_path_rejections_are_problems() {
+    let server = test_server(
+        Router::new()
+            .route("/list", get(list))
+            .route("/one/{id}", get(one)),
+    );
+
+    for bad in ["abc", "-1"] {
+        let r = server.get(&format!("/list?limit={bad}")).await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(r.header("content-type"), "application/problem+json");
+        let v = r.json::<Value>();
+        assert_eq!(v["type"], "urn:nm:problem:validation");
+        assert_eq!(v["errors"][0]["field"], "query");
+        assert!(
+            !r.text().contains(bad),
+            "request content must not be echoed"
+        );
+    }
+    server.get("/list?limit=7").await.assert_text("7");
+
+    let r = server.get("/one/not-a-uuid").await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.header("content-type"), "application/problem+json");
+    let v = r.json::<Value>();
+    assert_eq!(v["type"], "urn:nm:problem:validation");
+    assert!(!r.text().contains("not-a-uuid"));
+
+    server
+        .get(&format!("/one/{}", Uuid::now_v7()))
         .await
         .assert_status_ok();
 }
