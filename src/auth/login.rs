@@ -284,8 +284,7 @@ pub async fn me(State(state): State<AppState>, user: CurrentUser) -> ApiResult<J
         display_name: u.display_name,
         is_instance_admin: u.is_instance_admin,
         totp_enabled: u.totp_enabled,
-        // Task 15 (passkeys) fills this in.
-        passkey_count: 0,
+        passkey_count: users::passkey_count(&state.pool, u.id).await?,
         workspaces: workspaces::for_user(&state.pool, u.id).await?,
         csrf_token: user.csrf_token,
     }))

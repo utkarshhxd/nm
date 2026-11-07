@@ -6,10 +6,11 @@ use axum::{Router, middleware};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
+use webauthn_rs::Webauthn;
 
 use crate::{
-    config::Config, crypto::secrets::Secrets, db, http, http::csrf,
-    http::security_headers::security_headers, telemetry,
+    auth::passkeys, config::Config, crypto::secrets::Secrets, db, error::ApiError, http,
+    http::csrf, http::security_headers::security_headers, telemetry,
 };
 
 #[derive(Clone)]
@@ -17,16 +18,29 @@ pub struct AppState {
     pub pool: PgPool,
     pub config: Arc<Config>,
     pub secrets: Arc<Secrets>,
+    /// The WebAuthn relying party, derived from `public_url`. `None` when that host is not a domain
+    /// name (an IP address), where passkeys cannot work; use `webauthn()`.
+    pub webauthn: Option<Arc<Webauthn>>,
 }
 
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> anyhow::Result<AppState> {
         let secrets = Arc::new(Secrets::new(&config.secret_key));
+        let webauthn = passkeys::relying_party(&config.public_url)?.map(Arc::new);
         Ok(AppState {
             pool,
             config: Arc::new(config),
             secrets,
+            webauthn,
         })
+    }
+
+    /// The relying party, or `409 passkeys-unavailable` on an instance whose `public_url` has no
+    /// domain name.
+    pub fn webauthn(&self) -> Result<&Webauthn, ApiError> {
+        self.webauthn
+            .as_deref()
+            .ok_or(ApiError::Conflict("passkeys-unavailable"))
     }
 }
 

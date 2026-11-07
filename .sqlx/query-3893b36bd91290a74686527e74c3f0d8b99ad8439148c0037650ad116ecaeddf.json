@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from auth_challenges where id = $1 and kind = $2 and user_id is not distinct from $3 and expires_at > now() returning state",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "auth_challenges",
+            "name": "state"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3893b36bd91290a74686527e74c3f0d8b99ad8439148c0037650ad116ecaeddf"
+}

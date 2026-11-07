@@ -21,6 +21,7 @@ use crate::{
 
 pub mod api_keys;
 pub mod login;
+pub mod passkeys;
 pub mod rate_limit;
 pub mod sessions;
 pub mod totp;
@@ -28,6 +29,7 @@ pub mod totp;
 pub fn routes() -> Router<AppState> {
     login::routes()
         .merge(totp::routes())
+        .merge(passkeys::routes())
         .merge(api_keys::routes())
 }
 

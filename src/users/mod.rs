@@ -138,6 +138,17 @@ pub async fn find_by_id(db: impl PgExecutor<'_>, id: Uuid) -> sqlx::Result<Optio
     .await
 }
 
+pub async fn passkey_count(db: impl PgExecutor<'_>, user_id: Uuid) -> sqlx::Result<u32> {
+    let n = sqlx::query_scalar!(
+        r#"select count(*) as "n!" from passkeys where user_id = $1"#,
+        user_id,
+    )
+    .fetch_one(db)
+    .await?;
+    // A user does not have four billion passkeys; saturate rather than wrap if one somehow does.
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 /// Removes the second factor: the TOTP secrets and every recovery code. Takes the caller's
 /// transaction connection because it is two statements that must land together.
 pub async fn clear_totp(db: &mut PgConnection, user_id: Uuid) -> sqlx::Result<()> {

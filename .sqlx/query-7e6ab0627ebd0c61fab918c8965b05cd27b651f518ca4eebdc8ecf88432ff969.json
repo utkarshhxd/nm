@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select credential_id from passkeys where user_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "credential_id",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "passkeys",
+            "name": "credential_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7e6ab0627ebd0c61fab918c8965b05cd27b651f518ca4eebdc8ecf88432ff969"
+}
