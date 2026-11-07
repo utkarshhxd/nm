@@ -22,7 +22,7 @@ base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["serde"] }
 chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive"] }
-cookie = "0.18"
+cookie = "0.18.2"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
