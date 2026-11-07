@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api, problemMessage } from "../api/client";
 import type { components } from "../api/schema";
@@ -39,6 +39,19 @@ function AuditLogPage({ id }: { id: string }) {
   const [cursor, setCursor] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
+  /**
+   * Which list the rows on screen belong to. The effect below bumps it whenever the workspace
+   * changes, and `page` captures it before its request and refuses to touch any state if it has
+   * moved on by the time the answer arrives.
+   *
+   * It is a ref, not a parameter, because the previous version took the liveness check as an
+   * argument and the "Load more" button passed `() => true`: a slow first page for workspace A,
+   * then a switch to B, and A's rows appended themselves under B's heading and left A's cursor
+   * behind — so the next page request returned only B rows older than A's last id, silently
+   * skipping a page of B. An audit log that answers "who did what here" with another tenant's
+   * rows is the worst failure this screen has. No call site can opt out of this one.
+   */
+  const generation = useRef(0);
 
   /**
    * One page, newest first. `cursor` is the previous page's `next_cursor`, which is the id of
@@ -48,12 +61,15 @@ function AuditLogPage({ id }: { id: string }) {
    * Deliberately not `useInfiniteQuery`: this is the only accumulating list in the app, and the
    * entry chunk is 45 KB from the 150 KB budget. Reach for it if a second screen needs one.
    */
-  async function page(after: string | null, live: () => boolean): Promise<void> {
+  async function page(after: string | null): Promise<void> {
+    const mine = generation.current;
     setBusy(true);
     const { data, error: problem } = await api.GET("/api/v1/workspaces/{id}/audit-log", {
       params: { path: { id }, query: after ? { cursor: after } : {} },
     });
-    if (!live()) return;
+    // The only write-barrier on this component's state: everything below is unreachable for an
+    // answer that outlived the list it was asked for.
+    if (mine !== generation.current) return;
     setBusy(false);
     if (problem || !data) {
       setError(problemMessage(problem, "The audit log could not be loaded."));
@@ -65,15 +81,14 @@ function AuditLogPage({ id }: { id: string }) {
   }
 
   useEffect(() => {
-    // `live` discards the result of the run StrictMode throws away, so the first page cannot be
-    // appended twice — and a slow answer for the workspace we have just navigated away from
-    // cannot land in the list of the one we are on now.
-    let live = true;
+    // Bumped on the way in and on the way out, so both a workspace change and the run StrictMode
+    // throws away retire every request already in flight.
+    generation.current += 1;
     setEntries([]);
     setCursor(null);
-    void page(null, () => live);
+    void page(null);
     return () => {
-      live = false;
+      generation.current += 1;
     };
     // `page` is redefined every render; `id` is the only thing it closes over that matters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -112,7 +127,7 @@ function AuditLogPage({ id }: { id: string }) {
           className={`mt-4 ${ROW_BUTTON}`}
           type="button"
           disabled={busy}
-          onClick={() => void page(cursor, () => true)}
+          onClick={() => void page(cursor)}
         >
           Load more
         </button>

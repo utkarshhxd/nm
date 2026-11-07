@@ -6,7 +6,7 @@ import { type FormEvent, useEffect, useState } from "react";
 import { api, problemMessage, problemType } from "../api/client";
 import { registerPasskey } from "../lib/passkeys";
 import { useMe } from "../lib/session";
-import { Alert, BUTTON, CARD, Field, SECONDARY_BUTTON } from "../lib/ui";
+import { Alert, BUTTON, CARD, CopyButton, Field, SECONDARY_BUTTON } from "../lib/ui";
 
 export default function AccountSecurity() {
   const me = useMe();
@@ -305,13 +305,7 @@ function RecoveryCodes({ codes, onSaved }: { codes: string[]; onSaved: () => voi
           </li>
         ))}
       </ul>
-      <button
-        className={BUTTON}
-        type="button"
-        onClick={() => void navigator.clipboard.writeText(text).catch(() => {})}
-      >
-        Copy
-      </button>
+      <CopyButton value={text} className={BUTTON} />
       <button className={SECONDARY_BUTTON} type="button" onClick={download}>
         Download
       </button>

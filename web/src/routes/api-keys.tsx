@@ -5,7 +5,7 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { api, problemMessage, problemType } from "../api/client";
 import { ROLES, type Role, canAssign } from "../lib/roles";
-import { Alert, BUTTON, CARD, ConfirmButton, Field, ROW_BUTTON, SELECT } from "../lib/ui";
+import { Alert, BUTTON, CARD, ConfirmButton, CopyButton, Field, ROW_BUTTON, SELECT } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
 function day(iso: string): string {
@@ -89,6 +89,9 @@ function ApiKeyList({ id, myRole }: { id: string; myRole: Role }) {
 
       {formError ? <Alert>{formError}</Alert> : null}
       {keys.isPending ? <p className="mt-4">Loading…</p> : null}
+      {keys.isError ? (
+        <Alert>The API keys could not be loaded. Reload the page to try again.</Alert>
+      ) : null}
       {keys.data && keys.data.length > 0 ? (
         <table className="mt-4 w-full text-left">
           <thead>
@@ -196,13 +199,7 @@ function NewKey({
         {created.key}
       </code>
       <p className="mt-4 flex flex-wrap gap-3">
-        <button
-          className={ROW_BUTTON}
-          type="button"
-          onClick={() => void navigator.clipboard.writeText(created.key).catch(() => {})}
-        >
-          Copy
-        </button>
+        <CopyButton value={created.key} />
         <button className={ROW_BUTTON} type="button" onClick={onStored}>
           I&apos;ve stored it
         </button>

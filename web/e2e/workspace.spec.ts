@@ -75,9 +75,13 @@ test("admin creates a workspace and a teammate joins by invite as editor", async
     // `canAssign` is false for an editor, so the control is disabled. The server is still the
     // one that refuses the change; this only checks that the UI does not invite the attempt.
     await expect(guestRow.getByRole("combobox")).toBeDisabled();
-    // An editor gets neither of the admin-only screens in the navigation.
+    // An editor gets neither of the admin-only screens in the navigation, and not the invite
+    // card either: both of its endpoints are `Role::Admin`, so it could only 403 on load.
     await expect(guest.getByRole("link", { name: "API keys", exact: true })).toHaveCount(0);
     await expect(guest.getByRole("link", { name: "Audit log", exact: true })).toHaveCount(0);
+    await expect(guest.getByRole("heading", { name: "Invite someone", exact: true })).toHaveCount(
+      0,
+    );
 
     await admin.reload();
     const adminRow = admin.getByRole("row").filter({ hasText: TEAMMATE });
@@ -94,9 +98,11 @@ test("admin creates a workspace and a teammate joins by invite as editor", async
     // The sole owner cannot leave. The message is the brief's, verbatim.
     await admin.goto("/w/globex/members");
     await admin.getByRole("button", { name: `Leave ${ADMIN_EMAIL}`, exact: true }).click();
-    await admin
-      .getByRole("button", { name: `Confirm leave ${ADMIN_EMAIL}`, exact: true })
-      .click();
+    const confirm = admin.getByRole("button", { name: `Confirm leave ${ADMIN_EMAIL}`, exact: true });
+    // Arming replaces the button that was pressed, so the confirmation has to take the focus
+    // with it or a keyboard user is dropped on <body> half way through.
+    await expect(confirm).toBeFocused();
+    await confirm.click();
     await expect(admin.getByRole("alert")).toHaveText(
       "A workspace needs at least one owner. Make someone else an owner first.",
     );
@@ -126,8 +132,9 @@ test("an API key is shown once and stops working when revoked", async ({ page, r
   await page.getByRole("button", { name: "I've stored it", exact: true }).click();
   await expect(page.getByTestId("api-key-value")).toHaveCount(0);
   await expect(page.getByText(`nm_${prefix}`, { exact: true })).toBeVisible();
-  // The whole key is gone from the page, not merely hidden.
-  await expect(page.getByText(key)).toHaveCount(0);
+  // The whole key is gone from the page, not merely hidden — asserted on a boolean, because a
+  // locator built from `key` puts the secret in the failure message and so in the report.
+  expect((await page.content()).includes(key), "the key is gone from the page").toBe(false);
 
   // `request` has never signed in, so it holds no cookie: everything below is the key's own
   // authority. A key may read its own workspace and nothing else (T12), which is also how the
@@ -166,4 +173,24 @@ test("workspace screens have no serious accessibility violations", async ({ page
       .map((v) => `${v.id} (${v.impact}): ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`);
     expect(serious, `accessibility violations on ${path}`).toEqual([]);
   }
+});
+
+test("a list that fails to load says so", async ({ page }) => {
+  await signIn(page, ADMIN_EMAIL, ADMIN_PASSWORD);
+  await createWorkspace(page, "failco", "Fail Co");
+
+  // Deterministic, not a timing trick: the response is replaced before the page asks for it.
+  // Without the `isError` branch this screen renders a card holding nothing but its heading,
+  // which reads exactly like a workspace with no members.
+  await page.route("**/api/v1/workspaces/*/members*", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ type: "urn:nm:problem:internal", detail: "internal error" }),
+    }),
+  );
+  await page.reload();
+  await expect(
+    page.getByText("The members could not be loaded. Reload the page to try again."),
+  ).toBeVisible();
 });

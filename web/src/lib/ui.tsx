@@ -113,6 +113,9 @@ export function ConfirmButton({
         className={ROW_BUTTON}
         type="button"
         aria-label={`Confirm ${verb} ${subject}`}
+        // Arming unmounts the button that was just pressed, so without this a keyboard user's
+        // focus falls to <body> in the middle of a confirmation. Nothing automated catches it.
+        autoFocus
         onClick={() => {
           setArmed(false);
           onConfirm();
@@ -129,5 +132,45 @@ export function ConfirmButton({
         Cancel
       </button>
     </span>
+  );
+}
+
+/**
+ * Puts `value` on the clipboard, and says so when it cannot.
+ *
+ * `navigator.clipboard` is **undefined** outside a secure context, so `navigator.clipboard
+ * .writeText(…)` throws a synchronous TypeError that a trailing `.catch` never sees. Self-hosting
+ * this over plain HTTP on a LAN address is a deployment we support, and the three things copied
+ * in this app — an invite link, a new API key, a set of recovery codes — are each shown once or
+ * are the whole point of the screen. Failing silently there loses them.
+ */
+export function CopyButton({ value, className }: { value: string; className?: string }) {
+  const [state, setState] = useState<"" | "copied" | "failed">("");
+
+  async function copy(): Promise<void> {
+    try {
+      const clipboard = navigator.clipboard as Clipboard | undefined;
+      if (!clipboard) throw new Error("no clipboard on this origin");
+      await clipboard.writeText(value);
+      setState("copied");
+    } catch {
+      setState("failed");
+    }
+  }
+
+  return (
+    <>
+      <button className={className ?? ROW_BUTTON} type="button" onClick={() => void copy()}>
+        Copy
+      </button>
+      {state === "copied" ? (
+        <span role="status" className="text-green-800 dark:text-green-300">
+          Copied
+        </span>
+      ) : null}
+      {state === "failed" ? (
+        <Alert>Copying failed — select the text and copy it yourself.</Alert>
+      ) : null}
+    </>
   );
 }

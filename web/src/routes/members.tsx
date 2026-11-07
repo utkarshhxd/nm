@@ -4,9 +4,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 
 import { api, problemMessage, problemType } from "../api/client";
-import { ROLES, type Role, canAssign } from "../lib/roles";
+import { ROLES, type Role, atLeast, canAssign } from "../lib/roles";
 import { useMe } from "../lib/session";
-import { Alert, BUTTON, CARD, ConfirmButton, Field, ROW_BUTTON, SELECT } from "../lib/ui";
+import { Alert, BUTTON, CARD, ConfirmButton, CopyButton, Field, SELECT } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
 /** The brief's wording for `409 last-owner`, which `humanise` cannot produce from the code. */
@@ -29,7 +29,11 @@ export default function Members() {
   return (
     <>
       <MemberList id={workspace.id} myRole={workspace.role} />
-      <Invites id={workspace.id} myRole={workspace.role} />
+      {/* Both invite endpoints are `Role::Admin`, so below that this card could only render a
+          dead form, a 403 on every load, and a false "No open invitations." */}
+      {atLeast(workspace.role, "admin") ? (
+        <Invites id={workspace.id} myRole={workspace.role} />
+      ) : null}
     </>
   );
 }
@@ -98,6 +102,9 @@ function MemberList({ id, myRole }: { id: string; myRole: Role }) {
       <h2 className="text-xl font-semibold">Members</h2>
       {error ? <Alert>{error}</Alert> : null}
       {members.isPending ? <p className="mt-4">Loading…</p> : null}
+      {members.isError ? (
+        <Alert>The members could not be loaded. Reload the page to try again.</Alert>
+      ) : null}
       {members.data ? (
         <table className="mt-4 w-full text-left">
           <thead>
@@ -268,18 +275,18 @@ function Invites({ id, myRole }: { id: string; myRole: Role }) {
             <a className="break-all font-mono underline" data-testid="invite-url" href={link}>
               {link}
             </a>
-            <button
-              className={ROW_BUTTON}
-              type="button"
-              onClick={() => void navigator.clipboard.writeText(link).catch(() => {})}
-            >
-              Copy
-            </button>
+            <CopyButton value={link} />
           </p>
         </div>
       ) : null}
 
       <h3 className="mt-6 font-semibold">Open invitations</h3>
+      {/* Without this branch a failed fetch renders "No open invitations.", which is a claim
+          about the workspace rather than about the request that did not come back. */}
+      {invites.isError ? (
+        <Alert>The open invitations could not be loaded. Reload the page to try again.</Alert>
+      ) : null}
+      {invites.isPending ? <p className="mt-2">Loading…</p> : null}
       {invites.data && invites.data.length > 0 ? (
         <ul className="mt-2">
           {invites.data.map((open) => (
@@ -298,9 +305,10 @@ function Invites({ id, myRole }: { id: string; myRole: Role }) {
             </li>
           ))}
         </ul>
-      ) : (
+      ) : null}
+      {invites.data && invites.data.length === 0 ? (
         <p className="mt-2">No open invitations.</p>
-      )}
+      ) : null}
     </section>
   );
 }
