@@ -29,4 +29,14 @@ RUN set -eux; \
     node --version; \
     pnpm --version
 
+# Playwright for the Task 15 end-to-end suite. Both halves must be baked into the image: the
+# dev container runs with `--rm`, so a browser or apt package installed during a run is gone
+# the moment it exits, and `playwright install` would re-download on every single test run.
+# PLAYWRIGHT_BROWSERS_PATH puts the browser at a fixed path instead of a per-user cache.
+# Keep PLAYWRIGHT_VERSION and web/package.json's @playwright/test pin in lockstep: Playwright
+# refuses to drive a browser build it did not ship with.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ARG PLAYWRIGHT_VERSION=1.65.0
+RUN npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium  && rm -rf /root/.npm /var/lib/apt/lists/*
+
 WORKDIR /work
