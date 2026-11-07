@@ -25,7 +25,8 @@ pub struct RequestMeta {
 /// The client address. `X-Forwarded-For` is a client-controlled header, so it is ignored unless
 /// `trust_proxy_headers` says a proxy we run sets it. Then the rightmost entry is used: it is the
 /// one our own proxy appended, while everything to its left is whatever the client sent.
-/// Absent, empty or unparseable header: the peer address.
+/// Entries may be a bare address, `addr:port` or `[v6]:port` (Azure Application Gateway and Front
+/// Door append the port). Absent, empty or unparseable header: the peer address.
 pub fn client_ip(
     headers: &HeaderMap,
     peer: Option<IpAddr>,
@@ -35,14 +36,31 @@ pub fn client_ip(
         return peer;
     }
     // The last header line, as a proxy appends rather than rewrites.
-    headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .next_back()
-        .and_then(|v| v.to_str().ok())
+    let Some(value) = headers.get_all("x-forwarded-for").iter().next_back() else {
+        return peer;
+    };
+    let parsed = value
+        .to_str()
+        .ok()
         .and_then(|v| v.rsplit(',').next())
-        .and_then(|entry| entry.trim().parse().ok())
-        .or(peer)
+        .and_then(|entry| parse_forwarded_entry(entry.trim()));
+    if parsed.is_none() {
+        // Never log the header: it is client-influenced.
+        tracing::warn!(
+            "trust_proxy_headers is on but the rightmost X-Forwarded-For entry is unparseable; \
+             using the peer address. Is the proxy topology as configured?"
+        );
+    }
+    parsed.or(peer)
+}
+
+/// Order matters: a bare IPv6 address must be tried first or it would be misread as host:port.
+fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
+    entry
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| entry.parse::<SocketAddr>().ok().map(|s| s.ip()))
+        .or_else(|| entry.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 pub(crate) fn truncate_user_agent(ua: &str) -> String {
@@ -98,6 +116,67 @@ mod tests {
     #[test]
     fn trusted_proxy_garbage_falls_back_to_peer() {
         let got = super::client_ip(&xff("nonsense"), Some(ip("10.0.0.1")), true);
+        assert_eq!(got, Some(ip("10.0.0.1")));
+    }
+
+    /// The rightmost entry of `value` as seen by a trusted-proxy deployment with peer 10.0.0.1.
+    fn trusted(value: &str) -> Option<IpAddr> {
+        super::client_ip(&xff(value), Some(ip("10.0.0.1")), true)
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_ipv4_with_port() {
+        assert_eq!(trusted("1.2.3.4:5678"), Some(ip("1.2.3.4")));
+        assert_eq!(trusted("6.6.6.6, 1.2.3.4:5678"), Some(ip("1.2.3.4")));
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_bracketed_ipv6_with_port() {
+        assert_eq!(trusted("[2001:db8::1]:443"), Some(ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_bare_ipv6_not_misread_as_host_port() {
+        assert_eq!(trusted("2001:db8::1"), Some(ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn trusted_proxy_accepts_bare_bracketed_ipv6() {
+        assert_eq!(trusted("[2001:db8::1]"), Some(ip("2001:db8::1")));
+    }
+
+    #[test]
+    fn trusted_proxy_garbage_with_port_falls_back_to_peer() {
+        assert_eq!(trusted("nonsense:80"), Some(ip("10.0.0.1")));
+    }
+
+    #[test]
+    fn trusted_proxy_empty_value_falls_back_to_peer() {
+        assert_eq!(trusted(""), Some(ip("10.0.0.1")));
+        assert_eq!(trusted("2.2.2.2,"), Some(ip("10.0.0.1")));
+    }
+
+    #[test]
+    fn trusted_proxy_trims_whitespace() {
+        assert_eq!(trusted("  6.6.6.6 ,\t2.2.2.2  "), Some(ip("2.2.2.2")));
+    }
+
+    #[test]
+    fn trusted_proxy_uses_last_of_multiple_header_lines() {
+        let mut h = xff("6.6.6.6");
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("5.5.5.5, 2.2.2.2"),
+        );
+        assert_eq!(
+            super::client_ip(&h, Some(ip("10.0.0.1")), true),
+            Some(ip("2.2.2.2"))
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_without_header_uses_peer() {
+        let got = super::client_ip(&HeaderMap::new(), Some(ip("10.0.0.1")), true);
         assert_eq!(got, Some(ip("10.0.0.1")));
     }
 }
