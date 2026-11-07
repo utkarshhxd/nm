@@ -15,5 +15,29 @@ services:
       timeout: 3s
       retries: 10
 
+  # Linux build environment (Windows can't link Rust here). Run via scripts/dev.sh.
+  dev:
+    profiles: ["tools"]
+    build:
+      context: docker
+      dockerfile: dev.Dockerfile
+    working_dir: /work
+    environment:
+      DATABASE_URL: postgres://nm:nm@postgres:5432/nm
+      NM_DATABASE_URL: postgres://nm:nm@postgres:5432/nm
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/work
+      - nm_target:/work/target
+      - nm_cargo_registry:/usr/local/cargo/registry
+      - nm_cargo_git:/usr/local/cargo/git
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   nm_pgdata:
+  nm_target:
+  nm_cargo_registry:
+  nm_cargo_git:
