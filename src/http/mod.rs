@@ -5,6 +5,7 @@ use axum::{Router, routing::any};
 use crate::{app::AppState, error::ApiError};
 
 mod health;
+pub mod request_meta;
 pub mod security_headers;
 
 /// Every route module adds its `.merge(...)` here.
