@@ -25,7 +25,7 @@ function enterApp(): void {
 function tooManyAttempts(retryAfter: string | null): string {
   const seconds = Number(retryAfter);
   const minutes = Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds / 60) : 15;
-  return `Too many attempts — try again in ${minutes} minutes`;
+  return `Too many attempts — try again in ${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
 export default function Login() {
