@@ -25,7 +25,7 @@
 - Every source file begins with `SPDX-License-Identifier: AGPL-3.0-only`, written in that file's comment syntax.
 
 **Dependencies**
-- **Allowed licenses:** MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, MPL-2.0, Unicode-3.0, GPL-3.0, AGPL-3.0.
+- **Allowed licenses:** MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, MPL-2.0, Unicode-3.0, GPL-3.0-only, GPL-3.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later.
 - **Never allowed:** GPL-2.0-only, SSPL, BUSL, Commons Clause, or any other non-OSI license.
 - Another permissive OSI license (for example CDLA-Permissive-2.0 for CA-root data) may be added only with a one-line justification comment in `deny.toml` / `web/scripts/check-licenses.mjs`.
 - Postgres 16+ is the only external runtime dependency. No Redis and no message broker.

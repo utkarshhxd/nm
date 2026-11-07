@@ -396,7 +396,7 @@ U = decided by the user. C = proposed during design and accepted (or not objecte
 ### Licensing
 
 - **The product is AGPL-3.0.** Every source file carries an SPDX header, and the repo has a `LICENSE` file.
-- **Allowed dependency licenses** (Rust crates and npm packages): MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, MPL-2.0, Unicode-3.0, GPL-3.0 and AGPL-3.0.
+- **Allowed dependency licenses** (Rust crates and npm packages): MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, MPL-2.0, Unicode-3.0, GPL-3.0-only, GPL-3.0-or-later, AGPL-3.0-only and AGPL-3.0-or-later (SPDX identifiers).
 - **Never allowed:** GPL-2.0-only, because it cannot be combined with AGPL-3.0. Also never: SSPL, BUSL, Commons Clause, or any other non-OSI "source-available" license.
 - CI enforces this with `cargo-deny` for Rust and a license checker for the npm packages.
 - **Contributions:** DCO sign-off (`Signed-off-by:`), no CLA. This is a design call. Note that a CLA would be needed if the org ever wants to sell a commercial license alongside the AGPL one.
