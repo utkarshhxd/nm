@@ -32,6 +32,9 @@ services:
       - nm_target:/work/target
       - nm_cargo_registry:/usr/local/cargo/registry
       - nm_cargo_git:/usr/local/cargo/git
+      # Linux-native install, kept off the Windows bind mount: esbuild and rollup ship
+      # platform-specific binaries, and the host filesystem is slow for a tree this size.
+      - nm_web_node_modules:/work/web/node_modules
     depends_on:
       postgres:
         condition: service_healthy
@@ -41,3 +44,4 @@ volumes:
   nm_target:
   nm_cargo_registry:
   nm_cargo_git:
+  nm_web_node_modules:
