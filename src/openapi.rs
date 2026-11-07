@@ -93,3 +93,46 @@ pub fn docs<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .config(Config::new([SPEC_PATH]).validator_url("none"))
         .into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::spec;
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    /// `operationId` must be unique across the document (OpenAPI 3.1 §4.8.10.3).
+    ///
+    /// utoipa derives it from the handler's **function name**, so two modules that each export a
+    /// `list` silently ship the same id, and nothing in the Rust build notices. The damage lands
+    /// in the generated TypeScript client: `openapi-typescript` keys one `operations` interface by
+    /// that id, so every colliding path takes on whichever duplicate won — a members GET typed as
+    /// the passkey list, with no path parameters. `skipLibCheck` hides the duplicate identifiers
+    /// it emits, so the symptom is a pile of type errors naming schemas nobody touched.
+    ///
+    /// This walks the serialised document rather than `PathItem`'s eight method fields, so it
+    /// checks exactly what is published and does not need updating if utoipa adds a verb.
+    #[test]
+    fn operation_ids_are_unique() {
+        let doc = serde_json::to_value(spec()).expect("the spec serialises");
+        let mut seen: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (path, item) in doc["paths"].as_object().expect("paths is an object") {
+            // A path item also holds `summary`, `parameters` and `$ref`; only an operation has an
+            // `operationId`, so this needs no list of verbs to filter by.
+            for (method, operation) in item.as_object().expect("a path item is an object") {
+                if let Some(id) = operation.get("operationId").and_then(Value::as_str) {
+                    seen.entry(id).or_default().push(format!("{method} {path}"));
+                }
+            }
+        }
+        assert!(
+            !seen.is_empty(),
+            "no operationId found at all: the walk is wrong, not the document"
+        );
+        let duplicates: Vec<_> = seen.iter().filter(|(_, used)| used.len() > 1).collect();
+        assert!(
+            duplicates.is_empty(),
+            "duplicate operationId {duplicates:?} — utoipa derives it from the handler's function \
+             name, so give each one an explicit `operation_id = \"…\"` in its `#[utoipa::path(…)]`"
+        );
+    }
+}
