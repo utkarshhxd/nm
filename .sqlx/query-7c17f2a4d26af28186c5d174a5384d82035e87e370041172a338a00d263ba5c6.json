@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into auth_challenges (id, user_id, ip, kind, state, expires_at) values ($1, $2, $3, $4, $5, now() + interval '5 minutes')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Inet",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7c17f2a4d26af28186c5d174a5384d82035e87e370041172a338a00d263ba5c6"
+}

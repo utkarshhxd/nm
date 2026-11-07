@@ -149,6 +149,16 @@ async fn adopt_session(app: &mut TestApp) -> Value {
     me
 }
 
+/// The `auth.login.failed` rows, as (target user, metadata).
+async fn failed_logins(pool: &PgPool) -> Vec<(Option<String>, Value)> {
+    sqlx::query_as(
+        "select target_id, metadata from audit_log where action = 'auth.login.failed' order by id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 fn assert_invalid_passkey(r: &TestResponse) {
     r.assert_status(StatusCode::UNAUTHORIZED);
     assert_eq!(r.json::<Value>()["type"], "urn:nm:problem:invalid-passkey");
@@ -267,8 +277,9 @@ async fn challenges_are_single_use(pool: PgPool) {
         .await
         .assert_status_ok();
     app.server.clear_cookies();
-    // The very same, valid, signed response again: the challenge is gone.
+    // The very same, valid, signed response again: the challenge is gone, and that is not audited.
     assert_invalid_passkey(&login_finish(&app, &challenge_id, &cred).await);
+    assert!(failed_logins(&pool).await.is_empty());
     app.server
         .get("/api/v1/me")
         .await
@@ -336,6 +347,9 @@ async fn removed_passkey_cannot_sign_in(pool: PgPool) {
     let cred = assertion(&mut soft, ORIGIN, options, &reg, reg.user_id);
     assert_invalid_passkey(&login_finish(&app, &challenge_id, &cred).await);
 
+    // No credential row was found, so nothing is audited: an anonymous caller cannot write rows.
+    assert!(failed_logins(&pool).await.is_empty());
+
     let removed: i64 =
         sqlx::query_scalar("select count(*) from audit_log where action = 'auth.passkey.removed'")
             .fetch_one(&pool)
@@ -372,6 +386,14 @@ async fn foreign_origin_rejected(pool: PgPool) {
         .get("/api/v1/me")
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
+    // The credential was real, so the failure is audited, with a reason and no credential material.
+    assert_eq!(
+        failed_logins(&pool).await,
+        vec![(
+            Some(reg.user_id.to_string()),
+            json!({ "method": "passkey", "reason": "verification-failed" })
+        )]
+    );
 }
 
 #[sqlx::test]
@@ -423,6 +445,14 @@ async fn stale_signature_counter_is_rejected(pool: PgPool) {
         .get("/api/v1/me")
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
+    // A possible clone is exactly what an operator wants to see.
+    assert_eq!(
+        failed_logins(&pool).await,
+        vec![(
+            Some(reg.user_id.to_string()),
+            json!({ "method": "passkey", "reason": "counter-not-advanced" })
+        )]
+    );
 }
 
 #[sqlx::test]
@@ -493,4 +523,42 @@ async fn concurrent_finishes_cannot_both_spend_a_challenge(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(sessions, 1);
+}
+
+#[sqlx::test]
+async fn login_start_is_capped_per_address(pool: PgPool) {
+    let app = TestApp::with_config(pool.clone(), |c| c.trust_proxy_headers = true).await;
+    let start = |ip: &'static str| {
+        app.server
+            .post("/api/v1/auth/passkey/login/start")
+            .add_header("x-forwarded-for", ip)
+    };
+    for _ in 0..20 {
+        start("203.0.113.1").await.assert_status_ok();
+    }
+    let over = start("203.0.113.1").await;
+    over.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(over.header("retry-after"), "60");
+    assert_eq!(over.json::<Value>()["type"], "urn:nm:problem:rate-limited");
+    // Refused starts store nothing; another address is untouched.
+    start("203.0.113.2").await.assert_status_ok();
+    let stored: i64 = sqlx::query_scalar("select count(*) from auth_challenges")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 21);
+
+    // Expired challenges stop counting.
+    sqlx::query("update auth_challenges set expires_at = now() - interval '1 minute'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    start("203.0.113.1").await.assert_status_ok();
+
+    // The cap is on its own: it shares nothing with password sign-in's attempt log.
+    let attempts: i64 = sqlx::query_scalar("select count(*) from login_attempts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0);
 }

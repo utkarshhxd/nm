@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*) as \"n!\" from auth_challenges\n               where ip = $1 and kind = 'passkey_login' and expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Inet"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "33481ce4f91be99b3b05036ed73eb061439d21fb4f8717d1bc07b0e123b8f48f"
+}

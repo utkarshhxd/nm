@@ -22,7 +22,7 @@ const MAX_FAILURES_PER_IP: i64 = 100;
 /// allocation cannot rotate through 2^64 addresses to dodge the per-IP limit. An IPv4-mapped
 /// address (`::ffff:a.b.c.d`, as a dual-stack listener or proxy may report) is keyed as the IPv4
 /// address it carries: masking it would put every IPv4 client in one `::` bucket.
-fn bucket(ip: Option<IpAddr>) -> Option<IpAddr> {
+pub(crate) fn bucket(ip: Option<IpAddr>) -> Option<IpAddr> {
     ip.map(|ip| match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),

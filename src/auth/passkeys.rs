@@ -11,6 +11,8 @@
 //! as `jsonb`, consumed by one conditional `delete … returning`, and never returned, logged or
 //! audited. Nothing here rate-limits sign-in: a WebAuthn signature cannot be guessed.
 
+use std::net::IpAddr;
+
 use axum::{
     Json, Router,
     extract::State,
@@ -29,11 +31,11 @@ use webauthn_rs::{
     Webauthn, WebauthnBuilder,
     prelude::{
         CredentialID, DiscoverableAuthentication, Passkey, PasskeyRegistration,
-        PublicKeyCredential, RegisterPublicKeyCredential,
+        PublicKeyCredential, RegisterPublicKeyCredential, WebauthnError,
     },
 };
 
-use super::{CurrentUser, login::LoginResponse, sessions};
+use super::{CurrentUser, login::LoginResponse, rate_limit, sessions};
 use crate::{
     app::AppState,
     audit::{self, Actor, AuditEvent, actions},
@@ -44,6 +46,12 @@ use crate::{
 };
 
 const RP_NAME: &str = "NM";
+
+/// How many unexpired sign-in challenges one address (its `rate_limit::bucket`) may hold. Starting
+/// a sign-in is free and unauthenticated, so this is what bounds `auth_challenges`. Generous for a
+/// person retrying a ceremony. Deliberately NOT charged to `login_attempts`: that bucket also
+/// guards password sign-in, and a free request must not be a lever to lock an address out of it.
+const MAX_LIVE_LOGIN_CHALLENGES_PER_IP: i64 = 20;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -66,7 +74,10 @@ pub fn routes() -> Router<AppState> {
 /// would break an otherwise fine `http://127.0.0.1:8080` install.
 pub fn relying_party(public_url: &Url) -> anyhow::Result<Option<Webauthn>> {
     let Some(rp_id) = public_url.domain() else {
-        tracing::warn!("public_url host is not a domain name; passkeys are disabled");
+        tracing::warn!(
+            public_url = %public_url,
+            "passkeys disabled: public_url host is not a domain name; set public_url to a domain to enable them"
+        );
         return Ok(None);
     };
     Ok(Some(
@@ -86,7 +97,7 @@ fn invalid_passkey() -> ApiError {
 /// A WebAuthn failure is the caller's, not ours: the reason (a bad signature, a wrong origin, a
 /// counter that went backwards) goes to the debug log by variant and never to the response, which
 /// is the same for every failure.
-fn rejected(e: webauthn_rs::prelude::WebauthnError) -> ApiError {
+fn rejected(e: WebauthnError) -> ApiError {
     tracing::debug!(error = ?e, "passkey ceremony rejected");
     invalid_passkey()
 }
@@ -100,24 +111,25 @@ fn internal(what: &str, e: impl std::fmt::Debug) -> ApiError {
 async fn store_challenge(
     db: &PgPool,
     user_id: Option<Uuid>,
+    ip: Option<IpAddr>,
     kind: &'static str,
     state: Value,
 ) -> sqlx::Result<Uuid> {
     let id = Uuid::now_v7();
     sqlx::query!(
-        "insert into auth_challenges (id, user_id, kind, state, expires_at) \
-         values ($1, $2, $3, $4, now() + interval '5 minutes')",
+        "insert into auth_challenges (id, user_id, ip, kind, state, expires_at) \
+         values ($1, $2, $3, $4, $5, now() + interval '5 minutes')",
         id,
         user_id,
+        ip as Option<IpAddr>,
         kind,
         state,
     )
     .execute(db)
     .await?;
     // shortcut: expired challenges are deleted inline on every new one; move to a scheduled job
-    // when the queue lands (M1). Best effort: it must not fail the request it rides on. Note it is
-    // only as good as the 5-minute window, since an anonymous caller can still add rows to
-    // `login/start` as fast as the server answers, and nothing rate-limits that endpoint.
+    // when the queue lands (M1). Best effort: it must not fail the request it rides on. The flood
+    // `login/start` invites is bounded separately, by `MAX_LIVE_LOGIN_CHALLENGES_PER_IP`.
     if let Err(e) = sqlx::query!("delete from auth_challenges where expires_at <= now()")
         .execute(db)
         .await
@@ -249,7 +261,7 @@ pub async fn register_start(
     let challenge = serde_json::to_value(RegistrationChallenge { name, registration })
         .map_err(|e| internal("serialise registration", e))?;
     let challenge_id =
-        store_challenge(&state.pool, Some(u.id), "passkey_register", challenge).await?;
+        store_challenge(&state.pool, Some(u.id), None, "passkey_register", challenge).await?;
     Ok(Json(ChallengeResponse {
         challenge_id,
         options,
@@ -406,17 +418,41 @@ pub async fn remove(
     responses(
         (status = 200, description = "Options for navigator.credentials.get with conditional mediation", body = ChallengeResponse),
         (status = 409, description = "passkeys-unavailable: public_url host is not a domain name"),
+        (status = 429, description = "rate-limited: this address already holds 20 unexpired sign-in challenges"),
     ),
 )]
-pub async fn login_start(State(state): State<AppState>) -> ApiResult<Json<ChallengeResponse>> {
-    let (rcr, ceremony) = state
-        .webauthn()?
+pub async fn login_start(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+) -> ApiResult<Json<ChallengeResponse>> {
+    let webauthn = state.webauthn()?;
+    // No address, no cap: as in `rate_limit`, an unknown caller is not limited.
+    let ip = rate_limit::bucket(meta.ip);
+    if let Some(ip) = ip {
+        // shortcut: count then insert, so a burst of concurrent starts can overshoot the cap by
+        // about its own width; use an advisory lock or a counter row if exactness ever matters.
+        let live = sqlx::query_scalar!(
+            r#"select count(*) as "n!" from auth_challenges
+               where ip = $1 and kind = 'passkey_login' and expires_at > now()"#,
+            ip as IpAddr,
+        )
+        .fetch_one(&state.pool)
+        .await?;
+        if live >= MAX_LIVE_LOGIN_CHALLENGES_PER_IP {
+            // The oldest challenge may free a slot sooner; a minute is a polite lower bound.
+            return Err(ApiError::TooManyRequests {
+                retry_after_secs: 60,
+            });
+        }
+    }
+    let (rcr, ceremony) = webauthn
         .start_discoverable_authentication()
         .map_err(|e| internal("start authentication", e))?;
     let options = public_key_options(&rcr)?;
     let challenge_id = store_challenge(
         &state.pool,
         None,
+        ip,
         "passkey_login",
         serde_json::to_value(ceremony).map_err(|e| internal("serialise ceremony", e))?,
     )
@@ -478,9 +514,35 @@ pub async fn login_finish(
 
     // Rejects a wrong origin, challenge, rp id or signature, missing user verification, and a
     // signature counter that did not advance (a possible cloned authenticator).
-    let result = webauthn
-        .finish_discoverable_authentication_v2(&credential, ceremony, &passkey)
-        .map_err(rejected)?;
+    let result =
+        match webauthn.finish_discoverable_authentication_v2(&credential, ceremony, &passkey) {
+            Ok(result) => result,
+            Err(e) => {
+                // The credential is real, so this is worth a trace; an attacker cannot reach this
+                // branch in volume without a credential id, which is not public. The reason is coarse
+                // and there is nothing of the credential or the ceremony in it. Audited after the
+                // transaction (and its row lock) is gone.
+                let reason = match e {
+                    WebauthnError::CredentialPossibleCompromise => "counter-not-advanced",
+                    _ => "verification-failed",
+                };
+                tx.rollback().await?;
+                audit::record(
+                    &state.pool,
+                    &meta,
+                    AuditEvent {
+                        workspace_id: None,
+                        actor: Actor::System,
+                        action: actions::AUTH_LOGIN_FAILED,
+                        target_type: Some("user"),
+                        target_id: Some(user_id.to_string()),
+                        metadata: json!({ "method": "passkey", "reason": reason }),
+                    },
+                )
+                .await?;
+                return Err(rejected(e));
+            }
+        };
     passkey.update_credential(&result);
     sqlx::query!(
         "update passkeys set passkey = $2, last_used_at = now() where id = $1",
