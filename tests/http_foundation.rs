@@ -2,15 +2,22 @@
 
 mod common;
 
+use std::borrow::Cow;
+
 use axum::{
     Router,
     http::StatusCode,
+    middleware,
+    response::Response,
     routing::{get, post},
 };
-use common::{TestApp, test_server};
+use common::{PW, TestApp, create_user, test_server};
 use nm::{
     error::{ApiJson, ApiPath, ApiQuery, ApiResult},
-    http::web_ui::{AssetSource, EmbeddedAssets},
+    http::{
+        security_headers::security_headers,
+        web_ui::{AssetSource, EmbeddedAssets, serve_web},
+    },
     pagination::PageParams,
 };
 use serde::Deserialize;
@@ -101,6 +108,49 @@ async fn security_headers_everywhere(pool: PgPool) {
             "{path}"
         );
     }
+}
+
+/// An authenticated API response must never be stored by a shared cache: `/me` carries the
+/// caller's email, workspaces and `csrf_token` (a usable write credential) with no `Set-Cookie`
+/// and no `Vary`, so a reverse-proxy cache would serve one user's body to the next caller.
+#[sqlx::test]
+async fn authenticated_api_responses_are_no_store(pool: PgPool) {
+    let mut app = TestApp::new(pool.clone()).await;
+    create_user(&pool, "cache@example.com", PW, false).await;
+    app.login("cache@example.com", PW).await;
+    let me = app.get("/api/v1/me").await;
+    me.assert_status_ok();
+    assert_eq!(me.header("cache-control"), "no-store");
+    assert_eq!(app.get("/readyz").await.header("cache-control"), "no-store");
+}
+
+/// The half that would fail silently: `security_headers` must stay path-scoped. A blanket
+/// `no-store` would cost nothing visible and destroy the `immutable` caching of the hashed
+/// bundle, which is what keeps the frontend fast.
+#[tokio::test]
+async fn security_headers_leave_asset_caching_alone() {
+    struct OneAsset;
+    impl AssetSource for OneAsset {
+        fn get(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+            (path == "assets/app-abc.js").then(|| Cow::Borrowed(&b"console.log(1)"[..]))
+        }
+    }
+    async fn asset() -> Response {
+        serve_web(&OneAsset, "/assets/app-abc.js", None)
+    }
+
+    let server = test_server(
+        Router::new()
+            .route("/assets/app-abc.js", get(asset))
+            .layer(middleware::from_fn(security_headers)),
+    );
+    let r = server.get("/assets/app-abc.js").await;
+    r.assert_status_ok();
+    assert_eq!(
+        r.header("cache-control"),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(r.header("x-content-type-options"), "nosniff");
 }
 
 #[sqlx::test]
