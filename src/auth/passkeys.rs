@@ -75,7 +75,9 @@ pub fn routes() -> Router<AppState> {
 pub fn relying_party(public_url: &Url) -> anyhow::Result<Option<Webauthn>> {
     let Some(rp_id) = public_url.domain() else {
         tracing::warn!(
-            public_url = %public_url,
+            // Host only, never the whole URL: a `user:pass@` userinfo component would
+            // otherwise reach the logs.
+            public_url_host = public_url.host_str().unwrap_or("<none>"),
             "passkeys disabled: public_url host is not a domain name; set public_url to a domain to enable them"
         );
         return Ok(None);
