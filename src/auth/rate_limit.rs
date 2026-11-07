@@ -3,8 +3,12 @@
 //! Sign-in lockout: failures per email and per client IP within a sliding window. Counting is
 //! keyed on what was submitted, never on whether a user exists, so `check` costs the same for
 //! a known and an unknown email.
+//!
+//! An attempt is stored as a failure *before* its password is checked and flipped to a success
+//! afterwards, so concurrent guesses cannot all slip past `check` while argon2 runs: the race
+//! window is one database round trip, and nothing is locked while hashing.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use sqlx::PgPool;
 
@@ -14,10 +18,20 @@ const WINDOW_SECS: f64 = 15.0 * 60.0;
 const MAX_FAILURES_PER_EMAIL: i64 = 10;
 const MAX_FAILURES_PER_IP: i64 = 100;
 
+/// IPv6 is keyed per /64, the smallest block an ISP or cloud customer is normally given, so one
+/// allocation cannot rotate through 2^64 addresses to dodge the per-IP limit. IPv4 is kept as is.
+fn bucket(ip: Option<IpAddr>) -> Option<IpAddr> {
+    ip.map(|ip| match ip {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        v4 => v4,
+    })
+}
+
 /// 429 when the email has 10 or more failures, or the IP 100 or more, in the last 15 minutes.
 /// `retry_after_secs` is the time until the oldest counted failure leaves the window (the later
-/// of the two when both limits are hit).
-pub async fn check(db: &PgPool, email: &str, ip: Option<IpAddr>) -> ApiResult<()> {
+/// of the two when both limits are hit). `email` is `None` when the submitted address did not
+/// normalise; only the IP limit applies then.
+pub async fn check(db: &PgPool, email: Option<&str>, ip: Option<IpAddr>) -> ApiResult<()> {
     let row = sqlx::query!(
         r#"select
              count(*) filter (where email = $1) as "email_failures!",
@@ -30,7 +44,7 @@ pub async fn check(db: &PgPool, email: &str, ip: Option<IpAddr>) -> ApiResult<()
            where not succeeded and at > now() - interval '15 minutes'
              and (email = $1 or ip = $2)"#,
         email,
-        ip as Option<IpAddr>,
+        bucket(ip) as Option<IpAddr>,
     )
     .fetch_one(db)
     .await?;
@@ -50,24 +64,59 @@ pub async fn check(db: &PgPool, email: &str, ip: Option<IpAddr>) -> ApiResult<()
     })
 }
 
-/// Records one sign-in attempt. Only `succeeded = false` rows count toward a lock.
-pub async fn record(
+/// Stores an attempt as a failure and returns its id; call `mark_succeeded` once the password
+/// has checked out. Only failures count toward a lock.
+pub async fn record_attempt(
     db: &PgPool,
-    email: &str,
+    email: Option<&str>,
     ip: Option<IpAddr>,
-    succeeded: bool,
-) -> sqlx::Result<()> {
-    sqlx::query!(
-        "insert into login_attempts (email, ip, succeeded) values ($1, $2, $3)",
+) -> sqlx::Result<i64> {
+    let id = sqlx::query_scalar!(
+        "insert into login_attempts (email, ip, succeeded) values ($1, $2, false) returning id",
         email,
-        ip as Option<IpAddr>,
-        succeeded,
+        bucket(ip) as Option<IpAddr>,
+    )
+    .fetch_one(db)
+    .await?;
+    // shortcut: old rows are deleted inline on every attempt; move to a scheduled job when the queue lands (M1).
+    // The cleanup must never fail the sign-in it piggybacks on, so its error is only logged.
+    if let Err(e) = sqlx::query!("delete from login_attempts where at < now() - interval '1 day'")
+        .execute(db)
+        .await
+    {
+        tracing::warn!(error = ?e, "login_attempts cleanup failed");
+    }
+    Ok(id)
+}
+
+/// Flips an attempt stored by `record_attempt` to a success, so it stops counting toward a lock.
+pub async fn mark_succeeded(db: &PgPool, id: i64) -> sqlx::Result<()> {
+    sqlx::query!(
+        "update login_attempts set succeeded = true where id = $1",
+        id
     )
     .execute(db)
     .await?;
-    // shortcut: old rows are deleted inline on every attempt; move to a scheduled job when the queue lands (M1).
-    sqlx::query!("delete from login_attempts where at < now() - interval '1 day'")
-        .execute(db)
-        .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_is_masked_to_64_and_ipv4_is_kept() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            bucket(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
+            ip("2001:db8:1:2::")
+        );
+        assert_eq!(
+            bucket(ip("2001:db8:1:2::1")),
+            bucket(ip("2001:db8:1:2:ffff::"))
+        );
+        assert_ne!(bucket(ip("2001:db8:1:2::1")), bucket(ip("2001:db8:1:3::1")));
+        assert_eq!(bucket(ip("9.9.9.9")), ip("9.9.9.9"));
+        assert_eq!(bucket(None), None);
+    }
 }

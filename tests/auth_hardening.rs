@@ -116,3 +116,83 @@ async fn ip_limit_keys_on_forwarded_ip_when_trusted(pool: PgPool) {
         .assert_status(StatusCode::TOO_MANY_REQUESTS);
     from(&app, "8.8.8.8").await.assert_status_ok();
 }
+
+#[sqlx::test]
+async fn successful_sign_ins_do_not_count_toward_the_lock(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    create_user(&pool, "ops@example.com", PW, false).await;
+    for _ in 0..9 {
+        login_as(&app, "ops@example.com", "wrong password here")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+    // Five successes would take 9 failures past the cap if they counted.
+    for _ in 0..5 {
+        login_as(&app, "ops@example.com", PW)
+            .await
+            .assert_status_ok();
+    }
+    // The tenth failure is still allowed to try; the one after it is locked out.
+    login_as(&app, "ops@example.com", "wrong password here")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    login_as(&app, "ops@example.com", PW)
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+}
+
+async fn row_counts(pool: &PgPool) -> (i64, i64) {
+    sqlx::query_as("select (select count(*) from login_attempts), (select count(*) from audit_log)")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn locked_requests_write_nothing_even_with_an_over_length_password(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    for _ in 0..10 {
+        login_as(&app, "ops@example.com", "wrong password here")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+    let before = row_counts(&pool).await;
+    let r = login_as(&app, "ops@example.com", &"x".repeat(1025)).await;
+    r.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(row_counts(&pool).await, before);
+}
+
+#[sqlx::test]
+async fn malformed_emails_have_no_email_bucket(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    for _ in 0..11 {
+        login_as(&app, "not an email", "wrong password here")
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+    let null_email: i64 =
+        sqlx::query_scalar("select count(*) from login_attempts where email is null")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(null_email, 11);
+}
+
+#[sqlx::test]
+async fn ipv6_limit_keys_on_the_64(pool: PgPool) {
+    let app = TestApp::with_config(pool.clone(), |c| c.trust_proxy_headers = true).await;
+    create_user(&pool, "ops@example.com", PW, false).await;
+    for i in 0..100 {
+        app.server
+            .post("/api/v1/auth/login")
+            .add_header("x-forwarded-for", format!("2001:db8:1:2::{i:x}"))
+            .json(&json!({"email": format!("nobody{i}@example.com"), "password": "wrong password here"}))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+    // Same /64, different host bits: locked. Another /64: not.
+    from(&app, "2001:db8:1:2:ffff::1")
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+    from(&app, "2001:db8:1:3::1").await.assert_status_ok();
+}

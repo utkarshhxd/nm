@@ -70,7 +70,6 @@ async fn login_failed(
     meta: &RequestMeta,
     email: Option<&str>,
 ) -> ApiResult<ApiError> {
-    rate_limit::record(&state.pool, email.unwrap_or(""), meta.ip, false).await?;
     audit::record(
         &state.pool,
         meta,
@@ -114,17 +113,20 @@ pub async fn login(
     // A malformed address cannot belong to a user: it is treated as unknown and never echoed.
     let email = users::normalize_email(&req.email).ok();
 
+    // First, before any write or password work, so a locked email or IP is refused even with the
+    // right password and a flood of requests cannot keep writing rows. It is keyed on the
+    // submitted email and IP only and never reads `users`, so it costs the same for a known and
+    // an unknown email.
+    rate_limit::check(&state.pool, email.as_deref(), meta.ip).await?;
+    // Stored as a failure now and flipped on success, so guesses already in flight count.
+    let attempt = rate_limit::record_attempt(&state.pool, email.as_deref(), meta.ip).await?;
+
     // Reject an over-length password BEFORE looking the user up. `verify_password` bails out
     // without argon2 work on such input, so branching on whether the user exists first would
     // make a 1025-byte password instant for a known email and ~25ms for an unknown one.
     if req.password.len() > MAX_PASSWORD_BYTES {
         return Err(login_failed(&state, &meta, email.as_deref()).await?);
     }
-
-    // Before the lookup, so a locked email is refused even with the right password, and with a
-    // query that costs the same whether or not the email has a user. A malformed address shares
-    // the "" key: it cannot sign in anyway.
-    rate_limit::check(&state.pool, email.as_deref().unwrap_or(""), meta.ip).await?;
 
     let user = match &email {
         Some(email) => users::find_by_email(&state.pool, email).await?,
@@ -144,7 +146,7 @@ pub async fn login(
         return Err(login_failed(&state, &meta, email.as_deref()).await?);
     };
 
-    rate_limit::record(&state.pool, &user.email, meta.ip, true).await?;
+    rate_limit::mark_succeeded(&state.pool, attempt).await?;
 
     let mut tx = state.pool.begin().await?;
     let session = sessions::create(&mut *tx, user.id, false, &meta).await?;

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update login_attempts set succeeded = true where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b880ca33bf7987c39d60230113b78ff8998c206388b51666ab691c48509b21df"
+}
