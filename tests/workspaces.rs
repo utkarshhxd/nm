@@ -514,3 +514,36 @@ async fn admins_rename_workspaces_and_it_is_audited(pool: PgPool) {
         json!({"name": "Acme Inc", "timezone": "Europe/London"})
     );
 }
+
+/// The two orderings differ on purpose. `/me.workspaces` is by name, because `home.tsx` redirects
+/// into its first element and a switcher a human reads must not reshuffle when a workspace is
+/// added. `GET /workspaces` is `id desc`, which its cursor forces. Do not unify them.
+#[sqlx::test]
+async fn me_orders_workspaces_by_name_and_the_endpoint_by_id(pool: PgPool) {
+    let (admin, admin_id) = client(&pool, "admin@example.com", true).await;
+    // `create_workspace` names a workspace after its slug, so "alpha" is the older id.
+    create_workspace(&pool, admin_id, "alpha").await;
+    create_workspace(&pool, admin_id, "zulu").await;
+
+    let me = admin.get("/api/v1/me").await.json::<Value>();
+    let names: Vec<&str> = me["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["alpha", "zulu"], "/me is by name");
+
+    let page = admin.get("/api/v1/workspaces").await.json::<Value>();
+    let names: Vec<&str> = page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["zulu", "alpha"],
+        "the paginated list is newest first"
+    );
+}

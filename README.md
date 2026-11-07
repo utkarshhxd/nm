@@ -55,8 +55,11 @@ Node and pnpm live in the dev container too:
   copies the server serves
 - `bash scripts/dev.sh pnpm --dir web check:bundle` — initial JS must stay under 150 KB gzipped
 - `bash scripts/dev.sh pnpm --dir web check:licenses` — production dependency licenses
-- `bash scripts/dev.sh pnpm --dir web gen:api` — regenerate `src/api/openapi.json` and
-  `src/api/schema.d.ts` from the server's spec; CI fails if the committed spec has drifted
+- `bash scripts/dev.sh pnpm --dir web gen:api` — regenerate **both** `src/api/openapi.json`
+  (from the server) and `src/api/schema.d.ts` (from that JSON). Run this, not half of it: CI
+  fails if either has drifted.
+- `bash scripts/dev.sh pnpm --dir web gen:schema` — the second half on its own, for when only
+  `openapi.json` changed. `gen:api` calls it, so there is one copy of the generation logic
 
 For the Vite dev server (`pnpm --dir web dev`, port 5173) run the backend with
 `NM_PUBLIC_URL=http://localhost:5173`, so its session cookie matches the origin the browser sees.

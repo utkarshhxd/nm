@@ -172,16 +172,20 @@ pub async fn create_workspace(
     })
 }
 
-/// Every workspace the user belongs to, for `/me`, newest first.
+/// Every workspace the user belongs to, for `/me`, **by name**.
 ///
-/// `id desc` matches `list` below, and that ordering is not free to choose there: its cursor
-/// pagination filters on `w.id < cursor`, so the list must descend. Same data, same order.
+/// Deliberately NOT `list`'s `w.id desc`, and the two must not be "unified": this is a short,
+/// unpaginated list a human reads in the workspace switcher, and `web/routes/home.tsx` redirects
+/// into its first element. By name that redirect is stable and meaningful; by id it would be
+/// whichever workspace happened to be created last, and it would move under the person every
+/// time one is added. `w.id` only breaks ties, so the order is total and the list never
+/// reshuffles between requests. `list` cannot do this — see the comment on its query.
 pub async fn for_user(db: impl PgExecutor<'_>, user_id: Uuid) -> sqlx::Result<Vec<MeWorkspace>> {
     sqlx::query_as!(
         MeWorkspace,
         r#"select w.id, w.slug, w.name, m.role as "role: Role"
            from memberships m join workspaces w on w.id = m.workspace_id
-           where m.user_id = $1 order by w.id desc"#,
+           where m.user_id = $1 order by w.name, w.id"#,
         user_id,
     )
     .fetch_all(db)
@@ -233,6 +237,9 @@ pub async fn list(
             return Ok(Json(Page::from_rows(rows, limit, |w| w.id)));
         }
     };
+    // `w.id desc` is forced by the cursor: the page filters on `w.id < $2`, so the ordering has
+    // to be the same column, descending. That is why this differs from `for_user`, which orders
+    // by name — do not "unify" the two, they are the same rows serving different jobs.
     let rows = sqlx::query_as!(
         Workspace,
         r#"select w.id, w.slug, w.name, w.timezone, m.role as "role: Role"

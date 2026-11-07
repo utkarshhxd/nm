@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select w.id, w.slug, w.name, m.role as \"role: Role\"\n           from memberships m join workspaces w on w.id = m.workspace_id\n           where m.user_id = $1 order by w.id desc",
+  "query": "select w.id, w.slug, w.name, m.role as \"role: Role\"\n           from memberships m join workspaces w on w.id = m.workspace_id\n           where m.user_id = $1 order by w.name, w.id",
   "describe": {
     "columns": [
       {
@@ -60,5 +60,5 @@
       false
     ]
   },
-  "hash": "143ae359f04da84f2b12be3aa624c21dc07d4a91dfe1a2543ee359395fbb55a6"
+  "hash": "fa278af13c0a11536e56ef336eeb263c0770193ddab6fb318a0fbf1a204c4398"
 }
