@@ -666,6 +666,18 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_PasskeySummary: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                id: string;
+                /** Format: date-time */
+                last_used_at?: string | null;
+                name: string;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Workspace: {
             data: {
                 /** Format: uuid */
@@ -1011,7 +1023,12 @@ export interface operations {
     };
     list_passkeys: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1024,7 +1041,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PasskeySummary"][];
+                    "application/json": components["schemas"]["Page_PasskeySummary"];
                 };
             };
             /** @description unauthenticated */

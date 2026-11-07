@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, name, created_at, last_used_at from passkeys where user_id = $1 order by created_at, id",
+  "query": "select id, name, created_at, last_used_at from passkeys where user_id = $1 and ($2::uuid is null or id > $2) order by id limit $3",
   "describe": {
     "columns": [
       {
@@ -50,7 +50,9 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Uuid",
+        "Int8"
       ]
     },
     "nullable": [
@@ -60,5 +62,5 @@
       true
     ]
   },
-  "hash": "d242891003c2eeeb5bc5687529357b10a6af989bd529e6971f6b238e55d1da7b"
+  "hash": "d69c971fe67b2f59255186f19441446170bd19b2fd40e6babce436317559da4d"
 }

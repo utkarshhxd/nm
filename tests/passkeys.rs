@@ -173,6 +173,8 @@ async fn register_then_sign_in_without_password(pool: PgPool) {
     let list = app.get("/api/v1/me/passkeys").await;
     list.assert_status_ok();
     let list = list.json::<Value>();
+    assert!(list["next_cursor"].is_null());
+    let list = &list["data"];
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["name"], "laptop");
     assert!(list[0]["last_used_at"].is_null());
@@ -329,7 +331,7 @@ async fn expired_challenge_rejected(pool: PgPool) {
 async fn removed_passkey_cannot_sign_in(pool: PgPool) {
     let mut app = TestApp::new(pool.clone()).await;
     let (mut soft, reg) = user_with_passkey(&mut app).await;
-    let id = app.get("/api/v1/me/passkeys").await.json::<Value>()[0]["id"]
+    let id = app.get("/api/v1/me/passkeys").await.json::<Value>()["data"][0]["id"]
         .as_str()
         .unwrap()
         .to_owned();

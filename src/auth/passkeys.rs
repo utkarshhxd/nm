@@ -39,8 +39,9 @@ use super::{CurrentUser, login::LoginResponse, rate_limit, sessions};
 use crate::{
     app::AppState,
     audit::{self, Actor, AuditEvent, actions},
-    error::{ApiError, ApiJson, ApiPath, ApiResult},
+    error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult},
     http::request_meta::RequestMeta,
+    pagination::{Page, PageParams},
     users,
     workspaces::validate_name,
 };
@@ -351,8 +352,9 @@ pub async fn register_finish(
     get,
     path = "/api/v1/me/passkeys",
     operation_id = "list_passkeys",
+    params(PageParams),
     responses(
-        (status = 200, description = "The caller's passkeys, oldest first", body = Vec<PasskeySummary>),
+        (status = 200, description = "The caller's passkeys, oldest first", body = Page<PasskeySummary>),
         (status = 401, description = "unauthenticated"),
         (status = 403, description = "user-session-required"),
     ),
@@ -360,16 +362,23 @@ pub async fn register_finish(
 pub async fn list(
     State(state): State<AppState>,
     user: CurrentUser,
-) -> ApiResult<Json<Vec<PasskeySummary>>> {
+    ApiQuery(page): ApiQuery<PageParams>,
+) -> ApiResult<Json<Page<PasskeySummary>>> {
+    let limit = page.limit();
+    // Ascending, unlike the workspace-scoped lists: passkey ids are UUIDv7, so `id` is creation
+    // order and the oldest-first order this endpoint has always had is kept. The cursor
+    // predicate follows the ordering (`id > cursor`), which is all `Page::from_rows` needs.
     let rows = sqlx::query_as!(
         PasskeySummary,
         "select id, name, created_at, last_used_at from passkeys \
-         where user_id = $1 order by created_at, id",
+         where user_id = $1 and ($2::uuid is null or id > $2) order by id limit $3",
         user.user_id,
+        page.after()?,
+        limit + 1,
     )
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(rows))
+    Ok(Json(Page::from_rows(rows, limit, |p| p.id)))
 }
 
 #[utoipa::path(

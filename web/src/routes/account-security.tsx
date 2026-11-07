@@ -357,7 +357,9 @@ function Passkeys() {
     queryFn: async () => {
       const { data, error: problem } = await api.GET("/api/v1/me/passkeys");
       if (problem || !data) throw new Error("could not load your passkeys");
-      return data;
+      // One page is the whole list in practice: these are the caller's own passkeys, and the
+      // default limit is 50. `next_cursor` is ignored rather than paged through.
+      return data.data;
     },
     retry: false,
   });
