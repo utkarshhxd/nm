@@ -350,6 +350,7 @@ pub async fn register_finish(
 #[utoipa::path(
     get,
     path = "/api/v1/me/passkeys",
+    operation_id = "list_passkeys",
     responses(
         (status = 200, description = "The caller's passkeys, oldest first", body = Vec<PasskeySummary>),
         (status = 401, description = "unauthenticated"),
@@ -374,6 +375,7 @@ pub async fn list(
 #[utoipa::path(
     delete,
     path = "/api/v1/me/passkeys/{id}",
+    operation_id = "remove_passkey",
     params(("id" = Uuid, Path, description = "Passkey id")),
     responses(
         (status = 204, description = "Removed; it can no longer sign in"),

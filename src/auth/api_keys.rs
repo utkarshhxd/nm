@@ -142,6 +142,7 @@ pub struct ApiKeySummary {
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{id}/api-keys",
+    operation_id = "create_api_key",
     params(("id" = Uuid, Path, description = "Workspace id")),
     request_body = NewApiKey,
     responses(
@@ -230,6 +231,7 @@ pub async fn create(
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{id}/api-keys",
+    operation_id = "list_api_keys",
     params(("id" = Uuid, Path, description = "Workspace id"), PageParams),
     responses(
         (status = 200, description = "Unrevoked keys, newest first", body = Page<ApiKeySummary>),
@@ -263,6 +265,7 @@ pub async fn list(
 #[utoipa::path(
     delete,
     path = "/api/v1/workspaces/{id}/api-keys/{key_id}",
+    operation_id = "revoke_api_key",
     params(
         ("id" = Uuid, Path, description = "Workspace id"),
         ("key_id" = Uuid, Path, description = "Key id"),

@@ -22,12 +22,20 @@ pub fn routes() -> Router<AppState> {
 
 /// One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put
 /// a secret in it.
+///
+/// `actor_email` and `actor_api_key_prefix` name the actor the ids point at, resolved by the two
+/// LEFT JOINs in `list`. They are a convenience for display, not a second identity: the ids stay
+/// authoritative, and either name is `None` once the user or key behind it has been deleted —
+/// `audit_log` has no foreign keys on purpose, so its rows outlive both.
 #[derive(Serialize, ToSchema)]
 pub struct AuditEntry {
     pub id: Uuid,
     pub action: String,
     pub actor_user_id: Option<Uuid>,
     pub actor_api_key_id: Option<Uuid>,
+    pub actor_email: Option<String>,
+    /// The key's public prefix, without the `nm_` scheme: a key is shown as `nm_{prefix}`.
+    pub actor_api_key_prefix: Option<String>,
     pub target_type: Option<String>,
     pub target_id: Option<String>,
     #[schema(value_type = Option<String>)]
@@ -40,6 +48,7 @@ pub struct AuditEntry {
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{id}/audit-log",
+    operation_id = "list_audit_log",
     params(("id" = Uuid, Path, description = "Workspace id"), PageParams),
     responses(
         (status = 200, description = "Newest first", body = Page<AuditEntry>),
@@ -56,13 +65,18 @@ pub async fn list(
     authorize(&state.pool, &principal, id, Role::Admin).await?;
     let limit = page.limit();
     // Audit ids are UUIDv7, so `id desc` is newest first.
+    // LEFT JOINs: the predicate stays `a.workspace_id = $1`, and an entry whose actor has since
+    // been deleted — or which has no actor at all — must still be returned, unnamed.
     let rows = sqlx::query_as!(
         AuditEntry,
-        r#"select id, action, actor_user_id, actor_api_key_id, target_type, target_id,
-                  ip as "ip: IpAddr", metadata, created_at
-           from audit_log
-           where workspace_id = $1 and ($2::uuid is null or id < $2)
-           order by id desc limit $3"#,
+        r#"select a.id, a.action, a.actor_user_id, a.actor_api_key_id,
+                  u.email as "actor_email?", k.prefix as "actor_api_key_prefix?",
+                  a.target_type, a.target_id, a.ip as "ip: IpAddr", a.metadata, a.created_at
+           from audit_log a
+           left join users u on u.id = a.actor_user_id
+           left join api_keys k on k.id = a.actor_api_key_id
+           where a.workspace_id = $1 and ($2::uuid is null or a.id < $2)
+           order by a.id desc limit $3"#,
         id,
         page.after()?,
         limit + 1,

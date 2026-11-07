@@ -274,7 +274,7 @@
         "tags": [
           "crate::auth::passkeys"
         ],
-        "operationId": "list",
+        "operationId": "list_passkeys",
         "responses": {
           "200": {
             "description": "The caller's passkeys, oldest first",
@@ -384,7 +384,7 @@
         "tags": [
           "crate::auth::passkeys"
         ],
-        "operationId": "remove",
+        "operationId": "remove_passkey",
         "parameters": [
           {
             "name": "id",
@@ -538,7 +538,7 @@
         "tags": [
           "crate::workspaces"
         ],
-        "operationId": "list",
+        "operationId": "list_workspaces",
         "parameters": [
           {
             "name": "limit",
@@ -578,7 +578,7 @@
         "tags": [
           "crate::workspaces"
         ],
-        "operationId": "create",
+        "operationId": "create_workspace",
         "requestBody": {
           "content": {
             "application/json": {
@@ -698,7 +698,7 @@
         "tags": [
           "crate::auth::api_keys"
         ],
-        "operationId": "list",
+        "operationId": "list_api_keys",
         "parameters": [
           {
             "name": "id",
@@ -754,7 +754,7 @@
         "tags": [
           "crate::auth::api_keys"
         ],
-        "operationId": "create",
+        "operationId": "create_api_key",
         "parameters": [
           {
             "name": "id",
@@ -805,7 +805,7 @@
         "tags": [
           "crate::auth::api_keys"
         ],
-        "operationId": "revoke",
+        "operationId": "revoke_api_key",
         "parameters": [
           {
             "name": "id",
@@ -846,7 +846,7 @@
         "tags": [
           "crate::audit::routes"
         ],
-        "operationId": "list",
+        "operationId": "list_audit_log",
         "parameters": [
           {
             "name": "id",
@@ -904,7 +904,7 @@
         "tags": [
           "crate::workspaces::invites"
         ],
-        "operationId": "list",
+        "operationId": "list_invites",
         "parameters": [
           {
             "name": "id",
@@ -960,7 +960,7 @@
         "tags": [
           "crate::workspaces::invites"
         ],
-        "operationId": "create",
+        "operationId": "create_invite",
         "parameters": [
           {
             "name": "id",
@@ -1014,7 +1014,7 @@
         "tags": [
           "crate::workspaces::invites"
         ],
-        "operationId": "revoke",
+        "operationId": "revoke_invite",
         "parameters": [
           {
             "name": "id",
@@ -1055,7 +1055,7 @@
         "tags": [
           "crate::workspaces::members"
         ],
-        "operationId": "list",
+        "operationId": "list_members",
         "parameters": [
           {
             "name": "id",
@@ -1109,7 +1109,7 @@
         "tags": [
           "crate::workspaces::members"
         ],
-        "operationId": "remove",
+        "operationId": "remove_member",
         "parameters": [
           {
             "name": "id",
@@ -1279,7 +1279,7 @@
       },
       "AuditEntry": {
         "type": "object",
-        "description": "One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put\na secret in it.",
+        "description": "One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put\na secret in it.\n\n`actor_email` and `actor_api_key_prefix` name the actor the ids point at, resolved by the two\nLEFT JOINs in `list`. They are a convenience for display, not a second identity: the ids stay\nauthoritative, and either name is `None` once the user or key behind it has been deleted —\n`audit_log` has no foreign keys on purpose, so its rows outlive both.",
         "required": [
           "id",
           "action",
@@ -1296,6 +1296,19 @@
               "null"
             ],
             "format": "uuid"
+          },
+          "actor_api_key_prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The key's public prefix, without the `nm_` scheme: a key is shown as `nm_{prefix}`."
+          },
+          "actor_email": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "actor_user_id": {
             "type": [
@@ -1842,7 +1855,7 @@
             "type": "array",
             "items": {
               "type": "object",
-              "description": "One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put\na secret in it.",
+              "description": "One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put\na secret in it.\n\n`actor_email` and `actor_api_key_prefix` name the actor the ids point at, resolved by the two\nLEFT JOINs in `list`. They are a convenience for display, not a second identity: the ids stay\nauthoritative, and either name is `None` once the user or key behind it has been deleted —\n`audit_log` has no foreign keys on purpose, so its rows outlive both.",
               "required": [
                 "id",
                 "action",
@@ -1859,6 +1872,19 @@
                     "null"
                   ],
                   "format": "uuid"
+                },
+                "actor_api_key_prefix": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The key's public prefix, without the `nm_` scheme: a key is shown as `nm_{prefix}`."
+                },
+                "actor_email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "actor_user_id": {
                   "type": [

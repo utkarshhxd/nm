@@ -145,7 +145,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["list"];
+        get: operations["list_passkeys"];
         put?: never;
         post?: never;
         delete?: never;
@@ -196,7 +196,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete: operations["remove"];
+        delete: operations["remove_passkey"];
         options?: never;
         head?: never;
         patch?: never;
@@ -273,9 +273,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["list"];
+        get: operations["list_workspaces"];
         put?: never;
-        post: operations["create"];
+        post: operations["create_workspace"];
         delete?: never;
         options?: never;
         head?: never;
@@ -305,9 +305,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["list"];
+        get: operations["list_api_keys"];
         put?: never;
-        post: operations["create"];
+        post: operations["create_api_key"];
         delete?: never;
         options?: never;
         head?: never;
@@ -324,7 +324,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete: operations["revoke"];
+        delete: operations["revoke_api_key"];
         options?: never;
         head?: never;
         patch?: never;
@@ -337,7 +337,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["list"];
+        get: operations["list_audit_log"];
         put?: never;
         post?: never;
         delete?: never;
@@ -353,9 +353,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["list"];
+        get: operations["list_invites"];
         put?: never;
-        post: operations["create"];
+        post: operations["create_invite"];
         delete?: never;
         options?: never;
         head?: never;
@@ -372,7 +372,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete: operations["revoke"];
+        delete: operations["revoke_invite"];
         options?: never;
         head?: never;
         patch?: never;
@@ -385,7 +385,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get: operations["list"];
+        get: operations["list_members"];
         put?: never;
         post?: never;
         delete?: never;
@@ -404,7 +404,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete: operations["remove"];
+        delete: operations["remove_member"];
         options?: never;
         head?: never;
         patch: operations["change_role"];
@@ -439,11 +439,19 @@ export interface components {
         /**
          * @description One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put
          *     a secret in it.
+         *
+         *     `actor_email` and `actor_api_key_prefix` name the actor the ids point at, resolved by the two
+         *     LEFT JOINs in `list`. They are a convenience for display, not a second identity: the ids stay
+         *     authoritative, and either name is `None` once the user or key behind it has been deleted —
+         *     `audit_log` has no foreign keys on purpose, so its rows outlive both.
          */
         AuditEntry: {
             action: string;
             /** Format: uuid */
             actor_api_key_id?: string | null;
+            /** @description The key's public prefix, without the `nm_` scheme: a key is shown as `nm_{prefix}`. */
+            actor_api_key_prefix?: string | null;
+            actor_email?: string | null;
             /** Format: uuid */
             actor_user_id?: string | null;
             /** Format: date-time */
@@ -615,6 +623,9 @@ export interface components {
                 action: string;
                 /** Format: uuid */
                 actor_api_key_id?: string | null;
+                /** @description The key's public prefix, without the `nm_` scheme: a key is shown as `nm_{prefix}`. */
+                actor_api_key_prefix?: string | null;
+                actor_email?: string | null;
                 /** Format: uuid */
                 actor_user_id?: string | null;
                 /** Format: date-time */
@@ -998,7 +1009,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    list_passkeys: {
         parameters: {
             query?: never;
             header?: never;
@@ -1129,7 +1140,7 @@ export interface operations {
             };
         };
     };
-    remove: {
+    remove_passkey: {
         parameters: {
             query?: never;
             header?: never;
@@ -1315,7 +1326,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    list_workspaces: {
         parameters: {
             query?: {
                 /** @description Page size, 1 to 200 (default 50). */
@@ -1340,7 +1351,7 @@ export interface operations {
             };
         };
     };
-    create: {
+    create_workspace: {
         parameters: {
             query?: never;
             header?: never;
@@ -1460,7 +1471,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    list_api_keys: {
         parameters: {
             query?: {
                 /** @description Page size, 1 to 200 (default 50). */
@@ -1502,7 +1513,7 @@ export interface operations {
             };
         };
     };
-    create: {
+    create_api_key: {
         parameters: {
             query?: never;
             header?: never;
@@ -1550,7 +1561,7 @@ export interface operations {
             };
         };
     };
-    revoke: {
+    revoke_api_key: {
         parameters: {
             query?: never;
             header?: never;
@@ -1587,7 +1598,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    list_audit_log: {
         parameters: {
             query?: {
                 /** @description Page size, 1 to 200 (default 50). */
@@ -1629,7 +1640,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    list_invites: {
         parameters: {
             query?: {
                 /** @description Page size, 1 to 200 (default 50). */
@@ -1671,7 +1682,7 @@ export interface operations {
             };
         };
     };
-    create: {
+    create_invite: {
         parameters: {
             query?: never;
             header?: never;
@@ -1726,7 +1737,7 @@ export interface operations {
             };
         };
     };
-    revoke: {
+    revoke_invite: {
         parameters: {
             query?: never;
             header?: never;
@@ -1763,7 +1774,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    list_members: {
         parameters: {
             query?: {
                 /** @description Page size, 1 to 200 (default 50). */
@@ -1797,7 +1808,7 @@ export interface operations {
             };
         };
     };
-    remove: {
+    remove_member: {
         parameters: {
             query?: never;
             header?: never;

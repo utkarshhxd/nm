@@ -205,6 +205,7 @@ async fn load(db: impl PgExecutor<'_>, id: Uuid, role: Role) -> ApiResult<Worksp
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces",
+    operation_id = "list_workspaces",
     params(PageParams),
     responses((status = 200, description = "The caller's workspaces, newest first", body = Page<Workspace>)),
 )]
@@ -247,6 +248,7 @@ pub async fn list(
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces",
+    operation_id = "create_workspace",
     request_body = NewWorkspace,
     responses(
         (status = 201, body = Workspace),

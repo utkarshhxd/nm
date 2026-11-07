@@ -36,8 +36,48 @@ const inviteRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/invite")),
 });
 
+// The named export, so the create-workspace form stays in home's chunk rather than a second one.
+const newWorkspaceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/workspaces/new",
+  component: lazyRouteComponent(() => import("./routes/home"), "NewWorkspace"),
+});
+
+// The workspace shell: the switcher, the navigation, and "Workspace not found" for a slug the
+// signed-in person is not a member of. Its children render inside its `Outlet`.
+const workspaceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/w/$slug",
+  component: lazyRouteComponent(() => import("./routes/workspace-layout")),
+});
+
+const membersRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "members",
+  component: lazyRouteComponent(() => import("./routes/members")),
+});
+
+const apiKeysRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "api-keys",
+  component: lazyRouteComponent(() => import("./routes/api-keys")),
+});
+
+const auditLogRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "audit-log",
+  component: lazyRouteComponent(() => import("./routes/audit-log")),
+});
+
 export const router = createRouter({
-  routeTree: rootRoute.addChildren([homeRoute, loginRoute, accountSecurityRoute, inviteRoute]),
+  routeTree: rootRoute.addChildren([
+    homeRoute,
+    loginRoute,
+    accountSecurityRoute,
+    inviteRoute,
+    newWorkspaceRoute,
+    workspaceRoute.addChildren([membersRoute, apiKeysRoute, auditLogRoute]),
+  ]),
 });
 
 declare module "@tanstack/react-router" {

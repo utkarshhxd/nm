@@ -94,6 +94,7 @@ pub struct Accepted {
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{id}/invites",
+    operation_id = "create_invite",
     params(("id" = Uuid, Path, description = "Workspace id")),
     request_body = NewInvite,
     responses(
@@ -200,6 +201,7 @@ pub async fn create(
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{id}/invites",
+    operation_id = "list_invites",
     params(("id" = Uuid, Path, description = "Workspace id"), PageParams),
     responses(
         (status = 200, description = "Open invites, newest first", body = Page<InviteSummary>),
@@ -234,6 +236,7 @@ pub async fn list(
 #[utoipa::path(
     delete,
     path = "/api/v1/workspaces/{id}/invites/{invite_id}",
+    operation_id = "revoke_invite",
     params(
         ("id" = Uuid, Path, description = "Workspace id"),
         ("invite_id" = Uuid, Path, description = "Invite id"),

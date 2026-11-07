@@ -403,6 +403,76 @@ async fn audit_log_paginates_newest_first(pool: PgPool) {
     assert!(page2["next_cursor"].is_null());
 }
 
+/// The audit log names its actors, and keeps the entries of actors that have since gone.
+///
+/// The two joins behind `actor_email` and `actor_api_key_prefix` are LEFT joins for exactly the
+/// second half of that: a workspace that stops naming the people who acted in it the moment one
+/// of them is deleted — or, worse, stops listing what they did — fails at its one job.
+#[sqlx::test]
+async fn audit_log_names_its_actors(pool: PgPool) {
+    let (owner_app, owner) = client(&pool, "owner@example.com", true).await;
+    let (admin_app, admin) = client(&pool, "admin@example.com", false).await;
+    let (_v, viewer) = client(&pool, "viewer@example.com", false).await;
+    // Event 1: workspace.created, by the owner.
+    let ws = create_workspace(&pool, owner, "acme").await;
+    add_member(&pool, ws, admin, Role::Admin).await;
+    add_member(&pool, ws, viewer, Role::Viewer).await;
+
+    // Event 2: member.role_changed, by the admin, who is deleted below.
+    admin_app
+        .patch(&format!("/api/v1/workspaces/{ws}/members/{viewer}"))
+        .json(&json!({"role": "editor"}))
+        .await
+        .assert_status_ok();
+
+    // Event 3: api_key.created, by the admin. Event 4: workspace.updated, by that key.
+    let created = admin_app
+        .post(&format!("/api/v1/workspaces/{ws}/api-keys"))
+        .json(&json!({"name": "bot", "role": "admin"}))
+        .await
+        .json::<Value>();
+    let key = created["key"].as_str().unwrap().to_owned();
+    let prefix = key.split('_').nth(1).unwrap().to_owned();
+    let bot = TestApp::new(pool.clone()).await;
+    bot.patch(&format!("/api/v1/workspaces/{ws}"))
+        .add_header("authorization", format!("Bearer {key}"))
+        .json(&json!({"name": "Acme Inc"}))
+        .await
+        .assert_status_ok();
+
+    let path = format!("/api/v1/workspaces/{ws}/audit-log");
+    let body = owner_app.get(&path).await.json::<Value>();
+    let rows = body["data"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 4);
+    // Newest first, and a key is named by its prefix rather than an address.
+    assert_eq!(rows[0]["action"], "workspace.updated");
+    assert_eq!(rows[0]["actor_api_key_prefix"], prefix);
+    assert!(rows[0]["actor_email"].is_null());
+    assert_eq!(rows[3]["action"], "workspace.created");
+    assert_eq!(rows[3]["actor_email"], "owner@example.com");
+    assert!(rows[3]["actor_api_key_prefix"].is_null());
+
+    sqlx::query("delete from users where id = $1")
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("delete the admin");
+
+    let after = owner_app.get(&path).await.json::<Value>();
+    let rows = after["data"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "a deleted actor must not take its entries with it"
+    );
+    let changed = rows
+        .iter()
+        .find(|e| e["action"] == "member.role_changed")
+        .expect("the role change is still listed");
+    assert!(changed["actor_email"].is_null());
+    assert_eq!(changed["actor_user_id"], admin.to_string());
+}
+
 #[sqlx::test]
 async fn admins_rename_workspaces_and_it_is_audited(pool: PgPool) {
     let (admin, admin_id) = client(&pool, "admin@example.com", false).await;

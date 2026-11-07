@@ -42,7 +42,10 @@ async function signInWithPassword(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   // Signing in is a POST and then a full page load. Waiting for the app here is what stops the
   // next `goto` from racing it and landing back on this screen with no session.
-  await expect(page.getByText(ADMIN_EMAIL)).toBeVisible();
+  //
+  // The whole sentence, not the address alone: once the admin has a workspace, `/` lands on the
+  // members table, where that same address is also a cell.
+  await expect(page.getByText(`Signed in as ${ADMIN_EMAIL}`)).toBeVisible();
 }
 
 test("password sign-in reaches the app", async ({ page }) => {
@@ -50,7 +53,7 @@ test("password sign-in reaches the app", async ({ page }) => {
   await page.getByLabel("Email").fill("admin@example.com");
   await page.getByLabel("Password").fill(PW);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(page.getByText("admin@example.com")).toBeVisible();
+  await expect(page.getByText("Signed in as admin@example.com")).toBeVisible();
 });
 
 test("a wrong password is shown on the form", async ({ page }) => {
@@ -98,7 +101,7 @@ test("TOTP enrolment, then sign-in needs a code", async ({ page }) => {
   await expect(code).toBeVisible();
   await code.fill(codeAt(secret, Date.now()));
   await page.getByRole("button", { name: "Verify", exact: true }).click();
-  await expect(page.getByText(ADMIN_EMAIL)).toBeVisible();
+  await expect(page.getByText(`Signed in as ${ADMIN_EMAIL}`)).toBeVisible();
 
   // Puts the shared account back as the other tests expect it, and covers the password prompt
   // the brief requires on the way out.

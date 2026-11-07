@@ -5,7 +5,7 @@
 // `aria-invalid` and `aria-describedby` — is written once instead of at each of the dozen
 // fields across the sign-in, invite and security screens.
 
-import type { ComponentProps, ReactNode } from "react";
+import { type ComponentProps, type ReactNode, useState } from "react";
 
 const FOCUS =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700 " +
@@ -20,6 +20,15 @@ export const SECONDARY_BUTTON =
 
 export const CARD =
   "mt-8 rounded border border-gray-300 p-6 dark:border-gray-700";
+
+/** A button sized for a table row or a list item: no `mt`/`ml`, which fight a flex row. */
+export const ROW_BUTTON =
+  "rounded border border-gray-500 px-3 py-1 font-medium text-blue-800 " +
+  `dark:border-gray-400 dark:text-blue-200 ${FOCUS}`;
+
+export const SELECT =
+  "rounded border border-gray-500 bg-white px-2 py-1 text-gray-900 disabled:opacity-60 " +
+  `dark:border-gray-400 dark:bg-gray-800 dark:text-gray-100 ${FOCUS}`;
 
 /** An error message screen readers announce; `id` ties it to the field that caused it. */
 export function Alert({ id, children }: { id?: string; children: ReactNode }) {
@@ -59,5 +68,66 @@ export function Field({ id, label, error, hint, ...input }: FieldProps) {
       ) : null}
       {error ? <Alert id={`${id}-error`}>{error}</Alert> : null}
     </div>
+  );
+}
+
+/**
+ * A destructive action behind one confirmation step, in place: removing a member, leaving a
+ * workspace, revoking an invitation or a key. `window.confirm` would do the same job, but it
+ * blocks the thread and cannot be styled or read by the same test selectors as everything else.
+ *
+ * `subject` is what is being acted on. It is only in the accessible name, so several rows can
+ * each carry a "Remove" button without the names colliding; the visible text stays inside the
+ * accessible name, which is what `label-content-name-mismatch` asks for.
+ */
+export function ConfirmButton({
+  action,
+  subject,
+  onConfirm,
+  disabled,
+}: {
+  action: string;
+  subject: string;
+  onConfirm: () => void;
+  disabled?: boolean;
+}) {
+  const [armed, setArmed] = useState(false);
+  const verb = action.toLowerCase();
+
+  if (!armed) {
+    return (
+      <button
+        className={ROW_BUTTON}
+        type="button"
+        aria-label={`${action} ${subject}`}
+        disabled={disabled}
+        onClick={() => setArmed(true)}
+      >
+        {action}
+      </button>
+    );
+  }
+  return (
+    <span className="inline-flex gap-2">
+      <button
+        className={ROW_BUTTON}
+        type="button"
+        aria-label={`Confirm ${verb} ${subject}`}
+        onClick={() => {
+          setArmed(false);
+          onConfirm();
+        }}
+      >
+        Confirm
+      </button>
+      <button
+        className={ROW_BUTTON}
+        type="button"
+        aria-label={`Cancel ${verb} ${subject}`}
+        onClick={() => setArmed(false)}
+      >
+        Cancel
+      </button>
+    </span>
   );
 }

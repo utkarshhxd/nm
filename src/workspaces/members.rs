@@ -110,6 +110,7 @@ async fn current_role(db: &mut PgConnection, workspace_id: Uuid, user_id: Uuid) 
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{id}/members",
+    operation_id = "list_members",
     params(("id" = Uuid, Path, description = "Workspace id"), PageParams),
     responses(
         (status = 200, body = Page<Member>),
@@ -201,6 +202,7 @@ pub async fn change_role(
 #[utoipa::path(
     delete,
     path = "/api/v1/workspaces/{id}/members/{user_id}",
+    operation_id = "remove_member",
     params(
         ("id" = Uuid, Path, description = "Workspace id"),
         ("user_id" = Uuid, Path, description = "Member's user id"),
