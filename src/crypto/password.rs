@@ -23,7 +23,12 @@ fn hasher() -> Argon2<'static> {
 }
 
 /// Hash with a fresh 16-byte salt from the OS CSPRNG. Returns a PHC string.
+///
+/// Rejects anything `validate_password` rejects, so a weak password cannot be
+/// hashed and stored by a caller that forgot to validate. Callers still run
+/// `validate_password` first to give the user a field-scoped error.
 pub fn hash_password(plain: &str) -> anyhow::Result<String> {
+    validate_password(plain).map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let mut salt = [0u8; 16];
     SysRng
         .try_fill_bytes(&mut salt)
@@ -34,12 +39,30 @@ pub fn hash_password(plain: &str) -> anyhow::Result<String> {
     Ok(phc.to_string())
 }
 
-/// True only if `plain` matches `phc`. A malformed `phc` costs one full
-/// argon2 run, like a wrong password, so the two are not told apart by timing.
+/// True only if `plain` matches `phc`.
+///
+/// Input longer than `MAX_CHARS * 4` bytes (the UTF-8 size of the longest valid
+/// password) returns false at once: that is a property of the caller's own
+/// input, not of the account, so it is no timing oracle and costs no argon2 run.
+///
+/// Every other failure, including a stored hash that is unparseable, names a
+/// different algorithm, or lacks a salt or digest, runs `burn_verify()` first,
+/// so it costs one argon2 run like a wrong password.
 pub fn verify_password(plain: &str, phc: &str) -> bool {
+    if plain.len() > MAX_CHARS * 4 {
+        return false;
+    }
     match PasswordHash::new(phc) {
-        Ok(parsed) => hasher().verify_password(plain.as_bytes(), &parsed).is_ok(),
-        Err(_) => {
+        Ok(parsed)
+            if parsed.algorithm == Algorithm::Argon2id.ident()
+                && parsed.salt.is_some()
+                && parsed.hash.is_some() =>
+        {
+            hasher().verify_password(plain.as_bytes(), &parsed).is_ok()
+        }
+        _ => {
+            // Corrupt or foreign row: nothing to match, but worth an operator's attention.
+            tracing::warn!("stored password hash is unparseable");
             burn_verify();
             false
         }
@@ -98,10 +121,53 @@ mod tests {
     }
 
     #[test]
+    fn foreign_or_incomplete_phc_is_just_false() {
+        let h = hash_password("correct horse battery").unwrap();
+        let salt_only = h.rsplit_once('$').unwrap().0.to_owned();
+        let no_salt = "$argon2id$v=19$m=19456,t=2,p=1";
+        let scrypt =
+            "$scrypt$ln=15,r=8,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g";
+        for bad in [salt_only.as_str(), no_salt, scrypt] {
+            assert!(!verify_password("correct horse battery", bad), "{bad}");
+        }
+        assert!(verify_password("correct horse battery", &h));
+    }
+
+    #[test]
+    fn hash_password_enforces_length_bounds() {
+        assert!(hash_password("short").is_err());
+        assert!(hash_password("").is_err());
+        assert!(hash_password(&"a".repeat(257)).is_err());
+        assert!(hash_password(&"a".repeat(12)).is_ok());
+    }
+
+    #[test]
+    fn verify_length_cap_is_in_bytes_not_chars() {
+        // 256 four-byte characters = 1024 bytes: the longest valid password still verifies.
+        let longest = "\u{1F600}".repeat(256);
+        let h = hash_password(&longest).unwrap();
+        assert!(verify_password(&longest, &h));
+        // One byte over the cap is rejected outright.
+        let over = format!("{longest}a");
+        assert!(!verify_password(&over, &h));
+    }
+
+    #[test]
     fn dummy_hash_is_a_valid_spec_hash() {
         assert!(DUMMY_HASH.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
-        // Parses and is a real verification, not an early parse failure.
-        assert!(!verify_password("anything", DUMMY_HASH));
+        // Tied to `hasher()`, not a literal: changing the spec params fails this
+        // until DUMMY_HASH is regenerated, so burn_verify cannot silently get cheaper.
+        let parsed = PasswordHash::new(DUMMY_HASH).unwrap();
+        // (Whole-`Params` equality is too strict: a parsed hash records output_len.)
+        let (dummy, spec) = (
+            Params::try_from(&parsed).unwrap(),
+            hasher().params().clone(),
+        );
+        assert_eq!(
+            (dummy.m_cost(), dummy.t_cost(), dummy.p_cost()),
+            (spec.m_cost(), spec.t_cost(), spec.p_cost())
+        );
+        assert!(parsed.salt.is_some() && parsed.hash.is_some());
         burn_verify();
     }
 

@@ -181,6 +181,27 @@ mod tests {
     }
 
     #[test]
+    fn header_is_authenticated_as_aad() {
+        // The explicit version/key-id checks run before AES-GCM, so only a direct
+        // cipher call can observe the AAD. Without it, this decrypt would succeed.
+        let s = secrets();
+        let blob = s.encrypt(b"x");
+        let nonce: [u8; NONCE_LEN] = blob[HEADER_LEN..HEADER_LEN + NONCE_LEN].try_into().unwrap();
+        let sealed = &blob[HEADER_LEN + NONCE_LEN..];
+        let no_aad = Payload {
+            msg: sealed,
+            aad: b"",
+        };
+        assert!(s.cipher.decrypt(&Nonce::from(nonce), no_aad).is_err());
+        let aad = [VERSION, KEY_ID];
+        let right = Payload {
+            msg: sealed,
+            aad: &aad,
+        };
+        assert_eq!(s.cipher.decrypt(&Nonce::from(nonce), right).unwrap(), b"x");
+    }
+
+    #[test]
     fn debug_does_not_print_key() {
         assert_eq!(format!("{:?}", secrets()), "Secrets(***)");
     }
