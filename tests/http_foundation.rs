@@ -53,7 +53,14 @@ async fn unknown_non_api_route_falls_back_to_spa(pool: PgPool) {
 #[sqlx::test]
 async fn api_paths_never_fall_back_to_index(pool: PgPool) {
     let app = TestApp::new(pool).await;
-    for path in ["/api", "/api/", "/api/v1/nope", "/api/v1/nope/deeper"] {
+    for path in [
+        "/api",
+        "/api/",
+        "/api/v1/nope",
+        "/api/v1/nope/deeper",
+        "//api",
+        "//api/v1/nope",
+    ] {
         let r = app.server.get(path).await;
         r.assert_status(StatusCode::NOT_FOUND);
         assert_eq!(

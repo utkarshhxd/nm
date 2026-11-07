@@ -48,10 +48,15 @@ pub async fn fallback(uri: Uri, headers: HeaderMap) -> Response {
 
 /// Serves `path` from `source`, falling back to `index.html` so the SPA can route it.
 pub fn serve_web(source: &dyn AssetSource, path: &str, accept_encoding: Option<&str>) -> Response {
+    // Exactly one leading slash. Stripping every slash instead would turn `//api/v1/nope`
+    // into `api/v1/nope`, which misses `is_reserved` below and would be answered with
+    // `index.html` and a 200.
+    let Some(name) = path.strip_prefix('/').filter(|rest| !rest.starts_with('/')) else {
+        return ApiError::NotFound.into_response();
+    };
     if is_reserved(path) {
         return ApiError::NotFound.into_response();
     }
-    let name = path.trim_start_matches('/');
     let cache_control = if path.starts_with("/assets/") {
         IMMUTABLE
     } else {
@@ -81,6 +86,12 @@ fn respond(
     accept_encoding: Option<&str>,
     cache_control: &'static str,
 ) -> Option<Response> {
+    // A precompressed variant is only ever reached through its base name, which is what
+    // carries the Content-Encoding. Served directly it would be opaque bytes under
+    // `application/octet-stream`, so the browser would save garbage instead of rendering it.
+    if name.ends_with(".br") || name.ends_with(".gz") {
+        return None;
+    }
     let accept = accept_encoding.unwrap_or_default();
     let (data, encoding) = [("br", "br"), ("gzip", "gz")]
         .into_iter()
@@ -240,12 +251,33 @@ mod tests {
         assert_eq!(body_of(res), NOT_BUILT.as_bytes());
     }
 
+    /// A precompressed file is served only through its base name, which supplies the
+    /// `Content-Encoding`. Asked for directly it falls through to the SPA.
+    #[test]
+    fn precompressed_variants_are_not_served_directly() {
+        let src = Map::new(&[
+            ("assets/app.js", b"raw bytes"),
+            ("assets/app.js.br", b"brotli bytes"),
+            ("assets/app.js.gz", b"gzip bytes"),
+            ("index.html", INDEX),
+        ]);
+        for path in ["/assets/app.js.br", "/assets/app.js.gz"] {
+            let res = serve_web(&src, path, Some("br, gzip"));
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            assert_eq!(header_of(&res, "content-type"), Some("text/html"), "{path}");
+            assert_eq!(header_of(&res, "cache-control"), Some(NO_CACHE), "{path}");
+            assert_eq!(header_of(&res, "content-encoding"), None, "{path}");
+            assert_eq!(body_of(res), INDEX, "{path}");
+        }
+    }
+
     /// Ruling: bare `/api` is not under `/api/`, so the API's wildcard 404 route misses it.
-    /// It must not be answered with `index.html`.
+    /// It must not be answered with `index.html`. Nor may a doubled slash smuggle one past
+    /// `is_reserved`.
     #[test]
     fn api_paths_are_never_the_spa() {
         let src = Map::new(&[("index.html", INDEX)]);
-        for path in ["/api", "/api/", "/api/v1/nope"] {
+        for path in ["/api", "/api/", "/api/v1/nope", "//api", "//api/v1/nope"] {
             let res = serve_web(&src, path, None);
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
             assert_eq!(
