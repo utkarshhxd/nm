@@ -5,11 +5,44 @@ use tracing_subscriber::EnvFilter;
 use crate::config::LogFormat;
 
 /// Filter comes from `NM_LOG` (same syntax as `RUST_LOG`), default `info`.
+/// A set but malformed `NM_LOG` panics at startup rather than being ignored.
 pub fn init_logging(format: LogFormat) {
-    let filter = EnvFilter::try_from_env("NM_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let spec = match std::env::var("NM_LOG") {
+        Ok(s) => Some(s),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => panic!("NM_LOG is not readable: {e}"),
+    };
+    let builder = tracing_subscriber::fmt().with_env_filter(env_filter(spec.as_deref()));
     match format {
         LogFormat::Json => builder.json().init(),
         LogFormat::Pretty => builder.pretty().init(),
+    }
+}
+
+fn env_filter(spec: Option<&str>) -> EnvFilter {
+    match spec {
+        None => EnvFilter::new("info"),
+        Some(s) => EnvFilter::try_new(s).unwrap_or_else(|e| panic!("invalid NM_LOG {s:?}: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_spec_defaults_to_info() {
+        assert_eq!(env_filter(None).to_string(), "info");
+    }
+
+    #[test]
+    fn valid_spec_is_used() {
+        assert_eq!(env_filter(Some("nm=debug")).to_string(), "nm=debug");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid NM_LOG")]
+    fn malformed_spec_panics() {
+        env_filter(Some("nm=notalevel"));
     }
 }

@@ -43,15 +43,26 @@ pub struct Config {
 /// Hand-written so the database URL (it carries the password) never reaches logs.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // No `..`: a new field must be named here, forcing a redaction decision.
+        let Config {
+            database_url: _,
+            listen,
+            public_url,
+            secret_key,
+            auto_migrate,
+            trust_proxy_headers,
+            metrics_listen,
+            log_format,
+        } = self;
         f.debug_struct("Config")
             .field("database_url", &"***")
-            .field("listen", &self.listen)
-            .field("public_url", &self.public_url)
-            .field("secret_key", &self.secret_key)
-            .field("auto_migrate", &self.auto_migrate)
-            .field("trust_proxy_headers", &self.trust_proxy_headers)
-            .field("metrics_listen", &self.metrics_listen)
-            .field("log_format", &self.log_format)
+            .field("listen", listen)
+            .field("public_url", public_url)
+            .field("secret_key", secret_key)
+            .field("auto_migrate", auto_migrate)
+            .field("trust_proxy_headers", trust_proxy_headers)
+            .field("metrics_listen", metrics_listen)
+            .field("log_format", log_format)
             .finish()
     }
 }
@@ -115,14 +126,20 @@ fn default_log_format() -> LogFormat {
     LogFormat::Json
 }
 
+/// TOML layer for an explicitly requested config file; a missing or unreadable
+/// file is an error, not a silent fallback to defaults.
+fn figment_for(config_file: Option<&str>) -> Figment {
+    match config_file {
+        Some(path) => Figment::new().merge(Toml::file_exact(path)),
+        None => Figment::new(),
+    }
+}
+
 impl Config {
     /// Env `NM_*` over an optional TOML file named by `NM_CONFIG_FILE`.
     pub fn load() -> Result<Config, ConfigError> {
-        let mut f = Figment::new();
-        if let Ok(path) = std::env::var("NM_CONFIG_FILE") {
-            f = f.merge(Toml::file(path));
-        }
-        Config::from_figment(f.merge(Env::prefixed("NM_")))
+        let path = std::env::var("NM_CONFIG_FILE").ok();
+        Config::from_figment(figment_for(path.as_deref()).merge(Env::prefixed("NM_")))
     }
 
     pub fn from_figment(f: Figment) -> Result<Config, ConfigError> {
@@ -281,6 +298,25 @@ mod tests {
         p.push(("NM_SECRET_KEY_FILE", "/nonexistent"));
         let e = Config::from_figment(figment_with(&p)).unwrap_err();
         assert!(matches!(e, ConfigError::SecretKeyConflict));
+    }
+
+    #[test]
+    fn missing_config_file_is_an_error() {
+        let e = Config::from_figment(figment_for(Some("/nonexistent/nm.toml"))).unwrap_err();
+        assert!(matches!(e, ConfigError::Invalid(_)), "{e}");
+    }
+
+    #[test]
+    fn config_file_values_are_loaded() {
+        let path = std::env::temp_dir().join(format!("nm-cfg-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("database_url = \"postgres://x\"\nsecret_key = \"{KEY_B64}\"\n"),
+        )
+        .unwrap();
+        let c = Config::from_figment(figment_for(path.to_str()));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(c.unwrap().database_url, "postgres://x");
     }
 
     #[test]
