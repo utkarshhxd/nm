@@ -63,6 +63,54 @@ jobs:
       - run: pnpm check:bundle
       - run: pnpm check:licenses
 
+  e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nm
+          POSTGRES_PASSWORD: nm
+          POSTGRES_DB: nm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nm -d nm"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # web/e2e/support/server.ts creates and drops `nm_e2e_<random>` on this server. The `nm`
+      # database named here is only how it reaches the server; it is never written to.
+      DATABASE_URL: postgres://nm:nm@localhost:5432/nm
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.11.0
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      # Keep the version equal to `sqlx` in Cargo.toml, as the `rust` job does. The harness
+      # shells out to `sqlx database create` and `drop` for its per-run database.
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      # Before `cargo build`: rust-embed compiles web/dist into the release binary.
+      - run: pnpm build
+        working-directory: web
+      - run: cargo build --release
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: web
+      - run: pnpm exec playwright test
+        working-directory: web
+
   deny:
     runs-on: ubuntu-latest
     steps:

@@ -17,6 +17,18 @@ const homeRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/home")),
 });
 
+const loginRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/login",
+  component: lazyRouteComponent(() => import("./routes/login")),
+});
+
+const accountSecurityRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/account/security",
+  component: lazyRouteComponent(() => import("./routes/account-security")),
+});
+
 // `invite_url` in the API's create-invite response points here.
 const inviteRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -25,7 +37,7 @@ const inviteRoute = createRoute({
 });
 
 export const router = createRouter({
-  routeTree: rootRoute.addChildren([homeRoute, inviteRoute]),
+  routeTree: rootRoute.addChildren([homeRoute, loginRoute, accountSecurityRoute, inviteRoute]),
 });
 
 declare module "@tanstack/react-router" {
