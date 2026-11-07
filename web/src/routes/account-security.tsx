@@ -36,6 +36,7 @@ function ChangePassword() {
   // `invalid-credentials`, a new password outside 12-256 characters is 422 `validation`.
   const [currentError, setCurrentError] = useState("");
   const [nextError, setNextError] = useState("");
+  const [formError, setFormError] = useState("");
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -43,18 +44,35 @@ function ChangePassword() {
     event.preventDefault();
     setCurrentError("");
     setNextError("");
+    setFormError("");
     setDone(false);
     setBusy(true);
-    const { error: problem } = await api.POST("/api/v1/me/password", {
-      body: { current_password: current, new_password: next },
-    });
+    let problem: unknown;
+    try {
+      ({ error: problem } = await api.POST("/api/v1/me/password", {
+        body: { current_password: current, new_password: next },
+      }));
+    } catch {
+      // The request never completed — offline, DNS, a dropped connection.
+      setBusy(false);
+      setFormError("The password could not be changed. Check your connection and try again.");
+      return;
+    }
     setBusy(false);
     if (problem) {
       const message = problemMessage(problem, "The password could not be changed.");
-      if (problemType(problem) === "urn:nm:problem:validation") {
-        setNextError(message);
-      } else {
-        setCurrentError(message);
+      // Only the two problems that are *about* a field go on that field. A 429, a 5xx or
+      // anything else says nothing about what was typed, and announcing it on an input tells
+      // the person to fix something that is not wrong.
+      switch (problemType(problem)) {
+        case "urn:nm:problem:validation":
+          setNextError(message);
+          break;
+        case "urn:nm:problem:invalid-credentials":
+          setCurrentError(message);
+          break;
+        default:
+          setFormError(message);
       }
       return;
     }
@@ -89,6 +107,7 @@ function ChangePassword() {
           value={next}
           onChange={(e) => setNext(e.target.value)}
         />
+        {formError ? <Alert>{formError}</Alert> : null}
         {done ? <p className="mt-2 text-green-800 dark:text-green-300">Password changed.</p> : null}
         <button className={BUTTON} type="submit" disabled={busy}>
           Change password
@@ -266,10 +285,12 @@ function RecoveryCodes({ codes, onSaved }: { codes: string[]; onSaved: () => voi
     link.href = url;
     link.download = "nm-recovery-codes.txt";
     link.click();
-    // Not in this tick: Firefox and Safari cancel a download whose object URL is revoked
-    // synchronously after the click, and "I've saved these" then clears the only copy of these
-    // codes that exists anywhere.
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    // Not in this tick, and not merely in the next macrotask: Firefox and Safari cancel a
+    // download whose object URL is revoked before the download has actually started, and they
+    // start it asynchronously. "I've saved these" then clears the only copy of these codes that
+    // exists anywhere, so a cancelled download loses them for good. 40s is the margin
+    // FileSaver.js settled on for the same reason.
+    setTimeout(() => URL.revokeObjectURL(url), 40_000);
   }
 
   return (

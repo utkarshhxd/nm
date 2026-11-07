@@ -45,6 +45,19 @@ function run(file: string, args: string[], env: NodeJS.ProcessEnv, input?: strin
   execFileSync(file, args, { env, input, stdio: ["pipe", "inherit", "inherit"] });
 }
 
+/**
+ * Exactly the shape `globalSetup` generates: `nm_e2e_` and twelve hex characters.
+ *
+ * The sweep below force-drops databases, so it decides for itself what it is allowed to touch
+ * rather than trusting its input. The ledger is gitignored and only this file writes it today,
+ * but a corrupted or hand-edited line would otherwise be a `DROP DATABASE` on `nm`, `postgres`
+ * or another project's data — and this repo's standing rule is that other projects' databases
+ * are never touched.
+ */
+export function isOurDatabase(name: string): boolean {
+  return /^nm_e2e_[0-9a-f]{12}$/.test(name);
+}
+
 function ledger(): string[] {
   try {
     return readFileSync(LEDGER, "utf8").split("\n").filter(Boolean);
@@ -53,19 +66,31 @@ function ledger(): string[] {
   }
 }
 
-/** Force-drops anything a previous run left behind. Only names this harness wrote. */
+function saveLedger(names: string[]): void {
+  if (names.length === 0) rmSync(LEDGER, { force: true });
+  else writeFileSync(LEDGER, names.map((name) => `${name}\n`).join(""));
+}
+
+/** Force-drops anything a previous run left behind, and only ever a name of our own shape. */
 function dropLeaked(server: URL, env: NodeJS.ProcessEnv): void {
+  const kept: string[] = [];
   for (const name of ledger()) {
+    if (!isOurDatabase(name)) {
+      console.log(`skipping ${JSON.stringify(name)}: not a database this harness created`);
+      continue;
+    }
     const stale = new URL(server);
     stale.pathname = `/${name}`;
     try {
       run("sqlx", ["database", "drop", "-y", "-f", ...SQLX], { ...env, DATABASE_URL: stale.href });
       console.log(`dropped leaked ${name}`);
     } catch {
-      // Already gone, or the server is unreachable — the run below will fail on its own terms.
+      // Unreachable server, or a drop that lost a race. Keep the entry: forgetting it here is
+      // what would make the leak permanent, since nothing else records the name.
+      kept.push(name);
     }
   }
-  rmSync(LEDGER, { force: true });
+  saveLedger(kept);
 }
 
 /**
@@ -140,15 +165,18 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   await requirePortFree();
   dropLeaked(new URL(server_url), env);
 
+  // Recorded BEFORE it exists: a kill in the window between the two would otherwise leak a
+  // database that nothing knows the name of. Sweeping a name that was never created is harmless
+  // either way: the drop is a no-op, or it fails and the entry is simply kept.
+  saveLedger([...ledger(), name]);
   run("sqlx", ["database", "create", ...SQLX], env);
-  writeFileSync(LEDGER, `${name}\n`);
 
   let server: ChildProcess | undefined;
   // `-f` force-drops: a browser that is still holding a connection must not strand the database.
   const teardown = async () => {
     await stop(server);
     run("sqlx", ["database", "drop", "-y", "-f", ...SQLX], env);
-    rmSync(LEDGER, { force: true });
+    saveLedger(ledger().filter((entry) => entry !== name));
     console.log(`dropped ${name}`);
   };
 
