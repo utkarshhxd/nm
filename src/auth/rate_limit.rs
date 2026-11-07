@@ -19,10 +19,15 @@ const MAX_FAILURES_PER_EMAIL: i64 = 10;
 const MAX_FAILURES_PER_IP: i64 = 100;
 
 /// IPv6 is keyed per /64, the smallest block an ISP or cloud customer is normally given, so one
-/// allocation cannot rotate through 2^64 addresses to dodge the per-IP limit. IPv4 is kept as is.
+/// allocation cannot rotate through 2^64 addresses to dodge the per-IP limit. An IPv4-mapped
+/// address (`::ffff:a.b.c.d`, as a dual-stack listener or proxy may report) is keyed as the IPv4
+/// address it carries: masking it would put every IPv4 client in one `::` bucket.
 fn bucket(ip: Option<IpAddr>) -> Option<IpAddr> {
     ip.map(|ip| match ip {
-        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        },
         v4 => v4,
     })
 }
@@ -118,5 +123,12 @@ mod tests {
         assert_ne!(bucket(ip("2001:db8:1:2::1")), bucket(ip("2001:db8:1:3::1")));
         assert_eq!(bucket(ip("9.9.9.9")), ip("9.9.9.9"));
         assert_eq!(bucket(None), None);
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_are_keyed_as_their_ipv4_address() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        assert_eq!(bucket(ip("::ffff:1.2.3.4")), bucket(ip("1.2.3.4")));
+        assert_ne!(bucket(ip("::ffff:1.2.3.4")), bucket(ip("::ffff:5.6.7.8")));
     }
 }
