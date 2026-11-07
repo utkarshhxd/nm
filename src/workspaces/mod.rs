@@ -21,6 +21,7 @@ use crate::{
     pagination::{Page, PageParams},
 };
 
+pub mod invites;
 pub mod members;
 pub mod roles;
 
@@ -29,6 +30,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/workspaces", get(list).post(create))
         .route("/api/v1/workspaces/{id}", get(show).patch(update))
         .merge(members::routes())
+        .merge(invites::routes())
 }
 
 /// A workspace as one caller sees it: `role` is the caller's own.

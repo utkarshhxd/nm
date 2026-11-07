@@ -44,23 +44,45 @@ pub fn normalize_email(raw: &str) -> Result<String, FieldError> {
     }
 }
 
+/// Trimmed, 1..=100 characters, no control characters (NUL would also fail a `text` insert).
+pub fn validate_display_name(raw: &str) -> Result<String, FieldError> {
+    let name = raw.trim();
+    if (1..=100).contains(&name.chars().count()) && !name.chars().any(char::is_control) {
+        return Ok(name.to_owned());
+    }
+    Err(FieldError::new(
+        "display_name",
+        "must be 1-100 characters with no control characters",
+    ))
+}
+
 /// Inserts a user. `409 email-taken` if the (normalised) address exists. The password must be
-/// 12..=256 characters (422 on field `password`). Takes an executor so a caller can create the user
-/// in the same transaction as other writes; note that a failed insert aborts that transaction.
+/// 12..=256 characters (422 on field `password`); `display_name`, if given, is validated by
+/// `validate_display_name` (422 on field `display_name`) and otherwise stays empty. Takes an
+/// executor so a caller can create the user in the same transaction as other writes; note that a
+/// failed insert aborts that transaction.
 pub async fn create_user(
     db: impl PgExecutor<'_>,
     email: &str,
     password: &str,
+    display_name: Option<&str>,
     is_instance_admin: bool,
 ) -> ApiResult<Uuid> {
     let email = normalize_email(email).map_err(|e| ApiError::Validation(vec![e]))?;
     validate_password(password).map_err(|e| ApiError::Validation(vec![e]))?;
+    let display_name = display_name
+        .map(validate_display_name)
+        .transpose()
+        .map_err(|e| ApiError::Validation(vec![e]))?
+        .unwrap_or_default();
     let hash = hash_password(password)?;
     let id = Uuid::now_v7();
     sqlx::query!(
-        "insert into users (id, email, password_hash, is_instance_admin) values ($1, $2, $3, $4)",
+        "insert into users (id, email, display_name, password_hash, is_instance_admin) \
+         values ($1, $2, $3, $4, $5)",
         id,
         email,
+        display_name,
         hash,
         is_instance_admin,
     )

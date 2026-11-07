@@ -26,6 +26,11 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::workspaces::members::list,
         crate::workspaces::members::change_role,
         crate::workspaces::members::remove,
+        crate::workspaces::invites::create,
+        crate::workspaces::invites::list,
+        crate::workspaces::invites::revoke,
+        crate::workspaces::invites::preview,
+        crate::workspaces::invites::accept,
         crate::audit::routes::list,
     ),
     components(schemas(
@@ -45,6 +50,12 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::workspaces::UpdateWorkspace,
         crate::workspaces::members::Member,
         crate::workspaces::members::ChangeRole,
+        crate::workspaces::invites::NewInvite,
+        crate::workspaces::invites::CreatedInvite,
+        crate::workspaces::invites::InviteSummary,
+        crate::workspaces::invites::InvitePreview,
+        crate::workspaces::invites::AcceptInvite,
+        crate::workspaces::invites::Accepted,
         crate::audit::routes::AuditEntry,
     ))
 )]

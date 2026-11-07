@@ -68,7 +68,7 @@ async fn admin(cmd: AdminCommand, pool: &sqlx::PgPool) -> anyhow::Result<()> {
             instance_admin,
         } => {
             let password = read_password_from_stdin()?;
-            let id = users::create_user(pool, &email, &password, instance_admin)
+            let id = users::create_user(pool, &email, &password, None, instance_admin)
                 .await
                 .map_err(api_error)?;
             println!("{id}");

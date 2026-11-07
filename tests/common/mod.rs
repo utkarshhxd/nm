@@ -69,7 +69,7 @@ pub fn test_server(router: Router) -> TestServer {
 pub const PW: &str = "correct horse battery";
 
 pub async fn create_user(pool: &PgPool, email: &str, password: &str, instance_admin: bool) -> Uuid {
-    nm::users::create_user(pool, email, password, instance_admin)
+    nm::users::create_user(pool, email, password, None, instance_admin)
         .await
         .expect("create user")
 }

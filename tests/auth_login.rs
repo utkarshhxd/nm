@@ -122,7 +122,7 @@ async fn email_case_and_spaces_are_normalised(pool: PgPool) {
     login_request(&app, "OPS@example.com", PW)
         .await
         .assert_status_ok();
-    let again = users::create_user(&pool, "ops@example.com", PW, false).await;
+    let again = users::create_user(&pool, "ops@example.com", PW, None, false).await;
     assert!(matches!(again, Err(ApiError::Conflict("email-taken"))));
 }
 
