@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{CurrentUser, sessions};
+use super::{CurrentUser, rate_limit, sessions};
 use crate::{
     app::AppState,
     audit::{self, Actor, AuditEvent, actions},
@@ -70,6 +70,7 @@ async fn login_failed(
     meta: &RequestMeta,
     email: Option<&str>,
 ) -> ApiResult<ApiError> {
+    rate_limit::record(&state.pool, email.unwrap_or(""), meta.ip, false).await?;
     audit::record(
         &state.pool,
         meta,
@@ -120,6 +121,11 @@ pub async fn login(
         return Err(login_failed(&state, &meta, email.as_deref()).await?);
     }
 
+    // Before the lookup, so a locked email is refused even with the right password, and with a
+    // query that costs the same whether or not the email has a user. A malformed address shares
+    // the "" key: it cannot sign in anyway.
+    rate_limit::check(&state.pool, email.as_deref().unwrap_or(""), meta.ip).await?;
+
     let user = match &email {
         Some(email) => users::find_by_email(&state.pool, email).await?,
         None => None,
@@ -137,6 +143,8 @@ pub async fn login(
     let Some(user) = user.filter(|_| verified) else {
         return Err(login_failed(&state, &meta, email.as_deref()).await?);
     };
+
+    rate_limit::record(&state.pool, &user.email, meta.ip, true).await?;
 
     let mut tx = state.pool.begin().await?;
     let session = sessions::create(&mut *tx, user.id, false, &meta).await?;

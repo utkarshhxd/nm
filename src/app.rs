@@ -8,8 +8,8 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 
 use crate::{
-    config::Config, crypto::secrets::Secrets, db, http, http::security_headers::security_headers,
-    telemetry,
+    config::Config, crypto::secrets::Secrets, db, http, http::csrf,
+    http::security_headers::security_headers, telemetry,
 };
 
 #[derive(Clone)]
@@ -32,6 +32,11 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     http::routes()
+        // Innermost, so a 403 still gets security headers and is counted by the metrics.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            csrf::require_csrf,
+        ))
         .with_state(state)
         .layer(telemetry::metrics_layer())
         // Outermost, so every response gets the headers: 404s, errors, metrics-free paths.

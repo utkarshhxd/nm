@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{app::AppState, error::ApiError};
 
 pub mod login;
+pub mod rate_limit;
 pub mod sessions;
 
 pub use login::routes;
