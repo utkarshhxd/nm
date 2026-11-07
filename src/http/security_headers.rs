@@ -32,6 +32,11 @@ const HEADERS: [(HeaderName, &str); 4] = [
 /// Deliberately NOT the SPA or `/assets/`: `web_ui` decides their caching, and the hashed bundle
 /// is served `immutable`, which is what keeps the frontend fast. Widening this to every path
 /// would silently throw that away.
+///
+/// The list is the same as `web_ui::is_reserved`'s, and the two stay separate on purpose: "never
+/// cached" and "never the SPA" are different ideas that happen to cover the same paths today.
+/// `uncacheable_and_is_reserved_agree` below pins that they still coincide, so adding a path to
+/// one and not the other fails rather than drifting.
 fn uncacheable(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/") || path == "/healthz" || path == "/readyz"
 }
@@ -55,14 +60,44 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::uncacheable;
+    use crate::http::web_ui::is_reserved;
+
+    /// Every path either predicate has an opinion about, plus near misses.
+    const PATHS: [&str; 11] = [
+        "/api",
+        "/api/",
+        "/api/v1/me",
+        "/api/v1/docs/",
+        "/healthz",
+        "/readyz",
+        "/assets/app-abc.js",
+        "/",
+        "/login",
+        "/apiary",
+        "/healthzz",
+    ];
 
     #[test]
     fn no_store_covers_the_api_and_the_probes_but_not_the_assets() {
         for path in ["/api", "/api/v1/me", "/api/v1/docs/", "/healthz", "/readyz"] {
             assert!(uncacheable(path), "{path}");
         }
-        for path in ["/assets/app-abc.js", "/", "/login", "/apiary"] {
+        for path in ["/assets/app-abc.js", "/", "/login", "/apiary", "/healthzz"] {
             assert!(!uncacheable(path), "{path}");
+        }
+    }
+
+    /// The two predicates are separate ideas, but they must stay in step: a path that is reserved
+    /// from the SPA is server-generated, and a server-generated response is one a shared cache
+    /// must not keep. Adding one to only one of them should fail here, not in production.
+    #[test]
+    fn uncacheable_and_is_reserved_agree() {
+        for path in PATHS {
+            assert_eq!(
+                uncacheable(path),
+                is_reserved(path),
+                "{path}: security_headers::uncacheable and web_ui::is_reserved disagree"
+            );
         }
     }
 }

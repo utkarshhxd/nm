@@ -521,29 +521,37 @@ async fn admins_rename_workspaces_and_it_is_audited(pool: PgPool) {
 #[sqlx::test]
 async fn me_orders_workspaces_by_name_and_the_endpoint_by_id(pool: PgPool) {
     let (admin, admin_id) = client(&pool, "admin@example.com", true).await;
-    // `create_workspace` names a workspace after its slug, so "alpha" is the older id.
-    create_workspace(&pool, admin_id, "alpha").await;
-    create_workspace(&pool, admin_id, "zulu").await;
+    // The names and this creation order are load-bearing: do NOT tidy them alphabetically.
+    // `create_workspace` names a workspace after its slug and ids are UUIDv7, so creating
+    // mike, alpha, zulu makes all three candidate orderings distinct —
+    //   id ascending  [mike, alpha, zulu]
+    //   id descending [zulu, alpha, mike]
+    //   name          [alpha, mike, zulu]
+    // With two workspaces no fixture can separate all three on both endpoints, and the test
+    // would still pass under a wrong ordering.
+    for slug in ["mike", "alpha", "zulu"] {
+        create_workspace(&pool, admin_id, slug).await;
+    }
+
+    let names = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
 
     let me = admin.get("/api/v1/me").await.json::<Value>();
-    let names: Vec<&str> = me["workspaces"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(names, ["alpha", "zulu"], "/me is by name");
+    assert_eq!(
+        names(&me["workspaces"]),
+        ["alpha", "mike", "zulu"],
+        "/me is by name"
+    );
 
     let page = admin.get("/api/v1/workspaces").await.json::<Value>();
-    let names: Vec<&str> = page["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["name"].as_str().unwrap())
-        .collect();
     assert_eq!(
-        names,
-        ["zulu", "alpha"],
+        names(&page["data"]),
+        ["zulu", "alpha", "mike"],
         "the paginated list is newest first"
     );
 }

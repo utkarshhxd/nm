@@ -75,7 +75,12 @@ pub fn serve_web(source: &dyn AssetSource, path: &str, accept_encoding: Option<&
 /// axum 0.8 wildcards need a character after the prefix, so `/api/{*rest}` misses it and it
 /// would otherwise be served `index.html` with a 200. The health checks are real routes and
 /// cannot reach this handler, but `serve_web` is public and must not contradict them.
-fn is_reserved(path: &str) -> bool {
+///
+/// This happens to list the same paths as `security_headers::uncacheable`, which are two
+/// different ideas that coincide — "never the SPA" and "never cached by a shared cache" — so
+/// they are deliberately NOT one function. `security_headers`'s tests assert the two agree, so
+/// a path added to only one of them fails loudly instead of drifting quietly.
+pub(crate) fn is_reserved(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/") || path == "/healthz" || path == "/readyz"
 }
 

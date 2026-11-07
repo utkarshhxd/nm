@@ -6,6 +6,11 @@ Open-source (AGPL-3.0), self-hosted email marketing platform in Rust and Postgre
 
 Everything runs in a Linux dev container, so Docker and a POSIX shell are all the host needs:
 every `cargo`, `sqlx`, `cargo deny` and `pnpm` command goes through `bash scripts/dev.sh …`.
+
+**Docker Compose 2.24 or newer** (`docker compose version`). `docker-compose.dev.yml` uses the
+long `env_file` syntax so that `.env` is optional — which is what lets the test suite run in a
+clone that has never created one — and an older Compose rejects it at step 1.
+
 From a fresh clone to a signed-in browser, in order:
 
 ```sh
