@@ -108,6 +108,19 @@ pub async fn resolve(db: &PgPool, cookie_value: &str) -> sqlx::Result<Option<Act
         )
         .execute(db)
         .await?;
+        // shortcut: dead sessions are deleted inline, riding the once-a-minute `last_seen_at`
+        // write rather than every request; move to a scheduled job when the queue lands (M1).
+        // Best effort, like the `login_attempts` and `auth_challenges` sweeps: it must not fail
+        // the request it rides on, so its error is only logged. Only the absolute lifetime is
+        // swept — a session idle past 7 days stops authenticating at once via the predicate
+        // above, and is deleted here when its 30-day `expires_at` passes, so the table stays
+        // bounded without a second index.
+        if let Err(e) = sqlx::query!("delete from sessions where expires_at <= now()")
+            .execute(db)
+            .await
+        {
+            tracing::warn!(error = ?e, "sessions cleanup failed");
+        }
     }
     Ok(Some(ActiveSession {
         user_id: row.user_id,

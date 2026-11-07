@@ -361,3 +361,34 @@ async fn logins_are_audited_without_secrets(pool: PgPool) {
         assert!(!text.contains(PW) && !text.contains("not the password"));
     }
 }
+
+/// Expired sessions are deleted inline, riding the once-a-minute `last_seen_at` write, so the
+/// table does not grow forever on an instance nobody ever signs out of.
+#[sqlx::test]
+async fn expired_sessions_are_swept(pool: PgPool) {
+    let mut app = TestApp::new(pool.clone()).await;
+    let id = create_user(&pool, "ops@example.com", PW, false).await;
+    app.login("ops@example.com", PW).await;
+    // A long-dead session of another sign-in, which nothing will ever present again.
+    let dead = nm::auth::sessions::create(&pool, id, false, &RequestMeta::default())
+        .await
+        .unwrap();
+    sqlx::query("update sessions set expires_at = now() - interval '1 day' where id_hash = $1")
+        .bind(&sha256(dead.cookie_value.as_bytes())[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The sweep rides the `last_seen_at` write, which only happens once the session is stale.
+    sqlx::query("update sessions set last_seen_at = now() - interval '2 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    app.get("/api/v1/me").await.assert_status_ok();
+
+    let left: i64 = sqlx::query_scalar("select count(*) from sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 1, "only the live session survives");
+}
