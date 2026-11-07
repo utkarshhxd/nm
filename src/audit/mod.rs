@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 use crate::http::request_meta::{RequestMeta, truncate_user_agent};
 
+pub mod routes;
+
 /// Action names. Reference these constants; never type an action string at a call site.
 pub mod actions {
     pub const AUTH_LOGIN_SUCCEEDED: &str = "auth.login.succeeded";

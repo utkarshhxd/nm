@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update memberships set role = $3 where workspace_id = $1 and user_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a53bcdbd7502e1a50584ea552f495f810b07a1fbb6b8caa4522c19383a856bc"
+}

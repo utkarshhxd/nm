@@ -14,6 +14,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(health::routes())
         .merge(crate::auth::routes())
+        .merge(crate::workspaces::routes())
+        .merge(crate::audit::routes::routes())
         .merge(crate::openapi::docs())
         // Catch-all for unknown `/api/*` paths. A route rather than `Router::fallback`
         // so route modules may still be merged freely (only one fallback is allowed),

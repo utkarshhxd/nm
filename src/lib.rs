@@ -13,3 +13,4 @@ pub mod openapi;
 pub mod pagination;
 pub mod telemetry;
 pub mod users;
+pub mod workspaces;

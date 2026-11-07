@@ -8,7 +8,7 @@ use axum::{
 };
 use axum_extra::extract::{CookieJar, cookie::Cookie};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -21,6 +21,7 @@ use crate::{
     error::{ApiError, ApiJson, ApiResult, FieldError},
     http::request_meta::RequestMeta,
     users,
+    workspaces::{self, MeWorkspace},
 };
 
 pub fn routes() -> Router<AppState> {
@@ -71,7 +72,7 @@ pub struct MeResponse {
     pub is_instance_admin: bool,
     pub totp_enabled: bool,
     pub passkey_count: u32,
-    pub workspaces: Vec<Value>,
+    pub workspaces: Vec<MeWorkspace>,
     /// Send as `X-CSRF-Token` on unsafe requests.
     pub csrf_token: String,
 }
@@ -283,9 +284,9 @@ pub async fn me(State(state): State<AppState>, user: CurrentUser) -> ApiResult<J
         display_name: u.display_name,
         is_instance_admin: u.is_instance_admin,
         totp_enabled: u.totp_enabled,
-        // Later tasks fill these in.
+        // Task 15 (passkeys) fills this in.
         passkey_count: 0,
-        workspaces: vec![],
+        workspaces: workspaces::for_user(&state.pool, u.id).await?,
         csrf_token: user.csrf_token,
     }))
 }

@@ -19,6 +19,14 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::auth::totp::confirm,
         crate::auth::totp::disable,
         crate::auth::totp::login_totp,
+        crate::workspaces::list,
+        crate::workspaces::create,
+        crate::workspaces::show,
+        crate::workspaces::update,
+        crate::workspaces::members::list,
+        crate::workspaces::members::change_role,
+        crate::workspaces::members::remove,
+        crate::audit::routes::list,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -30,6 +38,14 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::auth::totp::ConfirmResponse,
         crate::auth::totp::DisableRequest,
         crate::auth::totp::SecondFactorRequest,
+        crate::workspaces::roles::Role,
+        crate::workspaces::Workspace,
+        crate::workspaces::MeWorkspace,
+        crate::workspaces::NewWorkspace,
+        crate::workspaces::UpdateWorkspace,
+        crate::workspaces::members::Member,
+        crate::workspaces::members::ChangeRole,
+        crate::audit::routes::AuditEntry,
     ))
 )]
 struct ApiDoc;

@@ -10,6 +10,8 @@ use axum_test::{TestRequest, TestServer};
 use nm::{
     app::{self, AppState},
     config::{Config, LogFormat, SecretKey},
+    http::request_meta::RequestMeta,
+    workspaces::roles::Role,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -112,4 +114,32 @@ impl TestApp {
     pub fn delete(&self, p: &str) -> TestRequest {
         self.with_csrf(self.server.delete(p))
     }
+}
+
+/// Creates a workspace through the library (so it is audited like a real one), owned by `owner`.
+pub async fn create_workspace(pool: &PgPool, owner: Uuid, slug: &str) -> Uuid {
+    nm::workspaces::create_workspace(
+        pool,
+        &RequestMeta::default(),
+        owner,
+        nm::workspaces::NewWorkspace {
+            slug: slug.to_owned(),
+            name: slug.to_owned(),
+            timezone: None,
+        },
+    )
+    .await
+    .expect("create workspace")
+    .id
+}
+
+/// Adds a membership directly, without an audit row.
+pub async fn add_member(pool: &PgPool, ws: Uuid, user: Uuid, role: Role) {
+    sqlx::query("insert into memberships (workspace_id, user_id, role) values ($1, $2, $3)")
+        .bind(ws)
+        .bind(user)
+        .bind(role)
+        .execute(pool)
+        .await
+        .expect("add member");
 }
