@@ -24,6 +24,12 @@ function codeAt(secret: string, atMillis: number): string {
   return totp.generate({ timestamp: atMillis });
 }
 
+async function readAll(stream: NodeJS.ReadableStream): Promise<string> {
+  let text = "";
+  for await (const chunk of stream) text += chunk;
+  return text;
+}
+
 /**
  * `exact: true` on every `getByRole` name below: Playwright matches an accessible name by
  * case-insensitive substring by default, and the sign-in screen carries both "Sign in" and
@@ -66,6 +72,18 @@ test("TOTP enrolment, then sign-in needs a code", async ({ page }) => {
   await page.getByRole("button", { name: "Confirm", exact: true }).click();
 
   await expect(page.getByTestId("recovery-code")).toHaveCount(10);
+
+  // The download has to survive the object URL being revoked. Nothing here prints a code: a
+  // failure message must not carry them, and the file itself stays in Playwright's temp dir.
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download", exact: true }).click(),
+  ]);
+  expect(await download.failure()).toBeNull();
+  expect(download.suggestedFilename()).toBe("nm-recovery-codes.txt");
+  const saved = await readAll(await download.createReadStream());
+  expect(saved.split("\n").filter(Boolean).length).toBe(10);
+
   await page.getByRole("button", { name: "I've saved these", exact: true }).click();
   await expect(page.getByTestId("recovery-code")).toHaveCount(0);
 
@@ -89,6 +107,27 @@ test("TOTP enrolment, then sign-in needs a code", async ({ page }) => {
   await page.getByLabel("Password", { exact: true }).fill(PW);
   await page.getByRole("button", { name: "Disable two-factor sign-in", exact: true }).click();
   await expect(page.getByRole("button", { name: "Set up", exact: true })).toBeVisible();
+});
+
+test("a wrong current password is reported on the current-password field", async ({ page }) => {
+  await signInWithPassword(page);
+  await page.goto("/account/security");
+
+  await page.getByLabel("Current password").fill("not-the-password");
+  await page.getByLabel("New password").fill("a-perfectly-fine-new-password");
+  await page.getByRole("button", { name: "Change password", exact: true }).click();
+
+  // The failure must be announced on the field that caused it. Binding it to the new-password
+  // field instead would send a screen-reader user to fix the input they got right.
+  await expect(page.getByLabel("Current password")).toHaveAttribute(
+    "aria-describedby",
+    "current-password-error",
+  );
+  await expect(page.getByLabel("New password")).toHaveAttribute(
+    "aria-describedby",
+    "new-password-hint",
+  );
+  await expect(page.locator("#current-password-error")).toHaveText("Current password is incorrect");
 });
 
 test("a newcomer accepts an invitation and lands in the app", async ({ page, request }) => {

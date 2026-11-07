@@ -3,23 +3,19 @@
 import { type FormEvent, useEffect, useState } from "react";
 
 import { api, problemDetail, problemType } from "../api/client";
+import { nextPath } from "../lib/navigation";
 import { signInWithPasskey } from "../lib/passkeys";
 import { BUTTON, Field, SECONDARY_BUTTON } from "../lib/ui";
 
 /**
- * Where to go once signed in. `next` comes from the URL, so only a path on this origin is
- * accepted: an absolute URL, `//elsewhere` or `/\elsewhere` (which browsers also read as
- * protocol-relative) would make this an open redirect.
+ * A full load, not a router navigation: it is what re-reads `/me` and the new session cookie.
+ *
+ * Every way into the app from this screen goes through here — the password form, the second
+ * factor, the passkey button and the passkey autofill — so `nextPath` is the single place the
+ * open-redirect check lives and cannot be bypassed by one of them.
  */
-function nextPath(): string {
-  const next = new URLSearchParams(window.location.search).get("next") ?? "";
-  const local = next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/\\");
-  return local ? next : "/";
-}
-
-/** A full load, not a router navigation: it is what re-reads `/me` and the new session cookie. */
 function enterApp(): void {
-  window.location.assign(nextPath());
+  window.location.assign(nextPath(window.location.href));
 }
 
 function tooManyAttempts(retryAfter: string | null): string {

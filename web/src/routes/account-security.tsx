@@ -3,7 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useState } from "react";
 
-import { api, problemMessage } from "../api/client";
+import { api, problemMessage, problemType } from "../api/client";
 import { registerPasskey } from "../lib/passkeys";
 import { useMe } from "../lib/session";
 import { Alert, BUTTON, CARD, Field, SECONDARY_BUTTON } from "../lib/ui";
@@ -30,13 +30,19 @@ export default function AccountSecurity() {
 function ChangePassword() {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
-  const [error, setError] = useState("");
+  // One message per field, not one shared one: a rejected *current* password announced as a
+  // defect of the *new* password field sends a screen-reader user to fix the input they got
+  // right. The server tells the two apart — a wrong current password is 401
+  // `invalid-credentials`, a new password outside 12-256 characters is 422 `validation`.
+  const [currentError, setCurrentError] = useState("");
+  const [nextError, setNextError] = useState("");
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    setError("");
+    setCurrentError("");
+    setNextError("");
     setDone(false);
     setBusy(true);
     const { error: problem } = await api.POST("/api/v1/me/password", {
@@ -44,7 +50,12 @@ function ChangePassword() {
     });
     setBusy(false);
     if (problem) {
-      setError(problemMessage(problem, "The password could not be changed."));
+      const message = problemMessage(problem, "The password could not be changed.");
+      if (problemType(problem) === "urn:nm:problem:validation") {
+        setNextError(message);
+      } else {
+        setCurrentError(message);
+      }
       return;
     }
     setCurrent("");
@@ -62,6 +73,7 @@ function ChangePassword() {
           type="password"
           autoComplete="current-password"
           required
+          error={currentError}
           value={current}
           onChange={(e) => setCurrent(e.target.value)}
         />
@@ -73,7 +85,7 @@ function ChangePassword() {
           minLength={12}
           required
           hint="At least 12 characters."
-          error={error}
+          error={nextError}
           value={next}
           onChange={(e) => setNext(e.target.value)}
         />
@@ -95,16 +107,21 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
   const [code, setCode] = useState("");
   const [password, setPassword] = useState("");
   const [turningOff, setTurningOff] = useState(false);
-  const [error, setError] = useState("");
+  // One message per failing action, each tied to the field that caused it. Setting up has no
+  // field at all, so its failure is a form-level alert rather than `aria-describedby` of an
+  // input the person never filled in.
+  const [setupError, setSetupError] = useState("");
+  const [codeError, setCodeError] = useState("");
+  const [passwordError, setPasswordError] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function start() {
-    setError("");
+    setSetupError("");
     setBusy(true);
     const { data, error: problem } = await api.POST("/api/v1/me/totp/setup");
     setBusy(false);
     if (problem || !data) {
-      setError(problemMessage(problem, "Two-factor setup could not be started."));
+      setSetupError(problemMessage(problem, "Two-factor setup could not be started."));
       return;
     }
     setSetup(data);
@@ -112,12 +129,12 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
 
   async function confirm(event: FormEvent) {
     event.preventDefault();
-    setError("");
+    setCodeError("");
     setBusy(true);
     const { data, error: problem } = await api.POST("/api/v1/me/totp/confirm", { body: { code } });
     setBusy(false);
     if (problem || !data) {
-      setError(problemMessage(problem, "That code was not accepted."));
+      setCodeError(problemMessage(problem, "That code was not accepted."));
       return;
     }
     setSetup(null);
@@ -128,12 +145,12 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
 
   async function disable(event: FormEvent) {
     event.preventDefault();
-    setError("");
+    setPasswordError("");
     setBusy(true);
     const { error: problem } = await api.DELETE("/api/v1/me/totp", { body: { password } });
     setBusy(false);
     if (problem) {
-      setError(problemMessage(problem, "Two-factor sign-in could not be turned off."));
+      setPasswordError(problemMessage(problem, "Two-factor sign-in could not be turned off."));
       return;
     }
     setPassword("");
@@ -166,7 +183,7 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
             inputMode="numeric"
             autoComplete="one-time-code"
             required
-            error={error}
+            error={codeError}
             value={code}
             onChange={(e) => setCode(e.target.value)}
           />
@@ -179,7 +196,7 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
       {!setup && !enabled ? (
         <>
           <p className="mt-4">A code from an authenticator app is asked for at every sign-in.</p>
-          {error ? <Alert>{error}</Alert> : null}
+          {setupError ? <Alert>{setupError}</Alert> : null}
           <button className={BUTTON} type="button" onClick={start} disabled={busy}>
             Set up
           </button>
@@ -197,7 +214,7 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
                 type="password"
                 autoComplete="current-password"
                 required
-                error={error}
+                error={passwordError}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />
@@ -249,7 +266,10 @@ function RecoveryCodes({ codes, onSaved }: { codes: string[]; onSaved: () => voi
     link.href = url;
     link.download = "nm-recovery-codes.txt";
     link.click();
-    URL.revokeObjectURL(url);
+    // Not in this tick: Firefox and Safari cancel a download whose object URL is revoked
+    // synchronously after the click, and "I've saved these" then clears the only copy of these
+    // codes that exists anywhere.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   return (
@@ -284,7 +304,10 @@ function RecoveryCodes({ codes, onSaved }: { codes: string[]; onSaved: () => voi
 function Passkeys() {
   const client = useQueryClient();
   const [name, setName] = useState("");
-  const [error, setError] = useState("");
+  // Adding fails because of the name field; removing has no field at all, so its failure is a
+  // form-level alert rather than `aria-describedby` of an input that had nothing to do with it.
+  const [addError, setAddError] = useState("");
+  const [removeError, setRemoveError] = useState("");
 
   const passkeys = useQuery({
     queryKey: ["passkeys"],
@@ -304,10 +327,10 @@ function Passkeys() {
     },
     onSuccess: async () => {
       setName("");
-      setError("");
+      setAddError("");
       await refresh();
     },
-    onError: (failure: Error) => setError(failure.message),
+    onError: (failure: Error) => setAddError(failure.message),
   });
 
   const remove = useMutation({
@@ -317,8 +340,11 @@ function Passkeys() {
       });
       if (problem) throw new Error(problemMessage(problem, "That passkey could not be removed."));
     },
-    onSuccess: refresh,
-    onError: (failure: Error) => setError(failure.message),
+    onSuccess: async () => {
+      setRemoveError("");
+      await refresh();
+    },
+    onError: (failure: Error) => setRemoveError(failure.message),
   });
 
   return (
@@ -343,6 +369,7 @@ function Passkeys() {
       ) : (
         <p className="mt-4">No passkeys yet.</p>
       )}
+      {removeError ? <Alert>{removeError}</Alert> : null}
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -354,7 +381,7 @@ function Passkeys() {
           id="passkey-name"
           label="Passkey name"
           required
-          error={error}
+          error={addError}
           value={name}
           onChange={(e) => setName(e.target.value)}
         />

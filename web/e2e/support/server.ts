@@ -13,6 +13,7 @@
 
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export const PORT = 8090;
@@ -23,11 +24,70 @@ export const ADMIN_PASSWORD = "e2e-admin-password";
 
 const NM = resolve(import.meta.dirname, "../../..", "target/release/nm");
 
+/**
+ * Every database this harness has created and not yet dropped, one name per line.
+ *
+ * Teardown drops the database and clears this, but a SIGKILL or a cancelled job kills the
+ * process before teardown runs and leaves the database behind. The next run reads this file and
+ * force-drops whatever is listed, so a leak heals itself.
+ *
+ * shortcut: a ledger, not a scan of `pg_database` — neither `psql` nor any Postgres client is on
+ * PATH here, and sqlx-cli can drop a named database but cannot list them. If the repo working
+ * tree is wiped between the kill and the next run, the leak survives; swap this for a real
+ * `datname like 'nm_e2e_%'` sweep the day a client library is in the image.
+ */
+const LEDGER = resolve(import.meta.dirname, "leaked-databases.txt");
+
 /** `--no-dotenv`: a stray `.env` in the repo must not point sqlx at a different server. */
 const SQLX = ["--no-dotenv"];
 
 function run(file: string, args: string[], env: NodeJS.ProcessEnv, input?: string): void {
   execFileSync(file, args, { env, input, stdio: ["pipe", "inherit", "inherit"] });
+}
+
+function ledger(): string[] {
+  try {
+    return readFileSync(LEDGER, "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/** Force-drops anything a previous run left behind. Only names this harness wrote. */
+function dropLeaked(server: URL, env: NodeJS.ProcessEnv): void {
+  for (const name of ledger()) {
+    const stale = new URL(server);
+    stale.pathname = `/${name}`;
+    try {
+      run("sqlx", ["database", "drop", "-y", "-f", ...SQLX], { ...env, DATABASE_URL: stale.href });
+      console.log(`dropped leaked ${name}`);
+    } catch {
+      // Already gone, or the server is unreachable — the run below will fail on its own terms.
+    }
+  }
+  rmSync(LEDGER, { force: true });
+}
+
+/**
+ * Refuses to run if anything is already answering on the port. Without this an unrelated
+ * healthy service — or an orphaned `nm` from a killed run, still pointing at a dropped
+ * database — is adopted silently and every test is run against the wrong server.
+ */
+async function requirePortFree(): Promise<void> {
+  try {
+    await fetch(`${BASE_URL}/readyz`, { signal: AbortSignal.timeout(2000) });
+  } catch {
+    return;
+  }
+  throw new Error(`something is already listening on ${BASE_URL}; stop it before running the e2e suite`);
+}
+
+/** True only for this project's readiness response, so a foreign server cannot be mistaken for ours. */
+async function isOurs(): Promise<boolean> {
+  const res = await fetch(`${BASE_URL}/readyz`);
+  if (!res.ok) return false;
+  const body: unknown = await res.json();
+  return (body as { database?: unknown }).database === "ok";
 }
 
 async function waitForReady(server: ChildProcess): Promise<void> {
@@ -36,13 +96,13 @@ async function waitForReady(server: ChildProcess): Promise<void> {
       throw new Error(`nm serve exited with code ${server.exitCode} before becoming ready`);
     }
     try {
-      if ((await fetch(`${BASE_URL}/readyz`)).ok) return;
+      if (await isOurs()) return;
     } catch {
       // Not listening yet.
     }
     await new Promise((done) => setTimeout(done, 250));
   }
-  throw new Error(`nm serve never answered ${BASE_URL}/readyz`);
+  throw new Error(`nm serve never answered ${BASE_URL}/readyz the way this project's server does`);
 }
 
 async function stop(server: ChildProcess | undefined): Promise<void> {
@@ -61,7 +121,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   }
 
   const database = new URL(server_url);
-  database.pathname = `/nm_e2e_${randomBytes(6).toString("hex")}`;
+  const name = `nm_e2e_${randomBytes(6).toString("hex")}`;
+  database.pathname = `/${name}`;
   const url = database.toString();
 
   const env: NodeJS.ProcessEnv = {
@@ -76,14 +137,19 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     NM_LOG: "warn",
   };
 
+  await requirePortFree();
+  dropLeaked(new URL(server_url), env);
+
   run("sqlx", ["database", "create", ...SQLX], env);
+  writeFileSync(LEDGER, `${name}\n`);
 
   let server: ChildProcess | undefined;
   // `-f` force-drops: a browser that is still holding a connection must not strand the database.
   const teardown = async () => {
     await stop(server);
     run("sqlx", ["database", "drop", "-y", "-f", ...SQLX], env);
-    console.log(`dropped ${database.pathname.slice(1)}`);
+    rmSync(LEDGER, { force: true });
+    console.log(`dropped ${name}`);
   };
 
   try {

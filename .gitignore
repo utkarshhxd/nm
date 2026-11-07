@@ -4,6 +4,8 @@ web/dist/
 # Playwright run artefacts; see playwright.config.ts for why none of them are recorded
 web/test-results/
 web/playwright-report/
+# The e2e harness's ledger of databases it has created but not yet dropped
+web/e2e/support/leaked-databases.txt
 # pnpm's content-addressable store, created by installs run in the dev container
 .pnpm-store/
 .env
