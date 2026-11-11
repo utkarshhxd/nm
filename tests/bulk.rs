@@ -530,3 +530,82 @@ async fn a_tag_or_list_of_another_workspace_is_404(pool: PgPool) {
         0
     );
 }
+
+async fn status_of(pool: &PgPool, contact: Uuid, list: Uuid) -> Option<String> {
+    sqlx::query_scalar("select status from list_memberships where contact_id = $1 and list_id = $2")
+        .bind(contact)
+        .bind(list)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+async fn set_status(pool: &PgPool, contact: Uuid, list: Uuid, status: &str) {
+    sqlx::query("update list_memberships set status = $3 where contact_id = $1 and list_id = $2")
+        .bind(contact)
+        .bind(list)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Bulk subscribe adds the missing and touches nothing else: no promoting `pending`, and above
+/// all no reviving `unsubscribed`.
+#[sqlx::test]
+async fn bulk_subscribe_never_changes_an_existing_membership(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let single = list(&app, ws, "single", false).await;
+    let double = list(&app, ws, "double", true).await;
+    let ids = contacts(&app, ws, "c", 4).await; // [none, pending, subscribed, unsubscribed]
+
+    for l in [single, double] {
+        for i in [1, 2, 3] {
+            app.post(&format!("{}/contacts/{}/lists", base(ws), ids[i]))
+                .json(&json!({"list_id": l}))
+                .await
+                .assert_status_success();
+        }
+        set_status(&pool, ids[1], l, "pending").await;
+        set_status(&pool, ids[2], l, "subscribed").await;
+        set_status(&pool, ids[3], l, "unsubscribed").await;
+    }
+    let token = select(&app, ws, json!({})).await;
+
+    for (l, new_status) in [(single, "subscribed"), (double, "pending")] {
+        let body = json!({"selection_token": token, "list_id": l});
+        // Only the contact with no row is added: the count says so.
+        assert_eq!(affected(bulk(&app, ws, "subscribe", body).await).await, 1);
+        let mut got = vec![];
+        for id in &ids {
+            got.push(status_of(&pool, *id, l).await.unwrap());
+        }
+        assert_eq!(got, [new_status, "pending", "subscribed", "unsubscribed"]);
+    }
+}
+
+/// The audit log outlives an erasure, so a search term, which can be an address, must not be in it.
+#[sqlx::test]
+async fn the_audit_row_does_not_hold_the_search_text(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    contact(&app, ws, "zebediah.quux@ex.test").await;
+    let token = select(&app, ws, json!({"q": "zebediah.quux@ex.test"})).await;
+    let body = json!({"selection_token": token, "tag_id": vip});
+    assert_eq!(affected(bulk(&app, ws, "tag", body).await).await, 1);
+
+    let (meta,): (String,) =
+        sqlx::query_as("select metadata::text from audit_log where action like 'contacts.bulk_%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    for needle in ["zebediah", "quux", "ex.test"] {
+        assert!(!meta.contains(needle), "{needle} leaked into {meta}");
+    }
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(
+        meta["filter"]["q"], "<redacted>",
+        "a reader can still tell a search was used"
+    );
+    assert_eq!(meta["affected"], 1);
+}

@@ -42,6 +42,12 @@ pub struct Selection {
     pub workspace_id: Uuid,
     pub filter: ContactFilter,
     /// UUIDv7 upper bound: the contacts selected are those with `id <= as_of`.
+    ///
+    /// The snapshot is only as precise as UUIDv7's millisecond: a contact another process creates
+    /// in the same millisecond as the token may fall on either side. And it holds only while
+    /// every contact id is a `Uuid::now_v7()`: any write path that assigns a different id (a v4
+    /// from an import, say) silently escapes the bound, and so can be acted on by a selection
+    /// that was made before it existed. Any new way of creating contacts must keep minting v7 ids.
     pub as_of: Uuid,
 }
 
@@ -152,9 +158,11 @@ pub async fn untag(
     Ok(q.build().execute(db).await?.rows_affected())
 }
 
-/// Adds every selected contact to the list, as `add_member` does one: `status` is what a new
-/// member gets (`pending` on a double-opt-in list), an existing `pending` or `subscribed` row is
-/// left alone, and an `unsubscribed` one is let back in. Returns how many rows were written.
+/// Adds every selected contact who is not on the list yet, with `status` (`pending` on a
+/// double-opt-in list). A membership that exists is never touched: `pending` is not promoted past
+/// the confirmation the list requires, and `unsubscribed` is not reversed, because nobody has
+/// asked to be mailed again. Returns how many rows were written, so a count below the selection
+/// tells the user something was skipped.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
@@ -173,11 +181,7 @@ pub async fn subscribe(
         .push_bind(status)
         .push(" = 'subscribed' then now() end from contacts where ");
     push_selected(&mut q, sel, excluded);
-    q.push(
-        " on conflict (contact_id, list_id) do update \
-         set status = excluded.status, subscribed_at = excluded.subscribed_at, \
-         unsubscribed_at = null where list_memberships.status = 'unsubscribed'",
-    );
+    q.push(" on conflict (contact_id, list_id) do nothing");
     Ok(q.build().execute(db).await?.rows_affected())
 }
 

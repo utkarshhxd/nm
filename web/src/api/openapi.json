@@ -1582,7 +1582,8 @@
         "tags": [
           "crate::contacts::routes"
         ],
-        "summary": "Puts every contact in the selection on a list: `pending` on a double-opt-in list, `subscribed`\notherwise. Someone who unsubscribed is let back in, as `POST /contacts/{id}/lists` does.\nA suppression is not lifted: a suppressed address stays unmailable.",
+        "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
+        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.",
         "operationId": "bulk_subscribe_contacts",
         "parameters": [
           {
@@ -1608,7 +1609,7 @@
         },
         "responses": {
           "200": {
-            "description": "How many memberships were written",
+            "description": "How many memberships were added; contacts already on the list, whatever their status, are not counted",
             "content": {
               "application/json": {
                 "schema": {

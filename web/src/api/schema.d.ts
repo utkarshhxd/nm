@@ -488,9 +488,13 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Puts every contact in the selection on a list: `pending` on a double-opt-in list, `subscribed`
-         *     otherwise. Someone who unsubscribed is let back in, as `POST /contacts/{id}/lists` does.
-         *     A suppression is not lifted: a suppressed address stays unmailable.
+         * Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in
+         *     list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
+         *     promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
+         * @description This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
+         *     back in. One admin re-adding one named person is a considered act they answer for; a bulk
+         *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
+         *     gets a sender blocklisted. Do not "fix" the asymmetry.
          */
         post: operations["bulk_subscribe_contacts"];
         delete?: never;
@@ -3105,7 +3109,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description How many memberships were written */
+            /** @description How many memberships were added; contacts already on the list, whatever their status, are not counted */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -536,6 +536,13 @@ async fn finish_bulk(
     extra: Value,
     affected: u64,
 ) -> ApiResult<Json<BulkResult>> {
+    // The search text can be an address or a name, and the audit log outlives an erasure: record
+    // that a search was part of the selection, never what it said. Not a hash either: a hash of
+    // an address falls to a dictionary.
+    let mut filter = json!(selection.filter);
+    if !filter["q"].is_null() {
+        filter["q"] = json!("<redacted>");
+    }
     audit::record(
         &mut *tx,
         meta,
@@ -546,7 +553,7 @@ async fn finish_bulk(
             target_type: None,
             target_id: None,
             metadata: json!({
-                "filter": selection.filter,
+                "filter": filter,
                 "as_of": selection.as_of,
                 "excluded": target.excluded_ids.len(),
                 "affected": affected,
@@ -636,9 +643,14 @@ pub async fn bulk_untag_contacts(
     .await
 }
 
-/// Puts every contact in the selection on a list: `pending` on a double-opt-in list, `subscribed`
-/// otherwise. Someone who unsubscribed is let back in, as `POST /contacts/{id}/lists` does.
-/// A suppression is not lifted: a suppressed address stays unmailable.
+/// Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in
+/// list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
+/// promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
+///
+/// This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
+/// back in. One admin re-adding one named person is a considered act they answer for; a bulk
+/// action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
+/// gets a sender blocklisted. Do not "fix" the asymmetry.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe",
@@ -646,7 +658,7 @@ pub async fn bulk_untag_contacts(
     params(("workspace_id" = Uuid, Path, description = "Workspace id")),
     request_body = BulkList,
     responses(
-        (status = 200, description = "How many memberships were written", body = BulkResult),
+        (status = 200, description = "How many memberships were added; contacts already on the list, whatever their status, are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
         (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
