@@ -82,18 +82,54 @@ pub struct NewSuppression {
     pub note: Option<String>,
 }
 
-/// `true` if `email` may not be mailed from `workspace_id`: an address block or a domain block, in
-/// this workspace or instance-wide. The single-address path, matching on the HMAC so it sees an
-/// erasure tombstone too. It is for the send-time check (a later milestone), NOT for creating or
-/// importing a contact: it is true for every reason, so using it there would refuse anyone who ever
+/// Whose block it is: this workspace's own, or one set instance-wide that every workspace inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockLevel {
+    Workspace,
+    Instance,
+}
+
+/// The standing block that stops one address being mailed, and nothing else about it: not the
+/// row's id, note or who made it, and never another address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+pub struct Block {
+    pub reason: Reason,
+    pub level: BlockLevel,
+    /// Whether it blocks this one address or every address on its domain.
+    pub scope: Scope,
+}
+
+/// The block that stops `email` being mailed from `workspace_id`, or `None`: an address block or a
+/// domain block, in this workspace or instance-wide. The single-address path, matching on the HMAC
+/// so it sees an erasure tombstone too. When several apply, the workspace's own is reported before
+/// an instance-wide one, and an address block before a domain block. It is for the send-time check
+/// (a later milestone) and for explaining a contact's page, NOT for creating or importing a
+/// contact: it finds a block for every reason, so using it there would refuse anyone who ever
 /// bounced or unsubscribed. Creating a contact asks `is_erased` instead.
 ///
 /// A domain block is exact: it does not cover subdomains, so a send-time check must not assume it
 /// does.
 ///
 /// Normalises `email` itself, so a caller cannot get a bypass by passing another Unicode form. An
-/// address that cannot be normalised at all counts as suppressed: this is a safety check, and it
-/// must fail closed, not answer "go ahead" about something it could not read.
+/// address that cannot be normalised at all is an error, never `None`: this is a safety check, and
+/// it must fail closed, not answer "go ahead" about something it could not read.
+pub async fn blocking_suppression(
+    db: impl PgExecutor<'_>,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> sqlx::Result<Option<Block>> {
+    let Ok(email) = normalize_email(email) else {
+        return Err(sqlx::Error::Protocol(
+            "address cannot be normalised, so it cannot be checked".into(),
+        ));
+    };
+    blocking(db, secrets, workspace_id, &email).await
+}
+
+/// `true` if `email` may not be mailed from `workspace_id`: `blocking_suppression` found a block.
+/// An address that cannot be normalised counts as suppressed.
 pub async fn is_suppressed(
     db: impl PgExecutor<'_>,
     secrets: &Secrets,
@@ -103,24 +139,48 @@ pub async fn is_suppressed(
     let Ok(email) = normalize_email(email) else {
         return Ok(true);
     };
-    let hmac = suppression_hmac(secrets, &email);
+    Ok(blocking(db, secrets, workspace_id, &email).await?.is_some())
+}
+
+/// The one predicate behind both; `email` is already normalised.
+async fn blocking(
+    db: impl PgExecutor<'_>,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> sqlx::Result<Option<Block>> {
+    let hmac = suppression_hmac(secrets, email);
     // A normalised address has exactly one `@`.
     let domain = email.split_once('@').map_or("", |(_, d)| d);
     // `(workspace_id = $1 or workspace_id is null)` is workspace scope and instance scope; the two
-    // `exists` are address scope and domain scope. Each reaches its own partial index.
-    sqlx::query_scalar!(
-        r#"select (
-             exists (select 1 from suppressions where lifted_at is null and scope = 'address'
-                       and email_hmac = $2 and (workspace_id = $1 or workspace_id is null))
-             or exists (select 1 from suppressions where lifted_at is null and scope = 'domain'
-                       and domain = $3 and (workspace_id = $1 or workspace_id is null))
-           ) as "blocked!""#,
+    // arms are address scope and domain scope. Each reaches its own partial index. At most two rows
+    // per arm can be live (one per workspace, one instance-wide), so no arm needs a limit. `false
+    // < true` puts a workspace block first, and `address < domain` an address block.
+    let row = sqlx::query!(
+        r#"(select reason as "reason!: Reason", workspace_id is null as "instance!",
+                   scope as "scope!: Scope"
+            from suppressions where lifted_at is null and scope = 'address'
+              and email_hmac = $2 and (workspace_id = $1 or workspace_id is null))
+           union all
+           (select reason, workspace_id is null, scope
+            from suppressions where lifted_at is null and scope = 'domain'
+              and domain = $3 and (workspace_id = $1 or workspace_id is null))
+           order by 2, 3 limit 1"#,
         workspace_id,
         hmac.as_slice(),
         domain,
     )
-    .fetch_one(db)
-    .await
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| Block {
+        reason: r.reason,
+        level: if r.instance {
+            BlockLevel::Instance
+        } else {
+            BlockLevel::Workspace
+        },
+        scope: r.scope,
+    }))
 }
 
 /// Serialises everything that writes or checks the erasure of one address, until the transaction

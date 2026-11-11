@@ -6,7 +6,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { api, problemMessage } from "../api/client";
@@ -43,9 +43,24 @@ const fullName = (c: Contact) => `${c.first_name} ${c.last_name}`.trim();
 const date = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 const count = (n: number, noun: string) => `${n.toLocaleString()} ${noun}${n === 1 ? "" : "s"}`;
 
-const COLUMNS: Column<Contact>[] = [
+// The link is out of the tab order: the row is the grid's one tab stop, and Enter on it follows the link.
+const columns = (slug: string): Column<Contact>[] => [
   { id: "name", header: "Name", width: "20ch", cell: (c) => fullName(c) || "—" },
-  { id: "email", header: "Email", sortable: true, cell: (c) => c.email },
+  {
+    id: "email",
+    header: "Email",
+    sortable: true,
+    cell: (c) => (
+      <Link
+        to="/w/$slug/contacts/$contactId"
+        params={{ slug, contactId: c.id }}
+        tabIndex={-1}
+        className="text-accent-text underline"
+      >
+        {c.email}
+      </Link>
+    ),
+  },
   {
     id: "created",
     header: "Added",
@@ -60,7 +75,13 @@ export default function Contacts() {
   const { workspace } = useWorkspace();
   // The layout renders no `Outlet` until the workspace resolves, so this is only a type guard.
   if (!workspace) return null;
-  return <ContactsPage id={workspace.id} canEdit={atLeast(workspace.role, "editor")} />;
+  return (
+    <ContactsPage
+      id={workspace.id}
+      slug={workspace.slug}
+      canEdit={atLeast(workspace.role, "editor")}
+    />
+  );
 }
 
 type Filters = {
@@ -74,7 +95,7 @@ type Filters = {
 
 type Result = { tone: "ok" | "warn"; text: string };
 
-function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
+function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit: boolean }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate({ from: "/w/$slug/contacts" });
   const search = useSearch({ from: "/w/$slug/contacts" });
@@ -298,6 +319,7 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
     }
   }
 
+  const cols = useMemo(() => columns(slug), [slug]);
   const gridSort: Sort = { id: filters.sort, dir: filters.dir };
   function onSort(column: string) {
     if (column !== "email" && column !== "created") return;
@@ -449,7 +471,7 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
           <DataGrid
             key={shownKey.current}
             caption="Contacts"
-            columns={COLUMNS}
+            columns={cols}
             rows={rows}
             getId={(c) => c.id}
             rowOffset={rowOffset}

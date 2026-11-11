@@ -56,12 +56,22 @@ const text = (value: unknown) => (typeof value === "string" && value !== "" ? va
 const pick = <T extends string>(value: unknown, allowed: readonly T[]) =>
   allowed.find((a) => a === value);
 
+type ContactsSearch = {
+  q?: string | undefined;
+  sort?: "created" | "email" | undefined;
+  dir?: "asc" | "desc" | undefined;
+  list_id?: string | undefined;
+  list_status?: "pending" | "subscribed" | "unsubscribed" | undefined;
+  tag_id?: string | undefined;
+};
+
 // The view lives in the URL, so it can be linked and the back button works. An unknown value is
 // dropped rather than rejected: a hand-edited link still opens.
 const contactsRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "contacts",
-  validateSearch: (search: Record<string, unknown>) => ({
+  // Optional keys, so a plain link to the contacts page need not spell out an empty search.
+  validateSearch: (search: Record<string, unknown>): ContactsSearch => ({
     q: text(search["q"]),
     sort: pick(search["sort"], ["created", "email"]),
     dir: pick(search["dir"], ["asc", "desc"]),
@@ -70,6 +80,25 @@ const contactsRoute = createRoute({
     tag_id: text(search["tag_id"]),
   }),
   component: lazyRouteComponent(() => import("./routes/contacts")),
+});
+
+const contactRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "contacts/$contactId",
+  component: lazyRouteComponent(() => import("./routes/contact-detail")),
+});
+
+const listsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "lists",
+  component: lazyRouteComponent(() => import("./routes/lists")),
+});
+
+// The named export, so the one lists chunk serves both screens.
+const listRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "lists/$listId",
+  component: lazyRouteComponent(() => import("./routes/lists"), "ListDetail"),
 });
 
 const membersRoute = createRoute({
@@ -97,7 +126,15 @@ export const router = createRouter({
     accountSecurityRoute,
     inviteRoute,
     newWorkspaceRoute,
-    workspaceRoute.addChildren([contactsRoute, membersRoute, apiKeysRoute, auditLogRoute]),
+    workspaceRoute.addChildren([
+      contactsRoute,
+      contactRoute,
+      listsRoute,
+      listRoute,
+      membersRoute,
+      apiKeysRoute,
+      auditLogRoute,
+    ]),
   ]),
 });
 

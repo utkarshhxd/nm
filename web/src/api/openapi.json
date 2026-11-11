@@ -1979,6 +1979,51 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
+      "get": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Computed on the server because the answer can depend on an instance-wide block that a\nworkspace's own suppression list does not contain and its admins cannot read. It discloses only\nthe verdict for this one contact.",
+        "operationId": "contact_eligibility",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Eligibility"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase": {
       "post": {
         "tags": [
@@ -2194,6 +2239,74 @@
           },
           "404": {
             "description": "not a member, or the contact was never on this list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags": {
+      "get": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "list_contact_tags",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tags on the contact, newest tag first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Tag"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
           }
         }
       }
@@ -3578,6 +3691,35 @@
           }
         }
       },
+      "Block": {
+        "type": "object",
+        "description": "The standing block that stops one address being mailed, and nothing else about it: not the\nrow's id, note or who made it, and never another address.",
+        "required": [
+          "reason",
+          "level",
+          "scope"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/BlockLevel"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope",
+            "description": "Whether it blocks this one address or every address on its domain."
+          }
+        }
+      },
+      "BlockLevel": {
+        "type": "string",
+        "description": "Whose block it is: this workspace's own, or one set instance-wide that every workspace inherits.",
+        "enum": [
+          "workspace",
+          "instance"
+        ]
+      },
       "BulkList": {
         "allOf": [
           {
@@ -4012,6 +4154,30 @@
         "properties": {
           "password": {
             "type": "string"
+          }
+        }
+      },
+      "Eligibility": {
+        "type": "object",
+        "description": "Whether a contact may be mailed, and if a standing block stops it, which one.",
+        "required": [
+          "mailable"
+        ],
+        "properties": {
+          "blocked_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "The block that stops this address, whether it is this workspace's or the whole instance's.\nIt says nothing about any other address. A list membership that is `pending` or\n`unsubscribed` is a separate reason a contact is not mailed on that list, and is not here."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mailable": {
+            "type": "boolean",
+            "description": "`false` exactly when `blocked_by` is set."
           }
         }
       },

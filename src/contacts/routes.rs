@@ -21,7 +21,7 @@ use crate::{
     http::request_meta::RequestMeta,
     lists::{self, MembershipStatus},
     pagination::{Page, sorted::SortedPageParams},
-    suppressions::erase_address,
+    suppressions::{Block, blocking_suppression, erase_address},
     tags,
     workspaces::{roles::Role, validate_timezone},
 };
@@ -37,6 +37,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(get_contact)
                 .patch(update_contact)
                 .delete(delete_contact),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility",
+            axum::routing::get(contact_eligibility),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase",
@@ -159,6 +163,49 @@ pub async fn get_contact(
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
     Ok(Json(get(&mut conn, workspace_id, id).await?))
+}
+
+/// Whether a contact may be mailed, and if a standing block stops it, which one.
+#[derive(Serialize, ToSchema)]
+pub struct Eligibility {
+    /// `false` exactly when `blocked_by` is set.
+    pub mailable: bool,
+    /// The block that stops this address, whether it is this workspace's or the whole instance's.
+    /// It says nothing about any other address. A list membership that is `pending` or
+    /// `unsubscribed` is a separate reason a contact is not mailed on that list, and is not here.
+    pub blocked_by: Option<Block>,
+}
+
+/// Computed on the server because the answer can depend on an instance-wide block that a
+/// workspace's own suppression list does not contain and its admins cannot read. It discloses only
+/// the verdict for this one contact.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility",
+    operation_id = "contact_eligibility",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Contact id"),
+    ),
+    responses(
+        (status = 200, body = Eligibility),
+        (status = 404, description = "not a member, or no such contact in this workspace"),
+    ),
+)]
+pub async fn contact_eligibility(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<Json<Eligibility>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    let contact = get(&mut conn, workspace_id, id).await?;
+    let blocked_by =
+        blocking_suppression(&mut *conn, &state.secrets, workspace_id, &contact.email).await?;
+    Ok(Json(Eligibility {
+        mailable: blocked_by.is_none(),
+        blocked_by,
+    }))
 }
 
 #[utoipa::path(

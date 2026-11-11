@@ -594,6 +594,27 @@ export interface paths {
         patch: operations["update_contact"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Computed on the server because the answer can depend on an instance-wide block that a
+         *     workspace's own suppression list does not contain and its admins cannot read. It discloses only
+         *     the verdict for this one contact.
+         */
+        get: operations["contact_eligibility"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase": {
         parameters: {
             query?: never;
@@ -647,6 +668,22 @@ export interface paths {
          *     and keeps the membership.
          */
         delete: operations["remove_contact_from_list"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_contact_tags"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -940,6 +977,21 @@ export interface components {
             target_id?: string | null;
             target_type?: string | null;
         };
+        /**
+         * @description The standing block that stops one address being mailed, and nothing else about it: not the
+         *     row's id, note or who made it, and never another address.
+         */
+        Block: {
+            level: components["schemas"]["BlockLevel"];
+            reason: components["schemas"]["Reason"];
+            /** @description Whether it blocks this one address or every address on its domain. */
+            scope: components["schemas"]["Scope"];
+        };
+        /**
+         * @description Whose block it is: this workspace's own, or one set instance-wide that every workspace inherits.
+         * @enum {string}
+         */
+        BlockLevel: "workspace" | "instance";
         BulkList: components["schemas"]["BulkTarget"] & {
             /** Format: uuid */
             list_id: string;
@@ -1097,6 +1149,12 @@ export interface components {
         Dir: "asc" | "desc";
         DisableRequest: {
             password: string;
+        };
+        /** @description Whether a contact may be mailed, and if a standing block stops it, which one. */
+        Eligibility: {
+            blocked_by?: components["schemas"]["Block"] | null;
+            /** @description `false` exactly when `blocked_by` is set. */
+            mailable: boolean;
         };
         /**
          * @description How a field's value is typed, stored as snake_case text (a `check` constraint, not an enum).
@@ -3494,6 +3552,37 @@ export interface operations {
             };
         };
     };
+    contact_eligibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Eligibility"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     erase_contact: {
         parameters: {
             query?: never;
@@ -3650,6 +3739,50 @@ export interface operations {
             };
             /** @description not a member, or the contact was never on this list */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_contact_tags: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tags on the contact, newest tag first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Tag"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

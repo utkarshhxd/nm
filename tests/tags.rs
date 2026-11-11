@@ -363,3 +363,43 @@ async fn tag_actions_are_audited_without_personal_data(pool: PgPool) {
         "an address reached the audit log"
     );
 }
+
+#[sqlx::test]
+async fn a_contacts_tags_are_listed_and_scoped_to_the_workspace(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (ws_b, other) = workspace(&pool, "other").await;
+    let (vip, late) = (
+        create_tag(&app, ws, "vip").await,
+        create_tag(&app, ws, "late").await,
+    );
+    let contact = create_contact(&app, ws, "a@ex.test").await;
+    let bare = create_contact(&app, ws, "b@ex.test").await;
+    for tag in [vip, late] {
+        app.put(&applied_path(ws, contact, tag))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+    let url = |c: Uuid| format!("/api/v1/workspaces/{ws}/contacts/{c}/tags");
+    let r = app.get(&url(contact)).await;
+    r.assert_status_ok();
+    let names: Vec<_> = r.json::<Value>()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["late", "vip"]);
+    assert_eq!(app.get(&url(bare)).await.json::<Value>()["data"], json!([]));
+
+    // Not a member of that workspace, and a contact id that is not in this one: both 404.
+    other
+        .get(&url(contact))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    other
+        .get(&format!(
+            "/api/v1/workspaces/{ws_b}/contacts/{contact}/tags"
+        ))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+}

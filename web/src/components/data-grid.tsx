@@ -204,6 +204,10 @@ export function DataGrid<T>({
           selecting.onToggle(getId(rows[here] as T));
         }
         return;
+      case "Enter":
+        // The row is the tab stop, so its link (`tabindex=-1`) is opened from the row itself.
+        if (event.target === row) row.querySelector("a")?.click();
+        return;
       case "Escape":
         return selecting?.onClear();
       case "a":

@@ -344,3 +344,126 @@ async fn creating_a_contact_checks_the_single_address_path(pool: PgPool) {
         .unwrap();
     assert_eq!(live, 1);
 }
+
+fn eligibility_url(ws: Uuid, contact: Uuid) -> String {
+    format!("/api/v1/workspaces/{ws}/contacts/{contact}/eligibility")
+}
+
+async fn eligibility(app: &TestApp, ws: Uuid, contact: Uuid) -> Value {
+    let r = app.get(&eligibility_url(ws, contact)).await;
+    r.assert_status_ok();
+    r.json()
+}
+
+#[sqlx::test]
+async fn eligibility_of_an_unblocked_contact_is_mailable(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let c = create_contact(&app, ws, "a@ex.test").await;
+    assert_eq!(
+        eligibility(&app, ws, c).await,
+        json!({"mailable": true, "blocked_by": null})
+    );
+}
+
+#[sqlx::test]
+async fn eligibility_names_the_reason_and_the_level_for_every_combination(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let mut n = 0;
+    for reason in ALL_REASONS {
+        // A tombstone is address-scope only (the table forbids it on a domain).
+        let scopes: &[Scope] = if reason == Reason::GdprErasure {
+            &[Scope::Address]
+        } else {
+            &[Scope::Address, Scope::Domain]
+        };
+        for &scope in scopes {
+            for workspace_scope in [true, false] {
+                n += 1;
+                let email = format!("p{n}@d{n}.test");
+                let c = create_contact(&app, ws, &email).await;
+                assert_eq!(eligibility(&app, ws, c).await["mailable"], true);
+                let value = match scope {
+                    Scope::Address => email.clone(),
+                    Scope::Domain => format!("d{n}.test"),
+                };
+                suppress(&app, workspace_scope.then_some(ws), scope, &value, reason).await;
+                assert_eq!(
+                    eligibility(&app, ws, c).await,
+                    json!({"mailable": false, "blocked_by": {
+                        "reason": reason,
+                        "level": if workspace_scope { "workspace" } else { "instance" },
+                        "scope": scope,
+                    }}),
+                    "{reason:?} {scope:?} workspace_scope={workspace_scope}"
+                );
+            }
+        }
+    }
+    assert_eq!(n, 4 * 2 * 2 + 2);
+}
+
+/// The case that would otherwise show a workspace admin nothing: the block is instance-wide, and
+/// the workspace's own suppression list does not contain it.
+#[sqlx::test]
+async fn an_instance_wide_block_is_explained_though_the_workspace_list_is_empty(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let c = create_contact(&app, ws, "x@ex.test").await;
+    suppress(&app, None, Scope::Address, "x@ex.test", Reason::Complained).await;
+    let own = app
+        .get(&format!("/api/v1/workspaces/{ws}/suppressions"))
+        .await;
+    own.assert_status_ok();
+    assert_eq!(own.json::<Value>()["data"], json!([]));
+    assert_eq!(
+        eligibility(&app, ws, c).await["blocked_by"],
+        json!({"reason": "complained", "level": "instance", "scope": "address"})
+    );
+}
+
+#[sqlx::test]
+async fn a_workspace_block_is_reported_before_an_instance_one(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let c = create_contact(&app, ws, "x@ex.test").await;
+    suppress(&app, None, Scope::Domain, "ex.test", Reason::Manual).await;
+    suppress(&app, Some(ws), Scope::Address, "x@ex.test", Reason::Bounced).await;
+    assert_eq!(
+        eligibility(&app, ws, c).await["blocked_by"],
+        json!({"reason": "bounced", "level": "workspace", "scope": "address"})
+    );
+}
+
+#[sqlx::test]
+async fn a_lifted_block_no_longer_explains_anything(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let c = create_contact(&app, ws, "x@ex.test").await;
+    suppress(&app, Some(ws), Scope::Address, "x@ex.test", Reason::Manual).await;
+    sqlx::query("update suppressions set lifted_at = now()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(eligibility(&app, ws, c).await["mailable"], true);
+}
+
+#[sqlx::test]
+async fn eligibility_is_scoped_to_the_workspace_and_a_viewer_may_read_it(pool: PgPool) {
+    let (ws_a, a) = workspace(&pool, "acme").await;
+    let (ws_b, b) = workspace(&pool, "other").await;
+    let in_a = create_contact(&a, ws_a, "x@ex.test").await;
+    let in_b = create_contact(&b, ws_b, "y@ex.test").await;
+    // Another workspace, and another workspace's contact id in mine: both 404.
+    a.get(&eligibility_url(ws_b, in_b))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    a.get(&eligibility_url(ws_a, in_b))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    a.get(&eligibility_url(ws_a, Uuid::now_v7()))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    let viewer = create_user(&pool, "viewer@example.com", PW, false).await;
+    add_member(&pool, ws_a, viewer, Role::Viewer).await;
+    let mut v = TestApp::new(pool.clone()).await;
+    v.login("viewer@example.com", PW).await;
+    v.get(&eligibility_url(ws_a, in_a)).await.assert_status_ok();
+}

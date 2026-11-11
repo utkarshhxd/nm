@@ -11,6 +11,7 @@ use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
+    contacts,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult},
     http::request_meta::RequestMeta,
     lists::validate_name,
@@ -31,6 +32,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}",
             axum::routing::put(apply_tag).delete(remove_tag),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags",
+            axum::routing::get(list_contact_tags),
         )
 }
 
@@ -330,4 +335,45 @@ pub async fn remove_tag(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags",
+    operation_id = "list_contact_tags",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Contact id"),
+        PageParams,
+    ),
+    responses(
+        (status = 200, description = "The tags on the contact, newest tag first", body = Page<Tag>),
+        (status = 404, description = "not a member, or no such contact in this workspace"),
+        (status = 422, description = "a malformed cursor"),
+    ),
+)]
+pub async fn list_contact_tags(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+    ApiQuery(page): ApiQuery<PageParams>,
+) -> ApiResult<Json<Page<Tag>>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    contacts::get(&mut conn, workspace_id, id).await?;
+    let limit = page.limit();
+    let rows = sqlx::query_as!(
+        Tag,
+        "select t.id, t.name, t.created_at from contact_tags ct \
+         join tags t on t.workspace_id = ct.workspace_id and t.id = ct.tag_id \
+         where ct.workspace_id = $1 and ct.contact_id = $2 and ($3::uuid is null or t.id < $3) \
+         order by t.id desc limit $4",
+        workspace_id,
+        id,
+        page.after()?,
+        limit + 1,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Json(Page::from_rows(rows, limit, |t| t.id)))
 }
