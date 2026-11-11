@@ -24,7 +24,7 @@ Everything in M0's Global Constraints still applies. In addition:
 - Never stop, modify or remove the containers `oci-email-postgres` or `marketing-automation`. They belong to other projects. Always use compose project `-p nm`.
 
 **After any change to an API route or its types**
-- Regenerate the OpenAPI document and the TypeScript client, and commit both: `bash scripts/dev.sh cargo run -q -- openapi > openapi.json` then `pnpm -C web gen:schema`. CI fails if either is stale.
+- Regenerate the OpenAPI document and the TypeScript client, and commit both: `bash scripts/dev.sh pnpm -C web gen:api` (which regenerates `web/src/api/openapi.json` and `web/src/api/schema.d.ts`). CI fails if either is stale.
 - Re-run `bash scripts/dev.sh cargo sqlx prepare -- --all-targets` and commit `.sqlx/`. CI builds offline.
 - Every `operationId` must be unique across the whole document; `src/openapi.rs` has a test that fails otherwise. utoipa derives the id from the handler's function name, so name handlers distinctly (`list_contacts`, not `list`).
 
@@ -118,7 +118,7 @@ git commit -m "fix: normalise emails to NFC before lowercasing"
 
 **Files:**
 - Create: `migrations/0010_custom_fields.sql`, `src/custom_fields/mod.rs`, `src/custom_fields/routes.rs`
-- Modify: `src/lib.rs` (declare the module), `src/app.rs` (merge the router), `src/audit/mod.rs` (action constants), `src/openapi.rs` (register paths and schemas)
+- Modify: `src/lib.rs` (declare the module), `src/http/mod.rs` (merge the router), `src/audit/mod.rs` (action constants), `src/openapi.rs` (register paths and schemas)
 - Test: `tests/custom_fields.rs`
 
 **Interfaces:**
@@ -162,10 +162,9 @@ Expected: PASS.
 - [ ] **Step 6: Regenerate the API artefacts and commit**
 
 ```bash
-bash scripts/dev.sh cargo run -q -- openapi > openapi.json
-pnpm -C web gen:schema
+bash scripts/dev.sh pnpm -C web gen:api
 bash scripts/dev.sh cargo sqlx prepare -- --all-targets
-git add migrations src/custom_fields src/lib.rs src/app.rs src/audit/mod.rs src/openapi.rs tests/custom_fields.rs openapi.json web/src/api/schema.d.ts .sqlx
+git add migrations src/custom_fields src/lib.rs src/http/mod.rs src/audit/mod.rs src/openapi.rs tests/custom_fields.rs web/src/api/openapi.json web/src/api/schema.d.ts .sqlx
 git commit -m "feat: custom field definitions, archived rather than destroyed"
 ```
 
@@ -175,7 +174,7 @@ git commit -m "feat: custom field definitions, archived rather than destroyed"
 
 **Files:**
 - Create: `migrations/0011_contacts.sql`, `src/contacts/mod.rs`, `src/contacts/routes.rs`
-- Modify: `src/lib.rs`, `src/app.rs`, `src/audit/mod.rs`, `src/openapi.rs`
+- Modify: `src/lib.rs`, `src/http/mod.rs`, `src/audit/mod.rs`, `src/openapi.rs`
 - Test: `tests/contacts.rs`
 
 **Interfaces:**
@@ -289,7 +288,7 @@ git commit -m "feat: keyset pagination with a sort key, and contact search"
 
 **Files:**
 - Create: `migrations/0012_lists.sql`, `src/lists/mod.rs`, `src/lists/routes.rs`
-- Modify: `src/lib.rs`, `src/app.rs`, `src/audit/mod.rs`, `src/openapi.rs`
+- Modify: `src/lib.rs`, `src/http/mod.rs`, `src/audit/mod.rs`, `src/openapi.rs`
 - Test: `tests/lists.rs`
 
 **Interfaces:**
@@ -345,7 +344,7 @@ git commit -m "feat: lists and memberships, with pending only on double opt-in"
 
 **Files:**
 - Create: `migrations/0013_tags.sql`, `src/tags/mod.rs`, `src/tags/routes.rs`
-- Modify: `src/lib.rs`, `src/app.rs`, `src/audit/mod.rs`, `src/openapi.rs`
+- Modify: `src/lib.rs`, `src/http/mod.rs`, `src/audit/mod.rs`, `src/openapi.rs`
 - Test: `tests/tags.rs`
 
 **Interfaces:**
@@ -393,7 +392,7 @@ git commit -m "feat: tags"
 
 **Files:**
 - Create: `migrations/0014_suppressions.sql`, `src/suppressions/mod.rs`, `src/suppressions/routes.rs`
-- Modify: `src/crypto/mod.rs` (add the HMAC helper), `src/lib.rs`, `src/app.rs`, `src/audit/mod.rs`, `src/openapi.rs`
+- Modify: `src/crypto/mod.rs` (add the HMAC helper), `src/lib.rs`, `src/http/mod.rs`, `src/audit/mod.rs`, `src/openapi.rs`
 - Test: `tests/suppressions.rs`
 
 **Interfaces:**

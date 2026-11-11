@@ -149,9 +149,14 @@ unsalted means one sweep covers every user at once.
   Every `create` caller is inside a transaction, where a "best-effort" delete would abort the
   sign-in.
 - **Run the full test suite as `cargo test -- --test-threads=4`.** The dev container reports 16
-  CPUs but the WSL2 VM is capped near 3.9 GB, and each `#[sqlx::test]` costs an argon2 at
-  m=19456 KiB plus its own database. Unthrottled, it killed the Docker engine three times. CI is
-  unaffected.
+  CPUs but the WSL2 VM is capped at 4 GB by the host's `~/.wslconfig`, and each `#[sqlx::test]`
+  costs an argon2 at m=19456 KiB plus its own database. CI is unaffected.
+  **Corrected during M1a:** `--test-threads` alone does not protect the engine. The crashes
+  happen in the *compile* phase, while rustc links the integration-test binaries in parallel —
+  the engine dies before a single test runs, so a test-phase limit cannot help. `scripts/dev.sh`
+  now sets `CARGO_BUILD_JOBS=2` for every command it runs, which is the actual fix; the
+  `--test-threads=4` limit stays for the argon2 cost at run time. Raising `memory=` in the host's
+  `~/.wslconfig` would remove both constraints.
 - A full-suite run occasionally dies with `error reading contents of migration directory` — the
   Windows bind mount under concurrent compilation. Re-run once before investigating.
 
