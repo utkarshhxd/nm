@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select user_id from memberships where workspace_id = $1 and role = 'owner' order by user_id for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "memberships",
+            "name": "user_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4e05fe03d93e0ce5c1f51e82d73c47db56c9997fb6a08a6451574309a770072a"
+}

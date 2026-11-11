@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update sessions set last_seen_at = now() where id_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a684da0fb205db78781b18fabf0c51dcd19f7d956e5777abdc1e35749463fb52"
+}

@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nm
+      POSTGRES_PASSWORD: nm
+      POSTGRES_DB: nm
+    ports:
+      - "5432:5432"
+    volumes:
+      - nm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nm -d nm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Linux build environment (Windows can't link Rust here). Run via scripts/dev.sh.
+  dev:
+    profiles: ["tools"]
+    build:
+      context: docker
+      dockerfile: dev.Dockerfile
+    working_dir: /work
+    # `.env` is how NM_SECRET_KEY reaches the container: compose's own `--env-file` only feeds
+    # variable substitution in this file, never the process environment inside the service.
+    # Optional, so a clone that has not run `cp .env.example .env` yet still builds and tests.
+    env_file:
+      - path: .env
+        required: false
+    # Set after `env_file`, so these win: inside the container Postgres is the service `postgres`,
+    # never `localhost`.
+    environment:
+      DATABASE_URL: postgres://nm:nm@postgres:5432/nm
+      NM_DATABASE_URL: postgres://nm:nm@postgres:5432/nm
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/work
+      - nm_target:/work/target
+      - nm_cargo_registry:/usr/local/cargo/registry
+      - nm_cargo_git:/usr/local/cargo/git
+      # Linux-native install, kept off the Windows bind mount: esbuild and rollup ship
+      # platform-specific binaries, and the host filesystem is slow for a tree this size.
+      - nm_web_node_modules:/work/web/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  nm_pgdata:
+  nm_target:
+  nm_cargo_registry:
+  nm_cargo_git:
+  nm_web_node_modules:

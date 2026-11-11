@@ -1,0 +1,39 @@
+[advisories]
+version = 2
+yanked = "deny"
+# RUSTSEC-2023-0071 (Marvin attack): a timing side channel in RSA PRIVATE-key operations (PKCS#1 v1.5
+# decryption and signing). No patched `rsa` exists upstream. Ignored because:
+#  - `rsa` reaches us only through `webauthn-rs`, which uses it for RS256 signature VERIFICATION only
+#    (webauthn-rs-core `crypto.rs:552`, crypto-glue `x509/chain.rs:368`): a public-key operation.
+#  - NM holds no RSA private key and performs no RSA private-key operation, which is exactly what the
+#    attack targets.
+# RE-VERIFY ON EVERY `webauthn-rs` OR `crypto-glue` BUMP: crypto-glue already ships private-key
+# operations (`new_key`, `oaep_sha256_decrypt`) that a future version could start using, and this
+# ignore would silently cover that. If either is reached by a new caller, drop the ignore.
+ignore = ["RUSTSEC-2023-0071"]
+
+[licenses]
+version = 2
+private = { ignore = true } # exempts our own unpublished crate
+unused-allowed-license = "allow"
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "GPL-3.0-only",
+  "GPL-3.0-or-later",
+  "AGPL-3.0-only",
+  "AGPL-3.0-or-later",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

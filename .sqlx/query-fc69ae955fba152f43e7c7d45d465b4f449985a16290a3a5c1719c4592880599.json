@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select w.name as workspace_name, i.email, i.role as \"role: Role\",\n                  exists(select 1 from users u where u.email = i.email) as \"account_exists!\"\n           from invites i join workspaces w on w.id = i.workspace_id\n           where i.token_hash = $1 and i.accepted_at is null and i.revoked_at is null\n             and i.expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workspaces",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "invites",
+            "name": "email"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "role: Role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "invites",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "account_exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "fc69ae955fba152f43e7c7d45d465b4f449985a16290a3a5c1719c4592880599"
+}

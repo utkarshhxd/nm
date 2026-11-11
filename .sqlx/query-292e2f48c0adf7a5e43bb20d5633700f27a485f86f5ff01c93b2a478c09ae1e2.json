@@ -1,0 +1,150 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select a.id, a.action, a.actor_user_id, a.actor_api_key_id,\n                  u.email as \"actor_email?\", k.prefix as \"actor_api_key_prefix?\",\n                  a.target_type, a.target_id, a.ip as \"ip: IpAddr\", a.metadata, a.created_at\n           from audit_log a\n           left join users u on u.id = a.actor_user_id\n           left join api_keys k on k.id = a.actor_api_key_id\n           where a.workspace_id = $1 and ($2::uuid is null or a.id < $2)\n           order by a.id desc limit $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "action",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "action"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "actor_user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "actor_user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "actor_api_key_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "actor_api_key_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "actor_email?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "email"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "actor_api_key_prefix?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "target_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "target_type"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "target_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "ip: IpAddr",
+        "type_info": "Inet",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "ip"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "metadata",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "metadata"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "292e2f48c0adf7a5e43bb20d5633700f27a485f86f5ff01c93b2a478c09ae1e2"
+}

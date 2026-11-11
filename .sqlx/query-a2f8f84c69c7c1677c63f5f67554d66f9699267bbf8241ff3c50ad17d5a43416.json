@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select email, role as \"role: Role\" from invites\n           where id = $1 and workspace_id = $2 and accepted_at is null and revoked_at is null\n           for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "invites",
+            "name": "email"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "role: Role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "invites",
+            "name": "role"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "a2f8f84c69c7c1677c63f5f67554d66f9699267bbf8241ff3c50ad17d5a43416"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into memberships (workspace_id, user_id, role) values ($1, $2, $3) on conflict do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "58b092d62ec36b867461801ad45ffecdc4f2de4a12972f57a4b5fa76e7c1d839"
+}
