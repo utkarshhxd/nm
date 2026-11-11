@@ -133,10 +133,10 @@ pub fn check_excluded(excluded: &[Uuid]) -> ApiResult<()> {
 
 /// `422` if no ids, or more than `MAX_IDS`, are named.
 pub fn check_ids(ids: &[Uuid]) -> ApiResult<()> {
-    if ids.len() > MAX_IDS {
+    if ids.is_empty() || ids.len() > MAX_IDS {
         return Err(ApiError::Validation(vec![FieldError::new(
             "ids",
-            format!("at most {MAX_IDS} ids can be selected"),
+            format!("name between 1 and {MAX_IDS} ids"),
         )]));
     }
     Ok(())

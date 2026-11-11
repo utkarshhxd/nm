@@ -79,6 +79,13 @@ function rowPx(): number {
  * every rendered row and `aria-rowcount` is `-1` until the real total is known; without them a
  * screen reader announces "row 3 of 40" for whatever happens to be rendered third.
  *
+ * Tab stops: the rows are ONE stop however many are loaded; the header's select-all checkbox and
+ * its sort buttons are ordinary stops, so the grid is a small, fixed number of them (four on the
+ * contacts table). That is deliberate and bounded: the rule exists so nobody tabs through a
+ * million rows, and three header controls that Tab reaches directly are more discoverable than
+ * arrow-only access. Do not "fix" it by roving the header row too, and do not let it grow with
+ * the data.
+ *
  * Remount it (`key`) when the query changes: scroll and focus then start over by construction.
  *
  * shortcut: no cell navigation, Shift-range selection, Ctrl+Home or sticky identity column; add

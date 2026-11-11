@@ -799,3 +799,47 @@ async fn creating_a_selection_reports_how_many_it_matched(pool: PgPool) {
         .await;
     assert_eq!(all.json::<Value>()["selected"], 5);
 }
+
+/// The irreversible one. Workspace A names workspace B's contacts to `bulk/delete`: they must
+/// survive, and neither number may reveal that those ids exist somewhere else. The workspace is
+/// scoped in both the `sel` CTE and the delete statement, so a one-layer regression would not
+/// redden this; removing both does.
+#[sqlx::test]
+async fn an_id_list_cannot_delete_another_workspaces_contacts(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (ws2, app2) = workspace(&pool, "other").await;
+    let mine = contacts(&app, ws, "m", 1).await;
+    let theirs = contacts(&app2, ws2, "t", 3).await;
+
+    let r = bulk(&app, ws, "delete", json!({"ids": theirs})).await;
+    r.assert_status_ok();
+    let v: Value = r.json();
+    assert_eq!((&v["selected"], &v["affected"]), (&json!(0), &json!(0)));
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 4);
+
+    // The same request with one of its own is scoped, not rejected.
+    let r = bulk(&app, ws, "delete", json!({"ids": [theirs[0], mine[0]]})).await;
+    let v: Value = r.json();
+    assert_eq!((&v["selected"], &v["affected"]), (&json!(1), &json!(1)));
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
+    assert_eq!(count_in(&pool, ws2).await, 3);
+}
+
+/// An empty list is not a selection: 422, and no audit row for an action that did nothing.
+#[sqlx::test]
+async fn an_empty_id_list_is_422_and_writes_no_audit_row(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    let before = count(&pool, "select count(*) from audit_log").await;
+    let r = bulk(&app, ws, "tag", json!({"ids": [], "tag_id": vip})).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(count(&pool, "select count(*) from audit_log").await, before);
+}
+
+async fn count_in(pool: &PgPool, ws: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from contacts where workspace_id = $1")
+        .bind(ws)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
