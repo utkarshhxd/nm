@@ -166,7 +166,8 @@ pub async fn add_member(
         Some(s) => Ok(s),
         None => Ok(sqlx::query_scalar!(
             r#"select status as "status: MembershipStatus" from list_memberships
-               where contact_id = $1 and list_id = $2"#,
+               where workspace_id = $1 and contact_id = $2 and list_id = $3"#,
+            workspace_id,
             contact_id,
             list_id,
         )

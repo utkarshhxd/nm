@@ -373,6 +373,35 @@ async fn roles_and_validation(pool: PgPool) {
         .await
         .assert_status(StatusCode::FORBIDDEN);
 
+    // Every write route refuses a viewer with `insufficient-role`. Each request is one that would
+    // succeed for an editor, so the 403 can only be the role. The member is already on the list,
+    // so a removal that got through would show in the row.
+    let member = create_contact(&editor, ws, "m@ex.test").await;
+    let outsider = create_contact(&editor, ws, "o@ex.test").await;
+    add(&editor, ws, list, member).await;
+    let forbidden = |r: axum_test::TestResponse| {
+        r.assert_status(StatusCode::FORBIDDEN);
+        assert_eq!(problem_type(&r), "urn:nm:problem:insufficient-role");
+    };
+    forbidden(viewer.patch(&one).json(&json!({"name": "renamed"})).await);
+    forbidden(
+        viewer
+            .post(&members_path(ws, list))
+            .json(&json!({"contact_id": outsider}))
+            .await,
+    );
+    forbidden(
+        viewer
+            .delete(&format!("{}/{member}", members_path(ws, list)))
+            .await,
+    );
+    let by_contact = format!("/api/v1/workspaces/{ws}/contacts/{member}/lists");
+    forbidden(viewer.delete(&format!("{by_contact}/{list}")).await);
+    // And none of it took effect.
+    assert_eq!(editor.get(&one).await.json::<Value>()["name"], "news");
+    assert_eq!(count_memberships(&pool).await, 1);
+    assert_eq!(row(&pool, list, member).await.0, "pending");
+
     // A blank name, and an unknown field.
     for body in [json!({"name": "  "}), json!({"name": "ok", "slug": "x"})] {
         editor
