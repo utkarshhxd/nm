@@ -252,7 +252,10 @@ impl ContactFilter {
 
 /// One page of contacts in `params`' order, after `params`' cursor. The keyset predicate compares
 /// `(sort_value, id)` as a row, in the column order of `contacts_keyset_email`, so the index
-/// serves both the filter and the order.
+/// serves both the filter and the order. Today the `id` half of that pair is unobservable: `email`
+/// is unique per workspace and `created` sorts by id alone. It is there for the first sort key
+/// that is not unique, and keeping it is what keeps the column order Postgres needs to use
+/// `contacts_keyset_email`. Do not remove it as dead weight.
 pub async fn list(
     db: &mut PgConnection,
     workspace_id: Uuid,
@@ -291,6 +294,8 @@ pub async fn list(
     }
     q.push(match sort {
         ContactSort::Email => format!(" order by email {order}, id {order}"),
+        // Creation order only because contact ids are `Uuid::now_v7()`: a contact imported with a
+        // v4 id would land at a random position.
         ContactSort::Created => format!(" order by id {order}"),
     });
     q.push(" limit ").push_bind(limit + 1);
