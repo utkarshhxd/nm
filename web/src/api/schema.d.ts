@@ -884,18 +884,22 @@ export interface components {
             secret: string;
         };
         /**
-         * @description A partial update: a field left out is left alone. The address cannot change, so `email` is an
-         *     unknown field here and is rejected, not ignored.
+         * @description A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit
+         *     `null` removes it. The address cannot change, so `email` is an unknown field here and is
+         *     rejected, not ignored.
          */
         UpdateContact: {
             /**
-             * @description Merged into the stored attributes key by key: a key left out keeps its value. A value
-             *     cannot be set to `null`; purging the field is how values are removed.
+             * @description Merged into the stored attributes key by key: a key left out keeps its value. A key set to
+             *     `null` is removed, also for an archived field; any other value for an archived field is
+             *     refused. `attributes` itself cannot be `null`.
              */
             attributes?: unknown;
+            /** @description `null` clears it to an empty string. */
             first_name?: string | null;
+            /** @description `null` clears it to an empty string. */
             last_name?: string | null;
-            /** @description An IANA time zone such as `Europe/London`. */
+            /** @description An IANA time zone such as `Europe/London`. `null` clears it. */
             timezone?: string | null;
         };
         /**

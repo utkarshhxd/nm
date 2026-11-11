@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update contacts set first_name = coalesce($3, first_name), last_name = coalesce($4, last_name), timezone = case when $5 then $6 else timezone end, attributes = (attributes - $7::text[]) || coalesce($8, '{}'::jsonb), updated_at = now() where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Bool",
+        "Text",
+        "TextArray",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "14599736deef2728233b700c1849b7d9c11c60fc212456afe07a08623aa6b19b"
+}

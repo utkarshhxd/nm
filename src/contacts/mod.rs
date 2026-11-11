@@ -64,7 +64,8 @@ pub(crate) fn validate_name(field: &'static str, raw: &str) -> Result<String, Fi
 /// returns it canonicalised: dates as `YYYY-MM-DD`, datetimes as UTC RFC 3339. Rejects an unknown
 /// key, a value of the wrong type, and ANY value for an archived field. `definitions_for` returns
 /// archived definitions so that existing values stay readable, so this is the one place that
-/// stops an archived field taking fresh data. `null` is not a value.
+/// stops an archived field taking fresh data. `null` is not a value: it is rejected here, and
+/// `validate_attributes_patch` is where it means "remove".
 pub fn validate_attributes(defs: &[Definition], attrs: &Value) -> Result<Value, Vec<FieldError>> {
     let Some(attrs) = attrs.as_object() else {
         return Err(vec![FieldError::new("attributes", "must be an object")]);
@@ -90,6 +91,34 @@ pub fn validate_attributes(defs: &[Definition], attrs: &Value) -> Result<Value, 
         Ok(Value::Object(out))
     } else {
         Err(errors)
+    }
+}
+
+/// `validate_attributes` for a merge patch (RFC 7386): returns the canonicalised values to set and
+/// the keys to remove. A `null` removes the key. Removal is not new data, so it is allowed for an
+/// archived field: without that, one person's value could only ever go by purging the field for
+/// the whole workspace. A key that names no field at all is still an error.
+pub fn validate_attributes_patch(
+    defs: &[Definition],
+    attrs: &Value,
+) -> Result<(Value, Vec<String>), Vec<FieldError>> {
+    let Some(map) = attrs.as_object() else {
+        return Err(vec![FieldError::new("attributes", "must be an object")]);
+    };
+    let (nulls, sets): (Map<String, Value>, Map<String, Value>) =
+        map.clone().into_iter().partition(|(_, v)| v.is_null());
+    let mut errors: Vec<FieldError> = nulls
+        .keys()
+        .filter(|k| !defs.iter().any(|d| d.key == **k))
+        .map(|k| FieldError::new(format!("attributes.{k}"), "no such custom field"))
+        .collect();
+    let sets = validate_attributes(defs, &Value::Object(sets));
+    match (errors.is_empty(), sets) {
+        (true, Ok(sets)) => Ok((sets, nulls.into_iter().map(|(k, _)| k).collect())),
+        (_, sets) => {
+            errors.extend(sets.err().into_iter().flatten());
+            Err(errors)
+        }
     }
 }
 
@@ -207,6 +236,15 @@ mod tests {
         let e = validate_attributes(&defs, &json!({"plan": "pro"})).unwrap_err();
         assert_eq!(e[0].field, "attributes.plan");
         assert!(validate_attributes(&defs, &json!({})).is_ok());
+    }
+
+    #[test]
+    fn null_removes_even_for_an_archived_field() {
+        let defs = [def("plan", FieldKind::Text, &[], true)];
+        let (sets, removed) = validate_attributes_patch(&defs, &json!({"plan": null})).unwrap();
+        assert_eq!((sets, removed), (json!({}), vec!["plan".to_owned()]));
+        assert!(validate_attributes_patch(&defs, &json!({"plan": "x"})).is_err());
+        assert!(validate_attributes_patch(&defs, &json!({"nope": null})).is_err());
     }
 
     #[test]

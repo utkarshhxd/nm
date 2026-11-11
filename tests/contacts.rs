@@ -606,3 +606,201 @@ async fn cross_workspace_get_is_404(pool: PgPool) {
     assert_eq!(count_contacts(&pool, ws2).await, 0);
     assert_eq!(get_contact(&editor1, ws1, theirs).await["first_name"], "");
 }
+
+/// The `fields` list of the newest `contact.updated` audit row, and the row's whole metadata text.
+async fn last_update_audit(pool: &PgPool, ws: Uuid) -> (Vec<String>, String) {
+    let m: Value = sqlx::query_scalar(
+        "select metadata from audit_log where workspace_id = $1 and action = 'contact.updated' \
+         order by id desc limit 1",
+    )
+    .bind(ws)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let fields = m["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap().to_owned())
+        .collect();
+    (fields, m.to_string())
+}
+
+#[sqlx::test]
+async fn null_clears_and_absent_leaves_alone(pool: PgPool) {
+    let (ws, editor, admin) = workspace(&pool, "acme").await;
+    for key in ["plan", "tier"] {
+        create_field(
+            &admin,
+            ws,
+            json!({"key": key, "label": key, "kind": "text"}),
+        )
+        .await;
+    }
+    let id = create_contact(
+        &editor,
+        ws,
+        json!({"email": "a@example.com", "first_name": "Ada", "last_name": "Lovelace",
+               "timezone": "Europe/London", "attributes": {"plan": "pro", "tier": "gold"}}),
+    )
+    .await;
+    let path = format!("{}/{id}", contacts_path(ws));
+    let full = get_contact(&editor, ws, id).await;
+
+    // Absent means unchanged, for every field.
+    let r = editor.patch(&path).json(&json!({})).await;
+    r.assert_status_ok();
+    let c = r.json::<Value>();
+    for k in ["first_name", "last_name", "timezone", "attributes"] {
+        assert_eq!(c[k], full[k], "{k}");
+    }
+
+    // null clears the time zone, and says so in the audit row.
+    let r = editor.patch(&path).json(&json!({"timezone": null})).await;
+    r.assert_status_ok();
+    let c = r.json::<Value>();
+    assert_eq!(c["timezone"], Value::Null);
+    assert_eq!(c["first_name"], "Ada");
+    assert_eq!(c["attributes"], full["attributes"]);
+    assert_eq!(last_update_audit(&pool, ws).await.0, ["timezone"]);
+
+    // A name is trimmed like any other write.
+    let r = editor
+        .patch(&path)
+        .json(&json!({"first_name": "  Grace "}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["first_name"], "Grace");
+
+    // null clears a name to "", and "" still does too.
+    let r = editor
+        .patch(&path)
+        .json(&json!({"first_name": null, "last_name": ""}))
+        .await;
+    r.assert_status_ok();
+    let c = r.json::<Value>();
+    assert_eq!(
+        (c["first_name"].as_str(), c["last_name"].as_str()),
+        (Some(""), Some(""))
+    );
+    assert_eq!(
+        last_update_audit(&pool, ws).await.0,
+        ["first_name", "last_name"]
+    );
+
+    // null removes one attribute key and leaves the others.
+    let r = editor
+        .patch(&path)
+        .json(&json!({"attributes": {"plan": null}}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["attributes"], json!({"tier": "gold"}));
+    assert_eq!(last_update_audit(&pool, ws).await.0, ["attributes.plan"]);
+
+    // Removing and setting in one request.
+    let r = editor
+        .patch(&path)
+        .json(&json!({"attributes": {"tier": null, "plan": "free"}}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["attributes"], json!({"plan": "free"}));
+
+    // Clearing a key that is not a custom field is still a typo, and attributes itself is not
+    // clearable by null.
+    for body in [
+        json!({"attributes": {"nope": null}}),
+        json!({"attributes": null}),
+    ] {
+        editor
+            .patch(&path)
+            .json(&body)
+            .await
+            .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[sqlx::test]
+async fn null_removes_the_value_of_an_archived_field(pool: PgPool) {
+    let (ws, editor, admin) = workspace(&pool, "acme").await;
+    let plan = create_field(
+        &admin,
+        ws,
+        json!({"key": "plan", "label": "Plan", "kind": "text"}),
+    )
+    .await;
+    create_field(
+        &admin,
+        ws,
+        json!({"key": "tier", "label": "Tier", "kind": "text"}),
+    )
+    .await;
+    let id = create_contact(
+        &editor,
+        ws,
+        json!({"email": "a@example.com", "attributes": {"plan": "pro", "tier": "gold"}}),
+    )
+    .await;
+    let other = create_contact(
+        &editor,
+        ws,
+        json!({"email": "b@example.com", "attributes": {"plan": "free"}}),
+    )
+    .await;
+    archive(&admin, ws, plan).await;
+
+    // New data is refused, removal is not: one person's value can be corrected or erased without
+    // purging the field for the whole workspace.
+    let path = format!("{}/{id}", contacts_path(ws));
+    editor
+        .patch(&path)
+        .json(&json!({"attributes": {"plan": "new"}}))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let r = editor
+        .patch(&path)
+        .json(&json!({"attributes": {"plan": null}}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["attributes"], json!({"tier": "gold"}));
+    assert_eq!(last_update_audit(&pool, ws).await.0, ["attributes.plan"]);
+    assert_eq!(
+        get_contact(&editor, ws, other).await["attributes"],
+        json!({"plan": "free"})
+    );
+}
+
+#[sqlx::test]
+async fn update_audit_holds_no_personal_data(pool: PgPool) {
+    let (ws, editor, admin) = workspace(&pool, "acme").await;
+    create_field(
+        &admin,
+        ws,
+        json!({"key": "plan", "label": "Plan", "kind": "text"}),
+    )
+    .await;
+    let id = create_contact(&editor, ws, json!({"email": "secret.person@example.com"})).await;
+    editor
+        .patch(&format!("{}/{id}", contacts_path(ws)))
+        .json(&json!({"first_name": "Zebulon", "last_name": "Quimby",
+                      "timezone": "Asia/Kolkata", "attributes": {"plan": "sekrit-value"}}))
+        .await
+        .assert_status_ok();
+    let (fields, text) = last_update_audit(&pool, ws).await;
+    assert_eq!(
+        fields,
+        ["first_name", "last_name", "timezone", "attributes.plan"]
+    );
+    for leaked in [
+        "secret.person",
+        "example.com",
+        "Zebulon",
+        "Quimby",
+        "Kolkata",
+        "sekrit",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "audit metadata leaked {leaked}: {text}"
+        );
+    }
+}

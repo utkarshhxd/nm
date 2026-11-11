@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{Contact, NewContact, create, get, validate_attributes, validate_name};
+use super::{Contact, NewContact, create, get, validate_attributes_patch, validate_name};
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
@@ -31,18 +31,40 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// A partial update: a field left out is left alone. The address cannot change, so `email` is an
-/// unknown field here and is rejected, not ignored.
+/// A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit
+/// `null` removes it. The address cannot change, so `email` is an unknown field here and is
+/// rejected, not ignored.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateContact {
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    /// Merged into the stored attributes key by key: a key left out keeps its value. A value
-    /// cannot be set to `null`; purging the field is how values are removed.
+    /// `null` clears it to an empty string.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>)]
+    pub first_name: Option<Option<String>>,
+    /// `null` clears it to an empty string.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>)]
+    pub last_name: Option<Option<String>>,
+    /// Merged into the stored attributes key by key: a key left out keeps its value. A key set to
+    /// `null` is removed, also for an archived field; any other value for an archived field is
+    /// refused. `attributes` itself cannot be `null`.
+    #[serde(default, deserialize_with = "present")]
     pub attributes: Option<Value>,
-    /// An IANA time zone such as `Europe/London`.
-    pub timezone: Option<String>,
+    /// An IANA time zone such as `Europe/London`. `null` clears it.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>)]
+    pub timezone: Option<Option<String>>,
+}
+
+/// With `#[serde(default)]`, tells a key that is absent (`None`) from one that is present, even as
+/// `null` (`Some(..)`). A plain `Option<T>` maps both to `None`, so a `null` would be silently
+/// ignored.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 #[utoipa::path(
@@ -138,20 +160,21 @@ pub async fn update_contact(
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
 
-    let first = input
-        .first_name
-        .as_deref()
-        .map(|n| validate_name("first_name", n))
-        .transpose();
-    let last = input
-        .last_name
-        .as_deref()
-        .map(|n| validate_name("last_name", n))
-        .transpose();
-    let tz = input.timezone.as_deref().map(validate_timezone).transpose();
+    // `Some(None)` is an explicit `null`; `None` is a key that was not sent.
+    let name = |field: &'static str, v: &Option<Option<String>>| {
+        v.as_ref()
+            .map(|n| validate_name(field, n.as_deref().unwrap_or_default()))
+            .transpose()
+    };
+    let first = name("first_name", &input.first_name);
+    let last = name("last_name", &input.last_name);
+    let tz = match &input.timezone {
+        Some(Some(t)) => validate_timezone(t).map(Some),
+        _ => Ok(None),
+    };
     let attrs = match &input.attributes {
         Some(a) => {
-            validate_attributes(&definitions_for(&mut *tx, workspace_id).await?, a).map(Some)
+            validate_attributes_patch(&definitions_for(&mut *tx, workspace_id).await?, a).map(Some)
         }
         None => Ok(None),
     };
@@ -163,38 +186,51 @@ pub async fn update_contact(
         errors.extend(attrs.err().into_iter().flatten());
         return Err(ApiError::Validation(errors));
     };
+    let (sets, removed) = match attrs {
+        Some((sets, removed)) => (Some(sets), removed.as_slice()),
+        None => (None, [].as_slice()),
+    };
 
-    // `||` on jsonb merges the top-level keys: a partial update erases nothing it did not name.
+    // A name left out is kept; `null` clears it to "". `timezone` needs its own flag, because
+    // `null` there means NULL and so cannot also mean "unchanged". The attributes first lose the
+    // removed keys, then merge the rest with `||`, which touches only the keys it names.
     let updated = sqlx::query!(
         "update contacts set first_name = coalesce($3, first_name), \
-         last_name = coalesce($4, last_name), timezone = coalesce($5, timezone), \
-         attributes = attributes || coalesce($6, '{}'::jsonb), updated_at = now() \
+         last_name = coalesce($4, last_name), \
+         timezone = case when $5 then $6 else timezone end, \
+         attributes = (attributes - $7::text[]) || coalesce($8, '{}'::jsonb), updated_at = now() \
          where workspace_id = $1 and id = $2",
         workspace_id,
         id,
-        first.as_ref(),
-        last.as_ref(),
+        first.as_deref(),
+        last.as_deref(),
+        input.timezone.is_some(),
         tz.as_deref(),
-        attrs.as_ref(),
+        removed,
+        sets,
     )
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
-    // Which fields changed, never their values: a name or an attribute can be personal data.
+    // Which fields changed or were cleared, never their values: a name or an attribute can be
+    // personal data, and the audit log outlives an erasure.
     let mut fields: Vec<String> = [
-        ("first_name", first.is_some()),
-        ("last_name", last.is_some()),
-        ("timezone", tz.is_some()),
+        ("first_name", input.first_name.is_some()),
+        ("last_name", input.last_name.is_some()),
+        ("timezone", input.timezone.is_some()),
     ]
     .into_iter()
     .filter(|(_, sent)| *sent)
     .map(|(name, _)| name.to_owned())
     .collect();
-    if let Some(Value::Object(a)) = attrs {
-        fields.extend(a.keys().map(|k| format!("attributes.{k}")));
-    }
+    let touched = sets
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .chain(removed);
+    fields.extend(touched.map(|k| format!("attributes.{k}")));
     audit::record(
         &mut *tx,
         &meta,
