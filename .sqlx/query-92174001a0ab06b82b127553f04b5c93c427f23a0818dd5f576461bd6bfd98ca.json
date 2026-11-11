@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into suppressions (id, workspace_id, scope, email_hmac, reason) values ($1, $2, 'address', $3, 'gdpr_erasure')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "92174001a0ab06b82b127553f04b5c93c427f23a0818dd5f576461bd6bfd98ca"
+}

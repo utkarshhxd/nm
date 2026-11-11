@@ -478,6 +478,27 @@ export interface paths {
         patch: operations["update_contact"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * GDPR erasure: deletes the contact, its list memberships and its tags, and leaves a block that
+         *     keeps the address from being mailed or added again. Admin only, and not reversible: no route
+         *     lifts it. A mistake is fixed with `DELETE`, which blocks nothing.
+         */
+        post: operations["erase_contact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists": {
         parameters: {
             query?: never;
@@ -2844,7 +2865,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description email-taken */
+            /** @description email-taken; or address-erased: this address was erased and can never be added again */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2970,6 +2991,43 @@ export interface operations {
             };
             /** @description invalid name, time zone or attribute, or an unknown field such as `email` */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    erase_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Erased. The address can never be added again */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: erasing a contact takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

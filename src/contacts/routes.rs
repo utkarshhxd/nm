@@ -17,6 +17,7 @@ use crate::{
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
     pagination::{Page, sorted::SortedPageParams},
+    suppressions::erase_address,
     workspaces::{roles::Role, validate_timezone},
 };
 
@@ -31,6 +32,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(get_contact)
                 .patch(update_contact)
                 .delete(delete_contact),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase",
+            axum::routing::post(erase_contact),
         )
 }
 
@@ -137,7 +142,7 @@ pub async fn get_contact(
         (status = 201, body = Contact),
         (status = 403, description = "insufficient-role: creating a contact takes editor"),
         (status = 404, description = "not a member, or no such workspace"),
-        (status = 409, description = "email-taken"),
+        (status = 409, description = "email-taken; or address-erased: this address was erased and can never be added again"),
         (status = 422, description = "invalid address, name, time zone or attribute"),
     ),
 )]
@@ -150,7 +155,7 @@ pub async fn create_contact(
 ) -> ApiResult<(StatusCode, Json<Contact>)> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
-    let id = create(&mut tx, workspace_id, input).await?;
+    let id = create(&mut tx, &state.secrets, workspace_id, input).await?;
     // The address is personal data an erasure must be able to remove, and the audit log is not
     // erased: record the id only.
     audit::record(
@@ -327,6 +332,64 @@ pub async fn delete_contact(
             workspace_id: Some(workspace_id),
             actor: principal.actor(),
             action: actions::CONTACT_DELETED,
+            target_type: Some("contact"),
+            target_id: Some(id.to_string()),
+            metadata: json!({}),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GDPR erasure: deletes the contact, its list memberships and its tags, and leaves a block that
+/// keeps the address from being mailed or added again. Admin only, and not reversible: no route
+/// lifts it. A mistake is fixed with `DELETE`, which blocks nothing.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase",
+    operation_id = "erase_contact",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Contact id"),
+    ),
+    responses(
+        (status = 204, description = "Erased. The address can never be added again"),
+        (status = 403, description = "insufficient-role: erasing a contact takes admin"),
+        (status = 404, description = "not a member, or no such contact in this workspace"),
+    ),
+)]
+pub async fn erase_contact(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let mut tx = state.pool.begin().await?;
+    authorize(&mut *tx, &principal, workspace_id, Role::Admin).await?;
+    // The address is read here only to hash it; the tombstone takes the lock before the delete,
+    // so a concurrent create of the same address either sees the tombstone or is deleted by us.
+    let email = get(&mut tx, workspace_id, id).await?.email;
+    erase_address(&mut tx, &state.secrets, workspace_id, &email).await?;
+    let deleted = sqlx::query!(
+        "delete from contacts where workspace_id = $1 and id = $2",
+        workspace_id,
+        id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    // The audit log outlives the contact and admins read it: the id and the action, never the
+    // address, or the erasure would not have erased anything.
+    audit::record(
+        &mut *tx,
+        &meta,
+        AuditEvent {
+            workspace_id: Some(workspace_id),
+            actor: principal.actor(),
+            action: actions::CONTACT_ERASED,
             target_type: Some("contact"),
             target_id: Some(id.to_string()),
             metadata: json!({}),

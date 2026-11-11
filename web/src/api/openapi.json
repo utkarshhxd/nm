@@ -1517,7 +1517,7 @@
             "description": "not a member, or no such workspace"
           },
           "409": {
-            "description": "email-taken"
+            "description": "email-taken; or address-erased: this address was erased and can never be added again"
           },
           "422": {
             "description": "invalid address, name, time zone or attribute"
@@ -1663,6 +1663,48 @@
           },
           "422": {
             "description": "invalid name, time zone or attribute, or an unknown field such as `email`"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "GDPR erasure: deletes the contact, its list memberships and its tags, and leaves a block that\nkeeps the address from being mailed or added again. Admin only, and not reversible: no route\nlifts it. A mistake is fixed with `DELETE`, which blocks nothing.",
+        "operationId": "erase_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Erased. The address can never be added again"
+          },
+          "403": {
+            "description": "insufficient-role: erasing a contact takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
           }
         }
       }

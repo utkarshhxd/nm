@@ -51,6 +51,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::contacts::routes::create_contact,
         crate::contacts::routes::update_contact,
         crate::contacts::routes::delete_contact,
+        crate::contacts::routes::erase_contact,
         crate::lists::routes::list_lists,
         crate::lists::routes::get_list,
         crate::lists::routes::create_list,

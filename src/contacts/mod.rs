@@ -11,6 +11,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
+    crypto::secrets::Secrets,
     custom_fields::{Definition, FieldKind, definitions_for},
     error::{ApiError, ApiResult, FieldError},
     lists::MembershipStatus,
@@ -18,6 +19,7 @@ use crate::{
         Page,
         sorted::{ContactSort, Dir, SortedPageParams, page},
     },
+    suppressions::is_erased,
     users::normalize_email,
     workspaces::validate_timezone,
 };
@@ -165,8 +167,13 @@ fn canonical_value(d: &Definition, v: &Value) -> Result<Value, &'static str> {
 
 /// Inserts a contact and returns its id. The caller passes the transaction (so the audit row
 /// commits with it) and has already authorised the actor. `409 email-taken` if the normalised
-/// address exists in this workspace; `422` per invalid field.
-pub async fn create(db: &mut PgConnection, workspace_id: Uuid, new: NewContact) -> ApiResult<Uuid> {
+/// address exists in this workspace, `409 address-erased` if it was erased; `422` per invalid field.
+pub async fn create(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    new: NewContact,
+) -> ApiResult<Uuid> {
     let email = normalize_email(&new.email);
     let first = validate_name("first_name", new.first_name.as_deref().unwrap_or(""));
     let last = validate_name("last_name", new.last_name.as_deref().unwrap_or(""));
@@ -183,6 +190,11 @@ pub async fn create(db: &mut PgConnection, workspace_id: Uuid, new: NewContact) 
         errors.extend(attrs.err().into_iter().flatten());
         return Err(ApiError::Validation(errors));
     };
+    // Erasure is permanent: a tombstoned address never becomes a contact again, however it
+    // arrives. This is what stops the next import re-creating the person.
+    if is_erased(&mut *db, secrets, workspace_id, email).await? {
+        return Err(ApiError::Conflict("address-erased"));
+    }
     let id = Uuid::now_v7();
     sqlx::query!(
         "insert into contacts (id, workspace_id, email, first_name, last_name, attributes, timezone) \

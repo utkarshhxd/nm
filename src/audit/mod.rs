@@ -34,6 +34,7 @@ pub mod actions {
     pub const CONTACT_CREATED: &str = "contact.created";
     pub const CONTACT_UPDATED: &str = "contact.updated";
     pub const CONTACT_DELETED: &str = "contact.deleted";
+    pub const CONTACT_ERASED: &str = "contact.erased";
     pub const LIST_CREATED: &str = "list.created";
     pub const LIST_UPDATED: &str = "list.updated";
     pub const LIST_DELETED: &str = "list.deleted";

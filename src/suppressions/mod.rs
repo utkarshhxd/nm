@@ -120,6 +120,75 @@ pub async fn is_suppressed(
     .await
 }
 
+/// Serialises everything that writes or checks the erasure of one address, until the transaction
+/// ends. Without it a contact create could read "no tombstone", an erase could commit, and the
+/// create could then insert: a contact for an erased address.
+async fn lock_address(db: &mut PgConnection, hmac: &[u8; 32]) -> sqlx::Result<()> {
+    let key = i64::from_be_bytes(hmac[..8].try_into().expect("32 bytes"));
+    sqlx::query!("select pg_advisory_xact_lock($1)", key)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// `true` if `email` was erased in `workspace_id` (or instance-wide). Narrower than
+/// `is_suppressed`, on purpose: a bounced or unsubscribed address may still be a contact (the
+/// eligibility view keeps it from being mailed), an erased one may not. Takes a lock held to the
+/// end of the transaction, so the caller must be about to write (see `lock_address`). An address
+/// that cannot be normalised counts as erased: refuse, never guess.
+pub async fn is_erased(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> sqlx::Result<bool> {
+    let Ok(email) = normalize_email(email) else {
+        return Ok(true);
+    };
+    let hmac = suppression_hmac(secrets, &email);
+    lock_address(db, &hmac).await?;
+    sqlx::query_scalar!(
+        r#"select exists (select 1 from suppressions where reason = 'gdpr_erasure'
+                            and email_hmac = $2 and (workspace_id = $1 or workspace_id is null))
+           as "erased!""#,
+        workspace_id,
+        hmac.as_slice(),
+    )
+    .fetch_one(db)
+    .await
+}
+
+/// Writes the erasure tombstone for an already-normalised `email`: the hash and no plaintext. Any
+/// other row for the address in this workspace (live or lifted, with its plaintext) is deleted
+/// first, so nothing readable survives and the tombstone cannot collide with a live block. The
+/// caller passes the transaction that deletes the contact.
+pub async fn erase_address(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> sqlx::Result<()> {
+    let hmac = suppression_hmac(secrets, email);
+    lock_address(db, &hmac).await?;
+    sqlx::query!(
+        "delete from suppressions where workspace_id = $1 and scope = 'address' and email_hmac = $2",
+        workspace_id,
+        hmac.as_slice(),
+    )
+    .execute(&mut *db)
+    .await?;
+    sqlx::query!(
+        "insert into suppressions (id, workspace_id, scope, email_hmac, reason) \
+         values ($1, $2, 'address', $3, 'gdpr_erasure')",
+        Uuid::now_v7(),
+        workspace_id,
+        hmac.as_slice(),
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// The domain of `x@<raw>` under exactly the rules `normalize_email` applies to an address, so a
 /// domain block and an address on that domain can never disagree about the spelling.
 fn normalize_domain(raw: &str) -> Result<String, FieldError> {
