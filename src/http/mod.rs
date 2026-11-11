@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
         .merge(crate::auth::routes())
         .merge(crate::workspaces::routes())
         .merge(crate::custom_fields::routes::routes())
+        .merge(crate::contacts::routes::routes())
         .merge(crate::audit::routes::routes())
         .merge(crate::openapi::docs())
         // Catch-all for unknown `/api/*` paths. A route rather than `Router::fallback`

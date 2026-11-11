@@ -22,6 +22,9 @@ pub enum FieldKind {
     Text,
     Number,
     Date,
+    // snake_case would spell it `date_time`; the check constraint and the spec say `datetime`.
+    #[serde(rename = "datetime")]
+    #[sqlx(rename = "datetime")]
     DateTime,
     Boolean,
     Select,

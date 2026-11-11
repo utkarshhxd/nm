@@ -5,6 +5,7 @@ pub mod audit;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod contacts;
 pub mod crypto;
 pub mod custom_fields;
 pub mod db;

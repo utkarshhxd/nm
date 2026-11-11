@@ -410,6 +410,42 @@ export interface paths {
         patch: operations["change_role"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_contact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_contact"];
+        put?: never;
+        post?: never;
+        /**
+         * A hard delete. It writes no suppression: the address may be added again. Erasing a person for
+         *     GDPR is a different, admin-only action.
+         */
+        delete: operations["delete_contact"];
+        options?: never;
+        head?: never;
+        patch: operations["update_contact"];
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/custom-fields": {
         parameters: {
             query?: never;
@@ -539,6 +575,20 @@ export interface components {
             /** @description Shown only here. */
             recovery_codes: string[];
         };
+        Contact: {
+            /** @description Custom field values by field key. Values of archived fields stay readable here. */
+            attributes: unknown;
+            /** Format: date-time */
+            created_at: string;
+            email: string;
+            first_name: string;
+            /** Format: uuid */
+            id: string;
+            last_name: string;
+            timezone?: string | null;
+            /** Format: date-time */
+            updated_at: string;
+        };
         /** @description The one response that carries the key. */
         CreatedApiKey: {
             /** Format: date-time */
@@ -587,7 +637,7 @@ export interface components {
          * @description How a field's value is typed, stored as snake_case text (a `check` constraint, not an enum).
          * @enum {string}
          */
-        FieldKind: "text" | "number" | "date" | "date_time" | "boolean" | "select" | "multi_select";
+        FieldKind: "text" | "number" | "date" | "datetime" | "boolean" | "select" | "multi_select";
         FinishRequest: {
             /** Format: uuid */
             challenge_id: string;
@@ -662,6 +712,17 @@ export interface components {
             name: string;
             /** @description `viewer`, `editor` or `admin`, and no higher than the caller's own role. */
             role: components["schemas"]["Role"];
+        };
+        /** @description A contact to insert. Nothing here is trusted: `create` validates every field. */
+        NewContact: {
+            /** @description Custom field values by field key; see `validate_attributes` for what each kind accepts. */
+            attributes?: unknown;
+            /** @description Normalised (trimmed, NFC, lowercased) before it is stored. */
+            email: string;
+            first_name?: string | null;
+            last_name?: string | null;
+            /** @description An IANA time zone such as `Europe/London`. */
+            timezone?: string | null;
         };
         NewCustomField: {
             /**
@@ -821,6 +882,21 @@ export interface components {
             otpauth_url: string;
             /** @description Base32 secret, shown only here. */
             secret: string;
+        };
+        /**
+         * @description A partial update: a field left out is left alone. The address cannot change, so `email` is an
+         *     unknown field here and is rejected, not ignored.
+         */
+        UpdateContact: {
+            /**
+             * @description Merged into the stored attributes key by key: a key left out keeps its value. A value
+             *     cannot be set to `null`; purging the field is how values are removed.
+             */
+            attributes?: unknown;
+            first_name?: string | null;
+            last_name?: string | null;
+            /** @description An IANA time zone such as `Europe/London`. */
+            timezone?: string | null;
         };
         /**
          * @description `key` is immutable, so an unknown field (`key` included) is rejected, not ignored. `kind` is
@@ -2027,6 +2103,177 @@ export interface operations {
             };
             /** @description last-owner */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewContact"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Contact"];
+                };
+            };
+            /** @description insufficient-role: creating a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description email-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid address, name, time zone or attribute */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Contact"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. Nothing is suppressed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateContact"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Contact"];
+                };
+            };
+            /** @description insufficient-role: editing a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name, time zone or attribute, or an unknown field such as `email` */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

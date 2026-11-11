@@ -31,6 +31,9 @@ pub mod actions {
     pub const CUSTOM_FIELD_UPDATED: &str = "custom_field.updated";
     pub const CUSTOM_FIELD_ARCHIVED: &str = "custom_field.archived";
     pub const CUSTOM_FIELD_PURGED: &str = "custom_field.purged";
+    pub const CONTACT_CREATED: &str = "contact.created";
+    pub const CONTACT_UPDATED: &str = "contact.updated";
+    pub const CONTACT_DELETED: &str = "contact.deleted";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

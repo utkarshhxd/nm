@@ -378,17 +378,14 @@ pub async fn purge_custom_field(
     if field.archived_at.is_none() {
         return Err(ApiError::Conflict("field-not-archived"));
     }
-    // Unchecked `sqlx::query`, because `contacts` does not exist until the next task; the macro
-    // cannot compile against it. That task MUST turn this into `query!` and add a
-    // `purge_strips_the_key` test to `tests/contacts.rs`.
     // shortcut: one statement in one transaction, holding a row lock per contact until it
     // commits; batch it if a single workspace ever holds enough contacts for that to hurt.
-    let affected = sqlx::query(
+    let affected = sqlx::query!(
         "update contacts set attributes = attributes - $2::text, updated_at = now() \
          where workspace_id = $1 and attributes ? $2",
+        workspace_id,
+        field.key,
     )
-    .bind(workspace_id)
-    .bind(&field.key)
     .execute(&mut *tx)
     .await?
     .rows_affected();

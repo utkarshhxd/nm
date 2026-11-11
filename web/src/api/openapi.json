@@ -1225,6 +1225,201 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/contacts": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "create_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewContact"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "email-taken"
+          },
+          "422": {
+            "description": "invalid address, name, time zone or attribute"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}": {
+      "get": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "get_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "A hard delete. It writes no suppression: the address may be added again. Erasing a person for\nGDPR is a different, admin-only action.",
+        "operationId": "delete_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. Nothing is suppressed"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "update_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateContact"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "invalid name, time zone or attribute, or an unknown field such as `email`"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/custom-fields": {
       "get": {
         "tags": [
@@ -1716,6 +1911,50 @@
           }
         }
       },
+      "Contact": {
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "first_name",
+          "last_name",
+          "attributes",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "attributes": {
+            "description": "Custom field values by field key. Values of archived fields stay readable here."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "email": {
+            "type": "string"
+          },
+          "first_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_name": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "CreatedApiKey": {
         "type": "object",
         "description": "The one response that carries the key.",
@@ -1855,7 +2094,7 @@
           "text",
           "number",
           "date",
-          "date_time",
+          "datetime",
           "boolean",
           "select",
           "multi_select"
@@ -2093,6 +2332,42 @@
             "description": "`viewer`, `editor` or `admin`, and no higher than the caller's own role."
           }
         }
+      },
+      "NewContact": {
+        "type": "object",
+        "description": "A contact to insert. Nothing here is trusted: `create` validates every field.",
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "attributes": {
+            "description": "Custom field values by field key; see `validate_attributes` for what each kind accepts."
+          },
+          "email": {
+            "type": "string",
+            "description": "Normalised (trimmed, NFC, lowercased) before it is stored."
+          },
+          "first_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An IANA time zone such as `Europe/London`."
+          }
+        },
+        "additionalProperties": false
       },
       "NewCustomField": {
         "type": "object",
@@ -2650,6 +2925,35 @@
             "description": "Base32 secret, shown only here."
           }
         }
+      },
+      "UpdateContact": {
+        "type": "object",
+        "description": "A partial update: a field left out is left alone. The address cannot change, so `email` is an\nunknown field here and is rejected, not ignored.",
+        "properties": {
+          "attributes": {
+            "description": "Merged into the stored attributes key by key: a key left out keeps its value. A value\ncannot be set to `null`; purging the field is how values are removed."
+          },
+          "first_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An IANA time zone such as `Europe/London`."
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateCustomField": {
         "type": "object",

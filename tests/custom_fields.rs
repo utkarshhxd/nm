@@ -220,9 +220,8 @@ async fn delete_archives_the_field(pool: PgPool) {
         ]
     );
 
-    // `delete_archives_and_keeps_values` — that after DELETE a contact's value is still readable —
-    // needs a contact to hold one, so it lives in `tests/contacts.rs`, written with the contacts
-    // table in the next task.
+    // `delete_archives_and_keeps_values`: that after DELETE a contact's value is still readable,
+    // needs a contact to hold one, so it lives in `tests/contacts.rs`.
 }
 
 #[sqlx::test]
