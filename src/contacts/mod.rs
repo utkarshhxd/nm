@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Contacts: the people a workspace sends email to. A contact has no status column: an opt-out is
-//! a suppression keyed by address (a later task), so it survives erasure and re-import.
+//! a suppression keyed by address, so it survives erasure and re-import.
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -168,6 +168,9 @@ fn canonical_value(d: &Definition, v: &Value) -> Result<Value, &'static str> {
 /// Inserts a contact and returns its id. The caller passes the transaction (so the audit row
 /// commits with it) and has already authorised the actor. `409 email-taken` if the normalised
 /// address exists in this workspace, `409 address-erased` if it was erased; `422` per invalid field.
+///
+/// Every write path into `contacts` must go through this function or re-check `suppressions::is_erased`
+/// itself: the erasure guard lives here, so a bulk `INSERT` elsewhere bypasses it silently.
 pub async fn create(
     db: &mut PgConnection,
     secrets: &Secrets,

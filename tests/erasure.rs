@@ -342,3 +342,25 @@ async fn erasing_a_blocked_address_replaces_the_block_and_keeps_no_plaintext(poo
             .unwrap();
     assert_eq!(rows, vec![(None, "gdpr_erasure".to_owned())]);
 }
+
+/// An erasure is one workspace's. The boundary is the `workspace_id = $1 or workspace_id is null`
+/// clause in `is_erased`: over-reaching would let one tenant's erasure block another tenant's
+/// legitimate contact.
+#[sqlx::test]
+async fn an_erasure_does_not_block_the_same_address_in_another_workspace(pool: PgPool) {
+    let a = workspace(&pool, "acme").await;
+    let b = workspace(&pool, "other").await;
+    let (c, ..) = mailable_contact(&a, ADDRESS).await;
+    a.admin
+        .post(&erase_path(a.id, c))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    create_contact(&b.editor, b.id, ADDRESS)
+        .await
+        .assert_status(StatusCode::CREATED);
+    // And still refused in the workspace that erased it.
+    create_contact(&a.editor, a.id, ADDRESS)
+        .await
+        .assert_status(StatusCode::CONFLICT);
+}

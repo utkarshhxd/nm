@@ -83,10 +83,13 @@ pub struct NewSuppression {
 }
 
 /// `true` if `email` may not be mailed from `workspace_id`: an address block or a domain block, in
-/// this workspace or instance-wide. The single-address path (a contact being created or imported),
-/// and the only one that sees an erasure tombstone, because it matches on the HMAC rather than on
-/// plaintext. A domain block is exact: it does not cover subdomains, so a send-time check must not
-/// assume it does.
+/// this workspace or instance-wide. The single-address path, matching on the HMAC so it sees an
+/// erasure tombstone too. It is for the send-time check (a later milestone), NOT for creating or
+/// importing a contact: it is true for every reason, so using it there would refuse anyone who ever
+/// bounced or unsubscribed. Creating a contact asks `is_erased` instead.
+///
+/// A domain block is exact: it does not cover subdomains, so a send-time check must not assume it
+/// does.
 ///
 /// Normalises `email` itself, so a caller cannot get a bypass by passing another Unicode form. An
 /// address that cannot be normalised at all counts as suppressed: this is a safety check, and it
@@ -123,6 +126,12 @@ pub async fn is_suppressed(
 /// Serialises everything that writes or checks the erasure of one address, until the transaction
 /// ends. Without it a contact create could read "no tombstone", an erase could commit, and the
 /// create could then insert: a contact for an erased address.
+///
+/// SHORTCUT: one lock per address, held to the end of the transaction. Fine for one create or one
+/// erase. A bulk path writing N addresses in ONE transaction would hold N locks in the shared lock
+/// table (`out of shared memory ... increase max_locks_per_transaction`), and two concurrent bulk
+/// writers taking them in different orders would deadlock. Such a path must batch into short
+/// sub-transactions and acquire the locks in sorted key order.
 async fn lock_address(db: &mut PgConnection, hmac: &[u8; 32]) -> sqlx::Result<()> {
     let key = i64::from_be_bytes(hmac[..8].try_into().expect("32 bytes"));
     sqlx::query!("select pg_advisory_xact_lock($1)", key)
