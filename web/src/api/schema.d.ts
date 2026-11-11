@@ -458,6 +458,118 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * A hard delete of every contact in the selection. Like `DELETE /contacts/{id}` it writes no
+         *     suppression: the addresses may be added again. It is not erasure.
+         */
+        post: operations["bulk_delete_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Puts every contact in the selection on a list: `pending` on a double-opt-in list, `subscribed`
+         *     otherwise. Someone who unsubscribed is let back in, as `POST /contacts/{id}/lists` does.
+         *     A suppression is not lifted: a suppressed address stays unmailable.
+         */
+        post: operations["bulk_subscribe_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/tag": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Tags every contact in the selection. */
+        post: operations["bulk_tag_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Unsubscribes every member of the selection from a list. */
+        post: operations["bulk_unsubscribe_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/untag": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Takes a tag off every contact in the selection. */
+        post: operations["bulk_untag_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/selection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Freezes "the contacts this filter matches" at this moment. The token holds the filter and a
+         *     time bound, not the contacts: contacts created afterwards are never part of it.
+         */
+        post: operations["create_contact_selection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts/{id}": {
         parameters: {
             query?: never;
@@ -824,6 +936,28 @@ export interface components {
             target_id?: string | null;
             target_type?: string | null;
         };
+        BulkList: components["schemas"]["BulkTarget"] & {
+            /** Format: uuid */
+            list_id: string;
+        };
+        /**
+         * @description How many contacts a bulk action changed. This can be fewer than the selection held: contacts
+         *     already in the wanted state, excluded, or deleted since are not counted.
+         */
+        BulkResult: {
+            /** Format: int64 */
+            affected: number;
+        };
+        BulkTag: components["schemas"]["BulkTarget"] & {
+            /** Format: uuid */
+            tag_id: string;
+        };
+        /** @description What a bulk route acts on: the selection, less the contacts the user ticked off. */
+        BulkTarget: {
+            /** @description Contacts to leave out. At most 10 000. */
+            excluded_ids?: string[];
+            selection_token: string;
+        };
         ChallengeResponse: {
             /**
              * Format: uuid
@@ -860,6 +994,27 @@ export interface components {
             timezone?: string | null;
             /** Format: date-time */
             updated_at: string;
+        };
+        /**
+         * @description Which contacts a list shows. It is embedded in a signed selection token later, so its
+         *     serialised form is part of that token's payload: renaming a field would invalidate tokens
+         *     already issued.
+         */
+        ContactFilter: {
+            /**
+             * Format: uuid
+             * @description Contacts with a membership row on this list, whatever its status: a `pending` or
+             *     `unsubscribed` member is still a member here. A list of another workspace matches nothing.
+             */
+            list_id?: string | null;
+            list_status?: components["schemas"]["MembershipStatus"] | null;
+            /** @description Case-insensitive substring of the address or name. */
+            q?: string | null;
+            /**
+             * Format: uuid
+             * @description Contacts with this tag. A tag of another workspace matches nothing.
+             */
+            tag_id?: string | null;
         };
         /** @description One list a contact is on, as the contact's page shows it. */
         ContactList: {
@@ -1351,6 +1506,11 @@ export interface components {
         SecondFactorRequest: {
             code?: string | null;
             recovery_code?: string | null;
+        };
+        /** @description The signed token for a selection; see `selection`. */
+        SelectionToken: {
+            /** @description Valid for one hour. Pass it to a `bulk/*` route. */
+            selection_token: string;
         };
         SetupResponse: {
             otpauth_url: string;
@@ -2873,6 +3033,293 @@ export interface operations {
                 content?: never;
             };
             /** @description invalid address, name, time zone or attribute */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_delete_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkTarget"];
+            };
+        };
+        responses: {
+            /** @description How many were deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_subscribe_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkList"];
+            };
+        };
+        responses: {
+            /** @description How many memberships were written */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such list, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_tag_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkTag"];
+            };
+        };
+        responses: {
+            /** @description How many were newly tagged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such tag, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_unsubscribe_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkList"];
+            };
+        };
+        responses: {
+            /** @description How many were unsubscribed now; those already unsubscribed or not on the list are not counted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such list, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_untag_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkTag"];
+            };
+        };
+        responses: {
+            /** @description How many had the tag */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such tag, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_contact_selection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContactFilter"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SelectionToken"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a `q` under 3 characters, or a `list_status` without a `list_id` */
             422: {
                 headers: {
                     [name: string]: unknown;

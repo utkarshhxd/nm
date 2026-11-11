@@ -1525,6 +1525,317 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "A hard delete of every contact in the selection. Like `DELETE /contacts/{id}` it writes no\nsuppression: the addresses may be added again. It is not erasure.",
+        "operationId": "bulk_delete_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTarget"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many were deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Puts every contact in the selection on a list: `pending` on a double-opt-in list, `subscribed`\notherwise. Someone who unsubscribed is let back in, as `POST /contacts/{id}/lists` does.\nA suppression is not lifted: a suppressed address stays unmailable.",
+        "operationId": "bulk_subscribe_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many memberships were written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such list, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/tag": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Tags every contact in the selection.",
+        "operationId": "bulk_tag_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many were newly tagged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such tag, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Unsubscribes every member of the selection from a list.",
+        "operationId": "bulk_unsubscribe_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many were unsubscribed now; those already unsubscribed or not on the list are not counted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such list, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/untag": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Takes a tag off every contact in the selection.",
+        "operationId": "bulk_untag_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many had the tag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such tag, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/selection": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Freezes \"the contacts this filter matches\" at this moment. The token holds the filter and a\ntime bound, not the contacts: contacts created afterwards are never part of it.",
+        "operationId": "create_contact_selection",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContactFilter"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SelectionToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a `q` under 3 characters, or a `list_status` without a `list_id`"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts/{id}": {
       "get": {
         "tags": [
@@ -3266,6 +3577,78 @@
           }
         }
       },
+      "BulkList": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BulkTarget"
+          },
+          {
+            "type": "object",
+            "required": [
+              "list_id"
+            ],
+            "properties": {
+              "list_id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            }
+          }
+        ]
+      },
+      "BulkResult": {
+        "type": "object",
+        "description": "How many contacts a bulk action changed. This can be fewer than the selection held: contacts\nalready in the wanted state, excluded, or deleted since are not counted.",
+        "required": [
+          "affected"
+        ],
+        "properties": {
+          "affected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "BulkTag": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BulkTarget"
+          },
+          {
+            "type": "object",
+            "required": [
+              "tag_id"
+            ],
+            "properties": {
+              "tag_id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            }
+          }
+        ]
+      },
+      "BulkTarget": {
+        "type": "object",
+        "description": "What a bulk route acts on: the selection, less the contacts the user ticked off.",
+        "required": [
+          "selection_token"
+        ],
+        "properties": {
+          "excluded_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Contacts to leave out. At most 10 000."
+          },
+          "selection_token": {
+            "type": "string"
+          }
+        }
+      },
       "ChallengeResponse": {
         "type": "object",
         "required": [
@@ -3377,6 +3760,46 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "ContactFilter": {
+        "type": "object",
+        "description": "Which contacts a list shows. It is embedded in a signed selection token later, so its\nserialised form is part of that token's payload: renaming a field would invalidate tokens\nalready issued.",
+        "properties": {
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Contacts with a membership row on this list, whatever its status: a `pending` or\n`unsubscribed` member is still a member here. A list of another workspace matches nothing."
+          },
+          "list_status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MembershipStatus",
+                "description": "Narrows `list_id` to the memberships with this status. Meaningless without `list_id`: the\nhandler refuses it, and `list` ignores it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "q": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Case-insensitive substring of the address or name."
+          },
+          "tag_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Contacts with this tag. A tag of another workspace matches nothing."
           }
         }
       },
@@ -4915,6 +5338,19 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "SelectionToken": {
+        "type": "object",
+        "description": "The signed token for a selection; see `selection`.",
+        "required": [
+          "selection_token"
+        ],
+        "properties": {
+          "selection_token": {
+            "type": "string",
+            "description": "Valid for one hour. Pass it to a `bulk/*` route."
           }
         }
       },

@@ -25,6 +25,7 @@ use crate::{
 };
 
 pub mod routes;
+pub mod selection;
 
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow, ToSchema)]
 pub struct Contact {
@@ -237,7 +238,7 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 /// Which contacts a list shows. It is embedded in a signed selection token later, so its
 /// serialised form is part of that token's payload: renaming a field would invalidate tokens
 /// already issued.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ContactFilter {
     /// Case-insensitive substring of the address or name.
     pub q: Option<String>,
@@ -271,28 +272,10 @@ impl ContactFilter {
     }
 }
 
-/// One page of contacts in `params`' order, after `params`' cursor. The keyset predicate compares
-/// `(sort_value, id)` as a row, in the column order of `contacts_keyset_email`, so the index
-/// serves both the filter and the order. Today the `id` half of that pair is unobservable: `email`
-/// is unique per workspace and `created` sorts by id alone. It is there for the first sort key
-/// that is not unique, and keeping it is what keeps the column order Postgres needs to use
-/// `contacts_keyset_email`. Do not remove it as dead weight.
-pub async fn list(
-    db: &mut PgConnection,
-    workspace_id: Uuid,
-    filter: &ContactFilter,
-    params: &SortedPageParams,
-) -> ApiResult<Page<Contact>> {
-    let (sort, limit) = (params.sort(), params.limit());
-    let (order, op) = match params.dir() {
-        Dir::Asc => ("asc", ">"),
-        Dir::Desc => ("desc", "<"),
-    };
-    let mut q = QueryBuilder::<Postgres>::new(
-        "select id, email, first_name, last_name, attributes, timezone, created_at, updated_at \
-         from contacts where workspace_id = ",
-    );
-    q.push_bind(workspace_id);
+/// Appends the filter's conditions, each as ` and ...`, to a query that has already constrained
+/// `workspace_id` on `contacts`. The list view and every bulk action share it, so "the contacts
+/// this filter shows" and "the contacts this filter acts on" cannot drift apart.
+pub(crate) fn push_filter(q: &mut QueryBuilder<Postgres>, filter: &ContactFilter) {
     if let Some(term) = &filter.q {
         // Must stay the index expression, spelled the same, for `contacts_search` to apply.
         q.push(" and (email || ' ' || first_name || ' ' || last_name) ilike '%' || ")
@@ -323,6 +306,31 @@ pub async fn list(
         .push_bind(tag_id)
         .push(")");
     }
+}
+
+/// One page of contacts in `params`' order, after `params`' cursor. The keyset predicate compares
+/// `(sort_value, id)` as a row, in the column order of `contacts_keyset_email`, so the index
+/// serves both the filter and the order. Today the `id` half of that pair is unobservable: `email`
+/// is unique per workspace and `created` sorts by id alone. It is there for the first sort key
+/// that is not unique, and keeping it is what keeps the column order Postgres needs to use
+/// `contacts_keyset_email`. Do not remove it as dead weight.
+pub async fn list(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    filter: &ContactFilter,
+    params: &SortedPageParams,
+) -> ApiResult<Page<Contact>> {
+    let (sort, limit) = (params.sort(), params.limit());
+    let (order, op) = match params.dir() {
+        Dir::Asc => ("asc", ">"),
+        Dir::Desc => ("desc", "<"),
+    };
+    let mut q = QueryBuilder::<Postgres>::new(
+        "select id, email, first_name, last_name, attributes, timezone, created_at, updated_at \
+         from contacts where workspace_id = ",
+    );
+    q.push_bind(workspace_id);
+    push_filter(&mut q, filter);
     if let Some((value, id)) = params.after()? {
         match sort {
             ContactSort::Email => {

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use axum::{Json, Router, extract::State, http::StatusCode};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use sqlx::{Postgres, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    Contact, ContactFilter, NewContact, create, get, list, validate_attributes_patch, validate_name,
+    Contact, ContactFilter, NewContact, create, get, list,
+    selection::{self, Selection},
+    validate_attributes_patch, validate_name,
 };
 use crate::{
     app::AppState,
@@ -16,8 +19,10 @@ use crate::{
     custom_fields::definitions_for,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
+    lists::{self, MembershipStatus},
     pagination::{Page, sorted::SortedPageParams},
     suppressions::erase_address,
+    tags,
     workspaces::{roles::Role, validate_timezone},
 };
 
@@ -36,6 +41,30 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase",
             axum::routing::post(erase_contact),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/selection",
+            axum::routing::post(create_selection),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/bulk/tag",
+            axum::routing::post(bulk_tag_contacts),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/bulk/untag",
+            axum::routing::post(bulk_untag_contacts),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe",
+            axum::routing::post(bulk_subscribe_contacts),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe",
+            axum::routing::post(bulk_unsubscribe_contacts),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete",
+            axum::routing::post(bulk_delete_contacts),
         )
 }
 
@@ -398,4 +427,324 @@ pub async fn erase_contact(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The signed token for a selection; see `selection`.
+#[derive(Serialize, ToSchema)]
+pub struct SelectionToken {
+    /// Valid for one hour. Pass it to a `bulk/*` route.
+    pub selection_token: String,
+}
+
+/// What a bulk route acts on: the selection, less the contacts the user ticked off.
+#[derive(Deserialize, ToSchema)]
+pub struct BulkTarget {
+    pub selection_token: String,
+    /// Contacts to leave out. At most 10 000.
+    #[serde(default)]
+    pub excluded_ids: Vec<Uuid>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct BulkTag {
+    #[serde(flatten)]
+    pub target: BulkTarget,
+    pub tag_id: Uuid,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct BulkList {
+    #[serde(flatten)]
+    pub target: BulkTarget,
+    pub list_id: Uuid,
+}
+
+/// How many contacts a bulk action changed. This can be fewer than the selection held: contacts
+/// already in the wanted state, excluded, or deleted since are not counted.
+#[derive(Serialize, ToSchema)]
+pub struct BulkResult {
+    pub affected: u64,
+}
+
+/// Freezes "the contacts this filter matches" at this moment. The token holds the filter and a
+/// time bound, not the contacts: contacts created afterwards are never part of it.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/selection",
+    operation_id = "create_contact_selection",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = ContactFilter,
+    responses(
+        (status = 200, body = SelectionToken),
+        (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 404, description = "not a member, or no such workspace"),
+        (status = 422, description = "a `q` under 3 characters, or a `list_status` without a `list_id`"),
+    ),
+)]
+pub async fn create_selection(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(filter): ApiJson<ContactFilter>,
+) -> ApiResult<Json<SelectionToken>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Editor).await?;
+    if filter.list_status.is_some() && filter.list_id.is_none() {
+        return Err(ApiError::Validation(vec![FieldError::new(
+            "list_status",
+            "needs a list_id to narrow",
+        )]));
+    }
+    let filter = ContactFilter {
+        list_id: filter.list_id,
+        list_status: filter.list_status,
+        tag_id: filter.tag_id,
+        ..ContactFilter::with_search(filter.q.as_deref())?
+    };
+    let selection = Selection::now(workspace_id, filter);
+    Ok(Json(SelectionToken {
+        selection_token: selection::issue(&state.secrets, &selection),
+    }))
+}
+
+/// Opens the transaction, authorises, and resolves the token: in that order, so a non-member
+/// learns nothing about whether a token was good. A token for another workspace is a `404`.
+async fn begin_bulk(
+    state: &AppState,
+    principal: &Principal,
+    workspace_id: Uuid,
+    target: &BulkTarget,
+) -> ApiResult<(Transaction<'static, Postgres>, Selection)> {
+    let mut tx = state.pool.begin().await?;
+    authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
+    selection::check_excluded(&target.excluded_ids)?;
+    let selection = selection::parse(&state.secrets, &target.selection_token)?;
+    if selection.workspace_id != workspace_id {
+        return Err(ApiError::NotFound);
+    }
+    Ok((tx, selection))
+}
+
+/// The one audit row for a bulk action: what was asked (the filter and its time bound) and what
+/// it did (the count), never the contacts. Per-contact rows would outgrow the contacts table.
+async fn finish_bulk(
+    mut tx: Transaction<'static, Postgres>,
+    meta: &RequestMeta,
+    principal: &Principal,
+    action: &'static str,
+    (selection, target): (&Selection, &BulkTarget),
+    extra: Value,
+    affected: u64,
+) -> ApiResult<Json<BulkResult>> {
+    audit::record(
+        &mut *tx,
+        meta,
+        AuditEvent {
+            workspace_id: Some(selection.workspace_id),
+            actor: principal.actor(),
+            action,
+            target_type: None,
+            target_id: None,
+            metadata: json!({
+                "filter": selection.filter,
+                "as_of": selection.as_of,
+                "excluded": target.excluded_ids.len(),
+                "affected": affected,
+                "with": extra,
+            }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(BulkResult { affected }))
+}
+
+/// Tags every contact in the selection.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/tag",
+    operation_id = "bulk_tag_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = BulkTag,
+    responses(
+        (status = 200, description = "How many were newly tagged", body = BulkResult),
+        (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 404, description = "not a member, no such tag, or a token for another workspace"),
+        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+    ),
+)]
+pub async fn bulk_tag_contacts(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<BulkTag>,
+) -> ApiResult<Json<BulkResult>> {
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
+    // Checked up front: with no contact to insert for, the foreign key would never object.
+    tags::get(&mut tx, workspace_id, input.tag_id).await?;
+    let n = selection::tag(&mut tx, &sel, &input.target.excluded_ids, input.tag_id).await?;
+    let extra = json!({ "tag_id": input.tag_id });
+    let action = actions::CONTACTS_BULK_TAGGED;
+    finish_bulk(
+        tx,
+        &meta,
+        &principal,
+        action,
+        (&sel, &input.target),
+        extra,
+        n,
+    )
+    .await
+}
+
+/// Takes a tag off every contact in the selection.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/untag",
+    operation_id = "bulk_untag_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = BulkTag,
+    responses(
+        (status = 200, description = "How many had the tag", body = BulkResult),
+        (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 404, description = "not a member, no such tag, or a token for another workspace"),
+        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+    ),
+)]
+pub async fn bulk_untag_contacts(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<BulkTag>,
+) -> ApiResult<Json<BulkResult>> {
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
+    tags::get(&mut tx, workspace_id, input.tag_id).await?;
+    let n = selection::untag(&mut tx, &sel, &input.target.excluded_ids, input.tag_id).await?;
+    let extra = json!({ "tag_id": input.tag_id });
+    let action = actions::CONTACTS_BULK_UNTAGGED;
+    finish_bulk(
+        tx,
+        &meta,
+        &principal,
+        action,
+        (&sel, &input.target),
+        extra,
+        n,
+    )
+    .await
+}
+
+/// Puts every contact in the selection on a list: `pending` on a double-opt-in list, `subscribed`
+/// otherwise. Someone who unsubscribed is let back in, as `POST /contacts/{id}/lists` does.
+/// A suppression is not lifted: a suppressed address stays unmailable.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe",
+    operation_id = "bulk_subscribe_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = BulkList,
+    responses(
+        (status = 200, description = "How many memberships were written", body = BulkResult),
+        (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 404, description = "not a member, no such list, or a token for another workspace"),
+        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+    ),
+)]
+pub async fn bulk_subscribe_contacts(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<BulkList>,
+) -> ApiResult<Json<BulkResult>> {
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
+    let list = lists::get(&mut tx, workspace_id, input.list_id).await?;
+    let status = if list.double_optin {
+        MembershipStatus::Pending
+    } else {
+        MembershipStatus::Subscribed
+    };
+    let excluded = &input.target.excluded_ids;
+    let n = selection::subscribe(&mut tx, &sel, excluded, input.list_id, status).await?;
+    let extra = json!({ "list_id": input.list_id });
+    let action = actions::CONTACTS_BULK_SUBSCRIBED;
+    finish_bulk(
+        tx,
+        &meta,
+        &principal,
+        action,
+        (&sel, &input.target),
+        extra,
+        n,
+    )
+    .await
+}
+
+/// Unsubscribes every member of the selection from a list.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe",
+    operation_id = "bulk_unsubscribe_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = BulkList,
+    responses(
+        (status = 200, description = "How many were unsubscribed now; those already unsubscribed or not on the list are not counted", body = BulkResult),
+        (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 404, description = "not a member, no such list, or a token for another workspace"),
+        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+    ),
+)]
+pub async fn bulk_unsubscribe_contacts(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<BulkList>,
+) -> ApiResult<Json<BulkResult>> {
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
+    lists::get(&mut tx, workspace_id, input.list_id).await?;
+    let excluded = &input.target.excluded_ids;
+    let n = selection::unsubscribe(&mut tx, &sel, excluded, input.list_id).await?;
+    let extra = json!({ "list_id": input.list_id });
+    let action = actions::CONTACTS_BULK_UNSUBSCRIBED;
+    finish_bulk(
+        tx,
+        &meta,
+        &principal,
+        action,
+        (&sel, &input.target),
+        extra,
+        n,
+    )
+    .await
+}
+
+/// A hard delete of every contact in the selection. Like `DELETE /contacts/{id}` it writes no
+/// suppression: the addresses may be added again. It is not erasure.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete",
+    operation_id = "bulk_delete_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = BulkTarget,
+    responses(
+        (status = 200, description = "How many were deleted", body = BulkResult),
+        (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 404, description = "not a member, or a token for another workspace"),
+        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+    ),
+)]
+pub async fn bulk_delete_contacts(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<BulkTarget>,
+) -> ApiResult<Json<BulkResult>> {
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input).await?;
+    let n = selection::delete(&mut tx, &sel, &input.excluded_ids).await?;
+    let action = actions::CONTACTS_BULK_DELETED;
+    finish_bulk(tx, &meta, &principal, action, (&sel, &input), json!({}), n).await
 }

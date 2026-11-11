@@ -35,6 +35,11 @@ pub mod actions {
     pub const CONTACT_UPDATED: &str = "contact.updated";
     pub const CONTACT_DELETED: &str = "contact.deleted";
     pub const CONTACT_ERASED: &str = "contact.erased";
+    pub const CONTACTS_BULK_TAGGED: &str = "contacts.bulk_tagged";
+    pub const CONTACTS_BULK_UNTAGGED: &str = "contacts.bulk_untagged";
+    pub const CONTACTS_BULK_SUBSCRIBED: &str = "contacts.bulk_subscribed";
+    pub const CONTACTS_BULK_UNSUBSCRIBED: &str = "contacts.bulk_unsubscribed";
+    pub const CONTACTS_BULK_DELETED: &str = "contacts.bulk_deleted";
     pub const LIST_CREATED: &str = "list.created";
     pub const LIST_UPDATED: &str = "list.updated";
     pub const LIST_DELETED: &str = "list.deleted";
