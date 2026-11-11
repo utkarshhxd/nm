@@ -46,7 +46,9 @@ pub struct Definition {
     pub archived_at: Option<DateTime<Utc>>,
 }
 
-/// Every definition in the workspace, archived ones included, for validating a contact's attributes.
+/// Every definition in the workspace, archived ones included: existing values must stay readable
+/// and typed. A caller validating a NEW value must reject any field whose `archived_at` is set,
+/// or archiving stops protecting anything and the field keeps taking fresh data.
 pub async fn definitions_for(
     db: impl PgExecutor<'_>,
     workspace_id: Uuid,

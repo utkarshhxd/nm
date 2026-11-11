@@ -417,3 +417,54 @@ async fn cross_workspace_field_is_404(pool: PgPool) {
     assert_eq!(count_fields(&pool, ws1).await, 1);
     assert_eq!(count_fields(&pool, ws2).await, 0);
 }
+
+#[sqlx::test]
+async fn definitions_for_returns_live_and_archived_fields(pool: PgPool) {
+    let (ws, admin) = workspace_with_admin(&pool, "acme").await;
+    let (empty, _) = workspace_with_admin(&pool, "empty").await;
+    let live = create_field(
+        &admin,
+        ws,
+        json!({"key": "plan", "label": "Plan", "kind": "text"}),
+    )
+    .await;
+    let gone = create_field(
+        &admin,
+        ws,
+        json!({"key": "tier", "label": "Tier", "kind": "select", "options": ["a", "b"]}),
+    )
+    .await;
+    admin
+        .delete(&format!("{}/{gone}", fields_path(ws)))
+        .await
+        .assert_status_ok();
+    // Another workspace's field must not appear.
+    let (other, other_admin) = workspace_with_admin(&pool, "other").await;
+    create_field(
+        &other_admin,
+        other,
+        json!({"key": "z", "label": "z", "kind": "text"}),
+    )
+    .await;
+
+    let defs = nm::custom_fields::definitions_for(&pool, ws).await.unwrap();
+    assert_eq!(defs.len(), 2);
+    let by_id = |id: Uuid| {
+        defs.iter()
+            .find(|d| d.id == id)
+            .expect("definition present")
+    };
+    assert_eq!(by_id(live).key, "plan");
+    assert_eq!(by_id(live).archived_at, None);
+    assert_eq!(by_id(gone).key, "tier");
+    assert_eq!(by_id(gone).kind, nm::custom_fields::FieldKind::Select);
+    assert_eq!(by_id(gone).options, ["a", "b"]);
+    assert!(by_id(gone).archived_at.is_some());
+
+    assert!(
+        nm::custom_fields::definitions_for(&pool, empty)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
