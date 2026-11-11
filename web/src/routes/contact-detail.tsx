@@ -256,6 +256,8 @@ function Tags({ ws, contactId }: { ws: string; contactId: string }) {
         params: { path: { workspace_id: ws, id: contactId }, query: { limit: 200 } },
       });
       if (!data) throw failed("The tags");
+      // shortcut: the first 200 tags only (the server maximum). A contact with more is not a case
+      // yet; add "Load more" the way the contacts grid pages when it is.
       return data.data;
     },
     retry: false,
@@ -336,6 +338,8 @@ function CustomFields({ ws, contact }: { ws: string; contact: Contact }) {
         params: { path: { workspace_id: ws }, query: { limit: 200 } },
       });
       if (!data) throw failed("The custom fields");
+      // shortcut: the first 200 definitions only (the server maximum). A workspace with more is
+      // not a case yet; add "Load more" when it is.
       return data.data;
     },
     retry: false,

@@ -112,20 +112,21 @@ pub struct Block {
 /// does.
 ///
 /// Normalises `email` itself, so a caller cannot get a bypass by passing another Unicode form. An
-/// address that cannot be normalised at all is an error, never `None`: this is a safety check, and
-/// it must fail closed, not answer "go ahead" about something it could not read.
+/// address that cannot be normalised at all is an `ApiError::Internal` (a 500), never `None`:
+/// this is a safety check, and it must fail closed, not answer "go ahead" about something it could
+/// not read. The message names the condition but not the address, which is personal data.
 pub async fn blocking_suppression(
     db: impl PgExecutor<'_>,
     secrets: &Secrets,
     workspace_id: Uuid,
     email: &str,
-) -> sqlx::Result<Option<Block>> {
+) -> ApiResult<Option<Block>> {
     let Ok(email) = normalize_email(email) else {
-        return Err(sqlx::Error::Protocol(
-            "address cannot be normalised, so it cannot be checked".into(),
-        ));
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "a stored address does not normalise, so its suppression status cannot be checked"
+        )));
     };
-    blocking(db, secrets, workspace_id, &email).await
+    Ok(blocking(db, secrets, workspace_id, &email).await?)
 }
 
 /// `true` if `email` may not be mailed from `workspace_id`: `blocking_suppression` found a block.

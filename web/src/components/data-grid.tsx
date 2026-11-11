@@ -205,8 +205,8 @@ export function DataGrid<T>({
         }
         return;
       case "Enter":
-        // The row is the tab stop, so its link (`tabindex=-1`) is opened from the row itself.
-        if (event.target === row) row.querySelector("a")?.click();
+        // The row is the tab stop, so its `data-row-link` (`tabindex=-1`) is opened from the row itself.
+        if (event.target === row) row.querySelector<HTMLElement>("[data-row-link]")?.click();
         return;
       case "Escape":
         return selecting?.onClear();

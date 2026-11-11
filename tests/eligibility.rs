@@ -9,6 +9,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{PW, TestApp, add_member, create_user, create_workspace};
 use nm::crypto::suppression_hmac;
+use nm::error::ApiError;
 use nm::suppressions::{Reason, Scope, is_suppressed};
 use nm::workspaces::roles::Role;
 use serde_json::{Value, json};
@@ -466,4 +467,25 @@ async fn eligibility_is_scoped_to_the_workspace_and_a_viewer_may_read_it(pool: P
     let mut v = TestApp::new(pool.clone()).await;
     v.login("viewer@example.com", PW).await;
     v.get(&eligibility_url(ws_a, in_a)).await.assert_status_ok();
+}
+
+#[sqlx::test]
+async fn an_address_that_will_not_normalise_is_an_error_not_a_go_ahead(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let secrets = &app.state.secrets;
+    // `is_suppressed` fails closed as `true`; `blocking_suppression` cannot name a block for it, so
+    // it must not answer `None`.
+    assert!(
+        is_suppressed(&pool, secrets, ws, "no spaces@allowed")
+            .await
+            .unwrap()
+    );
+    let err = nm::suppressions::blocking_suppression(&pool, secrets, ws, "no spaces@allowed")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Internal(_)));
+    let ApiError::Internal(cause) = err else {
+        unreachable!()
+    };
+    assert!(!cause.to_string().contains("spaces"), "{cause}");
 }

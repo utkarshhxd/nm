@@ -247,6 +247,12 @@ async fn viewer_cannot_apply_a_tag(pool: PgPool) {
     r.assert_status_ok();
     assert_eq!(r.json::<Value>()["data"].as_array().unwrap().len(), 2);
 
+    // ...including a contact's own tags.
+    viewer
+        .get(&format!("/api/v1/workspaces/{ws}/contacts/{contact}/tags"))
+        .await
+        .assert_status_ok();
+
     // Every write route refuses a viewer with `insufficient-role`. Each request is one that would
     // succeed for an editor, so the 403 can only be the role.
     let forbidden = |r: axum_test::TestResponse| {

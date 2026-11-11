@@ -55,6 +55,7 @@ const columns = (slug: string): Column<Contact>[] => [
         to="/w/$slug/contacts/$contactId"
         params={{ slug, contactId: c.id }}
         tabIndex={-1}
+        data-row-link
         className="text-accent-text underline"
       >
         {c.email}
