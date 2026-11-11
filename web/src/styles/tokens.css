@@ -12,7 +12,13 @@
 /* Keeps every `dark:` utility in the route files following the attribute, not the OS. */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-:root {
+/*
+ * `[data-theme="dark"]`, not `:root[data-theme="dark"]`, and `[data-theme="light"]` alongside `:root`:
+ * a theme can be scoped to a subtree, e.g. a preview pane rendering another palette. The research
+ * writes the dark selector with `:root`; dropping it is what makes that work.
+ */
+:root,
+[data-theme="light"] {
   color-scheme: light;
 
   --canvas: oklch(0.985 0.003 265);
@@ -62,7 +68,7 @@
   --dur-2: 160ms;
 }
 
-:root[data-theme="dark"] {
+[data-theme="dark"] {
   color-scheme: dark;
 
   --canvas: oklch(0.165 0.01 265);
@@ -116,9 +122,15 @@
 }
 
 /*
- * `inline`, so `.bg-surface` compiles to `background-color: var(--surface)`, which the dark block
- * above can override at runtime. With a plain `@theme` Tailwind bakes the literal into the
- * utility and dark mode silently never changes a colour.
+ * `inline`, so `.bg-surface` compiles to `background-color: var(--surface)`, resolved on the
+ * element itself. Plain `@theme` would emit `--color-surface: var(--surface)` on `:root`, where it
+ * resolves once, and every descendant inherits that answer.
+ *
+ * With the theme attribute on <html>, the same element, both forms work, so nothing fails if this
+ * is changed. The difference appears only when a theme is scoped to a subtree: inside
+ * `<div data-theme="dark">` plain `@theme` stays light. The theme spec's
+ * `a_theme_can_be_scoped_to_a_subtree` is what proves `inline` is doing that job; it is not
+ * paranoia, so do not drop it.
  */
 @theme inline {
   --color-canvas: var(--canvas);

@@ -22,7 +22,6 @@ export function Checkbox({ indeterminate = false, className, ...rest }: Checkbox
       type="checkbox"
       // 20px plus a 2px margin each side is the 24px target WCAG 2.5.8 asks for.
       className={`m-0.5 size-5 accent-accent${className ? ` ${className}` : ""}`}
-      aria-checked={indeterminate ? "mixed" : undefined}
       {...rest}
     />
   );

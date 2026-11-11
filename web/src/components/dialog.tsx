@@ -31,6 +31,9 @@ const SHAPE = {
  * heading when the dialog is informational, never a destructive button.
  *
  * Children are mounted only while open, so a form inside always starts empty.
+ *
+ * Set `open` to false before unmounting a Dialog. Unmounting one that is still open skips
+ * `close()`, so the browser never returns focus to the trigger and it falls to <body>.
  */
 export function Dialog({
   open,

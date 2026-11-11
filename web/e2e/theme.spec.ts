@@ -71,6 +71,31 @@ test("dark_mode_applies_before_first_paint", async ({ browser, app }) => {
   expect(seen["dark"]).not.toBe(seen["light"]);
 });
 
+/**
+ * `@theme inline` over `:root` variables is what lets a theme be scoped to a subtree. With the
+ * attribute on <html> a plain `@theme` behaves identically, which is exactly why this test is the
+ * only thing that notices the difference. See the comment above `@theme inline` in tokens.css.
+ */
+test("a_theme_can_be_scoped_to_a_subtree", async ({ page, app }) => {
+  await stored(page, "light");
+  await page.goto(app + SAMPLE);
+  const colours = await page.evaluate(() => {
+    const el = document.createElement("div");
+    el.className = "bg-surface";
+    document.body.append(el);
+    const bg = () => getComputedStyle(el).backgroundColor;
+    const light = bg();
+    el.dataset["theme"] = "dark";
+    const nested = bg();
+    delete el.dataset["theme"];
+    document.documentElement.dataset["theme"] = "dark";
+    const wholePage = bg();
+    return { light, nested, wholePage };
+  });
+  expect(colours.nested).not.toBe(colours.light);
+  expect(colours.nested).toBe(colours.wholePage);
+});
+
 test("both_themes_pass_axe_on_a_sample_page", async ({ browser, app }) => {
   for (const theme of ["light", "dark"] as const) {
     // The OS says the opposite, so only the stored choice can produce the right theme.
