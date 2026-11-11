@@ -27,6 +27,10 @@ pub mod actions {
     pub const INVITE_ACCEPTED: &str = "invite.accepted";
     pub const API_KEY_CREATED: &str = "api_key.created";
     pub const API_KEY_REVOKED: &str = "api_key.revoked";
+    pub const CUSTOM_FIELD_CREATED: &str = "custom_field.created";
+    pub const CUSTOM_FIELD_UPDATED: &str = "custom_field.updated";
+    pub const CUSTOM_FIELD_ARCHIVED: &str = "custom_field.archived";
+    pub const CUSTOM_FIELD_PURGED: &str = "custom_field.purged";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

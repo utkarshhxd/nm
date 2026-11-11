@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod crypto;
+pub mod custom_fields;
 pub mod db;
 pub mod error;
 pub mod http;

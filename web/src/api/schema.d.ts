@@ -410,6 +410,54 @@ export interface paths {
         patch: operations["change_role"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/custom-fields": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_custom_fields"];
+        put?: never;
+        post: operations["create_custom_field"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["archive_custom_field"];
+        options?: never;
+        head?: never;
+        patch: operations["update_custom_field"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}/purge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["purge_custom_field"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -435,6 +483,11 @@ export interface components {
             name: string;
             prefix: string;
             role: components["schemas"]["Role"];
+        };
+        Archived: {
+            field: components["schemas"]["Definition"];
+            /** @description States, so no client has to guess, that deleting did not delete data. */
+            note: string;
         };
         /**
          * @description One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put
@@ -513,9 +566,28 @@ export interface components {
             id: string;
             name: string;
         };
+        Definition: {
+            /**
+             * Format: date-time
+             * @description Set when the field was deleted. Contacts keep their values until the field is purged.
+             */
+            archived_at?: string | null;
+            /** Format: uuid */
+            id: string;
+            key: string;
+            kind: components["schemas"]["FieldKind"];
+            label: string;
+            /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
+            options: string[];
+        };
         DisableRequest: {
             password: string;
         };
+        /**
+         * @description How a field's value is typed, stored as snake_case text (a `check` constraint, not an enum).
+         * @enum {string}
+         */
+        FieldKind: "text" | "number" | "date" | "date_time" | "boolean" | "select" | "multi_select";
         FinishRequest: {
             /** Format: uuid */
             challenge_id: string;
@@ -591,6 +663,17 @@ export interface components {
             /** @description `viewer`, `editor` or `admin`, and no higher than the caller's own role. */
             role: components["schemas"]["Role"];
         };
+        NewCustomField: {
+            /**
+             * @description `^[a-z][a-z0-9_]{0,62}$`. The JSONB key every contact's value is stored under; it cannot
+             *     change afterwards.
+             */
+            key: string;
+            kind: components["schemas"]["FieldKind"];
+            label: string;
+            /** @description Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind. */
+            options?: string[] | null;
+        };
         NewInvite: {
             email: string;
             role: components["schemas"]["Role"];
@@ -636,6 +719,23 @@ export interface components {
                 metadata: Record<string, never>;
                 target_id?: string | null;
                 target_type?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Definition: {
+            data: {
+                /**
+                 * Format: date-time
+                 * @description Set when the field was deleted. Contacts keep their values until the field is purged.
+                 */
+                archived_at?: string | null;
+                /** Format: uuid */
+                id: string;
+                key: string;
+                kind: components["schemas"]["FieldKind"];
+                label: string;
+                /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
+                options: string[];
             }[];
             next_cursor?: string | null;
         };
@@ -699,6 +799,13 @@ export interface components {
             last_used_at?: string | null;
             name: string;
         };
+        Purged: {
+            /**
+             * Format: int64
+             * @description Contacts whose value for the field was removed.
+             */
+            affected: number;
+        };
         /**
          * @description A member's role, stored as lowercase text. Variants run from least to most privileged:
          *     `authorize` compares roles with `<`, so the order here is load-bearing.
@@ -714,6 +821,15 @@ export interface components {
             otpauth_url: string;
             /** @description Base32 secret, shown only here. */
             secret: string;
+        };
+        /**
+         * @description `key` is immutable, so an unknown field (`key` included) is rejected, not ignored. `kind` is
+         *     accepted only so that a change can be refused with a message that says why.
+         */
+        UpdateCustomField: {
+            kind?: components["schemas"]["FieldKind"] | null;
+            label?: string | null;
+            options?: string[] | null;
         };
         /** @description The slug cannot change in M0, so an unknown field (`slug` included) is rejected, not ignored. */
         UpdateWorkspace: {
@@ -1910,6 +2026,229 @@ export interface operations {
                 content?: never;
             };
             /** @description last-owner */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_custom_fields: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first, archived fields included */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Definition"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewCustomField"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Definition"];
+                };
+            };
+            /** @description insufficient-role: creating a field takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description key-taken, even by an archived field */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid key, label or options */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    archive_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Custom field id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Archived. Every contact keeps its value */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Archived"];
+                };
+            };
+            /** @description insufficient-role: archiving a field takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such field in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Custom field id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateCustomField"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Definition"];
+                };
+            };
+            /** @description insufficient-role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such field in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid label or options, an unknown field such as `key`, or a kind change */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    purge_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Custom field id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every contact's value for the field was removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Purged"];
+                };
+            };
+            /** @description insufficient-role: purging takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such field in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description field-not-archived */
             409: {
                 headers: {
                     [name: string]: unknown;

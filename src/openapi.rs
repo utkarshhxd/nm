@@ -41,6 +41,11 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::auth::api_keys::create,
         crate::auth::api_keys::list,
         crate::auth::api_keys::revoke,
+        crate::custom_fields::routes::list_custom_fields,
+        crate::custom_fields::routes::create_custom_field,
+        crate::custom_fields::routes::update_custom_field,
+        crate::custom_fields::routes::archive_custom_field,
+        crate::custom_fields::routes::purge_custom_field,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -74,6 +79,12 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::auth::api_keys::NewApiKey,
         crate::auth::api_keys::CreatedApiKey,
         crate::auth::api_keys::ApiKeySummary,
+        crate::custom_fields::FieldKind,
+        crate::custom_fields::Definition,
+        crate::custom_fields::routes::NewCustomField,
+        crate::custom_fields::routes::UpdateCustomField,
+        crate::custom_fields::routes::Archived,
+        crate::custom_fields::routes::Purged,
     ))
 )]
 struct ApiDoc;

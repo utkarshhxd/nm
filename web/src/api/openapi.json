@@ -1224,6 +1224,269 @@
           }
         }
       }
+    },
+    "/api/v1/workspaces/{workspace_id}/custom-fields": {
+      "get": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "list_custom_fields",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first, archived fields included",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Definition"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "create_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewCustomField"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Definition"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a field takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "key-taken, even by an archived field"
+          },
+          "422": {
+            "description": "invalid key, label or options"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}": {
+      "delete": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "archive_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom field id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Archived. Every contact keeps its value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Archived"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: archiving a field takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such field in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "update_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom field id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCustomField"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Definition"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role"
+          },
+          "404": {
+            "description": "not a member, or no such field in this workspace"
+          },
+          "422": {
+            "description": "invalid label or options, an unknown field such as `key`, or a kind change"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}/purge": {
+      "post": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "purge_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom field id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every contact's value for the field was removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Purged"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: purging takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such field in this workspace"
+          },
+          "409": {
+            "description": "field-not-archived"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1293,6 +1556,22 @@
           },
           "role": {
             "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "Archived": {
+        "type": "object",
+        "required": [
+          "field",
+          "note"
+        ],
+        "properties": {
+          "field": {
+            "$ref": "#/components/schemas/Definition"
+          },
+          "note": {
+            "type": "string",
+            "description": "States, so no client has to guess, that deleting did not delete data."
           }
         }
       },
@@ -1518,6 +1797,46 @@
           }
         }
       },
+      "Definition": {
+        "type": "object",
+        "required": [
+          "id",
+          "key",
+          "label",
+          "kind",
+          "options"
+        ],
+        "properties": {
+          "archived_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set when the field was deleted. Contacts keep their values until the field is purged."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FieldKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
+          }
+        }
+      },
       "DisableRequest": {
         "type": "object",
         "required": [
@@ -1528,6 +1847,19 @@
             "type": "string"
           }
         }
+      },
+      "FieldKind": {
+        "type": "string",
+        "description": "How a field's value is typed, stored as snake_case text (a `check` constraint, not an enum).",
+        "enum": [
+          "text",
+          "number",
+          "date",
+          "date_time",
+          "boolean",
+          "select",
+          "multi_select"
+        ]
       },
       "FinishRequest": {
         "type": "object",
@@ -1762,6 +2094,37 @@
           }
         }
       },
+      "NewCustomField": {
+        "type": "object",
+        "required": [
+          "key",
+          "label",
+          "kind"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "`^[a-z][a-z0-9_]{0,62}$`. The JSONB key every contact's value is stored under; it cannot\nchange afterwards."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FieldKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "options": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind."
+          }
+        },
+        "additionalProperties": false
+      },
       "NewInvite": {
         "type": "object",
         "required": [
@@ -1940,6 +2303,63 @@
                     "string",
                     "null"
                   ]
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Definition": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "key",
+                "label",
+                "kind",
+                "options"
+              ],
+              "properties": {
+                "archived_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Set when the field was deleted. Contacts keep their values until the field is purged."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/components/schemas/FieldKind"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
                 }
               }
             }
@@ -2174,6 +2594,19 @@
           }
         }
       },
+      "Purged": {
+        "type": "object",
+        "required": [
+          "affected"
+        ],
+        "properties": {
+          "affected": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Contacts whose value for the field was removed."
+          }
+        }
+      },
       "Role": {
         "type": "string",
         "description": "A member's role, stored as lowercase text. Variants run from least to most privileged:\n`authorize` compares roles with `<`, so the order here is load-bearing.",
@@ -2217,6 +2650,39 @@
             "description": "Base32 secret, shown only here."
           }
         }
+      },
+      "UpdateCustomField": {
+        "type": "object",
+        "description": "`key` is immutable, so an unknown field (`key` included) is rejected, not ignored. `kind` is\naccepted only so that a change can be refused with a message that says why.",
+        "properties": {
+          "kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FieldKind",
+                "description": "Must equal the field's current kind: changing it is not supported yet."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "options": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateWorkspace": {
         "type": "object",
