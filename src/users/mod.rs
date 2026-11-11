@@ -215,7 +215,19 @@ mod tests {
     }
 
     #[test]
-    fn normalisation_is_idempotent() {
+    fn lowercasing_can_create_a_composable_pair() {
+        // No precomposed capital T-diaeresis exists, so the first NFC leaves "T"+U+0308 alone;
+        // lowercasing yields "t"+U+0308, which composes to U+1E97. Only the second NFC unifies
+        // the two spellings.
+        assert_eq!(
+            normalize_email("T\u{308}@example.com").unwrap(),
+            normalize_email("\u{1e97}@example.com").unwrap()
+        );
+    }
+
+    // Regression guard only: the pre-change `trim().to_lowercase()` also satisfied this.
+    #[test]
+    fn normalising_twice_changes_nothing() {
         for raw in [
             "\u{130}nfo@example.com",
             "JOSE\u{301}@Example.COM",
