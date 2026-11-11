@@ -1050,7 +1050,7 @@ export interface components {
          *     must be absent.
          */
         NewSuppression: {
-            /** @description Required for `domain`, such as `spam.example`. Matches that exact domain only. */
+            /** @description Required for `domain`, such as `spam.example`. Matches that exact domain only: subdomains are NOT covered (`spam.example` leaves `mail.spam.example` mailable). */
             domain?: string | null;
             /** @description Required for `address`. Normalised (trimmed, NFC, lowercased) before it is stored. */
             email?: string | null;

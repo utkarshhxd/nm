@@ -3968,7 +3968,7 @@
               "string",
               "null"
             ],
-            "description": "Required for `domain`, such as `spam.example`. Matches that exact domain only."
+            "description": "Required for `domain`, such as `spam.example`. Matches that exact domain only: subdomains are NOT covered (`spam.example` leaves `mail.spam.example` mailable)."
           },
           "email": {
             "type": [

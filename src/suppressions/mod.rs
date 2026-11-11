@@ -42,7 +42,7 @@ pub enum Reason {
 pub enum Scope {
     /// One address.
     Address,
-    /// Every address on exactly this domain (not its subdomains).
+    /// Every address on exactly this domain: `spam.test` does NOT cover `mail.spam.test`.
     Domain,
 }
 
@@ -74,7 +74,7 @@ pub struct NewSuppression {
     pub scope: Scope,
     /// Required for `address`. Normalised (trimmed, NFC, lowercased) before it is stored.
     pub email: Option<String>,
-    /// Required for `domain`, such as `spam.example`. Matches that exact domain only.
+    /// Required for `domain`, such as `spam.example`. Matches that exact domain only: subdomains are NOT covered (`spam.example` leaves `mail.spam.example` mailable).
     pub domain: Option<String>,
     /// Anything but `gdpr_erasure`, which only erasing a contact writes.
     pub reason: Reason,
@@ -85,7 +85,8 @@ pub struct NewSuppression {
 /// `true` if `email` may not be mailed from `workspace_id`: an address block or a domain block, in
 /// this workspace or instance-wide. The single-address path (a contact being created or imported),
 /// and the only one that sees an erasure tombstone, because it matches on the HMAC rather than on
-/// plaintext.
+/// plaintext. A domain block is exact: it does not cover subdomains, so a send-time check must not
+/// assume it does.
 ///
 /// Normalises `email` itself, so a caller cannot get a bypass by passing another Unicode form. An
 /// address that cannot be normalised at all counts as suppressed: this is a safety check, and it

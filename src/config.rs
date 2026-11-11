@@ -28,6 +28,13 @@ impl fmt::Debug for SecretKey {
     }
 }
 
+/// Wiped when dropped. `Clone` still copies the bytes, so each copy wipes itself.
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,

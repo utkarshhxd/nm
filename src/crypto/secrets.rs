@@ -39,6 +39,13 @@ pub struct Secrets {
     master: [u8; 32],
 }
 
+/// Wipes the master-key copy; the AES key schedule is wiped by `aes-gcm`'s `zeroize` feature.
+impl Drop for Secrets {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.master);
+    }
+}
+
 /// Hand-written so the key can never reach a log through `{:?}`.
 impl fmt::Debug for Secrets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,7 +63,7 @@ impl Secrets {
 
     /// A 32-byte key for one purpose: HMAC-SHA256 of `label` under the master key. A distinct label
     /// gives an unrelated key, so a value keyed for one purpose can never be replayed as another.
-    pub fn derive_key(&self, label: &str) -> [u8; 32] {
+    pub(crate) fn derive_key(&self, label: &str) -> [u8; 32] {
         super::tokens::hmac_sha256(&self.master, label.as_bytes())
     }
 
