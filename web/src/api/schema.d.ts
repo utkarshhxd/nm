@@ -483,6 +483,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Idempotent: applying a tag the contact already has is a `204` and changes nothing. */
+        put: operations["apply_tag"];
+        post?: never;
+        delete: operations["remove_tag"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/custom-fields": {
         parameters: {
             query?: never;
@@ -602,6 +619,39 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_tags"];
+        put?: never;
+        post: operations["create_tag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/tags/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** A hard delete. The tag comes off every contact that had it; the contacts stay. */
+        delete: operations["delete_tag"];
+        options?: never;
+        head?: never;
+        patch: operations["update_tag"];
         trace?: never;
     };
 }
@@ -927,6 +977,10 @@ export interface components {
         NewPasskey: {
             name: string;
         };
+        NewTag: {
+            /** @description Unique in the workspace. 1-100 characters. */
+            name: string;
+        };
         NewWorkspace: {
             name: string;
             slug: string;
@@ -1081,6 +1135,16 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_Tag: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                id: string;
+                name: string;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Workspace: {
             data: {
                 /** Format: uuid */
@@ -1125,6 +1189,13 @@ export interface components {
             /** @description Base32 secret, shown only here. */
             secret: string;
         };
+        Tag: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
         /**
          * @description A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit
          *     `null` removes it. The address cannot change, so `email` is an unknown field here and is
@@ -1163,6 +1234,10 @@ export interface components {
             double_optin?: boolean | null;
             name?: string | null;
             visibility?: components["schemas"]["Visibility"] | null;
+        };
+        UpdateTag: {
+            /** @description Unique in the workspace. 1-100 characters. */
+            name: string;
         };
         /** @description The slug cannot change in M0, so an unknown field (`slug` included) is rejected, not ignored. */
         UpdateWorkspace: {
@@ -2389,6 +2464,8 @@ export interface operations {
                 list_id?: string;
                 /** @description Only with `list_id`: narrows it to memberships with this status. */
                 list_status?: components["schemas"]["MembershipStatus"];
+                /** @description Only contacts with this tag. */
+                tag_id?: string;
             };
             header?: never;
             path: {
@@ -2713,6 +2790,84 @@ export interface operations {
                 content?: never;
             };
             /** @description not a member, or the contact was never on this list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    apply_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+                /** @description Tag id */
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The contact has the tag */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: tagging a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact or tag in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+                /** @description Tag id */
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tag is off the contact */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: untagging a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or the contact did not have this tag */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3283,6 +3438,195 @@ export interface operations {
             };
             /** @description not a member, or the contact was never on this list */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_tags: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Tag"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTag"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Tag"];
+                };
+            };
+            /** @description insufficient-role: creating a tag takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description tag-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Tag id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, and removed from every contact */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a tag takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such tag in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Tag id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateTag"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Tag"];
+                };
+            };
+            /** @description insufficient-role: renaming a tag takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such tag in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description tag-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name, or an unknown field */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

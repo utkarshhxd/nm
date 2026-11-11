@@ -98,6 +98,7 @@ pub async fn list_contacts(
     let filter = ContactFilter {
         list_id: params.list_id,
         list_status: params.list_status,
+        tag_id: params.tag_id,
         ..ContactFilter::with_search(params.q.as_deref())?
     };
     Ok(Json(list(&mut conn, workspace_id, &filter, &params).await?))

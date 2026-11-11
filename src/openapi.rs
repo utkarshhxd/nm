@@ -62,6 +62,12 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::lists::routes::list_contact_lists,
         crate::lists::routes::add_contact_to_list,
         crate::lists::routes::remove_contact_from_list,
+        crate::tags::routes::list_tags,
+        crate::tags::routes::create_tag,
+        crate::tags::routes::update_tag,
+        crate::tags::routes::delete_tag,
+        crate::tags::routes::apply_tag,
+        crate::tags::routes::remove_tag,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -116,6 +122,9 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::lists::routes::NewMember,
         crate::lists::routes::NewContactList,
         crate::lists::routes::Membership,
+        crate::tags::Tag,
+        crate::tags::routes::NewTag,
+        crate::tags::routes::UpdateTag,
     ))
 )]
 struct ApiDoc;

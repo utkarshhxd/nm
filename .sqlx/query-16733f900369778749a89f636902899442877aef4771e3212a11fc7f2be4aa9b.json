@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into contact_tags (workspace_id, contact_id, tag_id) values ($1, $2, $3) on conflict (contact_id, tag_id) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16733f900369778749a89f636902899442877aef4771e3212a11fc7f2be4aa9b"
+}

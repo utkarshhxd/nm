@@ -440,3 +440,91 @@ async fn list_status_narrows_list_id(pool: PgPool) {
         r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
+
+/// Puts the tag on the i-th seeded contact.
+async fn put(f: &Fixture, tag: &str, i: usize) {
+    let url = format!(
+        "/api/v1/workspaces/{}/contacts/{}/tags/{tag}",
+        f.ws, f.seeded[i].1
+    );
+    f.app.put(&url).await.assert_status(StatusCode::NO_CONTENT);
+}
+
+#[sqlx::test]
+async fn filters_by_tag_id(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let tags = format!("/api/v1/workspaces/{}/tags", f.ws);
+    let mut tag_ids = vec![];
+    for name in ["mine", "theirs"] {
+        let r = f.app.post(&tags).json(&json!({"name": name})).await;
+        r.assert_status(StatusCode::CREATED);
+        tag_ids.push(r.json::<Value>()["id"].as_str().unwrap().to_owned());
+    }
+    let (mine, theirs) = (&tag_ids[0], &tag_ids[1]);
+    let tagged = [0, 2, 3, 6, 9];
+    for i in tagged {
+        put(&f, mine, i).await;
+    }
+    // Another tag's contacts must not leak in.
+    put(&f, theirs, 1).await;
+    put(&f, theirs, 2).await;
+
+    let creation: Vec<String> = tagged.iter().map(|&i| f.seeded[i].0.clone()).collect();
+    let mut alphabetical = creation.clone();
+    alphabetical.sort();
+    assert_ne!(
+        creation, alphabetical,
+        "fixture: the tagged contacts' two orders coincide"
+    );
+    let mut newest_first = creation.clone();
+    newest_first.reverse();
+
+    // Page sizes that put a boundary mid-list (2) and exactly at its end (5).
+    for limit in [2, 5] {
+        assert_eq!(
+            f.emails(limit, &format!("tag_id={mine}&sort=email")).await,
+            alphabetical,
+            "limit={limit}"
+        );
+        assert_eq!(
+            f.emails(limit, &format!("tag_id={mine}")).await,
+            newest_first,
+            "limit={limit}"
+        );
+    }
+    let sizes: Vec<usize> = f
+        .pages(2, &format!("tag_id={mine}&sort=email"))
+        .await
+        .iter()
+        .map(|p| p["data"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, [2, 2, 1]);
+    // `zoe` and `ben`, the two the other tag was put on.
+    let mut other = f.emails(50, &format!("tag_id={theirs}&sort=email")).await;
+    other.sort();
+    assert_eq!(other, [email("ben"), email("zoe")]);
+    // Combined with a search: `quinn` is mia (tagged) and kai (not).
+    assert_eq!(
+        f.emails(50, &format!("tag_id={mine}&q=quinn")).await,
+        [email("mia")]
+    );
+
+    // Another workspace's tag matches nothing, and neither does one that does not exist.
+    let other_owner = create_user(&pool, "other@example.com", PW, false).await;
+    let other_ws = create_workspace(&pool, other_owner, "other").await;
+    let other = editor(&pool, other_ws, "other-editor", Role::Editor).await;
+    let r = other
+        .post(&format!("/api/v1/workspaces/{other_ws}/tags"))
+        .json(&json!({"name": "mine"}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let foreign = r.json::<Value>()["id"].as_str().unwrap().to_owned();
+    for tag in [foreign, Uuid::now_v7().to_string()] {
+        assert!(f.emails(50, &format!("tag_id={tag}")).await.is_empty());
+    }
+    let r = f
+        .app
+        .get(&format!("{}?tag_id=nope", contacts_path(f.ws)))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}

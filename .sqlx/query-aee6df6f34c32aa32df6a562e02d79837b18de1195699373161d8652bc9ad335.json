@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update tags set name = $3 where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aee6df6f34c32aa32df6a562e02d79837b18de1195699373161d8652bc9ad335"
+}

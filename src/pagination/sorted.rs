@@ -40,7 +40,7 @@ pub enum Dir {
     Desc,
 }
 
-/// `?limit=&cursor=&sort=&dir=&q=&list_id=&list_status=` for the contact list.
+/// `?limit=&cursor=&sort=&dir=&q=&list_id=&list_status=&tag_id=` for the contact list.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct SortedPageParams {
@@ -58,6 +58,8 @@ pub struct SortedPageParams {
     pub list_id: Option<Uuid>,
     /// Only with `list_id`: narrows it to memberships with this status.
     pub list_status: Option<MembershipStatus>,
+    /// Only contacts with this tag.
+    pub tag_id: Option<Uuid>,
 }
 
 impl SortedPageParams {

@@ -219,10 +219,9 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
-/// Which contacts a list shows. `tag_id` is defined now but not yet applied: tags do not exist
-/// until a later task, which wires it into `list` (and embeds this type in a signed selection
-/// token). So its being unread here is not an oversight. The serialised form is part of that
-/// token's payload: renaming a field would invalidate tokens already issued.
+/// Which contacts a list shows. It is embedded in a signed selection token later, so its
+/// serialised form is part of that token's payload: renaming a field would invalidate tokens
+/// already issued.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactFilter {
     /// Case-insensitive substring of the address or name.
@@ -233,6 +232,7 @@ pub struct ContactFilter {
     /// Narrows `list_id` to the memberships with this status. Meaningless without `list_id`: the
     /// handler refuses it, and `list` ignores it.
     pub list_status: Option<MembershipStatus>,
+    /// Contacts with this tag. A tag of another workspace matches nothing.
     pub tag_id: Option<Uuid>,
 }
 
@@ -297,6 +297,16 @@ pub async fn list(
             q.push(" and m.status = ").push_bind(status);
         }
         q.push(")");
+    }
+    if let Some(tag_id) = filter.tag_id {
+        // Correlated on `workspace_id` as well as the contact, like the list filter.
+        q.push(
+            " and exists (select 1 from contact_tags t \
+             where t.workspace_id = contacts.workspace_id and t.contact_id = contacts.id \
+             and t.tag_id = ",
+        )
+        .push_bind(tag_id)
+        .push(")");
     }
     if let Some((value, id)) = params.after()? {
         match sort {

@@ -1307,6 +1307,16 @@
             "schema": {
               "$ref": "#/components/schemas/MembershipStatus"
             }
+          },
+          {
+            "name": "tag_id",
+            "in": "query",
+            "description": "Only contacts with this tag.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -1695,6 +1705,107 @@
           },
           "404": {
             "description": "not a member, or the contact was never on this list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}": {
+      "put": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "summary": "Idempotent: applying a tag the contact already has is a `204` and changes nothing.",
+        "operationId": "apply_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tag_id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The contact has the tag"
+          },
+          "403": {
+            "description": "insufficient-role: tagging a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact or tag in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "remove_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tag_id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The tag is off the contact"
+          },
+          "403": {
+            "description": "insufficient-role: untagging a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or the contact did not have this tag"
           }
         }
       }
@@ -2389,6 +2500,218 @@
           },
           "404": {
             "description": "not a member, or the contact was never on this list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/tags": {
+      "get": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "list_tags",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Tag"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "create_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a tag takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "tag-name-taken"
+          },
+          "422": {
+            "description": "invalid name, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/tags/{id}": {
+      "delete": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "summary": "A hard delete. The tag comes off every contact that had it; the contacts stay.",
+        "operationId": "delete_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, and removed from every contact"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a tag takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such tag in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "update_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: renaming a tag takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such tag in this workspace"
+          },
+          "409": {
+            "description": "tag-name-taken"
+          },
+          "422": {
+            "description": "invalid name, or an unknown field"
           }
         }
       }
@@ -3327,6 +3650,19 @@
           }
         }
       },
+      "NewTag": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace. 1-100 characters."
+          }
+        },
+        "additionalProperties": false
+      },
       "NewWorkspace": {
         "type": "object",
         "required": [
@@ -3873,6 +4209,44 @@
           }
         }
       },
+      "Page_Tag": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "created_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Workspace": {
         "type": "object",
         "required": [
@@ -4005,6 +4379,27 @@
           }
         }
       },
+      "Tag": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "UpdateContact": {
         "type": "object",
         "description": "A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit\n`null` removes it. The address cannot change, so `email` is an unknown field here and is\nrejected, not ignored.",
@@ -4101,6 +4496,19 @@
                 "type": "null"
               }
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateTag": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace. 1-100 characters."
           }
         },
         "additionalProperties": false
