@@ -35,6 +35,8 @@ pub enum SecretsError {
 /// The version and key id are authenticated as associated data.
 pub struct Secrets {
     cipher: Aes256Gcm,
+    /// Kept only to derive purpose-specific subkeys (`derive_key`); never exposed or formatted.
+    master: [u8; 32],
 }
 
 /// Hand-written so the key can never reach a log through `{:?}`.
@@ -48,7 +50,14 @@ impl Secrets {
     pub fn new(key: &SecretKey) -> Secrets {
         Secrets {
             cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(key.0)),
+            master: key.0,
         }
+    }
+
+    /// A 32-byte key for one purpose: HMAC-SHA256 of `label` under the master key. A distinct label
+    /// gives an unrelated key, so a value keyed for one purpose can never be replayed as another.
+    pub fn derive_key(&self, label: &str) -> [u8; 32] {
+        super::tokens::hmac_sha256(&self.master, label.as_bytes())
     }
 
     /// Encrypts under a fresh random nonce, so equal plaintexts give different blobs.

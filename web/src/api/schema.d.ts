@@ -5,6 +5,38 @@
  */
 
 export interface paths {
+    "/api/v1/admin/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_instance_suppressions"];
+        put?: never;
+        post: operations["create_instance_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/suppressions/{id}/lift": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["lift_instance_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -621,6 +653,42 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_suppressions"];
+        put?: never;
+        post: operations["create_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/suppressions/{id}/lift": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-enables mailing someone who opted out, bounced or complained, so it takes admin. The row
+         *     stays, with `lifted_at` set, and the audit row names the reason it was lifted from.
+         */
+        post: operations["lift_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/tags": {
         parameters: {
             query?: never;
@@ -977,6 +1045,21 @@ export interface components {
         NewPasskey: {
             name: string;
         };
+        /**
+         * @description A suppression to add. `scope` decides which of `email` and `domain` is required, and the other
+         *     must be absent.
+         */
+        NewSuppression: {
+            /** @description Required for `domain`, such as `spam.example`. Matches that exact domain only. */
+            domain?: string | null;
+            /** @description Required for `address`. Normalised (trimmed, NFC, lowercased) before it is stored. */
+            email?: string | null;
+            /** @description Up to 500 characters; line breaks are allowed. */
+            note?: string | null;
+            /** @description Anything but `gdpr_erasure`, which only erasing a contact writes. */
+            reason: components["schemas"]["Reason"];
+            scope: components["schemas"]["Scope"];
+        };
         NewTag: {
             /** @description Unique in the workspace. 1-100 characters. */
             name: string;
@@ -1135,6 +1218,36 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_Suppression: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                created_by_user_id?: string | null;
+                /** @description Domain scope only. */
+                domain?: string | null;
+                /** @description Address scope only; null on an erasure tombstone, whose plaintext was destroyed. */
+                email?: string | null;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * Format: date-time
+                 * @description Set when lifted. A lifted row stays, as history.
+                 */
+                lifted_at?: string | null;
+                /** Format: uuid */
+                lifted_by_user_id?: string | null;
+                note?: string | null;
+                reason: components["schemas"]["Reason"];
+                scope: components["schemas"]["Scope"];
+                /**
+                 * Format: uuid
+                 * @description Null for an instance-wide suppression, which applies to every workspace.
+                 */
+                workspace_id?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Tag: {
             data: {
                 /** Format: date-time */
@@ -1174,11 +1287,18 @@ export interface components {
             affected: number;
         };
         /**
+         * @description Why an address is blocked. Stored as text under a `check` constraint, not a Postgres enum.
+         * @enum {string}
+         */
+        Reason: "unsubscribed_all" | "bounced" | "complained" | "manual" | "gdpr_erasure";
+        /**
          * @description A member's role, stored as lowercase text. Variants run from least to most privileged:
          *     `authorize` compares roles with `<`, so the order here is load-bearing.
          * @enum {string}
          */
         Role: "viewer" | "editor" | "admin" | "owner";
+        /** @enum {string} */
+        Scope: "address" | "domain";
         /** @description Exactly one of the two. */
         SecondFactorRequest: {
             code?: string | null;
@@ -1188,6 +1308,34 @@ export interface components {
             otpauth_url: string;
             /** @description Base32 secret, shown only here. */
             secret: string;
+        };
+        /** @description A suppression as the API shows it. There is deliberately no hash field here. */
+        Suppression: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            created_by_user_id?: string | null;
+            /** @description Domain scope only. */
+            domain?: string | null;
+            /** @description Address scope only; null on an erasure tombstone, whose plaintext was destroyed. */
+            email?: string | null;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: date-time
+             * @description Set when lifted. A lifted row stays, as history.
+             */
+            lifted_at?: string | null;
+            /** Format: uuid */
+            lifted_by_user_id?: string | null;
+            note?: string | null;
+            reason: components["schemas"]["Reason"];
+            scope: components["schemas"]["Scope"];
+            /**
+             * Format: uuid
+             * @description Null for an instance-wide suppression, which applies to every workspace.
+             */
+            workspace_id?: string | null;
         };
         Tag: {
             /** Format: date-time */
@@ -1267,6 +1415,136 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_instance_suppressions: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+                /** @description Also list the ones that were lifted (default: only the ones in force). */
+                include_lifted?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance-wide suppressions, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Suppression"];
+                };
+            };
+            /** @description instance-admin-required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_instance_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSuppression"];
+            };
+        };
+        responses: {
+            /** @description An instance-wide suppression: it blocks in every workspace */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description instance-admin-required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-exists: that address or domain is already blocked instance-wide */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    lift_instance_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Suppression id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The suppression, now lifted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description instance-admin-required; or erasure-not-liftable: nobody lifts an erasure */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such instance-wide suppression */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-already-lifted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -3438,6 +3716,150 @@ export interface operations {
             };
             /** @description not a member, or the contact was never on this list */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_suppressions: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+                /** @description Also list the ones that were lifted (default: only the ones in force). */
+                include_lifted?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This workspace's own suppressions, newest first. Instance-wide ones are not listed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Suppression"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSuppression"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description insufficient-role: adding a suppression takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-exists: that address or domain is already blocked */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    lift_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Suppression id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The suppression, now lifted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description insufficient-role: lifting takes admin; or erasure-not-liftable: nobody lifts an erasure */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such suppression in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-already-lifted */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

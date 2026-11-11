@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::{TryRng, rngs::SysRng};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -15,6 +16,14 @@ pub fn random_token(bytes: usize) -> String {
 
 pub fn sha256(input: &[u8]) -> [u8; 32] {
     Sha256::digest(input).into()
+}
+
+/// HMAC-SHA256 (RFC 2104). Any key length is valid for HMAC.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes any key length");
+    mac.update(msg);
+    mac.finalize().into_bytes().into()
 }
 
 /// Constant-time in the contents. Unequal lengths return false at once, which
@@ -41,6 +50,16 @@ mod tests {
         assert_eq!(
             h.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// RFC 4231, test case 2.
+    #[test]
+    fn hmac_sha256_known_vector() {
+        let h = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            h.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
     }
 

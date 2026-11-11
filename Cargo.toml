@@ -24,6 +24,7 @@ chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive"] }
 cookie = "0.18.2"
 figment = { version = "0.10.19", features = ["env", "toml"] }
+hmac = "0.13.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 mime_guess = "2.0.5"

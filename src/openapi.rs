@@ -68,6 +68,12 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::tags::routes::delete_tag,
         crate::tags::routes::apply_tag,
         crate::tags::routes::remove_tag,
+        crate::suppressions::routes::list_suppressions,
+        crate::suppressions::routes::create_suppression,
+        crate::suppressions::routes::lift_suppression,
+        crate::suppressions::routes::list_instance_suppressions,
+        crate::suppressions::routes::create_instance_suppression,
+        crate::suppressions::routes::lift_instance_suppression,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -125,6 +131,10 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::tags::Tag,
         crate::tags::routes::NewTag,
         crate::tags::routes::UpdateTag,
+        crate::suppressions::Suppression,
+        crate::suppressions::NewSuppression,
+        crate::suppressions::Reason,
+        crate::suppressions::Scope,
     ))
 )]
 struct ApiDoc;

@@ -10,6 +10,141 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/v1/admin/suppressions": {
+      "get": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "list_instance_suppressions",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_lifted",
+            "in": "query",
+            "description": "Also list the ones that were lifted (default: only the ones in force).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Instance-wide suppressions, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "instance-admin-required"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "create_instance_suppression",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSuppression"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "An instance-wide suppression: it blocks in every workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "instance-admin-required"
+          },
+          "409": {
+            "description": "suppression-exists: that address or domain is already blocked instance-wide"
+          },
+          "422": {
+            "description": "an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/suppressions/{id}/lift": {
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "lift_instance_suppression",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Suppression id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The suppression, now lifted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "instance-admin-required; or erasure-not-liftable: nobody lifts an erasure"
+          },
+          "404": {
+            "description": "no such instance-wide suppression"
+          },
+          "409": {
+            "description": "suppression-already-lifted"
+          }
+        }
+      }
+    },
     "/api/v1/auth/login": {
       "post": {
         "tags": [
@@ -2504,6 +2639,176 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/suppressions": {
+      "get": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "list_suppressions",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_lifted",
+            "in": "query",
+            "description": "Also list the ones that were lifted (default: only the ones in force).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This workspace's own suppressions, newest first. Instance-wide ones are not listed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Suppression"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "create_suppression",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSuppression"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: adding a suppression takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "suppression-exists: that address or domain is already blocked"
+          },
+          "422": {
+            "description": "an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/suppressions/{id}/lift": {
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "summary": "Re-enables mailing someone who opted out, bounced or complained, so it takes admin. The row\nstays, with `lifted_at` set, and the audit row names the reason it was lifted from.",
+        "operationId": "lift_suppression",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Suppression id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The suppression, now lifted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: lifting takes admin; or erasure-not-liftable: nobody lifts an erasure"
+          },
+          "404": {
+            "description": "not a member, or no such suppression in this workspace"
+          },
+          "409": {
+            "description": "suppression-already-lifted"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/tags": {
       "get": {
         "tags": [
@@ -3650,6 +3955,45 @@
           }
         }
       },
+      "NewSuppression": {
+        "type": "object",
+        "description": "A suppression to add. `scope` decides which of `email` and `domain` is required, and the other\nmust be absent.",
+        "required": [
+          "scope",
+          "reason"
+        ],
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for `domain`, such as `spam.example`. Matches that exact domain only."
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for `address`. Normalised (trimmed, NFC, lowercased) before it is stored."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Up to 500 characters; line breaks are allowed."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason",
+            "description": "Anything but `gdpr_erasure`, which only erasing a contact writes."
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope"
+          }
+        },
+        "additionalProperties": false
+      },
       "NewTag": {
         "type": "object",
         "required": [
@@ -4209,6 +4553,99 @@
           }
         }
       },
+      "Page_Suppression": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A suppression as the API shows it. There is deliberately no hash field here.",
+              "required": [
+                "id",
+                "scope",
+                "reason",
+                "created_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "created_by_user_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
+                "domain": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Domain scope only."
+                },
+                "email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Address scope only; null on an erasure tombstone, whose plaintext was destroyed."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "lifted_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Set when lifted. A lifted row stays, as history."
+                },
+                "lifted_by_user_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "$ref": "#/components/schemas/Reason"
+                },
+                "scope": {
+                  "$ref": "#/components/schemas/Scope"
+                },
+                "workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid",
+                  "description": "Null for an instance-wide suppression, which applies to every workspace."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Tag": {
         "type": "object",
         "required": [
@@ -4335,6 +4772,17 @@
           }
         }
       },
+      "Reason": {
+        "type": "string",
+        "description": "Why an address is blocked. Stored as text under a `check` constraint, not a Postgres enum.",
+        "enum": [
+          "unsubscribed_all",
+          "bounced",
+          "complained",
+          "manual",
+          "gdpr_erasure"
+        ]
+      },
       "Role": {
         "type": "string",
         "description": "A member's role, stored as lowercase text. Variants run from least to most privileged:\n`authorize` compares roles with `<`, so the order here is load-bearing.",
@@ -4343,6 +4791,13 @@
           "editor",
           "admin",
           "owner"
+        ]
+      },
+      "Scope": {
+        "type": "string",
+        "enum": [
+          "address",
+          "domain"
         ]
       },
       "SecondFactorRequest": {
@@ -4376,6 +4831,82 @@
           "secret": {
             "type": "string",
             "description": "Base32 secret, shown only here."
+          }
+        }
+      },
+      "Suppression": {
+        "type": "object",
+        "description": "A suppression as the API shows it. There is deliberately no hash field here.",
+        "required": [
+          "id",
+          "scope",
+          "reason",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by_user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Domain scope only."
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Address scope only; null on an erasure tombstone, whose plaintext was destroyed."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lifted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set when lifted. A lifted row stays, as history."
+          },
+          "lifted_by_user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope"
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Null for an instance-wide suppression, which applies to every workspace."
           }
         }
       },

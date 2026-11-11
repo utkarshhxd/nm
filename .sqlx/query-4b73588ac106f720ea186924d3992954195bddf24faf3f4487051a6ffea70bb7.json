@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select reason as \"reason: Reason\", lifted_at from suppressions\n           where id = $2 and workspace_id is not distinct from $1 for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reason: Reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "lifted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "lifted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "4b73588ac106f720ea186924d3992954195bddf24faf3f4487051a6ffea70bb7"
+}
