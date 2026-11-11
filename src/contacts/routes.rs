@@ -78,7 +78,7 @@ where
     responses(
         (status = 200, description = "Newest first unless `sort` says otherwise", body = Page<Contact>),
         (status = 404, description = "not a member, or no such workspace"),
-        (status = 422, description = "a malformed cursor, an unknown `sort`, or a `q` under 3 characters"),
+        (status = 422, description = "a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id`"),
     ),
 )]
 pub async fn list_contacts(
@@ -89,8 +89,15 @@ pub async fn list_contacts(
 ) -> ApiResult<Json<Page<Contact>>> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    if params.list_status.is_some() && params.list_id.is_none() {
+        return Err(ApiError::Validation(vec![FieldError::new(
+            "list_status",
+            "needs a list_id to narrow",
+        )]));
+    }
     let filter = ContactFilter {
         list_id: params.list_id,
+        list_status: params.list_status,
         ..ContactFilter::with_search(params.q.as_deref())?
     };
     Ok(Json(list(&mut conn, workspace_id, &filter, &params).await?))

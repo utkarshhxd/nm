@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select double_optin from lists where workspace_id = $1 and id = $2 for update",
+  "query": "select double_optin from lists where workspace_id = $1 and id = $2",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "1daf8fb3a2265b4a4a75b09416dd07a00d28049fa81a7627b2faefab235e70a9"
+  "hash": "2c0df16685034e47356c9847d9bbed4155e64e33ee093e5b64163e78ffe79766"
 }

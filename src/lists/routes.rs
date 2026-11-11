@@ -7,13 +7,14 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    List, Member, MembershipStatus, Visibility, add_member, get, remove_member,
+    ContactList, List, Member, MembershipStatus, Visibility, add_member, get, remove_member,
     validate_description, validate_name,
 };
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
+    contacts,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult},
     http::request_meta::RequestMeta,
     pagination::{Page, PageParams},
@@ -40,6 +41,14 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}",
             axum::routing::delete(remove_list_member),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists",
+            axum::routing::get(list_contact_lists).post(add_contact_to_list),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}",
+            axum::routing::delete(remove_contact_from_list),
+        )
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -60,8 +69,8 @@ pub struct NewList {
 pub struct UpdateList {
     pub name: Option<String>,
     pub description: Option<String>,
-    /// Cannot be switched off while the list has `pending` members: they have not confirmed, and
-    /// a `pending` row on a single-opt-in list would break what `pending` means.
+    /// Only decides the status of members added from now on. A member already `pending` stays
+    /// `pending` (not mailable) when this is switched off.
     pub double_optin: Option<bool>,
     pub visibility: Option<Visibility>,
 }
@@ -72,9 +81,16 @@ pub struct NewMember {
     pub contact_id: Uuid,
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NewContactList {
+    pub list_id: Uuid,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct Membership {
     pub contact_id: Uuid,
+    pub list_id: Uuid,
     pub status: MembershipStatus,
 }
 
@@ -215,7 +231,7 @@ pub async fn create_list(
         (status = 200, body = List),
         (status = 403, description = "insufficient-role: editing a list takes editor"),
         (status = 404, description = "not a member, or no such list in this workspace"),
-        (status = 409, description = "list-name-taken, or pending-members: double opt-in cannot be switched off while members are pending"),
+        (status = 409, description = "list-name-taken"),
         (status = 422, description = "invalid name or description, or an unknown field"),
     ),
 )]
@@ -238,29 +254,10 @@ pub async fn update_list(
         let errors = [name.err(), description.err()].into_iter().flatten();
         return Err(ApiError::Validation(errors.collect()));
     };
-    // Locked, so a member added meanwhile (which takes `for share`) waits for this to finish.
-    let double_optin = sqlx::query_scalar!(
-        "select double_optin from lists where workspace_id = $1 and id = $2 for update",
-        workspace_id,
-        id,
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if double_optin && input.double_optin == Some(false) {
-        let pending = sqlx::query_scalar!(
-            r#"select exists (select 1 from list_memberships
-                              where workspace_id = $1 and list_id = $2 and status = 'pending')
-               as "pending!""#,
-            workspace_id,
-            id,
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if pending {
-            return Err(ApiError::Conflict("pending-members"));
-        }
-    }
-    sqlx::query!(
+    // `pending` rows may outlive a `double_optin` change: one left on a list that is now
+    // single opt-in still means "not confirmed, not mailable", and nothing else can resolve it
+    // before the M1c confirmation flow. Only a NEW member's status follows the setting.
+    let updated = sqlx::query!(
         "update lists set name = coalesce($3, name), description = coalesce($4, description), \
          double_optin = coalesce($5, double_optin), visibility = coalesce($6, visibility), \
          updated_at = now() where workspace_id = $1 and id = $2",
@@ -277,6 +274,9 @@ pub async fn update_list(
         Some(d) if d.is_unique_violation() => ApiError::Conflict("list-name-taken"),
         _ => e.into(),
     })?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
     let fields: Vec<&str> = [
         ("name", input.name.is_some()),
         ("description", input.description.is_some()),
@@ -423,27 +423,16 @@ pub async fn add_list_member(
     ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
     ApiJson(input): ApiJson<NewMember>,
 ) -> ApiResult<Json<Membership>> {
-    let mut tx = state.pool.begin().await?;
-    authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
-    let status = add_member(&mut tx, workspace_id, id, input.contact_id).await?;
-    audit::record(
-        &mut *tx,
+    let membership = add_audited(
+        &state,
         &meta,
-        AuditEvent {
-            workspace_id: Some(workspace_id),
-            actor: principal.actor(),
-            action: actions::LIST_MEMBER_ADDED,
-            target_type: Some("list"),
-            target_id: Some(id.to_string()),
-            metadata: json!({ "contact_id": input.contact_id, "status": status }),
-        },
+        &principal,
+        workspace_id,
+        id,
+        input.contact_id,
     )
     .await?;
-    tx.commit().await?;
-    Ok(Json(Membership {
-        contact_id: input.contact_id,
-        status,
-    }))
+    Ok(Json(membership))
 }
 
 /// Unsubscribes; it does not delete the membership.
@@ -468,22 +457,168 @@ pub async fn remove_list_member(
     principal: Principal,
     ApiPath((workspace_id, id, contact_id)): ApiPath<(Uuid, Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
+    remove_audited(&state, &meta, &principal, workspace_id, id, contact_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The one place a membership is added, for the list-side and the contact-side route alike: it
+/// authorises first, writes, and audits in the same transaction. The audit row records ids and
+/// the status, never an address.
+async fn add_audited(
+    state: &AppState,
+    meta: &RequestMeta,
+    principal: &Principal,
+    workspace_id: Uuid,
+    list_id: Uuid,
+    contact_id: Uuid,
+) -> ApiResult<Membership> {
     let mut tx = state.pool.begin().await?;
-    authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
-    remove_member(&mut tx, workspace_id, id, contact_id).await?;
+    authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
+    let status = add_member(&mut tx, workspace_id, list_id, contact_id).await?;
     audit::record(
         &mut *tx,
-        &meta,
+        meta,
+        AuditEvent {
+            workspace_id: Some(workspace_id),
+            actor: principal.actor(),
+            action: actions::LIST_MEMBER_ADDED,
+            target_type: Some("list"),
+            target_id: Some(list_id.to_string()),
+            metadata: json!({ "contact_id": contact_id, "status": status }),
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Membership {
+        contact_id,
+        list_id,
+        status,
+    })
+}
+
+/// The one place a membership is unsubscribed; see `add_audited`.
+async fn remove_audited(
+    state: &AppState,
+    meta: &RequestMeta,
+    principal: &Principal,
+    workspace_id: Uuid,
+    list_id: Uuid,
+    contact_id: Uuid,
+) -> ApiResult<()> {
+    let mut tx = state.pool.begin().await?;
+    authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
+    remove_member(&mut tx, workspace_id, list_id, contact_id).await?;
+    audit::record(
+        &mut *tx,
+        meta,
         AuditEvent {
             workspace_id: Some(workspace_id),
             actor: principal.actor(),
             action: actions::LIST_MEMBER_REMOVED,
             target_type: Some("list"),
-            target_id: Some(id.to_string()),
+            target_id: Some(list_id.to_string()),
             metadata: json!({ "contact_id": contact_id }),
         },
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists",
+    operation_id = "list_contact_lists",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Contact id"),
+        PageParams,
+    ),
+    responses(
+        (status = 200, description = "Every list the contact has a membership on, whatever its status, newest list first", body = Page<ContactList>),
+        (status = 404, description = "not a member, or no such contact in this workspace"),
+        (status = 422, description = "a malformed cursor"),
+    ),
+)]
+pub async fn list_contact_lists(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+    ApiQuery(page): ApiQuery<PageParams>,
+) -> ApiResult<Json<Page<ContactList>>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    contacts::get(&mut conn, workspace_id, id).await?;
+    let limit = page.limit();
+    let rows = sqlx::query_as!(
+        ContactList,
+        r#"select m.list_id, l.name, m.status as "status: MembershipStatus",
+                  m.subscribed_at, m.unsubscribed_at
+           from list_memberships m
+           join lists l on l.workspace_id = m.workspace_id and l.id = m.list_id
+           where m.workspace_id = $1 and m.contact_id = $2 and ($3::uuid is null or m.list_id < $3)
+           order by m.list_id desc limit $4"#,
+        workspace_id,
+        id,
+        page.after()?,
+        limit + 1,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Json(Page::from_rows(rows, limit, |l| l.list_id)))
+}
+
+/// The same as `POST /lists/{id}/members`, from the contact's side.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists",
+    operation_id = "add_contact_to_list",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Contact id"),
+    ),
+    request_body = NewContactList,
+    responses(
+        (status = 200, description = "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one", body = Membership),
+        (status = 403, description = "insufficient-role: changing a contact's lists takes editor"),
+        (status = 404, description = "not a member, or no such contact or list in this workspace"),
+    ),
+)]
+pub async fn add_contact_to_list(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+    ApiJson(input): ApiJson<NewContactList>,
+) -> ApiResult<Json<Membership>> {
+    let membership =
+        add_audited(&state, &meta, &principal, workspace_id, input.list_id, id).await?;
+    Ok(Json(membership))
+}
+
+/// The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,
+/// and keeps the membership.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}",
+    operation_id = "remove_contact_from_list",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Contact id"),
+        ("list_id" = Uuid, Path, description = "List id"),
+    ),
+    responses(
+        (status = 204, description = "Unsubscribed. The membership stays, as `unsubscribed`"),
+        (status = 403, description = "insufficient-role: changing a contact's lists takes editor"),
+        (status = 404, description = "not a member, or the contact was never on this list"),
+    ),
+)]
+pub async fn remove_contact_from_list(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath((workspace_id, id, list_id)): ApiPath<(Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    remove_audited(&state, &meta, &principal, workspace_id, list_id, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::{DEFAULT_LIMIT, MAX_LIMIT, Page};
 use crate::error::{ApiError, ApiResult, FieldError};
+use crate::lists::MembershipStatus;
 
 /// What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,
 /// `contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.
@@ -39,7 +40,7 @@ pub enum Dir {
     Desc,
 }
 
-/// `?limit=&cursor=&sort=&dir=&q=&list_id=` for the contact list.
+/// `?limit=&cursor=&sort=&dir=&q=&list_id=&list_status=` for the contact list.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct SortedPageParams {
@@ -55,6 +56,8 @@ pub struct SortedPageParams {
     pub q: Option<String>,
     /// Only contacts with a membership on this list, whatever its status.
     pub list_id: Option<Uuid>,
+    /// Only with `list_id`: narrows it to memberships with this status.
+    pub list_status: Option<MembershipStatus>,
 }
 
 impl SortedPageParams {

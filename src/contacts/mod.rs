@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::{
     custom_fields::{Definition, FieldKind, definitions_for},
     error::{ApiError, ApiResult, FieldError},
+    lists::MembershipStatus,
     pagination::{
         Page,
         sorted::{ContactSort, Dir, SortedPageParams, page},
@@ -229,6 +230,9 @@ pub struct ContactFilter {
     /// Contacts with a membership row on this list, whatever its status: a `pending` or
     /// `unsubscribed` member is still a member here. A list of another workspace matches nothing.
     pub list_id: Option<Uuid>,
+    /// Narrows `list_id` to the memberships with this status. Meaningless without `list_id`: the
+    /// handler refuses it, and `list` ignores it.
+    pub list_status: Option<MembershipStatus>,
     pub tag_id: Option<Uuid>,
 }
 
@@ -288,8 +292,11 @@ pub async fn list(
              where m.workspace_id = contacts.workspace_id and m.contact_id = contacts.id \
              and m.list_id = ",
         )
-        .push_bind(list_id)
-        .push(")");
+        .push_bind(list_id);
+        if let Some(status) = filter.list_status {
+            q.push(" and m.status = ").push_bind(status);
+        }
+        q.push(")");
     }
     if let Some((value, id)) = params.after()? {
         match sort {
@@ -359,9 +366,12 @@ mod tests {
     }
 
     #[test]
-    fn filter_serialises_all_three_fields() {
+    fn filter_serialises_all_four_fields() {
         let v = serde_json::to_value(ContactFilter::default()).unwrap();
-        assert_eq!(v, json!({"q": null, "list_id": null, "tag_id": null}));
+        assert_eq!(
+            v,
+            json!({"q": null, "list_id": null, "list_status": null, "tag_id": null})
+        );
         let f: ContactFilter = serde_json::from_value(v).unwrap();
         assert_eq!(f, ContactFilter::default());
     }

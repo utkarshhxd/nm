@@ -446,6 +446,43 @@ export interface paths {
         patch: operations["update_contact"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_contact_lists"];
+        put?: never;
+        /** The same as `POST /lists/{id}/members`, from the contact's side. */
+        post: operations["add_contact_to_list"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,
+         *     and keeps the membership.
+         */
+        delete: operations["remove_contact_from_list"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/custom-fields": {
         parameters: {
             query?: never;
@@ -662,6 +699,17 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /** @description One list a contact is on, as the contact's page shows it. */
+        ContactList: {
+            /** Format: uuid */
+            list_id: string;
+            name: string;
+            status: components["schemas"]["MembershipStatus"];
+            /** Format: date-time */
+            subscribed_at?: string | null;
+            /** Format: date-time */
+            unsubscribed_at?: string | null;
+        };
         /**
          * @description What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,
          *     `contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.
@@ -817,12 +865,15 @@ export interface components {
         Membership: {
             /** Format: uuid */
             contact_id: string;
+            /** Format: uuid */
+            list_id: string;
             status: components["schemas"]["MembershipStatus"];
         };
         /**
          * @description What a membership row says. It means the same on every list: `Pending` is written only on a
          *     double-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here
-         *     depends on the list's setting.
+         *     depends on the list's setting. A `Pending` row can outlive the list's
+         *     double opt-in being switched off: it still means "not confirmed" and is not mailable.
          * @enum {string}
          */
         MembershipStatus: "pending" | "subscribed" | "unsubscribed";
@@ -841,6 +892,10 @@ export interface components {
             last_name?: string | null;
             /** @description An IANA time zone such as `Europe/London`. */
             timezone?: string | null;
+        };
+        NewContactList: {
+            /** Format: uuid */
+            list_id: string;
         };
         NewCustomField: {
             /**
@@ -927,6 +982,19 @@ export interface components {
                 timezone?: string | null;
                 /** Format: date-time */
                 updated_at: string;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_ContactList: {
+            data: {
+                /** Format: uuid */
+                list_id: string;
+                name: string;
+                status: components["schemas"]["MembershipStatus"];
+                /** Format: date-time */
+                subscribed_at?: string | null;
+                /** Format: date-time */
+                unsubscribed_at?: string | null;
             }[];
             next_cursor?: string | null;
         };
@@ -1089,8 +1157,8 @@ export interface components {
         UpdateList: {
             description?: string | null;
             /**
-             * @description Cannot be switched off while the list has `pending` members: they have not confirmed, and
-             *     a `pending` row on a single-opt-in list would break what `pending` means.
+             * @description Only decides the status of members added from now on. A member already `pending` stays
+             *     `pending` (not mailable) when this is switched off.
              */
             double_optin?: boolean | null;
             name?: string | null;
@@ -2319,6 +2387,8 @@ export interface operations {
                 q?: string;
                 /** @description Only contacts with a membership on this list, whatever its status. */
                 list_id?: string;
+                /** @description Only with `list_id`: narrows it to memberships with this status. */
+                list_status?: components["schemas"]["MembershipStatus"];
             };
             header?: never;
             path: {
@@ -2345,7 +2415,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a malformed cursor, an unknown `sort`, or a `q` under 3 characters */
+            /** @description a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id` */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -2518,6 +2588,132 @@ export interface operations {
             };
             /** @description invalid name, time zone or attribute, or an unknown field such as `email` */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_contact_lists: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every list the contact has a membership on, whatever its status, newest list first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ContactList"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    add_contact_to_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewContactList"];
+            };
+        };
+        responses: {
+            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            /** @description insufficient-role: changing a contact's lists takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact or list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_contact_from_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+                /** @description List id */
+                list_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unsubscribed. The membership stays, as `unsubscribed` */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: changing a contact's lists takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or the contact was never on this list */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2952,7 +3148,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description list-name-taken, or pending-members: double opt-in cannot be switched off while members are pending */
+            /** @description list-name-taken */
             409: {
                 headers: {
                     [name: string]: unknown;

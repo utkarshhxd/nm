@@ -59,6 +59,9 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::lists::routes::list_list_members,
         crate::lists::routes::add_list_member,
         crate::lists::routes::remove_list_member,
+        crate::lists::routes::list_contact_lists,
+        crate::lists::routes::add_contact_to_list,
+        crate::lists::routes::remove_contact_from_list,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -104,12 +107,14 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::contacts::NewContact,
         crate::contacts::routes::UpdateContact,
         crate::lists::List,
+        crate::lists::ContactList,
         crate::lists::Member,
         crate::lists::MembershipStatus,
         crate::lists::Visibility,
         crate::lists::routes::NewList,
         crate::lists::routes::UpdateList,
         crate::lists::routes::NewMember,
+        crate::lists::routes::NewContactList,
         crate::lists::routes::Membership,
     ))
 )]

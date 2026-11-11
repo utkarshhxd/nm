@@ -1,0 +1,79 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select m.list_id, l.name, m.status as \"status: MembershipStatus\",\n                  m.subscribed_at, m.unsubscribed_at\n           from list_memberships m\n           join lists l on l.workspace_id = m.workspace_id and l.id = m.list_id\n           where m.workspace_id = $1 and m.contact_id = $2 and ($3::uuid is null or m.list_id < $3)\n           order by m.list_id desc limit $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "list_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "list_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status: MembershipStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "subscribed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "subscribed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "unsubscribed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "unsubscribed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "9e9d199b2b2a70cb3a19e1a0733909fdf369463bb64b9e37898fda0f93ee1281"
+}

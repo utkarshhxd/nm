@@ -384,23 +384,190 @@ async fn roles_and_validation(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn double_optin_cannot_be_switched_off_under_pending_members(pool: PgPool) {
+async fn double_optin_can_be_switched_off_and_pending_rows_stay_pending(pool: PgPool) {
     let (ws, app) = workspace(&pool, "acme").await;
     let list = create_list(&app, ws, "news", true).await;
-    let contact = create_contact(&app, ws, "a@ex.test").await;
-    add(&app, ws, list, contact).await;
+    let waiting = create_contact(&app, ws, "a@ex.test").await;
+    let newcomer = create_contact(&app, ws, "b@ex.test").await;
+    add(&app, ws, list, waiting).await;
     let url = format!("{}/{list}", lists_path(ws));
 
-    let r = app.patch(&url).json(&json!({"double_optin": false})).await;
-    r.assert_status(StatusCode::CONFLICT);
-    assert_eq!(problem_type(&r), "urn:nm:problem:pending-members");
-    // Once nobody is pending it goes through, and `pending` can no longer be written.
-    remove(&app, ws, list, contact).await;
+    // 200, not a refusal: with no confirmation flow before M1c, a pending row could otherwise
+    // only be cleared one at a time, and the setting could never be turned off.
     app.patch(&url)
         .json(&json!({"double_optin": false}))
         .await
         .assert_status_ok();
-    assert_eq!(add(&app, ws, list, contact).await, "subscribed");
+    // The row that was pending is left exactly as it was: still pending, still not mailable.
+    assert_eq!(
+        row(&pool, list, waiting).await,
+        ("pending".into(), false, false)
+    );
+    // A new member of the now single-opt-in list is subscribed at once.
+    assert_eq!(add(&app, ws, list, newcomer).await, "subscribed");
+    // Adding the pending one again leaves it pending: only an unsubscribed row is rewritten.
+    assert_eq!(add(&app, ws, list, waiting).await, "pending");
+}
+
+/// `(action, target_type, target_id, metadata)` of the list audit rows, oldest first.
+async fn list_audit(
+    pool: &PgPool,
+    ws: Uuid,
+) -> Vec<(String, Option<String>, Option<String>, Value)> {
+    sqlx::query_as(
+        "select action, target_type, target_id, metadata from audit_log \
+         where workspace_id = $1 and action like 'list.%' order by created_at, id",
+    )
+    .bind(ws)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn list_actions_are_audited_without_personal_data(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let list = create_list(&app, ws, "news", false).await;
+    let contact = create_contact(&app, ws, "pii.person@ex.test").await;
+    add(&app, ws, list, contact).await;
+    remove(&app, ws, list, contact).await;
+    // The contact-side routes write the same rows.
+    let by_contact = format!("/api/v1/workspaces/{ws}/contacts/{contact}/lists");
+    app.post(&by_contact)
+        .json(&json!({"list_id": list}))
+        .await
+        .assert_status_ok();
+    app.delete(&format!("{by_contact}/{list}"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    app.patch(&format!("{}/{list}", lists_path(ws)))
+        .json(&json!({"visibility": "public", "description": "hello"}))
+        .await
+        .assert_status_ok();
+    app.delete(&format!("{}/{list}", lists_path(ws)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let (list_id, contact_id) = (Some(list.to_string()), contact.to_string());
+    let target = |action: &str, metadata: Value| {
+        (
+            action.to_owned(),
+            Some("list".to_owned()),
+            list_id.clone(),
+            metadata,
+        )
+    };
+    assert_eq!(
+        list_audit(&pool, ws).await,
+        [
+            target("list.created", json!({"name": "news"})),
+            target(
+                "list.member_added",
+                json!({"contact_id": contact_id, "status": "subscribed"})
+            ),
+            target("list.member_removed", json!({"contact_id": contact_id})),
+            target(
+                "list.member_added",
+                json!({"contact_id": contact_id, "status": "subscribed"})
+            ),
+            target("list.member_removed", json!({"contact_id": contact_id})),
+            target(
+                "list.updated",
+                json!({"fields": ["description", "visibility"]})
+            ),
+            target("list.deleted", json!({})),
+        ]
+    );
+    // The address is personal data an erasure must be able to remove; the audit log is not erased.
+    let all = sqlx::query_scalar::<_, String>("select metadata::text from audit_log")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .join(" ");
+    assert!(
+        !all.contains("pii.person"),
+        "an address reached the audit log"
+    );
+}
+
+#[sqlx::test]
+async fn a_contacts_lists_can_be_read_and_changed_from_the_contact(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let viewer = client(&pool, "viewer@example.com", ws, Role::Viewer).await;
+    let single = create_list(&app, ws, "single", false).await;
+    let double = create_list(&app, ws, "double", true).await;
+    let contact = create_contact(&app, ws, "a@ex.test").await;
+    let path = format!("/api/v1/workspaces/{ws}/contacts/{contact}/lists");
+
+    assert!(
+        app.get(&path).await.json::<Value>()["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for (list, status) in [(single, "subscribed"), (double, "pending")] {
+        let r = app.post(&path).json(&json!({"list_id": list})).await;
+        r.assert_status_ok();
+        let body: Value = r.json();
+        assert_eq!(body["status"], status);
+        assert_eq!(body["list_id"], list.to_string());
+    }
+    // The same rows the list-side routes see.
+    assert_eq!(row(&pool, single, contact).await.0, "subscribed");
+
+    // Newest list first, with the name and status: what the contact page shows.
+    let page: Value = app.get(&format!("{path}?limit=1")).await.json();
+    assert_eq!(page["data"][0]["name"], "double");
+    assert_eq!(page["data"][0]["status"], "pending");
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let page: Value = app
+        .get(&format!("{path}?limit=1&cursor={cursor}"))
+        .await
+        .json();
+    assert_eq!(page["data"][0]["list_id"], single.to_string());
+    assert!(page["next_cursor"].is_null());
+
+    app.delete(&format!("{path}/{single}"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        row(&pool, single, contact).await,
+        ("unsubscribed".into(), true, true)
+    );
+    // Never on that list: nothing to remove.
+    let other = create_list(&app, ws, "other", false).await;
+    app.delete(&format!("{path}/{other}"))
+        .await
+        .assert_status_not_found();
+
+    // Viewers read but do not write.
+    viewer.get(&path).await.assert_status_ok();
+    viewer
+        .post(&path)
+        .json(&json!({"list_id": other}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+
+    // Another workspace's list, and another workspace's contact, are 404.
+    let (ws_b, app_b) = workspace(&pool, "globex").await;
+    let list_b = create_list(&app_b, ws_b, "b", false).await;
+    app.post(&path)
+        .json(&json!({"list_id": list_b}))
+        .await
+        .assert_status_not_found();
+    app_b
+        .get(&format!(
+            "/api/v1/workspaces/{ws_b}/contacts/{contact}/lists"
+        ))
+        .await
+        .assert_status_not_found();
+    app_b
+        .post(&format!(
+            "/api/v1/workspaces/{ws_b}/contacts/{contact}/lists"
+        ))
+        .json(&json!({"list_id": list_b}))
+        .await
+        .assert_status_not_found();
 }
 
 #[sqlx::test]

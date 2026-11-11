@@ -24,7 +24,8 @@ pub enum Visibility {
 
 /// What a membership row says. It means the same on every list: `Pending` is written only on a
 /// double-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here
-/// depends on the list's setting.
+/// depends on the list's setting. A `Pending` row can outlive the list's
+/// double opt-in being switched off: it still means "not confirmed" and is not mailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
@@ -53,6 +54,16 @@ pub struct List {
     pub visibility: Visibility,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// One list a contact is on, as the contact's page shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ContactList {
+    pub list_id: Uuid,
+    pub name: String,
+    pub status: MembershipStatus,
+    pub subscribed_at: Option<DateTime<Utc>>,
+    pub unsubscribed_at: Option<DateTime<Utc>>,
 }
 
 /// A contact's standing on one list.
@@ -119,10 +130,8 @@ pub async fn add_member(
     list_id: Uuid,
     contact_id: Uuid,
 ) -> ApiResult<MembershipStatus> {
-    // `for share` holds off a concurrent `update_list` that is switching double opt-in off, so the
-    // setting read here is still true when the row below is written.
     let double_optin = sqlx::query_scalar!(
-        "select double_optin from lists where workspace_id = $1 and id = $2 for share",
+        "select double_optin from lists where workspace_id = $1 and id = $2",
         workspace_id,
         list_id,
     )

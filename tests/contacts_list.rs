@@ -366,3 +366,77 @@ async fn filters_by_list_id(pool: PgPool) {
         .await;
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[sqlx::test]
+async fn list_status_narrows_list_id(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let lists = format!("/api/v1/workspaces/{}/lists", f.ws);
+    // Double opt-in, so adding writes `pending`.
+    let r = f.app.post(&lists).json(&json!({"name": "doi"})).await;
+    r.assert_status(StatusCode::CREATED);
+    let list = r.json::<Value>()["id"].as_str().unwrap().to_owned();
+    let members = format!("{lists}/{list}/members");
+    // Contacts 0..6 are added (pending); then 1 and 2 are made subscribed and 3, 4, 5 unsubscribed,
+    // leaving 0 pending. Contacts 6..10 are on no list.
+    let ids: Vec<Uuid> = f.seeded.iter().map(|(_, id)| *id).collect();
+    for id in &ids[..6] {
+        let r = f.app.post(&members).json(&json!({"contact_id": id})).await;
+        r.assert_status_ok();
+    }
+    // There is no confirmation flow yet, so make the subscribed ones directly.
+    for id in &ids[1..3] {
+        sqlx::query("update list_memberships set status = 'subscribed' where contact_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for id in &ids[3..6] {
+        f.app
+            .delete(&format!("{members}/{id}"))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+    let by_creation = |range: std::ops::Range<usize>| -> Vec<String> {
+        f.seeded[range]
+            .iter()
+            .rev()
+            .map(|(e, _)| e.clone())
+            .collect()
+    };
+    // No status: every membership row, as before.
+    assert_eq!(
+        f.emails(2, &format!("list_id={list}")).await,
+        by_creation(0..6)
+    );
+    for (status, expected) in [
+        ("pending", by_creation(0..1)),
+        ("subscribed", by_creation(1..3)),
+        ("unsubscribed", by_creation(3..6)),
+    ] {
+        // Page size 1 puts a boundary between every two rows of the narrowed result.
+        for limit in [1, 2, 50] {
+            assert_eq!(
+                f.emails(limit, &format!("list_id={list}&list_status={status}"))
+                    .await,
+                expected,
+                "{status} limit={limit}"
+            );
+        }
+    }
+    // Contacts that are not on the list are not matched by any status.
+    assert!(
+        !f.emails(50, &format!("list_id={list}&list_status=pending"))
+            .await
+            .contains(&f.seeded[9].0)
+    );
+
+    // A status says nothing without a list, and an unknown one is not a status.
+    for q in [
+        "list_status=pending".to_owned(),
+        format!("list_id={list}&list_status=bogus"),
+    ] {
+        let r = f.app.get(&format!("{}?{q}", contacts_path(f.ws))).await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}

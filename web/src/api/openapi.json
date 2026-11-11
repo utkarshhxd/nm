@@ -1298,6 +1298,15 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "list_status",
+            "in": "query",
+            "description": "Only with `list_id`: narrows it to memberships with this status.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/MembershipStatus"
+            }
           }
         ],
         "responses": {
@@ -1315,7 +1324,7 @@
             "description": "not a member, or no such workspace"
           },
           "422": {
-            "description": "a malformed cursor, an unknown `sort`, or a `q` under 3 characters"
+            "description": "a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id`"
           }
         }
       },
@@ -1509,6 +1518,183 @@
           },
           "422": {
             "description": "invalid name, time zone or attribute, or an unknown field such as `email`"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "list_contact_lists",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every list the contact has a membership on, whatever its status, newest list first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ContactList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "The same as `POST /lists/{id}/members`, from the contact's side.",
+        "operationId": "add_contact_to_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewContactList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: changing a contact's lists takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact or list in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}": {
+      "delete": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,\nand keeps the membership.",
+        "operationId": "remove_contact_from_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "list_id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unsubscribed. The membership stays, as `unsubscribed`"
+          },
+          "403": {
+            "description": "insufficient-role: changing a contact's lists takes editor"
+          },
+          "404": {
+            "description": "not a member, or the contact was never on this list"
           }
         }
       }
@@ -2022,7 +2208,7 @@
             "description": "not a member, or no such list in this workspace"
           },
           "409": {
-            "description": "list-name-taken, or pending-members: double opt-in cannot be switched off while members are pending"
+            "description": "list-name-taken"
           },
           "422": {
             "description": "invalid name or description, or an unknown field"
@@ -2479,6 +2665,41 @@
           }
         }
       },
+      "ContactList": {
+        "type": "object",
+        "description": "One list a contact is on, as the contact's page shows it.",
+        "required": [
+          "list_id",
+          "name",
+          "status"
+        ],
+        "properties": {
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
+          },
+          "subscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "unsubscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
       "ContactSort": {
         "type": "string",
         "description": "What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,\n`contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.",
@@ -2908,10 +3129,15 @@
         "type": "object",
         "required": [
           "contact_id",
+          "list_id",
           "status"
         ],
         "properties": {
           "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "list_id": {
             "type": "string",
             "format": "uuid"
           },
@@ -2922,7 +3148,7 @@
       },
       "MembershipStatus": {
         "type": "string",
-        "description": "What a membership row says. It means the same on every list: `Pending` is written only on a\ndouble-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here\ndepends on the list's setting.",
+        "description": "What a membership row says. It means the same on every list: `Pending` is written only on a\ndouble-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here\ndepends on the list's setting. A `Pending` row can outlive the list's\ndouble opt-in being switched off: it still means \"not confirmed\" and is not mailable.",
         "enum": [
           "pending",
           "subscribed",
@@ -2977,6 +3203,19 @@
               "null"
             ],
             "description": "An IANA time zone such as `Europe/London`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewContactList": {
+        "type": "object",
+        "required": [
+          "list_id"
+        ],
+        "properties": {
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
           }
         },
         "additionalProperties": false
@@ -3300,6 +3539,58 @@
                 },
                 "updated_at": {
                   "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_ContactList": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One list a contact is on, as the contact's page shows it.",
+              "required": [
+                "list_id",
+                "name",
+                "status"
+              ],
+              "properties": {
+                "list_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/MembershipStatus"
+                },
+                "subscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "unsubscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
                   "format": "date-time"
                 }
               }
@@ -3793,7 +4084,7 @@
               "boolean",
               "null"
             ],
-            "description": "Cannot be switched off while the list has `pending` members: they have not confirmed, and\na `pending` row on a single-opt-in list would break what `pending` means."
+            "description": "Only decides the status of members added from now on. A member already `pending` stays\n`pending` (not mailable) when this is switched off."
           },
           "name": {
             "type": [
