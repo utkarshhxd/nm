@@ -51,6 +51,27 @@ const workspaceRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/workspace-layout")),
 });
 
+const text = (value: unknown) => (typeof value === "string" && value !== "" ? value : undefined);
+
+const pick = <T extends string>(value: unknown, allowed: readonly T[]) =>
+  allowed.find((a) => a === value);
+
+// The view lives in the URL, so it can be linked and the back button works. An unknown value is
+// dropped rather than rejected: a hand-edited link still opens.
+const contactsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "contacts",
+  validateSearch: (search: Record<string, unknown>) => ({
+    q: text(search["q"]),
+    sort: pick(search["sort"], ["created", "email"]),
+    dir: pick(search["dir"], ["asc", "desc"]),
+    list_id: text(search["list_id"]),
+    list_status: pick(search["list_status"], ["pending", "subscribed", "unsubscribed"]),
+    tag_id: text(search["tag_id"]),
+  }),
+  component: lazyRouteComponent(() => import("./routes/contacts")),
+});
+
 const membersRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "members",
@@ -76,7 +97,7 @@ export const router = createRouter({
     accountSecurityRoute,
     inviteRoute,
     newWorkspaceRoute,
-    workspaceRoute.addChildren([membersRoute, apiKeysRoute, auditLogRoute]),
+    workspaceRoute.addChildren([contactsRoute, membersRoute, apiKeysRoute, auditLogRoute]),
   ]),
 });
 
