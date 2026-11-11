@@ -26,14 +26,20 @@ let csrf = "";
 
 const ids = { tag: "", single: "", double: "" };
 
-async function api(method: "post" | "get", path: string, data?: unknown) {
+async function api(method: "post" | "get" | "delete", path: string, data?: unknown) {
   const url = `/api/v1/workspaces/${workspaceId}${path}`;
+  const headers = { "X-CSRF-Token": csrf };
   const res =
     method === "get"
       ? await context.request.get(url)
-      : await context.request.post(url, { data, headers: { "X-CSRF-Token": csrf } });
+      : method === "delete"
+        ? await context.request.delete(url, { headers })
+        : await context.request.post(url, { data, headers });
   expect(res.ok(), `${method} ${path} -> ${res.status()}`).toBe(true);
-  return (await res.json()) as { id?: string; data?: { id: string; email: string }[] };
+  return (res.status() === 204 ? {} : await res.json()) as {
+    id?: string;
+    data?: { id: string; email: string }[];
+  };
 }
 
 async function seed(): Promise<void> {
@@ -180,12 +186,18 @@ test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
   await grid().getByRole("checkbox", { name: "Select all loaded contacts" }).check();
   await expect(page.getByText("100 contacts selected", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Select all contacts matching this view" }).click();
-  await expect(page.getByText(/All contacts matching this view are selected/)).toBeVisible();
+  // The real count, not an estimate, and from now on the grid may say how many rows there are.
+  await expect(
+    page.getByText(`All ${TOTAL.toLocaleString("en-US")} contacts matching this view are selected`),
+  ).toBeVisible();
+  await expect(grid()).toHaveAttribute("aria-rowcount", String(TOTAL + 1));
 
   const first = rows().first().getByRole("checkbox");
   const excluded = (await first.getAttribute("aria-label"))?.replace("Select ", "") ?? "";
   await first.uncheck();
-  await expect(page.getByText(/except 1\b/)).toBeVisible();
+  await expect(
+    page.getByText(`${(TOTAL - 1).toLocaleString("en-US")} of ${TOTAL.toLocaleString("en-US")} contacts matching`),
+  ).toBeVisible();
 
   await page.getByLabel("Tag to add", { exact: true }).selectOption({ label: "vip" });
   await page.getByRole("button", { name: "Add tag", exact: true }).click();
@@ -221,6 +233,36 @@ test("subscribing_to_a_double_opt_in_list_says_pending_and_never_resurrects", as
   await page.getByRole("button", { name: "Subscribe to list", exact: true }).click();
   await expect(result()).toContainText("0 of 1");
   await expect(result()).toContainText("already on the list");
+});
+
+test("ticked_rows_are_subscribed_by_id_and_an_unsubscribed_one_is_skipped", async () => {
+  // Three contacts, one of whom has already unsubscribed from the list: ticking rows sends ids,
+  // and the server's bulk rule (never revive an opt-out) applies to them as to a filter.
+  const [one, two, three] = ["user1001", "user1002", "user1003"];
+  const found = async (q: string) => (await api("get", `/contacts?q=${q}@`)).data?.[0]?.id ?? "";
+  const gone = await found(three ?? "");
+  await api("post", `/contacts/${gone}/lists`, { list_id: ids.single });
+  await api("delete", `/lists/${ids.single}/members/${gone}`); // unsubscribes, keeps the row
+
+  await open("?q=user100");
+  const bodies: { selection_token?: string; ids?: string[] }[] = [];
+  await page.route("**/contacts/bulk/subscribe", async (route) => {
+    bodies.push(route.request().postDataJSON());
+    await route.continue();
+  });
+  for (const who of [one, two, three]) {
+    await page.getByRole("checkbox", { name: `Select ${who}@example.test` }).check();
+  }
+  await expect(page.getByText("3 contacts selected", { exact: true })).toBeVisible();
+  await page.getByLabel("List to subscribe to", { exact: true }).selectOption({ label: "Announcements" });
+  await page.getByRole("button", { name: "Subscribe to list", exact: true }).click();
+  await expect(result()).toContainText("2 of 3 selected contacts were subscribed");
+  await expect(result()).toContainText("already on the list");
+  await page.unroute("**/contacts/bulk/subscribe");
+
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0]?.ids).toHaveLength(3);
+  expect(bodies[0]?.selection_token).toBeUndefined();
 });
 
 test("grid_is_one_tab_stop_and_arrow_keys_move_the_row", async () => {

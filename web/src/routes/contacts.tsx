@@ -156,7 +156,14 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
 
   const rows = useMemo(() => query.data?.pages.flatMap((p) => p.rows) ?? [], [query.data]);
   const rowOffset = query.data?.pages[0]?.start ?? 0;
-  const total = query.hasNextPage ? null : rowOffset + rows.length;
+  // How many contacts the current filter matched, once someone has asked to select them all.
+  // Until then (or after the filters change) it is unknown, and an unknown total is `-1`.
+  const [matched, setMatched] = useState<{ key: string; n: number } | null>(null);
+  const total = !query.hasNextPage
+    ? rowOffset + rows.length
+    : matched?.key === filterKey
+      ? matched.n
+      : null;
 
   // Remounts the grid (scroll, focus, virtualiser) once the new query's data is what is shown.
   const shownKey = useRef(filterKey);
@@ -167,6 +174,7 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
   const [result, setResult] = useState<Result | null>(null);
   const [failure, setFailure] = useState("");
   const [busy, setBusy] = useState(false);
+  const [counting, setCounting] = useState(false);
   const live = useRef(filterKey);
   live.current = filterKey;
 
@@ -227,7 +235,9 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
   }
 
   async function selectAllMatching() {
-    setBusy(true);
+    // The count is a live count over the whole match, which is slow at ten million rows: it is only
+    // asked for here, and the bar shows a skeleton until it lands.
+    setCounting(true);
     setFailure("");
     const mine = filterKey;
     const { data, error } = await api.POST("/api/v1/workspaces/{workspace_id}/contacts/selection", {
@@ -239,10 +249,14 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
         tag_id: filters.tag_id,
       },
     });
-    setBusy(false);
+    setCounting(false);
     if (mine !== live.current) return; // the filters moved on; this token is for a view that is gone
-    if (error || !data) setFailure(problemMessage(error, "Could not select every matching contact."));
-    else store.selectAll(data.selection_token);
+    if (error || !data) {
+      setFailure(problemMessage(error, "Could not select every matching contact."));
+      return;
+    }
+    setMatched({ key: mine, n: data.selected });
+    store.selectAll(data.selection_token, data.selected);
   }
 
   async function bulk(kind: "tag" | "subscribe", target: string, name: string) {
@@ -252,50 +266,29 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
     setFailure("");
     setResult(null);
     try {
-      if (current.mode === "all") {
-        const body = { selection_token: current.token, excluded_ids: [...current.excluded] };
-        const { data, error } =
-          kind === "tag"
-            ? await api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/tag", {
-                params: { path: { workspace_id: id } },
-                body: { ...body, tag_id: target },
-              })
-            : await api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe", {
-                params: { path: { workspace_id: id } },
-                body: { ...body, list_id: target },
-              });
-        if (error || !data) {
-          setFailure(problemMessage(error, "The action failed and nothing was changed."));
-          return;
-        }
-        const message = describe(kind, name, data);
-        setResult(message);
-        announce(message.text);
-      } else {
-        // The bulk routes take a token and nothing else, so a ticked-rows selection tags one
-        // contact at a time (idempotent), which is why it is capped at `MAX_IDS`.
-        const ids = [...current.ids];
-        let done = 0;
-        for (let at = 0; at < ids.length; at += 20) {
-          const answers = await Promise.all(
-            ids.slice(at, at + 20).map((contactId) =>
-              api.PUT("/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}", {
-                params: { path: { workspace_id: id, id: contactId, tag_id: target } },
-              }),
-            ),
-          );
-          done += answers.filter((a) => !a.error).length;
-        }
-        const message: Result =
-          done === ids.length
-            ? { tone: "ok", text: `Tagged ${count(done, "contact")} with “${name}”.` }
-            : {
-                tone: "warn",
-                text: `Tagged ${done} of ${count(ids.length, "contact")} with “${name}”. The rest failed.`,
-              };
-        setResult(message);
-        announce(message.text);
+      // A filter selection goes as its token and exclusions, ticked rows as their ids: the
+        // server takes exactly one of the two, and applies the same rules to both.
+      const body =
+        current.mode === "all"
+          ? { selection_token: current.token, excluded_ids: [...current.excluded] }
+          : { ids: [...current.ids] };
+      const { data, error } =
+        kind === "tag"
+          ? await api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/tag", {
+              params: { path: { workspace_id: id } },
+              body: { ...body, tag_id: target },
+            })
+          : await api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe", {
+              params: { path: { workspace_id: id } },
+              body: { ...body, list_id: target },
+            });
+      if (error || !data) {
+        setFailure(problemMessage(error, "The action failed and nothing was changed."));
+        return;
       }
+      const message = describe(kind, name, data);
+      setResult(message);
+      announce(message.text);
       // The table only changes when it is filtered by what the action changed.
       if (filters.list_id || filters.tag_id) {
         await queryClient.invalidateQueries({ queryKey: ["contacts", id] });
@@ -375,14 +368,20 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
             <p className="font-medium">
               {selection.mode === "ids"
                 ? `${count(selection.ids.size, "contact")} selected`
-                : `All contacts matching this view are selected${
-                    selection.excluded.size ? `, except ${selection.excluded.size.toLocaleString()}` : ""
-                  }.`}
+                : selection.excluded.size
+                  ? `${(selection.matched - selection.excluded.size).toLocaleString()} of ${selection.matched.toLocaleString()} contacts matching this view are selected (${selection.excluded.size.toLocaleString()} left out).`
+                  : `All ${selection.matched.toLocaleString()} contacts matching this view are selected.`}
             </p>
             {selection.mode === "ids" ? (
-              <Button variant="ghost" disabled={busy} onClick={() => void selectAllMatching()}>
-                Select all contacts matching this view
-              </Button>
+              counting ? (
+                <div className="w-56">
+                  <Skeleton label="Counting matching contacts" />
+                </div>
+              ) : (
+                <Button variant="ghost" onClick={() => void selectAllMatching()}>
+                  Select all contacts matching this view
+                </Button>
+              )
             ) : null}
             <BulkAction
               label="Tag to add"
@@ -392,20 +391,14 @@ function ContactsPage({ id, canEdit }: { id: string; canEdit: boolean }) {
               busy={busy}
               onRun={(target, name) => void bulk("tag", target, name)}
             />
-            {selection.mode === "all" ? (
-              <BulkAction
-                label="List to subscribe to"
-                placeholder="Choose a list…"
-                action="Subscribe to list"
-                options={lists.data ?? []}
-                busy={busy}
-                onRun={(target, name) => void bulk("subscribe", target, name)}
-              />
-            ) : (
-              <span className="text-fg-muted">
-                To subscribe contacts to a list, select all contacts matching this view.
-              </span>
-            )}
+            <BulkAction
+              label="List to subscribe to"
+              placeholder="Choose a list…"
+              action="Subscribe to list"
+              options={lists.data ?? []}
+              busy={busy}
+              onRun={(target, name) => void bulk("subscribe", target, name)}
+            />
             <Button variant="ghost" onClick={() => store.clear()}>
               Clear selection
             </Button>

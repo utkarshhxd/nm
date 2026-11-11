@@ -8,7 +8,7 @@ use common::{PW, TestApp, add_member, create_user, create_workspace};
 use nm::{
     contacts::{
         ContactFilter,
-        selection::{MAX_EXCLUDED, Selection, issue},
+        selection::{MAX_EXCLUDED, MAX_IDS, Selection, issue},
     },
     workspaces::roles::Role,
 };
@@ -208,6 +208,7 @@ fn token_aged(app: &TestApp, ws: Uuid, age: std::time::Duration) -> String {
         workspace_id: ws,
         filter: ContactFilter::default(),
         as_of: Uuid::new_v7(Timestamp::from_unix(NoContext, secs, 0)),
+        ids: None,
     };
     issue(&app.state.secrets, &sel)
 }
@@ -660,4 +661,141 @@ async fn response_carries_selected_and_the_resulting_status(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(meta["selected"], 6);
+}
+
+/// Ticked rows, no token. The same skip-unsubscribed rule as a filter selection, and the same two
+/// numbers: three of four were added, and the one who unsubscribed was not brought back.
+#[sqlx::test]
+async fn an_id_list_subscribes_the_new_and_skips_an_unsubscribed_contact(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (_, other) = workspace(&pool, "other").await;
+    let single = list(&app, ws, "single", false).await;
+    let ids = contacts(&app, ws, "c", 4).await;
+    app.post(&format!("{}/contacts/{}/lists", base(ws), ids[3]))
+        .json(&json!({"list_id": single}))
+        .await
+        .assert_status_success();
+    set_status(&pool, ids[3], single, "unsubscribed").await;
+    let outsider = Uuid::now_v7(); // not a contact of this workspace at all
+    drop(other);
+
+    let mut named = ids.clone();
+    named.push(outsider);
+    let r = bulk(
+        &app,
+        ws,
+        "subscribe",
+        json!({"ids": named, "list_id": single}),
+    )
+    .await;
+    r.assert_status_ok();
+    let v: Value = r.json();
+    assert_eq!((&v["selected"], &v["affected"]), (&json!(4), &json!(3)));
+    assert_eq!(v["status"], "subscribed");
+    assert_eq!(
+        status_of(&pool, ids[3], single).await.unwrap(),
+        "unsubscribed"
+    );
+    for id in &ids[..3] {
+        assert_eq!(status_of(&pool, *id, single).await.unwrap(), "subscribed");
+    }
+}
+
+/// An id of another workspace's contact selects nothing: the workspace scope is in the statement.
+#[sqlx::test]
+async fn an_id_list_cannot_reach_another_workspaces_contacts(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (ws2, app2) = workspace(&pool, "other").await;
+    let theirs = contacts(&app2, ws2, "t", 2).await;
+    let vip = tag(&app, ws, "vip").await;
+    let r = bulk(&app, ws, "tag", json!({"ids": theirs, "tag_id": vip})).await;
+    let v: Value = r.json();
+    assert_eq!((&v["selected"], &v["affected"]), (&json!(0), &json!(0)));
+    assert!(tagged(&pool, vip).await.is_empty());
+}
+
+#[sqlx::test]
+async fn exactly_one_of_ids_and_a_token(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    let ids = contacts(&app, ws, "c", 2).await;
+    let token = select(&app, ws, json!({})).await;
+    for body in [
+        json!({"ids": ids, "selection_token": token, "tag_id": vip}),
+        json!({"tag_id": vip}),
+        json!({"ids": ids, "excluded_ids": [ids[0]], "tag_id": vip}),
+    ] {
+        let r = bulk(&app, ws, "tag", body).await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert!(tagged(&pool, vip).await.is_empty());
+}
+
+#[sqlx::test]
+async fn ids_are_bounded(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    contacts(&app, ws, "c", 2).await;
+    let ids = |n: usize| (0..n).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+    let r = bulk(
+        &app,
+        ws,
+        "tag",
+        json!({"ids": ids(MAX_IDS + 1), "tag_id": vip}),
+    )
+    .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    // Exactly the cap is accepted (and matches nothing here).
+    let r = bulk(&app, ws, "tag", json!({"ids": ids(MAX_IDS), "tag_id": vip})).await;
+    assert_eq!(affected(r).await, 0);
+}
+
+/// One row, saying it was an id list and how many, with none of the ids in it.
+#[sqlx::test]
+async fn an_id_list_writes_one_audit_row_without_the_ids(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    let before = count(&pool, "select count(*) from audit_log").await;
+    assert_eq!(
+        affected(bulk(&app, ws, "tag", json!({"ids": ids, "tag_id": vip})).await).await,
+        3
+    );
+    assert_eq!(
+        count(&pool, "select count(*) from audit_log").await,
+        before + 1
+    );
+    let (meta,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'contacts.bulk_tagged'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for id in &ids {
+        assert!(!meta.contains(&id.to_string()), "{id} leaked into {meta}");
+    }
+    let meta: Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(
+        (&meta["by"], &meta["ids"], &meta["selected"]),
+        (&json!("ids"), &json!(3), &json!(3))
+    );
+}
+
+/// `selected` is the live count under the token's own bound, so a later signup is not in it.
+#[sqlx::test]
+async fn creating_a_selection_reports_how_many_it_matched(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    contacts(&app, ws, "match", 3).await;
+    contacts(&app, ws, "other", 2).await;
+    let r = app
+        .post(&format!("{}/contacts/selection", base(ws)))
+        .json(&json!({"q": "match"}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["selected"], 3);
+    let all = app
+        .post(&format!("{}/contacts/selection", base(ws)))
+        .json(&json!({}))
+        .await;
+    assert_eq!(all.json::<Value>()["selected"], 5);
 }

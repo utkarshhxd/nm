@@ -961,11 +961,20 @@ export interface components {
             /** Format: uuid */
             tag_id: string;
         };
-        /** @description What a bulk route acts on: the selection, less the contacts the user ticked off. */
+        /** @description What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts. */
         BulkTarget: {
-            /** @description Contacts to leave out. At most 10 000. */
+            /** @description Contacts to leave out of a `selection_token`. At most 10 000. */
             excluded_ids?: string[];
-            selection_token: string;
+            /**
+             * @description These contacts and no others, e.g. the ticked rows of a table: at most 10 000. Ids that are
+             *     not in this workspace select nothing. Cannot be combined with `excluded_ids`.
+             */
+            ids?: string[] | null;
+            /**
+             * @description From `POST /contacts/selection`: every contact its filter matched, as of then, less
+             *     `excluded_ids`. Send this or `ids`, not both and not neither.
+             */
+            selection_token?: string | null;
         };
         ChallengeResponse: {
             /**
@@ -1540,6 +1549,15 @@ export interface components {
         };
         /** @description The signed token for a selection; see `selection`. */
         SelectionToken: {
+            /**
+             * Format: int64
+             * @description How many contacts the filter matches, as of the token's `as_of`. A live count over the
+             *     whole match: deliberately exempt from the 150 ms p95 target, like
+             *     `GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks
+             *     for it when the user asks to select everything, and shows a skeleton until it lands. It is
+             *     never kept as a counter on a table: hand-maintained counters drift.
+             */
+            selected: number;
             /** @description Valid for one hour. Pass it to a `bulk/*` route. */
             selection_token: string;
         };
@@ -3111,7 +3129,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3159,7 +3177,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3207,7 +3225,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3255,7 +3273,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3303,7 +3321,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, or too many excluded_ids */
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;

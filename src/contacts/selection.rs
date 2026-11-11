@@ -35,6 +35,10 @@ const TTL: Duration = Duration::from_secs(60 * 60);
 /// one request could carry hundreds of megabytes into a `<> all(...)`.
 pub const MAX_EXCLUDED: usize = 10_000;
 
+/// The most ids a client may name in an explicit id-list selection; the same bound, for the same
+/// reason, as `MAX_EXCLUDED`.
+pub const MAX_IDS: usize = 10_000;
+
 /// What a signed token carries. The field names are part of the token format: renaming one
 /// invalidates tokens already issued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,9 +53,22 @@ pub struct Selection {
     /// from an import, say) silently escapes the bound, and so can be acted on by a selection
     /// that was made before it existed. Any new way of creating contacts must keep minting v7 ids.
     pub as_of: Uuid,
+    /// An explicit list of contacts instead of `filter`: the ticked rows of a table. Never in an
+    /// issued token (a token is a predicate); only `BulkTarget` builds one, from `ids`. It is
+    /// still scoped by `workspace_id`, so an id from another workspace selects nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ids: Option<Vec<Uuid>>,
 }
 
 impl Selection {
+    /// A selection of exactly these contacts, as of now.
+    pub fn of_ids(workspace_id: Uuid, ids: Vec<Uuid>) -> Selection {
+        Selection {
+            ids: Some(ids),
+            ..Selection::now(workspace_id, ContactFilter::default())
+        }
+    }
+
     /// A selection of `filter` as of now. Within one process `now_v7` is monotonic, so every
     /// contact created after this call has a greater id. Two processes inside the same
     /// millisecond have no such order: a contact created by the other one in that millisecond may
@@ -61,6 +78,7 @@ impl Selection {
             workspace_id,
             filter,
             as_of: Uuid::now_v7(),
+            ids: None,
         }
     }
 }
@@ -113,9 +131,35 @@ pub fn check_excluded(excluded: &[Uuid]) -> ApiResult<()> {
     Ok(())
 }
 
+/// `422` if no ids, or more than `MAX_IDS`, are named.
+pub fn check_ids(ids: &[Uuid]) -> ApiResult<()> {
+    if ids.len() > MAX_IDS {
+        return Err(ApiError::Validation(vec![FieldError::new(
+            "ids",
+            format!("at most {MAX_IDS} ids can be selected"),
+        )]));
+    }
+    Ok(())
+}
+
+/// How many contacts `sel` matches under its own `as_of` bound. A live count over the whole
+/// match, so as slow as the match is big: the caller asks for it only when the user asks to select
+/// everything.
+pub async fn count(db: &mut PgConnection, sel: &Selection) -> ApiResult<u64> {
+    let mut q = QueryBuilder::<Postgres>::new("select count(*)::bigint from contacts where ");
+    push_selected(&mut q, sel, &[]);
+    let n: i64 = q.build_query_scalar().fetch_one(db).await?;
+    Ok(n.unsigned_abs())
+}
+
 /// Appends the selection's conditions on `contacts`, after `... where `.
 fn push_selected(q: &mut QueryBuilder<Postgres>, sel: &Selection, excluded: &[Uuid]) {
     q.push("workspace_id = ").push_bind(sel.workspace_id);
+    if let Some(ids) = &sel.ids {
+        // Literal ids: no snapshot bound (the caller named these contacts) and no filter.
+        q.push(" and id = any(").push_bind(ids.clone()).push(")");
+        return;
+    }
     // The snapshot: only what existed when the token was issued. Remove this and a signup
     // between the click and the action joins the selection.
     q.push(" and id <= ").push_bind(sel.as_of);

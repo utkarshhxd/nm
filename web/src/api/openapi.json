@@ -1572,7 +1572,7 @@
             "description": "not a member, or a token for another workspace"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1625,7 +1625,7 @@
             "description": "not a member, no such list, or a token for another workspace"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1677,7 +1677,7 @@
             "description": "not a member, no such tag, or a token for another workspace"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1729,7 +1729,7 @@
             "description": "not a member, no such list, or a token for another workspace"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1781,7 +1781,7 @@
             "description": "not a member, no such tag, or a token for another workspace"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, or too many excluded_ids"
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -3649,10 +3649,7 @@
       },
       "BulkTarget": {
         "type": "object",
-        "description": "What a bulk route acts on: the selection, less the contacts the user ticked off.",
-        "required": [
-          "selection_token"
-        ],
+        "description": "What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.",
         "properties": {
           "excluded_ids": {
             "type": "array",
@@ -3660,10 +3657,25 @@
               "type": "string",
               "format": "uuid"
             },
-            "description": "Contacts to leave out. At most 10 000."
+            "description": "Contacts to leave out of a `selection_token`. At most 10 000."
+          },
+          "ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "These contacts and no others, e.g. the ticked rows of a table: at most 10 000. Ids that are\nnot in this workspace select nothing. Cannot be combined with `excluded_ids`."
           },
           "selection_token": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From `POST /contacts/selection`: every contact its filter matched, as of then, less\n`excluded_ids`. Send this or `ids`, not both and not neither."
           }
         }
       },
@@ -5438,9 +5450,16 @@
         "type": "object",
         "description": "The signed token for a selection; see `selection`.",
         "required": [
-          "selection_token"
+          "selection_token",
+          "selected"
         ],
         "properties": {
+          "selected": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many contacts the filter matches, as of the token's `as_of`. A live count over the\nwhole match: deliberately exempt from the 150 ms p95 target, like\n`GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks\nfor it when the user asks to select everything, and shows a skeleton until it lands. It is\nnever kept as a counter on a table: hand-maintained counters drift.",
+            "minimum": 0
+          },
           "selection_token": {
             "type": "string",
             "description": "Valid for one hour. Pass it to a `bulk/*` route."

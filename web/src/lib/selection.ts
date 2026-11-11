@@ -9,11 +9,11 @@
 export type Selection =
   | { mode: "none" }
   | { mode: "ids"; ids: ReadonlySet<string> }
-  | { mode: "all"; token: string; excluded: ReadonlySet<string> };
+  | { mode: "all"; token: string; matched: number; excluded: ReadonlySet<string> };
 
-/** The server refuses more than 10,000 `excluded_ids`; a plain id list is capped far lower. */
+/** The server refuses more than 10,000 `excluded_ids` and 10,000 `ids`. */
 export const MAX_EXCLUDED = 10_000;
-export const MAX_IDS = 1_000;
+export const MAX_IDS = 10_000;
 
 export type SelectionStore = ReturnType<typeof createSelection>;
 
@@ -55,7 +55,7 @@ export function createSelection() {
           if (excluded.size >= MAX_EXCLUDED) return false;
           excluded.add(id);
         }
-        set({ mode: "all", token: state.token, excluded });
+        set({ ...state, excluded });
       } else {
         set({ mode: "ids", ids: new Set([id]) });
       }
@@ -66,7 +66,9 @@ export function createSelection() {
       set(ids.length ? { mode: "ids", ids: new Set(ids.slice(0, MAX_IDS)) } : { mode: "none" });
       return Math.max(0, ids.length - MAX_IDS);
     },
-    selectAll: (token: string) => set({ mode: "all", token, excluded: new Set() }),
+    /** `matched` is how many contacts the token's filter matched when it was issued. */
+    selectAll: (token: string, matched: number) =>
+      set({ mode: "all", token, matched, excluded: new Set() }),
     clear() {
       if (state.mode !== "none") set({ mode: "none" });
     },

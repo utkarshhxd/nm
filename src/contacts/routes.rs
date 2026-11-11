@@ -434,13 +434,24 @@ pub async fn erase_contact(
 pub struct SelectionToken {
     /// Valid for one hour. Pass it to a `bulk/*` route.
     pub selection_token: String,
+    /// How many contacts the filter matches, as of the token's `as_of`. A live count over the
+    /// whole match: deliberately exempt from the 150 ms p95 target, like
+    /// `GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks
+    /// for it when the user asks to select everything, and shows a skeleton until it lands. It is
+    /// never kept as a counter on a table: hand-maintained counters drift.
+    pub selected: u64,
 }
 
-/// What a bulk route acts on: the selection, less the contacts the user ticked off.
+/// What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.
 #[derive(Deserialize, ToSchema)]
 pub struct BulkTarget {
-    pub selection_token: String,
-    /// Contacts to leave out. At most 10 000.
+    /// From `POST /contacts/selection`: every contact its filter matched, as of then, less
+    /// `excluded_ids`. Send this or `ids`, not both and not neither.
+    pub selection_token: Option<String>,
+    /// These contacts and no others, e.g. the ticked rows of a table: at most 10 000. Ids that are
+    /// not in this workspace select nothing. Cannot be combined with `excluded_ids`.
+    pub ids: Option<Vec<Uuid>>,
+    /// Contacts to leave out of a `selection_token`. At most 10 000.
     #[serde(default)]
     pub excluded_ids: Vec<Uuid>,
 }
@@ -510,8 +521,10 @@ pub async fn create_selection(
         ..ContactFilter::with_search(filter.q.as_deref())?
     };
     let selection = Selection::now(workspace_id, filter);
+    let selected = selection::count(&mut conn, &selection).await?;
     Ok(Json(SelectionToken {
         selection_token: selection::issue(&state.secrets, &selection),
+        selected,
     }))
 }
 
@@ -526,7 +539,25 @@ async fn begin_bulk(
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
     selection::check_excluded(&target.excluded_ids)?;
-    let selection = selection::parse(&state.secrets, &target.selection_token)?;
+    let selection = match (&target.selection_token, &target.ids) {
+        (Some(token), None) => selection::parse(&state.secrets, token)?,
+        (None, Some(ids)) => {
+            selection::check_ids(ids)?;
+            if !target.excluded_ids.is_empty() {
+                return Err(ApiError::Validation(vec![FieldError::new(
+                    "excluded_ids",
+                    "only applies to a selection_token",
+                )]));
+            }
+            Selection::of_ids(workspace_id, ids.clone())
+        }
+        _ => {
+            return Err(ApiError::Validation(vec![FieldError::new(
+                "selection_token",
+                "send exactly one of selection_token and ids",
+            )]));
+        }
+    };
     if selection.workspace_id != workspace_id {
         return Err(ApiError::NotFound);
     }
@@ -548,6 +579,13 @@ async fn finish_bulk(
     // that a search was part of the selection, never what it said. Not a hash either: a hash of
     // an address falls to a dictionary.
     let mut filter = json!(selection.filter);
+    // An explicit id list is recorded as such and as a count, never as the ids: one row, not one
+    // per contact, and ids are personal data the log would outlive.
+    let by = if selection.ids.is_some() {
+        "ids"
+    } else {
+        "filter"
+    };
     if !filter["q"].is_null() {
         filter["q"] = json!("<redacted>");
     }
@@ -561,8 +599,10 @@ async fn finish_bulk(
             target_type: None,
             target_id: None,
             metadata: json!({
+                "by": by,
                 "filter": filter,
                 "as_of": selection.as_of,
+                "ids": selection.ids.as_ref().map(Vec::len),
                 // A count, not the ids, by design (one row, not one per contact): replayed calls with
                 // different exclusions cannot be told apart afterwards. Do not turn this into a list.
                 "excluded": target.excluded_ids.len(),
@@ -592,7 +632,7 @@ async fn finish_bulk(
         (status = 200, description = "How many were newly tagged", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_tag_contacts(
@@ -631,7 +671,7 @@ pub async fn bulk_tag_contacts(
         (status = 200, description = "How many had the tag", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_untag_contacts(
@@ -676,7 +716,7 @@ pub async fn bulk_untag_contacts(
         (status = 200, description = "How many memberships were added; contacts already on the list, whatever their status, are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_subscribe_contacts(
@@ -720,7 +760,7 @@ pub async fn bulk_subscribe_contacts(
         (status = 200, description = "How many were unsubscribed now; those already unsubscribed or not on the list are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_unsubscribe_contacts(
@@ -760,7 +800,7 @@ pub async fn bulk_unsubscribe_contacts(
         (status = 200, description = "How many were deleted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, or too many excluded_ids"),
+        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_delete_contacts(
