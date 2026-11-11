@@ -51,3 +51,15 @@ workspaces of mixed size.
 `ready-for-agent` once the load test exists.
 
 ## Comments
+
+## Also measure: the bulk-action CTE (added M1a task 10)
+
+Bulk actions run `with sel as (<predicate>), done as (<action> returning 1) select count(sel),
+count(done)`. Referencing `sel` twice makes Postgres materialise it — one uuid per selected
+contact, spilling to a temp file past `work_mem`, so memory is bounded but I/O is not free. At ten
+million contacts that is a few hundred MB of temp file plus a hash semi-join on `sel`. Nobody has
+measured it. Include this shape in the same 10M-row load test as the search cost above.
+
+For context, a single-transaction bulk write at that size has larger problems than the CTE (WAL
+volume, row locks held for the duration), and the pre-CTE form scanned the same rows anyway. This
+is a measurement to take, not a known regression.
