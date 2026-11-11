@@ -68,7 +68,7 @@ pub struct ContactList {
 
 /// A contact's standing on one list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
-pub struct Member {
+pub struct ListMember {
     pub contact_id: Uuid,
     pub email: String,
     pub status: MembershipStatus,

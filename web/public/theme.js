@@ -3,6 +3,8 @@
 // Sets <html data-theme> before first paint. It is a blocking <script src> in index.html's <head>
 // rather than an inline script because the CSP (src/http/security_headers.rs) has no 'unsafe-inline'
 // for scripts. No import, no framework: it must run before anything else does.
+// Linked to that CSP: inlining this script, or hashing it into the header, would break dark mode in
+// production while every local test still passed. See the comment above HEADERS in security_headers.rs.
 (function () {
   var theme = null;
   try {

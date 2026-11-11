@@ -1138,6 +1138,23 @@ export interface components {
             /** @description Unused until the preference center, which shows the `public` lists as topics. */
             visibility: components["schemas"]["Visibility"];
         };
+        /** @description A contact's standing on one list. */
+        ListMember: {
+            /** Format: uuid */
+            contact_id: string;
+            email: string;
+            status: components["schemas"]["MembershipStatus"];
+            /**
+             * Format: date-time
+             * @description Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
+             */
+            subscribed_at?: string | null;
+            /**
+             * Format: date-time
+             * @description Set only while the status is `unsubscribed`.
+             */
+            unsubscribed_at?: string | null;
+        };
         LoginRequest: {
             email: string;
             password: string;
@@ -1176,22 +1193,14 @@ export interface components {
             role: components["schemas"]["Role"];
             slug: string;
         };
-        /** @description A contact's standing on one list. */
         Member: {
-            /** Format: uuid */
-            contact_id: string;
+            display_name: string;
             email: string;
-            status: components["schemas"]["MembershipStatus"];
-            /**
-             * Format: date-time
-             * @description Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
-             */
-            subscribed_at?: string | null;
-            /**
-             * Format: date-time
-             * @description Set only while the status is `unsubscribed`.
-             */
-            unsubscribed_at?: string | null;
+            /** Format: date-time */
+            joined_at: string;
+            role: components["schemas"]["Role"];
+            /** Format: uuid */
+            user_id: string;
         };
         Membership: {
             /** Format: uuid */
@@ -1400,7 +1409,7 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
-        Page_Member: {
+        Page_ListMember: {
             data: {
                 /** Format: uuid */
                 contact_id: string;
@@ -1416,6 +1425,18 @@ export interface components {
                  * @description Set only while the status is `unsubscribed`.
                  */
                 unsubscribed_at?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Member: {
+            data: {
+                display_name: string;
+                email: string;
+                /** Format: date-time */
+                joined_at: string;
+                role: components["schemas"]["Role"];
+                /** Format: uuid */
+                user_id: string;
             }[];
             next_cursor?: string | null;
         };
@@ -4195,7 +4216,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Page_Member"];
+                    "application/json": components["schemas"]["Page_ListMember"];
                 };
             };
             /** @description not a member, or no such list in this workspace */

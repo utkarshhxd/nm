@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    ContactList, List, Member, MembershipStatus, Visibility, add_member, get, remove_member,
+    ContactList, List, ListMember, MembershipStatus, Visibility, add_member, get, remove_member,
     validate_description, validate_name,
 };
 use crate::{
@@ -375,7 +375,7 @@ pub async fn delete_list(
         PageParams,
     ),
     responses(
-        (status = 200, description = "Every status, newest contact first", body = Page<Member>),
+        (status = 200, description = "Every status, newest contact first", body = Page<ListMember>),
         (status = 404, description = "not a member, or no such list in this workspace"),
         (status = 422, description = "a malformed cursor"),
     ),
@@ -385,13 +385,13 @@ pub async fn list_list_members(
     principal: Principal,
     ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
     ApiQuery(page): ApiQuery<PageParams>,
-) -> ApiResult<Json<Page<Member>>> {
+) -> ApiResult<Json<Page<ListMember>>> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
     get(&mut conn, workspace_id, id).await?;
     let limit = page.limit();
     let rows = sqlx::query_as!(
-        Member,
+        ListMember,
         r#"select m.contact_id, c.email, m.status as "status: MembershipStatus",
                   m.subscribed_at, m.unsubscribed_at
            from list_memberships m

@@ -2915,7 +2915,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_Member"
+                  "$ref": "#/components/schemas/Page_ListMember"
                 }
               }
             }
@@ -4136,6 +4136,43 @@
           }
         }
       },
+      "ListMember": {
+        "type": "object",
+        "description": "A contact's standing on one list.",
+        "required": [
+          "contact_id",
+          "email",
+          "status"
+        ],
+        "properties": {
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
+          },
+          "subscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Null while `pending`, and after an unsubscribe is undone on a double-opt-in list."
+          },
+          "unsubscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set only while the status is `unsubscribed`."
+          }
+        }
+      },
       "LoginRequest": {
         "type": "object",
         "required": [
@@ -4259,38 +4296,30 @@
       },
       "Member": {
         "type": "object",
-        "description": "A contact's standing on one list.",
         "required": [
-          "contact_id",
+          "user_id",
           "email",
-          "status"
+          "display_name",
+          "role",
+          "joined_at"
         ],
         "properties": {
-          "contact_id": {
-            "type": "string",
-            "format": "uuid"
+          "display_name": {
+            "type": "string"
           },
           "email": {
             "type": "string"
           },
-          "status": {
-            "$ref": "#/components/schemas/MembershipStatus"
+          "joined_at": {
+            "type": "string",
+            "format": "date-time"
           },
-          "subscribed_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "Null while `pending`, and after an unsubscribe is undone on a double-opt-in list."
+          "role": {
+            "$ref": "#/components/schemas/Role"
           },
-          "unsubscribed_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "Set only while the status is `unsubscribed`."
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -4994,7 +5023,7 @@
           }
         }
       },
-      "Page_Member": {
+      "Page_ListMember": {
         "type": "object",
         "required": [
           "data"
@@ -5036,6 +5065,52 @@
                   ],
                   "format": "date-time",
                   "description": "Set only while the status is `unsubscribed`."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Member": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "user_id",
+                "email",
+                "display_name",
+                "role",
+                "joined_at"
+              ],
+              "properties": {
+                "display_name": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string"
+                },
+                "joined_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "role": {
+                  "$ref": "#/components/schemas/Role"
+                },
+                "user_id": {
+                  "type": "string",
+                  "format": "uuid"
                 }
               }
             }

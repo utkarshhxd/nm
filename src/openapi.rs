@@ -134,7 +134,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::contacts::routes::BulkResult,
         crate::lists::List,
         crate::lists::ContactList,
-        crate::lists::Member,
+        crate::lists::ListMember,
         crate::lists::MembershipStatus,
         crate::lists::Visibility,
         crate::lists::routes::NewList,
