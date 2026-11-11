@@ -609,3 +609,55 @@ async fn the_audit_row_does_not_hold_the_search_text(pool: PgPool) {
     );
     assert_eq!(meta["affected"], 1);
 }
+
+/// `affected` alone cannot be read: the caller needs `selected` to say "N of M", and on a
+/// double-opt-in list needs `status` to know the people are not yet mailable.
+#[sqlx::test]
+async fn response_carries_selected_and_the_resulting_status(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    let single = list(&app, ws, "single", false).await;
+    let double = list(&app, ws, "double", true).await;
+    let ids = contacts(&app, ws, "c", 6).await;
+    let token = select(&app, ws, json!({})).await;
+    contacts(&app, ws, "late", 3).await; // after the token: in neither number
+    for id in &ids[..4] {
+        app.put(&format!("{}/contacts/{id}/tags/{vip}", base(ws)))
+            .await
+            .assert_status_success();
+    }
+
+    let r = bulk(
+        &app,
+        ws,
+        "tag",
+        json!({"selection_token": token, "tag_id": vip}),
+    )
+    .await;
+    r.assert_status_ok();
+    let v: Value = r.json();
+    assert_eq!((&v["selected"], &v["affected"]), (&json!(6), &json!(2)));
+    assert!(v.get("status").is_none(), "only subscribe has a status");
+
+    for (l, status) in [(double, "pending"), (single, "subscribed")] {
+        let body = json!({"selection_token": token, "list_id": l, "excluded_ids": [ids[0]]});
+        let v: Value = bulk(&app, ws, "subscribe", body.clone()).await.json();
+        assert_eq!((&v["selected"], &v["affected"]), (&json!(5), &json!(5)));
+        assert_eq!(v["status"], status);
+        // Again: all five selected, none of them changed.
+        let v: Value = bulk(&app, ws, "subscribe", body).await.json();
+        assert_eq!((&v["selected"], &v["affected"]), (&json!(5), &json!(0)));
+        assert_eq!(v["status"], status);
+    }
+
+    let v: Value = bulk(&app, ws, "delete", json!({"selection_token": token}))
+        .await
+        .json();
+    assert_eq!((&v["selected"], &v["affected"]), (&json!(6), &json!(6)));
+    let meta: Value =
+        sqlx::query_scalar("select metadata from audit_log where action = 'contacts.bulk_deleted'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(meta["selected"], 6);
+}

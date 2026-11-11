@@ -199,6 +199,8 @@ pub async fn create(
     if is_erased(&mut *db, secrets, workspace_id, email).await? {
         return Err(ApiError::Conflict("address-erased"));
     }
+    // Must stay UUIDv7: a selection's snapshot is `id <= as_of` (see `selection::Selection`), so
+    // a contact id that is not time-ordered escapes that bound entirely.
     let id = Uuid::now_v7();
     sqlx::query!(
         "insert into contacts (id, workspace_id, email, first_name, last_name, attributes, timezone) \
@@ -236,8 +238,9 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 }
 
 /// Which contacts a list shows. It is embedded in a signed selection token later, so its
-/// serialised form is part of that token's payload: renaming a field would invalidate tokens
-/// already issued.
+/// serialised form is part of that token's payload: renaming a field, or adding one (the payload is
+/// not tolerant of a missing field), would make tokens already issued fail to decode, as a
+/// `422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ContactFilter {
     /// Case-insensitive substring of the address or name.

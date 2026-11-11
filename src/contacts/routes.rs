@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     Contact, ContactFilter, NewContact, create, get, list,
-    selection::{self, Selection},
+    selection::{self, Counts, Selection},
     validate_attributes_patch, validate_name,
 };
 use crate::{
@@ -459,11 +459,19 @@ pub struct BulkList {
     pub list_id: Uuid,
 }
 
-/// How many contacts a bulk action changed. This can be fewer than the selection held: contacts
-/// already in the wanted state, excluded, or deleted since are not counted.
+/// What a bulk action did, as two numbers taken from the same statement. `affected` is how many
+/// contacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the
+/// exclusions). `affected` is lower whenever some were already in the wanted state, so the UI can
+/// say "N of M".
 #[derive(Serialize, ToSchema)]
 pub struct BulkResult {
     pub affected: u64,
+    pub selected: u64,
+    /// Only for `subscribe`: the status the new memberships were written with. `pending` means
+    /// the contacts are on a double-opt-in list and not mailable until they confirm, and nothing
+    /// in this milestone confirms them: `affected` is not a count of people who can be mailed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<MembershipStatus>,
 }
 
 /// Freezes "the contacts this filter matches" at this moment. The token holds the filter and a
@@ -534,7 +542,7 @@ async fn finish_bulk(
     action: &'static str,
     (selection, target): (&Selection, &BulkTarget),
     extra: Value,
-    affected: u64,
+    (counts, status): (Counts, Option<MembershipStatus>),
 ) -> ApiResult<Json<BulkResult>> {
     // The search text can be an address or a name, and the audit log outlives an erasure: record
     // that a search was part of the selection, never what it said. Not a hash either: a hash of
@@ -555,15 +563,22 @@ async fn finish_bulk(
             metadata: json!({
                 "filter": filter,
                 "as_of": selection.as_of,
+                // A count, not the ids, by design (one row, not one per contact): replayed calls with
+                // different exclusions cannot be told apart afterwards. Do not turn this into a list.
                 "excluded": target.excluded_ids.len(),
-                "affected": affected,
+                "selected": counts.selected,
+                "affected": counts.affected,
                 "with": extra,
             }),
         },
     )
     .await?;
     tx.commit().await?;
-    Ok(Json(BulkResult { affected }))
+    Ok(Json(BulkResult {
+        affected: counts.affected,
+        selected: counts.selected,
+        status,
+    }))
 }
 
 /// Tags every contact in the selection.
@@ -600,7 +615,7 @@ pub async fn bulk_tag_contacts(
         action,
         (&sel, &input.target),
         extra,
-        n,
+        (n, None),
     )
     .await
 }
@@ -638,7 +653,7 @@ pub async fn bulk_untag_contacts(
         action,
         (&sel, &input.target),
         extra,
-        n,
+        (n, None),
     )
     .await
 }
@@ -689,7 +704,7 @@ pub async fn bulk_subscribe_contacts(
         action,
         (&sel, &input.target),
         extra,
-        n,
+        (n, Some(status)),
     )
     .await
 }
@@ -728,7 +743,7 @@ pub async fn bulk_unsubscribe_contacts(
         action,
         (&sel, &input.target),
         extra,
-        n,
+        (n, None),
     )
     .await
 }
@@ -758,5 +773,14 @@ pub async fn bulk_delete_contacts(
     let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input).await?;
     let n = selection::delete(&mut tx, &sel, &input.excluded_ids).await?;
     let action = actions::CONTACTS_BULK_DELETED;
-    finish_bulk(tx, &meta, &principal, action, (&sel, &input), json!({}), n).await
+    finish_bulk(
+        tx,
+        &meta,
+        &principal,
+        action,
+        (&sel, &input),
+        json!({}),
+        (n, None),
+    )
+    .await
 }

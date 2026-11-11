@@ -125,93 +125,135 @@ fn push_selected(q: &mut QueryBuilder<Postgres>, sel: &Selection, excluded: &[Uu
     push_filter(q, &sel.filter);
 }
 
-/// Puts the tag on every selected contact that lacks it. Returns how many were newly tagged.
+/// What a bulk statement did. Both numbers come out of the one statement, so they describe the same
+/// rows: `selected` is what the predicate matched under the `as_of` bound (less the exclusions),
+/// `affected` is how many of those the action actually changed. A count taken separately could
+/// disagree with the action, which is worse than no count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    pub selected: u64,
+    pub affected: u64,
+}
+
+/// `with sel as (<the selection>), done as (<action> returning 1) select count(sel), count(done)`.
+/// `action` appends the data-changing statement, which reads `sel` for the contact ids.
+async fn run(
+    db: &mut PgConnection,
+    sel: &Selection,
+    excluded: &[Uuid],
+    action: impl FnOnce(&mut QueryBuilder<Postgres>),
+) -> ApiResult<Counts> {
+    let mut q = QueryBuilder::<Postgres>::new("with sel as (select id from contacts where ");
+    push_selected(&mut q, sel, excluded);
+    q.push("), done as (");
+    action(&mut q);
+    q.push(
+        " returning 1) \
+         select (select count(*) from sel)::bigint, (select count(*) from done)::bigint",
+    );
+    let (selected, affected): (i64, i64) = q.build_query_as().fetch_one(db).await?;
+    // Counts are never negative.
+    Ok(Counts {
+        selected: selected.unsigned_abs(),
+        affected: affected.unsigned_abs(),
+    })
+}
+
+/// Puts the tag on every selected contact that lacks it; `affected` is how many were newly tagged.
 pub async fn tag(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     tag_id: Uuid,
-) -> ApiResult<u64> {
-    let mut q = QueryBuilder::<Postgres>::new(
-        "insert into contact_tags (workspace_id, contact_id, tag_id) select workspace_id, id, ",
-    );
-    q.push_bind(tag_id).push(" from contacts where ");
-    push_selected(&mut q, sel, excluded);
-    q.push(" on conflict (contact_id, tag_id) do nothing");
-    Ok(q.build().execute(db).await?.rows_affected())
+) -> ApiResult<Counts> {
+    run(db, sel, excluded, |q| {
+        q.push("insert into contact_tags (workspace_id, contact_id, tag_id) select ")
+            .push_bind(sel.workspace_id)
+            .push(", id, ")
+            .push_bind(tag_id)
+            .push(" from sel on conflict (contact_id, tag_id) do nothing");
+    })
+    .await
 }
 
-/// Takes the tag off every selected contact that has it. Returns how many had it.
+/// Takes the tag off every selected contact that has it; `affected` is how many had it.
 pub async fn untag(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     tag_id: Uuid,
-) -> ApiResult<u64> {
-    let mut q = QueryBuilder::<Postgres>::new("delete from contact_tags where workspace_id = ");
-    q.push_bind(sel.workspace_id)
-        .push(" and tag_id = ")
-        .push_bind(tag_id)
-        .push(" and contact_id in (select id from contacts where ");
-    push_selected(&mut q, sel, excluded);
-    q.push(")");
-    Ok(q.build().execute(db).await?.rows_affected())
+) -> ApiResult<Counts> {
+    run(db, sel, excluded, |q| {
+        q.push("delete from contact_tags where workspace_id = ")
+            .push_bind(sel.workspace_id)
+            .push(" and tag_id = ")
+            .push_bind(tag_id)
+            .push(" and contact_id in (select id from sel)");
+    })
+    .await
 }
 
 /// Adds every selected contact who is not on the list yet, with `status` (`pending` on a
 /// double-opt-in list). A membership that exists is never touched: `pending` is not promoted past
 /// the confirmation the list requires, and `unsubscribed` is not reversed, because nobody has
-/// asked to be mailed again. Returns how many rows were written, so a count below the selection
-/// tells the user something was skipped.
+/// asked to be mailed again. `affected` is how many rows were written, so a count below
+/// `selected` tells the user something was skipped.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
     status: MembershipStatus,
-) -> ApiResult<u64> {
-    let mut q = QueryBuilder::<Postgres>::new(
-        "insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at) \
-         select workspace_id, id, ",
-    );
-    q.push_bind(list_id)
-        .push(", ")
-        .push_bind(status)
-        .push(", case when ")
-        .push_bind(status)
-        .push(" = 'subscribed' then now() end from contacts where ");
-    push_selected(&mut q, sel, excluded);
-    q.push(" on conflict (contact_id, list_id) do nothing");
-    Ok(q.build().execute(db).await?.rows_affected())
+) -> ApiResult<Counts> {
+    run(db, sel, excluded, |q| {
+        q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at) \
+                select ")
+            .push_bind(sel.workspace_id)
+            .push(", id, ")
+            .push_bind(list_id)
+            .push(", ")
+            .push_bind(status)
+            .push(", case when ")
+            .push_bind(status)
+            .push(" = 'subscribed' then now() end from sel on conflict (contact_id, list_id) do nothing");
+    })
+    .await
 }
 
 /// Marks every selected member of the list `unsubscribed`; a contact not on the list, or already
-/// unsubscribed, is not counted and keeps its first `unsubscribed_at`.
+/// unsubscribed, is not counted in `affected` and keeps its first `unsubscribed_at`.
 pub async fn unsubscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
-) -> ApiResult<u64> {
-    let mut q = QueryBuilder::<Postgres>::new(
-        "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
-         where status <> 'unsubscribed' and workspace_id = ",
-    );
-    q.push_bind(sel.workspace_id)
+) -> ApiResult<Counts> {
+    run(db, sel, excluded, |q| {
+        q.push(
+            "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
+             where status <> 'unsubscribed' and workspace_id = ",
+        )
+        .push_bind(sel.workspace_id)
         .push(" and list_id = ")
         .push_bind(list_id)
-        .push(" and contact_id in (select id from contacts where ");
-    push_selected(&mut q, sel, excluded);
-    q.push(")");
-    Ok(q.build().execute(db).await?.rows_affected())
+        .push(" and contact_id in (select id from sel)");
+    })
+    .await
 }
 
 /// Hard-deletes every selected contact, with its memberships and tags. Writes no suppression:
 /// like `DELETE /contacts/{id}`, this is not erasure.
-pub async fn delete(db: &mut PgConnection, sel: &Selection, excluded: &[Uuid]) -> ApiResult<u64> {
-    let mut q = QueryBuilder::<Postgres>::new("delete from contacts where ");
-    push_selected(&mut q, sel, excluded);
-    Ok(q.build().execute(db).await?.rows_affected())
+pub async fn delete(
+    db: &mut PgConnection,
+    sel: &Selection,
+    excluded: &[Uuid],
+) -> ApiResult<Counts> {
+    run(db, sel, excluded, |q| {
+        q.push("delete from contacts where workspace_id = ")
+            .push_bind(sel.workspace_id)
+            .push(" and id in (select id from sel)");
+    })
+    .await
 }
 
 #[cfg(test)]

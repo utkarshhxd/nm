@@ -945,12 +945,17 @@ export interface components {
             list_id: string;
         };
         /**
-         * @description How many contacts a bulk action changed. This can be fewer than the selection held: contacts
-         *     already in the wanted state, excluded, or deleted since are not counted.
+         * @description What a bulk action did, as two numbers taken from the same statement. `affected` is how many
+         *     contacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the
+         *     exclusions). `affected` is lower whenever some were already in the wanted state, so the UI can
+         *     say "N of M".
          */
         BulkResult: {
             /** Format: int64 */
             affected: number;
+            /** Format: int64 */
+            selected: number;
+            status?: components["schemas"]["MembershipStatus"] | null;
         };
         BulkTag: components["schemas"]["BulkTarget"] & {
             /** Format: uuid */
@@ -1001,8 +1006,9 @@ export interface components {
         };
         /**
          * @description Which contacts a list shows. It is embedded in a signed selection token later, so its
-         *     serialised form is part of that token's payload: renaming a field would invalidate tokens
-         *     already issued.
+         *     serialised form is part of that token's payload: renaming a field, or adding one (the payload is
+         *     not tolerant of a missing field), would make tokens already issued fail to decode, as a
+         *     `422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.
          */
         ContactFilter: {
             /**

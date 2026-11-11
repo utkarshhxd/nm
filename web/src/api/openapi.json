@@ -3599,15 +3599,32 @@
       },
       "BulkResult": {
         "type": "object",
-        "description": "How many contacts a bulk action changed. This can be fewer than the selection held: contacts\nalready in the wanted state, excluded, or deleted since are not counted.",
+        "description": "What a bulk action did, as two numbers taken from the same statement. `affected` is how many\ncontacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the\nexclusions). `affected` is lower whenever some were already in the wanted state, so the UI can\nsay \"N of M\".",
         "required": [
-          "affected"
+          "affected",
+          "selected"
         ],
         "properties": {
           "affected": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "selected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MembershipStatus",
+                "description": "Only for `subscribe`: the status the new memberships were written with. `pending` means\nthe contacts are on a double-opt-in list and not mailable until they confirm, and nothing\nin this milestone confirms them: `affected` is not a count of people who can be mailed."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -3766,7 +3783,7 @@
       },
       "ContactFilter": {
         "type": "object",
-        "description": "Which contacts a list shows. It is embedded in a signed selection token later, so its\nserialised form is part of that token's payload: renaming a field would invalidate tokens\nalready issued.",
+        "description": "Which contacts a list shows. It is embedded in a signed selection token later, so its\nserialised form is part of that token's payload: renaming a field, or adding one (the payload is\nnot tolerant of a missing field), would make tokens already issued fail to decode, as a\n`422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.",
         "properties": {
           "list_id": {
             "type": [
