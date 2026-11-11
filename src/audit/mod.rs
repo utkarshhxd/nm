@@ -34,6 +34,11 @@ pub mod actions {
     pub const CONTACT_CREATED: &str = "contact.created";
     pub const CONTACT_UPDATED: &str = "contact.updated";
     pub const CONTACT_DELETED: &str = "contact.deleted";
+    pub const LIST_CREATED: &str = "list.created";
+    pub const LIST_UPDATED: &str = "list.updated";
+    pub const LIST_DELETED: &str = "list.deleted";
+    pub const LIST_MEMBER_ADDED: &str = "list.member_added";
+    pub const LIST_MEMBER_REMOVED: &str = "list.member_removed";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

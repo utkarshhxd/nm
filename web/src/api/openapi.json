@@ -1288,6 +1288,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "list_id",
+            "in": "query",
+            "description": "Only contacts with a membership on this list, whatever its status.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -1762,6 +1772,437 @@
           },
           "409": {
             "description": "field-not-archived"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "list_lists",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_List"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "create_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/List"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a list takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "list-name-taken"
+          },
+          "422": {
+            "description": "invalid name or description"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "get_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/List"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "A hard delete. It takes every membership of the list with it, unsubscribed ones included: the\nlist itself is gone, so there is nothing left to be unsubscribed from.",
+        "operationId": "delete_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, with its memberships"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a list takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "update_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/List"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a list takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          },
+          "409": {
+            "description": "list-name-taken, or pending-members: double opt-in cannot be switched off while members are pending"
+          },
+          "422": {
+            "description": "invalid name or description, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "list_list_members",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every status, newest contact first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Member"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "Adding someone who is already `pending` or `subscribed` changes nothing; adding an\n`unsubscribed` one subscribes them again.",
+        "operationId": "add_list_member",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewMember"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: changing a list's members takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such list or contact in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}": {
+      "delete": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "Unsubscribes; it does not delete the membership.",
+        "operationId": "remove_list_member",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "contact_id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unsubscribed. The membership stays, as `unsubscribed`"
+          },
+          "403": {
+            "description": "insufficient-role: changing a list's members takes editor"
+          },
+          "404": {
+            "description": "not a member, or the contact was never on this list"
           }
         }
       }
@@ -2278,6 +2719,46 @@
           }
         }
       },
+      "List": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "double_optin",
+          "visibility",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string"
+          },
+          "double_optin": {
+            "type": "boolean",
+            "description": "`true`: a new member is `pending` until they confirm. `false`: a new member is\n`subscribed` at once."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/Visibility",
+            "description": "Unused until the preference center, which shows the `public` lists as topics."
+          }
+        }
+      },
       "LoginRequest": {
         "type": "object",
         "required": [
@@ -2388,32 +2869,65 @@
       },
       "Member": {
         "type": "object",
+        "description": "A contact's standing on one list.",
         "required": [
-          "user_id",
+          "contact_id",
           "email",
-          "display_name",
-          "role",
-          "joined_at"
+          "status"
         ],
         "properties": {
-          "display_name": {
-            "type": "string"
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
           },
           "email": {
             "type": "string"
           },
-          "joined_at": {
-            "type": "string",
-            "format": "date-time"
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
           },
-          "role": {
-            "$ref": "#/components/schemas/Role"
+          "subscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Null while `pending`, and after an unsubscribe is undone on a double-opt-in list."
           },
-          "user_id": {
-            "type": "string",
-            "format": "uuid"
+          "unsubscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set only while the status is `unsubscribed`."
           }
         }
+      },
+      "Membership": {
+        "type": "object",
+        "required": [
+          "contact_id",
+          "status"
+        ],
+        "properties": {
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
+          }
+        }
+      },
+      "MembershipStatus": {
+        "type": "string",
+        "description": "What a membership row says. It means the same on every list: `Pending` is written only on a\ndouble-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here\ndepends on the list's setting.",
+        "enum": [
+          "pending",
+          "subscribed",
+          "unsubscribed"
+        ]
       },
       "NewApiKey": {
         "type": "object",
@@ -2512,6 +3026,56 @@
             "$ref": "#/components/schemas/Role"
           }
         }
+      },
+      "NewList": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "double_optin": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default `true`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace."
+          },
+          "visibility": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Visibility",
+                "description": "Default `private`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewMember": {
+        "type": "object",
+        "required": [
+          "contact_id"
+        ],
+        "properties": {
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
       },
       "NewPasskey": {
         "type": "object",
@@ -2861,7 +3425,7 @@
           }
         }
       },
-      "Page_Member": {
+      "Page_List": {
         "type": "object",
         "required": [
           "data"
@@ -2872,29 +3436,94 @@
             "items": {
               "type": "object",
               "required": [
-                "user_id",
-                "email",
-                "display_name",
-                "role",
-                "joined_at"
+                "id",
+                "name",
+                "description",
+                "double_optin",
+                "visibility",
+                "created_at",
+                "updated_at"
               ],
               "properties": {
-                "display_name": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "description": {
                   "type": "string"
+                },
+                "double_optin": {
+                  "type": "boolean",
+                  "description": "`true`: a new member is `pending` until they confirm. `false`: a new member is\n`subscribed` at once."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "visibility": {
+                  "$ref": "#/components/schemas/Visibility",
+                  "description": "Unused until the preference center, which shows the `public` lists as topics."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Member": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A contact's standing on one list.",
+              "required": [
+                "contact_id",
+                "email",
+                "status"
+              ],
+              "properties": {
+                "contact_id": {
+                  "type": "string",
+                  "format": "uuid"
                 },
                 "email": {
                   "type": "string"
                 },
-                "joined_at": {
-                  "type": "string",
-                  "format": "date-time"
+                "status": {
+                  "$ref": "#/components/schemas/MembershipStatus"
                 },
-                "role": {
-                  "$ref": "#/components/schemas/Role"
+                "subscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Null while `pending`, and after an unsubscribe is undone on a double-opt-in list."
                 },
-                "user_id": {
-                  "type": "string",
-                  "format": "uuid"
+                "unsubscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Set only while the status is `unsubscribed`."
                 }
               }
             }
@@ -3149,6 +3778,42 @@
         },
         "additionalProperties": false
       },
+      "UpdateList": {
+        "type": "object",
+        "description": "A field left out is left alone.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "double_optin": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Cannot be switched off while the list has `pending` members: they have not confirmed, and\na `pending` row on a single-opt-in list would break what `pending` means."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visibility": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Visibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "UpdateWorkspace": {
         "type": "object",
         "description": "The slug cannot change in M0, so an unknown field (`slug` included) is rejected, not ignored.",
@@ -3167,6 +3832,14 @@
           }
         },
         "additionalProperties": false
+      },
+      "Visibility": {
+        "type": "string",
+        "description": "Stored as text under a `check` constraint, not a Postgres enum.",
+        "enum": [
+          "public",
+          "private"
+        ]
       },
       "Workspace": {
         "type": "object",

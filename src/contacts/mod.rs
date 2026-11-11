@@ -218,14 +218,16 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
-/// Which contacts a list shows. `list_id` and `tag_id` are defined now but not yet applied: lists
-/// and tags do not exist until later tasks, which wire them into `list` (and embed this type in a
-/// signed selection token). So their being unread here is not an oversight. The serialised form
-/// is part of that token's payload: renaming a field would invalidate tokens already issued.
+/// Which contacts a list shows. `tag_id` is defined now but not yet applied: tags do not exist
+/// until a later task, which wires it into `list` (and embeds this type in a signed selection
+/// token). So its being unread here is not an oversight. The serialised form is part of that
+/// token's payload: renaming a field would invalidate tokens already issued.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactFilter {
     /// Case-insensitive substring of the address or name.
     pub q: Option<String>,
+    /// Contacts with a membership row on this list, whatever its status: a `pending` or
+    /// `unsubscribed` member is still a member here. A list of another workspace matches nothing.
     pub list_id: Option<Uuid>,
     pub tag_id: Option<Uuid>,
 }
@@ -277,6 +279,17 @@ pub async fn list(
         q.push(" and (email || ' ' || first_name || ' ' || last_name) ilike '%' || ")
             .push_bind(escape_like(term))
             .push(" || '%'");
+    }
+    if let Some(list_id) = filter.list_id {
+        // Correlated on `workspace_id` as well as the contact, so a list of another workspace
+        // matches nothing.
+        q.push(
+            " and exists (select 1 from list_memberships m \
+             where m.workspace_id = contacts.workspace_id and m.contact_id = contacts.id \
+             and m.list_id = ",
+        )
+        .push_bind(list_id)
+        .push(")");
     }
     if let Some((value, id)) = params.after()? {
         match sort {

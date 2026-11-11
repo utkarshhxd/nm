@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select double_optin from lists where workspace_id = $1 and id = $2 for share",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "double_optin",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "double_optin"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9089894380b5f1d7e789f685f334acc8303193e873820a72d7de95bc12d6bd6c"
+}

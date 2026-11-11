@@ -89,7 +89,10 @@ pub async fn list_contacts(
 ) -> ApiResult<Json<Page<Contact>>> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
-    let filter = ContactFilter::with_search(params.q.as_deref())?;
+    let filter = ContactFilter {
+        list_id: params.list_id,
+        ..ContactFilter::with_search(params.q.as_deref())?
+    };
     Ok(Json(list(&mut conn, workspace_id, &filter, &params).await?))
 }
 

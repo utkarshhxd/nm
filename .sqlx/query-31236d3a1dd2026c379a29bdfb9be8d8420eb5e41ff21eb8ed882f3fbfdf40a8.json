@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update lists set name = coalesce($3, name), description = coalesce($4, description), double_optin = coalesce($5, double_optin), visibility = coalesce($6, visibility), updated_at = now() where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "31236d3a1dd2026c379a29bdfb9be8d8420eb5e41ff21eb8ed882f3fbfdf40a8"
+}

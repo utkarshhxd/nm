@@ -264,3 +264,105 @@ async fn bad_cursors_and_sorts_are_422_and_non_members_404(pool: PgPool) {
     stranger.login("stranger@example.com", PW).await;
     stranger.get(&base).await.assert_status_not_found();
 }
+
+#[sqlx::test]
+async fn filters_by_list_id(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let lists = format!("/api/v1/workspaces/{}/lists", f.ws);
+    let mut list_ids = vec![];
+    for name in ["mine", "theirs"] {
+        // Single opt-in, so no status is `pending` and the test says nothing about that.
+        let r = f
+            .app
+            .post(&lists)
+            .json(&json!({"name": name, "double_optin": false}))
+            .await;
+        r.assert_status(StatusCode::CREATED);
+        list_ids.push(r.json::<Value>()["id"].as_str().unwrap().to_owned());
+    }
+    let (mine, theirs) = (&list_ids[0], &list_ids[1]);
+    let members = |list: &str| format!("{lists}/{list}/members");
+    // Five of the ten, picked so that email order and creation order differ among them.
+    let member_idx = [0, 2, 3, 6, 9];
+    for i in member_idx {
+        let (_, id) = f.seeded[i];
+        let r = f
+            .app
+            .post(&members(mine))
+            .json(&json!({"contact_id": id}))
+            .await;
+        r.assert_status_ok();
+    }
+    // Another list's members must not leak in.
+    let r = f
+        .app
+        .post(&members(theirs))
+        .json(&json!({"contact_id": f.seeded[1].1}))
+        .await;
+    r.assert_status_ok();
+    // An unsubscribed member keeps its row, and is still listed: the filter asks for the list's
+    // membership rows, whatever their status.
+    f.app
+        .delete(&format!("{}/{}", members(mine), f.seeded[3].1))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let creation: Vec<String> = member_idx.iter().map(|&i| f.seeded[i].0.clone()).collect();
+    let mut alphabetical = creation.clone();
+    alphabetical.sort();
+    assert_ne!(
+        creation, alphabetical,
+        "fixture: the members' two orders coincide"
+    );
+    let mut newest_first = creation.clone();
+    newest_first.reverse();
+
+    // Page sizes that put a boundary mid-list (2) and exactly at its end (5).
+    for limit in [2, 5] {
+        assert_eq!(
+            f.emails(limit, &format!("list_id={mine}&sort=email")).await,
+            alphabetical,
+            "limit={limit}"
+        );
+        assert_eq!(
+            f.emails(limit, &format!("list_id={mine}")).await,
+            newest_first,
+            "limit={limit}"
+        );
+    }
+    let sizes: Vec<usize> = f
+        .pages(2, &format!("list_id={mine}&sort=email"))
+        .await
+        .iter()
+        .map(|p| p["data"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(sizes, [2, 2, 1]);
+    assert_eq!(
+        f.emails(50, &format!("list_id={theirs}")).await,
+        [f.seeded[1].0.clone()]
+    );
+    // Combined with a search: `quinn` is mia (a member) and kai (not).
+    assert_eq!(
+        f.emails(50, &format!("list_id={mine}&q=quinn")).await,
+        [email("mia")]
+    );
+
+    // Another workspace's list matches nothing, and neither does one that does not exist.
+    let other_owner = create_user(&pool, "other@example.com", PW, false).await;
+    let other_ws = create_workspace(&pool, other_owner, "other").await;
+    let other = editor(&pool, other_ws, "other-editor", Role::Editor).await;
+    let r = other
+        .post(&format!("/api/v1/workspaces/{other_ws}/lists"))
+        .json(&json!({"name": "mine"}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let foreign = r.json::<Value>()["id"].as_str().unwrap().to_owned();
+    for list in [foreign, Uuid::now_v7().to_string()] {
+        assert!(f.emails(50, &format!("list_id={list}")).await.is_empty());
+    }
+    let r = f
+        .app
+        .get(&format!("{}?list_id=nope", contacts_path(f.ws)))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}

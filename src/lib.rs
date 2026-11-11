@@ -11,6 +11,7 @@ pub mod custom_fields;
 pub mod db;
 pub mod error;
 pub mod http;
+pub mod lists;
 pub mod openapi;
 pub mod pagination;
 pub mod telemetry;

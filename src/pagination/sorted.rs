@@ -39,7 +39,7 @@ pub enum Dir {
     Desc,
 }
 
-/// `?limit=&cursor=&sort=&dir=&q=` for the contact list.
+/// `?limit=&cursor=&sort=&dir=&q=&list_id=` for the contact list.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct SortedPageParams {
@@ -53,6 +53,8 @@ pub struct SortedPageParams {
     pub dir: Option<Dir>,
     /// Case-insensitive substring of the address or name, at least 3 characters.
     pub q: Option<String>,
+    /// Only contacts with a membership on this list, whatever its status.
+    pub list_id: Option<Uuid>,
 }
 
 impl SortedPageParams {

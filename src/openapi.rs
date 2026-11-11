@@ -51,6 +51,14 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::contacts::routes::create_contact,
         crate::contacts::routes::update_contact,
         crate::contacts::routes::delete_contact,
+        crate::lists::routes::list_lists,
+        crate::lists::routes::get_list,
+        crate::lists::routes::create_list,
+        crate::lists::routes::update_list,
+        crate::lists::routes::delete_list,
+        crate::lists::routes::list_list_members,
+        crate::lists::routes::add_list_member,
+        crate::lists::routes::remove_list_member,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -95,6 +103,14 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::pagination::sorted::Dir,
         crate::contacts::NewContact,
         crate::contacts::routes::UpdateContact,
+        crate::lists::List,
+        crate::lists::Member,
+        crate::lists::MembershipStatus,
+        crate::lists::Visibility,
+        crate::lists::routes::NewList,
+        crate::lists::routes::UpdateList,
+        crate::lists::routes::NewMember,
+        crate::lists::routes::Membership,
     ))
 )]
 struct ApiDoc;

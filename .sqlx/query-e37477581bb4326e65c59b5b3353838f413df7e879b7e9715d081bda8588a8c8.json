@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, name, description, double_optin, visibility as \"visibility: Visibility\",\n                  created_at, updated_at\n           from lists\n           where workspace_id = $1 and ($2::uuid is null or id < $2)\n           order by id desc limit $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "double_optin",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "double_optin"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "visibility: Visibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e37477581bb4326e65c59b5b3353838f413df7e879b7e9715d081bda8588a8c8"
+}

@@ -494,6 +494,79 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/lists": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_lists"];
+        put?: never;
+        post: operations["create_list"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_list"];
+        put?: never;
+        post?: never;
+        /**
+         * A hard delete. It takes every membership of the list with it, unsubscribed ones included: the
+         *     list itself is gone, so there is nothing left to be unsubscribed from.
+         */
+        delete: operations["delete_list"];
+        options?: never;
+        head?: never;
+        patch: operations["update_list"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_list_members"];
+        put?: never;
+        /**
+         * Adding someone who is already `pending` or `subscribed` changes nothing; adding an
+         *     `unsubscribed` one subscribes them again.
+         */
+        post: operations["add_list_member"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unsubscribes; it does not delete the membership. */
+        delete: operations["remove_list_member"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -673,6 +746,23 @@ export interface components {
             invited_by?: string | null;
             role: components["schemas"]["Role"];
         };
+        List: {
+            /** Format: date-time */
+            created_at: string;
+            description: string;
+            /**
+             * @description `true`: a new member is `pending` until they confirm. `false`: a new member is
+             *     `subscribed` at once.
+             */
+            double_optin: boolean;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** @description Unused until the preference center, which shows the `public` lists as topics. */
+            visibility: components["schemas"]["Visibility"];
+        };
         LoginRequest: {
             email: string;
             password: string;
@@ -707,15 +797,35 @@ export interface components {
             role: components["schemas"]["Role"];
             slug: string;
         };
+        /** @description A contact's standing on one list. */
         Member: {
-            display_name: string;
-            email: string;
-            /** Format: date-time */
-            joined_at: string;
-            role: components["schemas"]["Role"];
             /** Format: uuid */
-            user_id: string;
+            contact_id: string;
+            email: string;
+            status: components["schemas"]["MembershipStatus"];
+            /**
+             * Format: date-time
+             * @description Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
+             */
+            subscribed_at?: string | null;
+            /**
+             * Format: date-time
+             * @description Set only while the status is `unsubscribed`.
+             */
+            unsubscribed_at?: string | null;
         };
+        Membership: {
+            /** Format: uuid */
+            contact_id: string;
+            status: components["schemas"]["MembershipStatus"];
+        };
+        /**
+         * @description What a membership row says. It means the same on every list: `Pending` is written only on a
+         *     double-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here
+         *     depends on the list's setting.
+         * @enum {string}
+         */
+        MembershipStatus: "pending" | "subscribed" | "unsubscribed";
         NewApiKey: {
             name: string;
             /** @description `viewer`, `editor` or `admin`, and no higher than the caller's own role. */
@@ -746,6 +856,18 @@ export interface components {
         NewInvite: {
             email: string;
             role: components["schemas"]["Role"];
+        };
+        NewList: {
+            description?: string | null;
+            /** @description Default `true`. */
+            double_optin?: boolean | null;
+            /** @description Unique in the workspace. */
+            name: string;
+            visibility?: components["schemas"]["Visibility"] | null;
+        };
+        NewMember: {
+            /** Format: uuid */
+            contact_id: string;
         };
         NewPasskey: {
             name: string;
@@ -840,15 +962,42 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_List: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                description: string;
+                /**
+                 * @description `true`: a new member is `pending` until they confirm. `false`: a new member is
+                 *     `subscribed` at once.
+                 */
+                double_optin: boolean;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** Format: date-time */
+                updated_at: string;
+                /** @description Unused until the preference center, which shows the `public` lists as topics. */
+                visibility: components["schemas"]["Visibility"];
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Member: {
             data: {
-                display_name: string;
-                email: string;
-                /** Format: date-time */
-                joined_at: string;
-                role: components["schemas"]["Role"];
                 /** Format: uuid */
-                user_id: string;
+                contact_id: string;
+                email: string;
+                status: components["schemas"]["MembershipStatus"];
+                /**
+                 * Format: date-time
+                 * @description Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
+                 */
+                subscribed_at?: string | null;
+                /**
+                 * Format: date-time
+                 * @description Set only while the status is `unsubscribed`.
+                 */
+                unsubscribed_at?: string | null;
             }[];
             next_cursor?: string | null;
         };
@@ -936,11 +1085,27 @@ export interface components {
             label?: string | null;
             options?: string[] | null;
         };
+        /** @description A field left out is left alone. */
+        UpdateList: {
+            description?: string | null;
+            /**
+             * @description Cannot be switched off while the list has `pending` members: they have not confirmed, and
+             *     a `pending` row on a single-opt-in list would break what `pending` means.
+             */
+            double_optin?: boolean | null;
+            name?: string | null;
+            visibility?: components["schemas"]["Visibility"] | null;
+        };
         /** @description The slug cannot change in M0, so an unknown field (`slug` included) is rejected, not ignored. */
         UpdateWorkspace: {
             name?: string | null;
             timezone?: string | null;
         };
+        /**
+         * @description Stored as text under a `check` constraint, not a Postgres enum.
+         * @enum {string}
+         */
+        Visibility: "public" | "private";
         /** @description A workspace as one caller sees it: `role` is the caller's own. */
         Workspace: {
             /** Format: uuid */
@@ -2152,6 +2317,8 @@ export interface operations {
                 dir?: components["schemas"]["Dir"];
                 /** @description Case-insensitive substring of the address or name, at least 3 characters. */
                 q?: string;
+                /** @description Only contacts with a membership on this list, whatever its status. */
+                list_id?: string;
             };
             header?: never;
             path: {
@@ -2574,6 +2741,352 @@ export interface operations {
             };
             /** @description field-not-archived */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_lists: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_List"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewList"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List"];
+                };
+            };
+            /** @description insufficient-role: creating a list takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description list-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name or description */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List"];
+                };
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, with its memberships */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a list takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateList"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List"];
+                };
+            };
+            /** @description insufficient-role: editing a list takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description list-name-taken, or pending-members: double opt-in cannot be switched off while members are pending */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name or description, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_list_members: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every status, newest contact first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Member"];
+                };
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    add_list_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewMember"];
+            };
+        };
+        responses: {
+            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            /** @description insufficient-role: changing a list's members takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such list or contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_list_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+                /** @description Contact id */
+                contact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unsubscribed. The membership stays, as `unsubscribed` */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: changing a list's members takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or the contact was never on this list */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
