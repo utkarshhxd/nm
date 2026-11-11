@@ -6,20 +6,24 @@
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Postgres, QueryBuilder};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
     custom_fields::{Definition, FieldKind, definitions_for},
     error::{ApiError, ApiResult, FieldError},
+    pagination::{
+        Page,
+        sorted::{ContactSort, Dir, SortedPageParams, page},
+    },
     users::normalize_email,
     workspaces::validate_timezone,
 };
 
 pub mod routes;
 
-#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow, ToSchema)]
 pub struct Contact {
     pub id: Uuid,
     pub email: String,
@@ -214,10 +218,135 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
+/// Which contacts a list shows. `list_id` and `tag_id` are defined now but not yet applied: lists
+/// and tags do not exist until later tasks, which wire them into `list` (and embed this type in a
+/// signed selection token). So their being unread here is not an oversight. The serialised form
+/// is part of that token's payload: renaming a field would invalidate tokens already issued.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactFilter {
+    /// Case-insensitive substring of the address or name.
+    pub q: Option<String>,
+    pub list_id: Option<Uuid>,
+    pub tag_id: Option<Uuid>,
+}
+
+/// Shorter terms cannot use the trigram index and would scan the whole table.
+const MIN_SEARCH_CHARS: usize = 3;
+
+impl ContactFilter {
+    /// A search of 1 or 2 characters is a 422; a blank one is no search.
+    pub fn with_search(q: Option<&str>) -> ApiResult<ContactFilter> {
+        let q = q.map(str::trim).filter(|q| !q.is_empty());
+        if q.is_some_and(|q| q.chars().count() < MIN_SEARCH_CHARS) {
+            return Err(ApiError::Validation(vec![FieldError::new(
+                "q",
+                "must be at least 3 characters",
+            )]));
+        }
+        Ok(ContactFilter {
+            q: q.map(str::to_owned),
+            ..ContactFilter::default()
+        })
+    }
+}
+
+/// One page of contacts in `params`' order, after `params`' cursor. The keyset predicate compares
+/// `(sort_value, id)` as a row, in the column order of `contacts_keyset_email`, so the index
+/// serves both the filter and the order.
+pub async fn list(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    filter: &ContactFilter,
+    params: &SortedPageParams,
+) -> ApiResult<Page<Contact>> {
+    let (sort, limit) = (params.sort(), params.limit());
+    let (order, op) = match params.dir() {
+        Dir::Asc => ("asc", ">"),
+        Dir::Desc => ("desc", "<"),
+    };
+    let mut q = QueryBuilder::<Postgres>::new(
+        "select id, email, first_name, last_name, attributes, timezone, created_at, updated_at \
+         from contacts where workspace_id = ",
+    );
+    q.push_bind(workspace_id);
+    if let Some(term) = &filter.q {
+        // Must stay the index expression, spelled the same, for `contacts_search` to apply.
+        q.push(" and (email || ' ' || first_name || ' ' || last_name) ilike '%' || ")
+            .push_bind(escape_like(term))
+            .push(" || '%'");
+    }
+    if let Some((value, id)) = params.after()? {
+        match sort {
+            ContactSort::Email => {
+                q.push(format!(" and (email, id) {op} ("))
+                    .push_bind(value)
+                    .push(", ")
+                    .push_bind(id)
+                    .push(")");
+            }
+            ContactSort::Created => {
+                q.push(format!(" and id {op} ")).push_bind(id);
+            }
+        }
+    }
+    q.push(match sort {
+        ContactSort::Email => format!(" order by email {order}, id {order}"),
+        ContactSort::Created => format!(" order by id {order}"),
+    });
+    q.push(" limit ").push_bind(limit + 1);
+    let rows = q.build_query_as::<Contact>().fetch_all(db).await?;
+    Ok(page(rows, limit, |c| {
+        let value = match sort {
+            ContactSort::Email => c.email.clone(),
+            ContactSort::Created => String::new(),
+        };
+        (value, c.id)
+    }))
+}
+
+/// Makes `%`, `_` and `\` in a search term match themselves: unescaped, `___` would match every
+/// row and no index could narrow it.
+fn escape_like(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn search_needs_three_characters() {
+        for short in ["a", "ab", " ab "] {
+            assert!(ContactFilter::with_search(Some(short)).is_err(), "{short}");
+        }
+        assert_eq!(ContactFilter::with_search(Some("  ")).unwrap().q, None);
+        assert_eq!(ContactFilter::with_search(None).unwrap().q, None);
+        assert_eq!(
+            ContactFilter::with_search(Some(" abc "))
+                .unwrap()
+                .q
+                .as_deref(),
+            Some("abc")
+        );
+        // Characters, not bytes: two multi-byte characters are still too short.
+        assert!(ContactFilter::with_search(Some("éé")).is_err());
+    }
+
+    #[test]
+    fn like_wildcards_are_escaped() {
+        assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
+    }
+
+    #[test]
+    fn filter_serialises_all_three_fields() {
+        let v = serde_json::to_value(ContactFilter::default()).unwrap();
+        assert_eq!(v, json!({"q": null, "list_id": null, "tag_id": null}));
+        let f: ContactFilter = serde_json::from_value(v).unwrap();
+        assert_eq!(f, ContactFilter::default());
+    }
 
     fn def(key: &str, kind: FieldKind, options: &[&str], archived: bool) -> Definition {
         Definition {

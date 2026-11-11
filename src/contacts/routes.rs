@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{Json, Router, extract::State, http::StatusCode};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{Contact, NewContact, create, get, validate_attributes_patch, validate_name};
+use super::{
+    Contact, ContactFilter, NewContact, create, get, list, validate_attributes_patch, validate_name,
+};
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
     custom_fields::definitions_for,
-    error::{ApiError, ApiJson, ApiPath, ApiResult, FieldError},
+    error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
+    pagination::{Page, sorted::SortedPageParams},
     workspaces::{roles::Role, validate_timezone},
 };
 
@@ -21,7 +24,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts",
-            post(create_contact),
+            axum::routing::get(list_contacts).post(create_contact),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts/{id}",
@@ -65,6 +68,29 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(d).map(Some)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/contacts",
+    operation_id = "list_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id"), SortedPageParams),
+    responses(
+        (status = 200, description = "Newest first unless `sort` says otherwise", body = Page<Contact>),
+        (status = 404, description = "not a member, or no such workspace"),
+        (status = 422, description = "a malformed cursor, an unknown `sort`, or a `q` under 3 characters"),
+    ),
+)]
+pub async fn list_contacts(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiQuery(params): ApiQuery<SortedPageParams>,
+) -> ApiResult<Json<Page<Contact>>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    let filter = ContactFilter::with_search(params.q.as_deref())?;
+    Ok(Json(list(&mut conn, workspace_id, &filter, &params).await?))
 }
 
 #[utoipa::path(

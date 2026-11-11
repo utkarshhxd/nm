@@ -1226,6 +1226,89 @@
       }
     },
     "/api/v1/workspaces/{workspace_id}/contacts": {
+      "get": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "list_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`. Only valid with the same `sort`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "Default `created`.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ContactSort"
+            }
+          },
+          {
+            "name": "dir",
+            "in": "query",
+            "description": "Default `desc` for `created`, `asc` for `email`.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Dir"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-insensitive substring of the address or name, at least 3 characters.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first unless `sort` says otherwise",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Contact"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor, an unknown `sort`, or a `q` under 3 characters"
+          }
+        }
+      },
       "post": {
         "tags": [
           "crate::contacts::routes"
@@ -1955,6 +2038,14 @@
           }
         }
       },
+      "ContactSort": {
+        "type": "string",
+        "description": "What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,\n`contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.",
+        "enum": [
+          "created",
+          "email"
+        ]
+      },
       "CreatedApiKey": {
         "type": "object",
         "description": "The one response that carries the key.",
@@ -2075,6 +2166,13 @@
             "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
           }
         }
+      },
+      "Dir": {
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ]
       },
       "DisableRequest": {
         "type": "object",
@@ -2578,6 +2676,67 @@
                     "string",
                     "null"
                   ]
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Contact": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "email",
+                "first_name",
+                "last_name",
+                "attributes",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "attributes": {
+                  "description": "Custom field values by field key. Values of archived fields stay readable here."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "email": {
+                  "type": "string"
+                },
+                "first_name": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "last_name": {
+                  "type": "string"
+                },
+                "timezone": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
                 }
               }
             }

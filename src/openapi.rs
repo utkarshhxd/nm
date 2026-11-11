@@ -46,6 +46,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::custom_fields::routes::update_custom_field,
         crate::custom_fields::routes::archive_custom_field,
         crate::custom_fields::routes::purge_custom_field,
+        crate::contacts::routes::list_contacts,
         crate::contacts::routes::get_contact,
         crate::contacts::routes::create_contact,
         crate::contacts::routes::update_contact,
@@ -90,6 +91,8 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::custom_fields::routes::Archived,
         crate::custom_fields::routes::Purged,
         crate::contacts::Contact,
+        crate::pagination::sorted::ContactSort,
+        crate::pagination::sorted::Dir,
         crate::contacts::NewContact,
         crate::contacts::routes::UpdateContact,
     ))

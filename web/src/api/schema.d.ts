@@ -417,7 +417,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        get: operations["list_contacts"];
         put?: never;
         post: operations["create_contact"];
         delete?: never;
@@ -589,6 +589,12 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /**
+         * @description What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,
+         *     `contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.
+         * @enum {string}
+         */
+        ContactSort: "created" | "email";
         /** @description The one response that carries the key. */
         CreatedApiKey: {
             /** Format: date-time */
@@ -630,6 +636,8 @@ export interface components {
             /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
             options: string[];
         };
+        /** @enum {string} */
+        Dir: "asc" | "desc";
         DisableRequest: {
             password: string;
         };
@@ -780,6 +788,23 @@ export interface components {
                 metadata: Record<string, never>;
                 target_id?: string | null;
                 target_type?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Contact: {
+            data: {
+                /** @description Custom field values by field key. Values of archived fields stay readable here. */
+                attributes: unknown;
+                /** Format: date-time */
+                created_at: string;
+                email: string;
+                first_name: string;
+                /** Format: uuid */
+                id: string;
+                last_name: string;
+                timezone?: string | null;
+                /** Format: date-time */
+                updated_at: string;
             }[];
             next_cursor?: string | null;
         };
@@ -2107,6 +2132,54 @@ export interface operations {
             };
             /** @description last-owner */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_contacts: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. Only valid with the same `sort`. */
+                cursor?: string;
+                /** @description Default `created`. */
+                sort?: components["schemas"]["ContactSort"];
+                /** @description Default `desc` for `created`, `asc` for `email`. */
+                dir?: components["schemas"]["Dir"];
+                /** @description Case-insensitive substring of the address or name, at least 3 characters. */
+                q?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first unless `sort` says otherwise */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Contact"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor, an unknown `sort`, or a `q` under 3 characters */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
