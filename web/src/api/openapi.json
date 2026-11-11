@@ -2462,6 +2462,51 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/mailable-count": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "How many members of the list may be emailed right now: subscribed and not suppressed, counted\nover the `mailable_list_members` view, the one definition of eligibility. Deliberately exempt\nfrom the 150 ms p95 target (1.4 s warm over 1.43M mailable contacts), so the UI fetches it on\nits own. It is counted live, never kept as a counter on the list: hand-maintained counters\ndrift.",
+        "operationId": "mailable_count",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MailableCount"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/lists/{id}/members": {
       "get": {
         "tags": [
@@ -3642,6 +3687,19 @@
           "status": {
             "type": "string",
             "description": "`ok` once signed in; `mfa_required` when a second factor must follow at\n`POST /api/v1/auth/login/totp` (the cookie set is then a 10-minute pending session)."
+          }
+        }
+      },
+      "MailableCount": {
+        "type": "object",
+        "required": [
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

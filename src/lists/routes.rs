@@ -34,6 +34,10 @@ pub fn routes() -> Router<AppState> {
                 .delete(delete_list),
         )
         .route(
+            "/api/v1/workspaces/{workspace_id}/lists/{id}/mailable-count",
+            axum::routing::get(mailable_count),
+        )
+        .route(
             "/api/v1/workspaces/{workspace_id}/lists/{id}/members",
             axum::routing::get(list_list_members).post(add_list_member),
         )
@@ -85,6 +89,11 @@ pub struct NewMember {
 #[serde(deny_unknown_fields)]
 pub struct NewContactList {
     pub list_id: Uuid,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MailableCount {
+    pub count: u64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -397,6 +406,45 @@ pub async fn list_list_members(
     .fetch_all(&mut *conn)
     .await?;
     Ok(Json(Page::from_rows(rows, limit, |m| m.contact_id)))
+}
+
+/// How many members of the list may be emailed right now: subscribed and not suppressed, counted
+/// over the `mailable_list_members` view, the one definition of eligibility. Deliberately exempt
+/// from the 150 ms p95 target (1.4 s warm over 1.43M mailable contacts), so the UI fetches it on
+/// its own. It is counted live, never kept as a counter on the list: hand-maintained counters
+/// drift.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/lists/{id}/mailable-count",
+    operation_id = "mailable_count",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "List id"),
+    ),
+    responses(
+        (status = 200, body = MailableCount),
+        (status = 404, description = "not a member, or no such list in this workspace"),
+    ),
+)]
+pub async fn mailable_count(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<Json<MailableCount>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    get(&mut conn, workspace_id, id).await?;
+    let count = sqlx::query_scalar!(
+        r#"select count(*) as "count!" from mailable_list_members
+           where workspace_id = $1 and list_id = $2"#,
+        workspace_id,
+        id,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(Json(MailableCount {
+        count: count.unsigned_abs(),
+    }))
 }
 
 /// Adding someone who is already `pending` or `subscribed` changes nothing; adding an

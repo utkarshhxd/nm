@@ -616,6 +616,29 @@ export interface paths {
         patch: operations["update_list"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/mailable-count": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How many members of the list may be emailed right now: subscribed and not suppressed, counted
+         *     over the `mailable_list_members` view, the one definition of eligibility. Deliberately exempt
+         *     from the 150 ms p95 target (1.4 s warm over 1.43M mailable contacts), so the UI fetches it on
+         *     its own. It is counted live, never kept as a counter on the list: hand-maintained counters
+         *     drift.
+         */
+        get: operations["mailable_count"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/lists/{id}/members": {
         parameters: {
             query?: never;
@@ -941,6 +964,10 @@ export interface components {
              *     `POST /api/v1/auth/login/totp` (the cookie set is then a 10-minute pending session).
              */
             status: string;
+        };
+        MailableCount: {
+            /** Format: int64 */
+            count: number;
         };
         MeResponse: {
             /** @description Send as `X-CSRF-Token` on unsafe requests. */
@@ -3590,6 +3617,37 @@ export interface operations {
             };
             /** @description invalid name or description, or an unknown field */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mailable_count: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MailableCount"];
+                };
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
