@@ -106,8 +106,15 @@ eligible when, and only when, it is `subscribed`.
 listmonk's `unconfirmed` still receives mail on single-opt-in lists but not on double-opt-in ones,
 so the meaning of a membership row depends on a *different* row's setting. That is a bug waiting to
 be written. In NM, adding a member to a list with `double_optin = false` writes `subscribed`
-directly; `pending` only ever exists on a double-opt-in list and is never mailable. No cross-row
-lookup is needed to know what a status means.
+directly; `pending` is only ever **created** on a double-opt-in list, and is never mailable. No
+cross-row lookup is needed to know what a status means.
+
+**A pending row may outlive a `double_optin` change, and that is allowed.** An earlier draft of
+this rule said pending could only ever *exist* on a double-opt-in list, which forced turning the
+flag off to refuse while any pending row remained. On a list with fifty thousand pending members
+that makes a boolean unflippable, and with no confirmation flow before M1c those rows cannot be
+resolved any other way. The property worth protecting is that `pending` is never mailable and is
+never created outside double opt-in; neither needs the stronger claim.
 
 ---
 
