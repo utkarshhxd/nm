@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{Segment, parse_new_rules};
+use super::{Segment, parse_new_rules, parse_unchanged_rules};
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
@@ -51,17 +51,19 @@ pub struct NewSegment {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSegment {
-    /// Cannot be `null`.
+    /// Cannot be `null`: leave it out to leave it alone.
     #[serde(default, deserialize_with = "present")]
-    #[schema(value_type = Option<String>)]
+    #[schema(value_type = String, required = false)]
     pub name: Option<Option<String>>,
     /// `null` clears it to an empty string.
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<String>)]
     pub description: Option<Option<String>>,
-    /// The whole replacement document. `null` is refused, not ignored.
+    /// The whole replacement document. Cannot be `null` (refused, not ignored): leave it out to
+    /// leave the rules alone. Resending the stored document is accepted unchanged, even if it
+    /// names a field that has since been archived.
     #[serde(default, deserialize_with = "present")]
-    #[schema(value_type = Option<Object>)]
+    #[schema(value_type = Object, required = false)]
     pub rules: Option<Value>,
 }
 
@@ -135,16 +137,24 @@ pub async fn get_segment(
     ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Segment>> {
     authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
-    let segment = sqlx::query_as!(
+    let mut conn = state.pool.acquire().await?;
+    get_segment_in(&mut conn, workspace_id, id).await.map(Json)
+}
+
+async fn get_segment_in(
+    db: &mut sqlx::PgConnection,
+    workspace_id: Uuid,
+    id: Uuid,
+) -> ApiResult<Segment> {
+    Ok(sqlx::query_as!(
         Segment,
         r#"select id, name, description, rules, version, created_by, created_at, updated_at
            from segments where workspace_id = $1 and id = $2"#,
         workspace_id,
         id,
     )
-    .fetch_one(&state.pool)
-    .await?;
-    Ok(Json(segment))
+    .fetch_one(db)
+    .await?)
 }
 
 #[utoipa::path(
@@ -266,11 +276,32 @@ pub async fn update_segment(
         let errors = [name.err(), description.err()].into_iter().flatten();
         return Err(ApiError::Validation(errors.collect()));
     };
+    // Nothing sent means nothing to write: no `updated_at`, and no audit row claiming an update.
+    if input.name.is_none() && input.description.is_none() && input.rules.is_none() {
+        return get_segment_in(&mut tx, workspace_id, id).await.map(Json);
+    }
     // Whatever is sent must be a whole, valid document: it is parsed on its own and never merged
-    // with the stored one.
+    // with the stored one. A document identical to the stored one holds no NEW rule, so it may
+    // name a field archived since; anything else may not. `is not distinct from` on `jsonb`, for
+    // the reason given at the update below. The row is locked, so the comparison cannot go stale
+    // before the write: another save cannot slip an archived name past it.
     let rules = match &input.rules {
         Some(doc) => {
-            let group = parse_new_rules(&mut tx, workspace_id, doc).await?;
+            let unchanged = sqlx::query_scalar!(
+                r#"select rules is not distinct from $3::jsonb as "unchanged!"
+                   from segments where workspace_id = $1 and id = $2 for update"#,
+                workspace_id,
+                id,
+                doc,
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+            let group = if unchanged {
+                parse_unchanged_rules(&mut tx, workspace_id, doc).await?
+            } else {
+                parse_new_rules(&mut tx, workspace_id, doc).await?
+            };
             Some(serde_json::to_value(&group).map_err(|e| ApiError::Internal(e.into()))?)
         }
         None => None,

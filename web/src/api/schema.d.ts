@@ -1824,10 +1824,14 @@ export interface components {
         UpdateSegment: {
             /** @description `null` clears it to an empty string. */
             description?: string | null;
-            /** @description Cannot be `null`. */
-            name?: string | null;
-            /** @description The whole replacement document. `null` is refused, not ignored. */
-            rules?: Record<string, never> | null;
+            /** @description Cannot be `null`: leave it out to leave it alone. */
+            name?: string;
+            /**
+             * @description The whole replacement document. Cannot be `null` (refused, not ignored): leave it out to
+             *     leave the rules alone. Resending the stored document is accepted unchanged, even if it
+             *     names a field that has since been archived.
+             */
+            rules?: Record<string, never>;
         };
         UpdateTag: {
             /** @description Unique in the workspace. 1-100 characters. */

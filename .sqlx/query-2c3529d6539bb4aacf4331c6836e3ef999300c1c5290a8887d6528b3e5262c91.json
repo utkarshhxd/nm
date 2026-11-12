@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select rules is not distinct from $3::jsonb as \"unchanged!\"\n                   from segments where workspace_id = $1 and id = $2 for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "unchanged!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2c3529d6539bb4aacf4331c6836e3ef999300c1c5290a8887d6528b3e5262c91"
+}

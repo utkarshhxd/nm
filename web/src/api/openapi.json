@@ -6305,18 +6305,12 @@
             "description": "`null` clears it to an empty string."
           },
           "name": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Cannot be `null`."
+            "type": "string",
+            "description": "Cannot be `null`: leave it out to leave it alone."
           },
           "rules": {
-            "type": [
-              "object",
-              "null"
-            ],
-            "description": "The whole replacement document. `null` is refused, not ignored."
+            "type": "object",
+            "description": "The whole replacement document. Cannot be `null` (refused, not ignored): leave it out to\nleave the rules alone. Resending the stored document is accepted unchanged, even if it\nnames a field that has since been archived."
           }
         },
         "additionalProperties": false

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select key, kind as \"kind: FieldKind\" from custom_fields\n           where workspace_id = $1 and archived_at is null for share",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind: FieldKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5fb445fa7153d67f20aa67127452e2de19ab487331525a5a2db8db70e1d18358"
+}

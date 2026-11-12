@@ -6,6 +6,8 @@
 
 mod common;
 
+use std::{future::IntoFuture, time::Duration};
+
 use axum::http::StatusCode;
 use common::{PW, TestApp, add_member, create_user, create_workspace};
 use nm::{
@@ -70,9 +72,13 @@ async fn create(app: &TestApp, ws: Uuid, name: &str, rules: Value) -> Uuid {
 }
 
 async fn create_field(app: &TestApp, ws: Uuid, key: &str) -> Uuid {
+    create_field_of(app, ws, key, "text").await
+}
+
+async fn create_field_of(app: &TestApp, ws: Uuid, key: &str, kind: &str) -> Uuid {
     let r = app
         .post(&fields(ws))
-        .json(&json!({"key": key, "label": key, "kind": "text"}))
+        .json(&json!({"key": key, "label": key, "kind": kind}))
         .await;
     r.assert_status(StatusCode::CREATED);
     id_of(&r)
@@ -573,6 +579,10 @@ async fn purge_is_refused_while_a_live_segment_names_the_field_and_lists_it(pool
         "{detail}"
     );
     assert!(
+        !detail.contains("and more"),
+        "two segments are not a truncated list: {detail}"
+    );
+    assert!(
         !detail.contains("prefix") && !detail.contains("value only"),
         "{detail}"
     );
@@ -664,4 +674,253 @@ async fn segment_writes_are_csrf_protected(pool: PgPool) {
     }
     assert_eq!(count(&pool).await, 1);
     assert_eq!(row(&pool, id).await.unwrap().0, "s");
+}
+
+/// Eleven are fetched and ten are listed, so ten is the largest list that is complete.
+#[sqlx::test]
+async fn purge_refusal_lists_ten_and_says_when_there_are_more(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let field = create_field(&app, ws, "plan").await;
+    for i in 0..11 {
+        create(&app, ws, &format!("n{i:02}"), plan_is("pro")).await;
+    }
+    app.delete(&format!("{}/{field}", fields(ws)))
+        .await
+        .assert_status_ok();
+    let purge = format!("{}/{field}/purge", fields(ws));
+
+    let r = app.post(&purge).await;
+    r.assert_status(StatusCode::CONFLICT);
+    let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("`n09`"), "{detail}");
+    assert!(
+        !detail.contains("`n10`"),
+        "an eleventh name was listed: {detail}"
+    );
+    assert!(detail.contains(", and more"), "{detail}");
+
+    // Exactly ten is a complete list, and must not claim otherwise.
+    sqlx::query("delete from segments where name = 'n10'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r = app.post(&purge).await;
+    r.assert_status(StatusCode::CONFLICT);
+    let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("`n09`"), "{detail}");
+    assert!(
+        !detail.contains("and more"),
+        "ten is not a truncated list: {detail}"
+    );
+}
+
+/// `jsonb` compares numbers by value, text compares their spelling. `1` and `1.0` are one
+/// predicate, so resaving it must not bump the version. The stored document is rewritten to the
+/// spelling that was sent, which is correct: what the rule means did not change.
+#[sqlx::test]
+async fn a_number_respelled_is_the_same_rule_and_does_not_bump_the_version(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    create_field_of(&app, ws, "seats", "number").await;
+    let rule = |v: &str| {
+        format!(r#"{{"match":"all","rules":[{{"field":"attr:seats","op":"eq","value":{v}}}]}}"#)
+    };
+    let id = create(&app, ws, "s", serde_json::from_str(&rule("1")).unwrap()).await;
+    let one = format!("{}/{id}", segments(ws));
+    let spelled = || async {
+        sqlx::query_scalar::<_, String>(
+            "select (rules->'rules'->0->'value')::text from segments where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(spelled().await, "1");
+
+    // `serde_json::Value` would keep `1.0` as a float, but the text is what is sent here.
+    let r = app
+        .patch(&one)
+        .content_type("application/json")
+        .bytes(format!(r#"{{"rules":{}}}"#, rule("1.0")).into())
+        .await;
+    r.assert_status_ok();
+    assert_eq!(
+        spelled().await,
+        "1.0",
+        "the stored spelling follows the save"
+    );
+    assert_eq!(
+        row(&pool, id).await.unwrap().3,
+        1,
+        "a respelled number bumped the version"
+    );
+
+    // A different number is a different rule.
+    let r = app
+        .patch(&one)
+        .content_type("application/json")
+        .bytes(format!(r#"{{"rules":{}}}"#, rule("2")).into())
+        .await;
+    assert_eq!(r.json::<Value>()["version"], 2);
+}
+
+/// A client that sends the whole object on every save must be able to rename a segment whose
+/// field was archived since. Only a document that differs from the stored one is held to the
+/// no-archived-field rule.
+#[sqlx::test]
+async fn resending_the_stored_rules_is_accepted_after_the_field_is_archived(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let field = create_field(&app, ws, "plan").await;
+    let doc = plan_is("pro");
+    let id = create(&app, ws, "pro", doc.clone()).await;
+    let one = format!("{}/{id}", segments(ws));
+    app.delete(&format!("{}/{field}", fields(ws)))
+        .await
+        .assert_status_ok();
+
+    let r = app
+        .patch(&one)
+        .json(&json!({"name": "renamed", "rules": doc}))
+        .await;
+    r.assert_status_ok();
+    let stored = row(&pool, id).await.unwrap();
+    assert_eq!((stored.0.as_str(), stored.3), ("renamed", 1));
+    assert_eq!(stored.2, doc);
+
+    // One value different, and it is a new document: refused, and nothing changed.
+    let r = app
+        .patch(&one)
+        .json(&json!({"name": "again", "rules": plan_is("free")}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&r), "urn:nm:problem:unknown-field");
+    let stored = row(&pool, id).await.unwrap();
+    assert_eq!((stored.0.as_str(), stored.2), ("renamed", doc));
+}
+
+/// A save holds its definitions `for share`, so an archive (and so the purge that can only follow
+/// it) waits for it, and the purge guard then sees what the save wrote. The save's own call is
+/// `parse_new_rules`; holding its transaction open is what a slow save looks like from outside.
+#[sqlx::test]
+async fn a_save_in_flight_holds_its_definitions_so_an_archive_waits(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let field = create_field(&app, ws, "plan").await;
+    let mut tx = pool.begin().await.unwrap();
+    let doc = plan_is("pro");
+    nm::segments::parse_new_rules(&mut tx, ws, &doc)
+        .await
+        .expect("parses while the field is live");
+
+    let archive = app.delete(&format!("{}/{field}", fields(ws)));
+    let mut archive = std::pin::pin!(archive.into_future());
+    tokio::select! {
+        _ = &mut archive => panic!("the archive did not wait for the save in flight"),
+        () = tokio::time::sleep(Duration::from_millis(600)) => {}
+    }
+    let archived: bool =
+        sqlx::query_scalar("select archived_at is not null from custom_fields where id = $1")
+            .bind(field)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!archived);
+
+    // The save commits (here: writes its segment), the archive proceeds, the purge is refused.
+    sqlx::query(
+        "insert into segments (id, workspace_id, name, rules) values ($1, $2, 'saved', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(&doc)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    archive.await.assert_status_ok();
+    let r = app.post(&format!("{}/{field}/purge", fields(ws))).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:field-in-use");
+}
+
+/// An empty PATCH changes nothing, so it writes nothing: an audit row saying "updated" with no
+/// field would be a statement the log must never make.
+#[sqlx::test]
+async fn an_empty_patch_writes_nothing(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (ws2, app2) = workspace(&pool, "globex").await;
+    let id = create(&app, ws, "s", first_name_is("a")).await;
+    let one = format!("{}/{id}", segments(ws));
+    let stamp = || async {
+        sqlx::query_scalar::<_, String>("select updated_at::text from segments where id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let before = stamp().await;
+
+    let r = app.patch(&one).json(&json!({})).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["name"], "s");
+    assert_eq!(stamp().await, before, "an empty patch moved updated_at");
+    let updates: i64 =
+        sqlx::query_scalar("select count(*) from audit_log where action = 'segment.updated'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(updates, 0, "an empty patch wrote an audit row");
+
+    // It still answers 404 for a segment that is not the caller's.
+    app2.patch(&format!("{}/{id}", segments(ws2)))
+        .json(&json!({}))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    app.patch(&format!("{}/{}", segments(ws), Uuid::now_v7()))
+        .json(&json!({}))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+}
+
+/// Renaming a foreign segment to a name one of ITS siblings holds would, if the UPDATE were not
+/// scoped to the workspace, trip the unique constraint and answer 409: which says the foreign
+/// workspace has a segment of that name. The answer must be the same 404 as for any other id.
+#[sqlx::test]
+async fn a_foreign_rename_cannot_probe_for_a_sibling_name(pool: PgPool) {
+    let (ws1, admin1) = workspace(&pool, "acme").await;
+    let (ws2, admin2) = workspace(&pool, "globex").await;
+    let target = create(&admin1, ws1, "target", first_name_is("a")).await;
+    create(&admin1, ws1, "sibling", first_name_is("b")).await;
+
+    let r = admin2
+        .patch(&format!("{}/{target}", segments(ws2)))
+        .json(&json!({"name": "sibling"}))
+        .await;
+    r.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(problem_type(&r), "urn:nm:problem:not-found");
+    assert_eq!(row(&pool, target).await.unwrap().0, "target");
+}
+
+/// The generated client is typed from this document. It must not offer `null` for what the server
+/// answers 422 to, and must for what `null` clears.
+#[test]
+fn the_patch_schema_is_nullable_only_where_null_means_something() {
+    let doc = serde_json::to_value(nm::openapi::spec()).unwrap();
+    let schema = &doc["components"]["schemas"]["UpdateSegment"];
+    let props = &schema["properties"];
+    let nullable = |field: &str| {
+        let t = &props[field]["type"];
+        t == "null"
+            || t.as_array().is_some_and(|a| a.iter().any(|x| x == "null"))
+            || props[field]["oneOf"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x["type"] == "null"))
+    };
+    assert!(!nullable("name"), "{props}");
+    assert!(!nullable("rules"), "{props}");
+    assert!(nullable("description"), "{props}");
+    let required = &schema["required"];
+    assert!(
+        required.is_null() || required.as_array().is_some_and(Vec::is_empty),
+        "{required}"
+    );
 }
