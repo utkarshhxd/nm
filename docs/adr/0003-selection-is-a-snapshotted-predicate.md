@@ -1,6 +1,8 @@
 # 0003. Selection is a snapshotted predicate
 
-Status: accepted (M1a). Spec: `.scratch/email-platform/specs/2026-11-11-m1a-contact-core.md` §8.2. Code: `src/contacts/selection.rs`.
+Status: **superseded by [ADR 0004](0004-selection-is-a-materialised-set.md)** (M1b). Accepted in M1a. Spec: `.scratch/email-platform/specs/2026-11-11-m1a-contact-core.md` §8.2. Code at the time: `src/contacts/selection.rs`.
+
+Superseded, not edited, for the reason the milestone applies to old audit strings: rewriting a record makes it a worse record than it was. Everything below describes the M1a design — a token carrying `{workspace_id, filter, as_of, issued}`, re-resolved when the action ran — and **none of it describes the code any more**. The predicate has left the token, the widening comparison is no longer the guarantee and no longer adds the exclusions back, and the alternative this document explicitly rejected ("the materialised set of ids the filter matched at issue time") is what M1b builds. ADR 0004 carries the measurements that killed the bounded-timestamp repair this one proposed.
 
 ## Decision
 

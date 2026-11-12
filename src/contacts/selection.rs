@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! A selection is a predicate and a moment, never a set of ids. "All 2.3 million contacts matching
-//! this filter" cannot be sent as ids, and re-running the filter when the action executes is a
-//! compliance bug: a signup or import landing in between would silently join the selection, and an
-//! unsubscribe or delete would act on people nobody selected. So the token carries the filter and
-//! `as_of`, a UUIDv7 taken when the token was issued. Contact ids are `Uuid::now_v7()`, so
-//! `id <= as_of` is exactly "existed at that moment", with no timestamp column.
+//! A selection is a **frozen set of contact ids**, never a predicate re-run when the action
+//! executes. `POST /contacts/selection` evaluates the predicate once and writes the ids it matched
+//! into `selection_snapshot_members`; the token that comes back carries nothing but
+//! `{workspace_id, snapshot_id, issued}`, and every bulk action here narrows `contacts` by that
+//! frozen set.
+//!
+//! Re-evaluating the predicate at action time is the compliance bug issue `04` records: a second
+//! editor writing a tag inside the token's hour changes what the action hits. No timestamp bound
+//! repairs it, because negation inverts — `not_has(tag)` bounded by `t` becomes *true* for a
+//! contact whose tag row is deleted, so a contact that was never shown is acted on, and proving a
+//! fact was *absent* at `t` is impossible once the row recording it is gone. See
+//! `docs/adr/0004-selection-is-a-materialised-set.md` for both measured counterexamples.
+//!
+//! **A snapshot narrows `contacts`; it never supplies ids.** Reading ids *out of* the members
+//! table and inserting them elsewhere hits a foreign-key violation the moment one selected contact
+//! has been deleted since selection, which kills the whole action. Narrowing degrades correctly:
+//! the deleted contact is simply absent and the `affected` count is short.
 //!
 //! Every bulk action here is one set-based statement. None loops over ids.
 
@@ -29,12 +40,14 @@ use crate::{
 /// Domain-separation label for the selection-token key: a token can never be replayed as any other
 /// HMAC'd value, nor the reverse.
 ///
-/// `v2` because `Selection` gained a required `issued`, and a `v1` token has none. Bumping the
-/// label refuses every outstanding token as `selection-invalid` — the path the UI already handles
-/// by asking the user to select again — rather than letting an uncounted token through the checks
-/// that stop a widened `bulk/delete` or `bulk/subscribe`. At most one hour of tokens can be
-/// outstanding.
-const SELECTION_DOMAIN: &str = "nm:selection:v2";
+/// `v3` because the payload's *meaning* changed: it carried `{workspace_id, filter, as_of,
+/// issued}` — a predicate to re-run — and now carries the id of a set that is already written
+/// down. A `v2` token must fail the HMAC rather than deserialise into something this build would
+/// misread: it has no `snapshot_id`, and nothing here may ever read a missing one as "no
+/// narrowing", which on `bulk/delete` is the whole workspace. Bumping the label refuses every
+/// outstanding token as `selection-invalid` — the path the UI already handles by asking the person
+/// to select again — and at most one hour of tokens can be outstanding.
+const SELECTION_DOMAIN: &str = "nm:selection:v3";
 
 /// A token older than this is refused. An hour is long enough to read a confirmation dialog and
 /// short enough that "everyone matching X, as of this morning" is not acted on tomorrow.
@@ -48,115 +61,99 @@ pub const MAX_EXCLUDED: usize = 10_000;
 /// reason, as `MAX_EXCLUDED`.
 pub const MAX_IDS: usize = 10_000;
 
-/// What a signed token carries. The field names are part of the token format: renaming one
-/// invalidates tokens already issued.
+/// What a signed token carries: which workspace, which frozen set, and how many contacts were in
+/// it. The field names are part of the token format: renaming one invalidates tokens already
+/// issued.
 ///
-/// `deny_unknown_fields` so the payload shape is fail-closed on its own, and not only because
-/// someone remembered to bump `SELECTION_DOMAIN`. A signed payload carrying a key this build does
-/// not know is a payload from a different version of this struct, and the one thing a selection
-/// must never do is resolve to more contacts than the version that issued it meant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// **No `serde(default)` on any field**, with `deny_unknown_fields` on top. A payload this build
+/// did not write is refused rather than read: a `snapshot_id` defaulted to anything at all is a
+/// selection with no frozen set behind it, and the one thing a selection must never do is resolve
+/// to more contacts than the version that issued it meant. The HMAC refuses an outstanding `v2`
+/// token first; this is the second lock, for the case where only the payload's shape differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Selection {
+pub struct Token {
     pub workspace_id: Uuid,
-    pub filter: ContactFilter,
-    /// UUIDv7 upper bound: the contacts selected are those with `id <= as_of`.
-    ///
-    /// The snapshot is only as precise as UUIDv7's millisecond: a contact another process creates
-    /// in the same millisecond as the token may fall on either side. And it holds only while
-    /// every contact id is a `Uuid::now_v7()`: any write path that assigns a different id (a v4
-    /// from an import, say) silently escapes the bound, and so can be acted on by a selection
-    /// that was made before it existed. Any new way of creating contacts must keep minting v7 ids.
-    pub as_of: Uuid,
-    /// An explicit list of contacts instead of `filter`: the ticked rows of a table. Never in an
-    /// issued token (a token is a predicate); only `BulkTarget` builds one, from `ids`. It is
-    /// still scoped by `workspace_id`, so an id from another workspace selects nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ids: Option<Vec<Uuid>>,
-    /// How many contacts this selection stood for when it was made: the live count for a filter,
-    /// the number of ids for an id list.
-    ///
-    /// This is what the person was shown before they confirmed, carried inside the signature so
-    /// the server can compare it with what the predicate resolves to when the action runs. The
-    /// `as_of` bound freezes creation time only — `push_filter` reads list memberships, tags and
-    /// names as they are now — so a contact that existed at `as_of` and did not match then does
-    /// match now if someone has since tagged it or added it to the list. Without this number
-    /// nothing notices.
-    ///
-    /// Required, not optional: an uncounted token is one the widening check cannot be run on.
+    /// The materialised set, by id. `Uuid::now_v7()`, so the issue time comes back out of the id
+    /// itself and the TTL is checked before the database is touched (section 8.5).
+    pub snapshot_id: Uuid,
+    /// How many contacts were frozen: `selection_snapshots.size`, which is the materialising
+    /// insert's own `rows_affected` and the number the person was shown before they confirmed.
     pub issued: u64,
 }
 
+/// What a bulk action acts on: a set of contacts that is already frozen, whichever way it was
+/// named.
+///
+/// An enum, not a struct of optional parts, because the state it makes unrepresentable is the one
+/// that empties a workspace: a selection carrying neither a snapshot nor ids narrows `contacts` by
+/// nothing at all, and `bulk/delete` of "nothing at all" is every contact there is. The house rule
+/// is unrepresentable, not merely unwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// A materialised snapshot, named by a signed token and found live in `selection_snapshots`.
+    Snapshot {
+        token: Token,
+        /// The predicate the snapshot was frozen for, as it was sent, copied out of
+        /// `selection_snapshots.filter` for the audit row the action writes (section 8.7). The
+        /// token carries no predicate and the snapshot is deleted within the hour, so without this
+        /// copy the log would read *"deleted 417,004 contacts, snapshot 0192…"* against a row that
+        /// no longer exists. `q` is redacted by the audit copy, not here.
+        filter: Value,
+    },
+    /// The ticked rows of a grid: these contacts and no others. An explicit id list is already a
+    /// frozen set, so it carries no `snapshot_id` and nothing is materialised for it. It is still
+    /// scoped by `workspace_id`, so an id from another workspace selects nothing.
+    Ids { workspace_id: Uuid, ids: Vec<Uuid> },
+}
+
 impl Selection {
-    /// A selection of exactly these contacts, as of now. `issued` is how many were named; the
-    /// resolved count can only be lower (an id from another workspace matches nothing), so an id
-    /// selection can never widen.
+    /// A selection of exactly these contacts. `issued` is how many were named; the resolved count
+    /// can only be lower (an id from another workspace matches nothing), so an id selection can
+    /// never widen.
     pub fn of_ids(workspace_id: Uuid, ids: Vec<Uuid>) -> Selection {
-        Selection {
-            issued: ids.len() as u64,
-            ids: Some(ids),
-            ..Selection::now(workspace_id, ContactFilter::default())
+        Selection::Ids { workspace_id, ids }
+    }
+
+    /// The workspace this selection belongs to. Every statement built from it is scoped by this,
+    /// whichever arm it came from.
+    pub fn workspace_id(&self) -> Uuid {
+        match self {
+            Selection::Snapshot { token, .. } => token.workspace_id,
+            Selection::Ids { workspace_id, .. } => *workspace_id,
         }
     }
 
-    /// A selection of `filter` as of now. Within one process `now_v7` is monotonic, so every
-    /// contact created after this call has a greater id. Two processes inside the same
-    /// millisecond have no such order: a contact created by the other one in that millisecond may
-    /// fall on either side.
-    pub fn now(workspace_id: Uuid, filter: ContactFilter) -> Selection {
-        Selection {
-            workspace_id,
-            filter,
-            as_of: Uuid::now_v7(),
-            ids: None,
-            // The count is not known until the filter has been run; the caller that issues a
-            // token sets it from `count` before signing. A selection that is never signed (the
-            // tests' own, and `of_ids`, which overrides it) is never compared against it.
-            issued: 0,
+    /// How many contacts this selection stood for when it was made — the number the confirmation
+    /// dialog showed.
+    pub fn issued(&self) -> u64 {
+        match self {
+            Selection::Snapshot { token, .. } => token.issued,
+            Selection::Ids { ids, .. } => ids.len() as u64,
         }
     }
 
-    /// True when the predicate resolved to more contacts than the selection was made for.
+    /// True when the action resolved to more contacts than the selection was made for.
     ///
-    /// Only a filter can widen, and only because `push_filter` reads current state: the people
-    /// who joined the match were already there at `as_of`, and someone tagged them, subscribed
-    /// them or renamed them into the search afterwards.
+    /// **It cannot be true**, which is the point of materialising the set (section 8.6): nothing
+    /// re-evaluates a predicate, so no write by anybody else can add a contact to a frozen set.
+    /// `selected` comes out of the statement that performed the action, over the frozen set less
+    /// the exclusions, so `selected ≤ |S| − |E ∩ S| ≤ |S| = issued` for a snapshot and
+    /// `selected ≤ |ids| = issued` for an id list. It is kept as defence in depth — it costs
+    /// nothing and it is the last line if the snapshot join is ever bypassed — and `tests/bulk.rs`
+    /// asserts it never fires.
     ///
-    /// `selected` and `issued` are **not the same quantity**, which is why `excluded` is a
-    /// parameter and not the caller's business to forget. `issued` is the whole match at issue
-    /// time, counted with no exclusions (`count` passes `&[]`); `selected` is the match at run
-    /// time *less* the excluded ids. Comparing them directly lets a widening of up to
-    /// `excluded.len()` through, and `MAX_EXCLUDED` is 10 000 — ten thousand contacts deleted
-    /// under a confirmation that read "Delete 1 contact".
-    ///
-    /// Writing `M0` for the match at issue time and `M1` for the match now:
-    /// `|M1| = selected + |M1 ∩ E| ≤ selected + |E|`, so refusing when `selected + |E| > |M0|`
-    /// guarantees `|M1| ≤ |M0|` whenever it does not refuse. State it the stronger way round,
-    /// because that is what it buys: `selected ≤ |M0| - |E|`, so an action never touches more
-    /// contacts than the number the confirmation dialog named. `|M1| ≤ |M0|` is the corollary.
-    ///
-    /// It over-refuses whenever an excluded id is not in `M1`, and **the UI can produce that** —
-    /// an earlier version of this comment said only an API client could, and that was wrong.
-    /// Two ways, both ending in a refusal of a selection that never widened. The grid applies
-    /// the filter but not the `as_of` bound, which lives only in `push_selected`, so a contact
-    /// created after the token and matching the filter is drawn as a ticked row on the next
-    /// refetch; unticking it excludes an id `M1` never held. And an excluded id that has left
-    /// the match only cancels out when nothing joined in the same window — a same-count swap
-    /// with an exclusion is refused too, although the count did not change.
-    ///
-    /// Over-refusing is the safe direction on the two actions that refuse — a delete that cannot
-    /// be undone, and a subscribe that makes people mailable — and it costs the user a fresh
-    /// selection. `tests/bulk.rs` pins the isolated leave-the-match case; neither path above is
-    /// covered.
-    ///
-    /// What it still does not catch is a same-count swap: one contact leaving the match while
-    /// another joins leaves `|M1|` unchanged and this returns false. The number that can be
-    /// substituted that way is bounded by how many contacts left the match inside the one-hour
-    /// window, which is not a small number by construction. Catching it needs the set of ids the
-    /// filter matched at issue time, which is exactly what a predicate selection exists not to
-    /// carry — see `docs/adr/0003-selection-is-a-snapshotted-predicate.md`.
-    pub fn widened(&self, selected: u64, excluded: usize) -> bool {
-        selected.saturating_add(excluded as u64) > self.issued
+    /// **The exclusions are not added back.** M1a compared `selected + excluded.len() > issued`,
+    /// which was right while `issued` was the whole match at issue time and `selected` the match
+    /// *now* less the exclusions: two different quantities, and comparing them raw let a widening
+    /// of up to `MAX_EXCLUDED` through. Here both sides count the same frozen set, so the
+    /// exclusion term is not merely redundant but wrong: `issued = |S|` and
+    /// `selected = |S| − |E ∩ S|`, so an excluded id that is *not* in the snapshot made the sum
+    /// exceed `issued` and refused `409 selection-widened` on the most ordinary action the grid
+    /// produces — unticking a row the live view shows and the frozen set does not. A tripwire that
+    /// fires in normal operation is a tripwire somebody on call deletes.
+    pub fn widened(&self, selected: u64) -> bool {
+        selected > self.issued()
     }
 }
 
@@ -165,9 +162,9 @@ fn mac(secrets: &Secrets, payload: &[u8]) -> [u8; 32] {
 }
 
 /// `base64url(json).base64url(hmac)`. Signed, not encrypted: it carries no secret, but a client
-/// cannot alter the filter, the workspace or the bound.
-pub fn issue(secrets: &Secrets, selection: &Selection) -> String {
-    let payload = serde_json::to_vec(selection).expect("a selection always serialises");
+/// cannot alter the workspace, the snapshot it names, or the count it was issued for.
+pub fn issue(secrets: &Secrets, token: &Token) -> String {
+    let payload = serde_json::to_vec(token).expect("a selection token always serialises");
     format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(&payload),
@@ -176,9 +173,16 @@ pub fn issue(secrets: &Secrets, selection: &Selection) -> String {
 }
 
 /// `422 selection-invalid` for anything that is not a token this instance issued, and `422
-/// selection-expired` once `as_of` is over an hour old. The caller compares `workspace_id` with
-/// the workspace it authorised.
-pub fn parse(secrets: &Secrets, token: &str) -> ApiResult<Selection> {
+/// selection-expired` once the snapshot id's own issue time is over an hour old. The caller
+/// compares `workspace_id` with the workspace it authorised.
+///
+/// The age is checked here, **before the database is touched**, and again by the action's `sel`
+/// CTE, which joins `selection_snapshots … and expires_at > now()`. Both, not either (section
+/// 8.5): this one needs no query and refuses a Friday token on Monday, and the CTE's join is what
+/// makes expiry independent of the reaper, which clears one snapshot a minute and can be hours
+/// behind. `snapshot_id` is a UUIDv7 exactly so this check is possible at all — a v4 would leave
+/// the TTL enforceable only by the row.
+pub fn parse(secrets: &Secrets, token: &str) -> ApiResult<Token> {
     let invalid = || ApiError::Unprocessable("selection-invalid");
     let (payload, sig) = token.split_once('.').ok_or_else(invalid)?;
     let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| invalid())?;
@@ -186,15 +190,15 @@ pub fn parse(secrets: &Secrets, token: &str) -> ApiResult<Selection> {
     if !tokens::constant_time_eq(&mac(secrets, &payload), &sig) {
         return Err(invalid());
     }
-    let selection: Selection = serde_json::from_slice(&payload).map_err(|_| invalid())?;
-    let issued = selection.as_of.get_timestamp().ok_or_else(invalid)?;
+    let token: Token = serde_json::from_slice(&payload).map_err(|_| invalid())?;
+    let issued = token.snapshot_id.get_timestamp().ok_or_else(invalid)?;
     let (secs, nanos) = issued.to_unix();
     let issued = UNIX_EPOCH + Duration::new(secs, nanos);
     // A clock that went backwards makes the age an error: treat it as zero rather than refusing.
     if SystemTime::now().duration_since(issued).unwrap_or_default() > TTL {
         return Err(ApiError::Unprocessable("selection-expired"));
     }
-    Ok(selection)
+    Ok(token)
 }
 
 /// `422` if more than `MAX_EXCLUDED` ids are excluded.
@@ -453,37 +457,88 @@ pub async fn sweep_expired_snapshots(pool: PgPool) {
     }
 }
 
-/// How many contacts `sel` matches under its own `as_of` bound. A live count over the whole
-/// match, so as slow as the match is big: the caller asks for it only when the user asks to select
-/// everything.
-pub async fn count(db: &mut PgConnection, sel: &Selection) -> ApiResult<u64> {
-    let mut q = QueryBuilder::<Postgres>::new("select count(*)::bigint from contacts where ");
-    push_selected(&mut q, sel, &[]);
-    let n: i64 = q.build_query_scalar().fetch_one(db).await?;
-    Ok(n.unsigned_abs())
+/// Resolves a token against the live snapshot it names, inside the action's own transaction.
+///
+/// `422 selection-expired` when there is no such live row: past `expires_at`, swept by the reaper,
+/// or superseded by a newer selection of the same actor's. Those are one answer on purpose — they
+/// are the same thing to the person holding the token, and telling them apart would disclose
+/// whether a snapshot id exists.
+///
+/// Read in the action's transaction, so this `now()` and the `sel` CTE's `now()` are the one
+/// transaction timestamp and cannot disagree about expiry.
+pub async fn resolve(db: &mut PgConnection, token: Token) -> ApiResult<Selection> {
+    let row = sqlx::query!(
+        "select filter, size from selection_snapshots \
+         where workspace_id = $1 and id = $2 and expires_at > now()",
+        token.workspace_id,
+        token.snapshot_id,
+    )
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Err(ApiError::Unprocessable("selection-expired"));
+    };
+    // `issued` was signed from this row's `size` when the token was minted, so a disagreement is
+    // this instance contradicting itself, not anything a client can cause. Refusing here is what
+    // lets the caller compare the confirmed count against `issued` and have compared it against
+    // `selection_snapshots.size` (section 9.2).
+    if row.size != i64::try_from(token.issued).unwrap_or(i64::MAX) {
+        return Err(ApiError::Unprocessable("selection-invalid"));
+    }
+    Ok(Selection::Snapshot {
+        token,
+        filter: row.filter,
+    })
+}
+
+/// Appends ` and id in (<the frozen set>)` to a query that has already constrained
+/// `contacts.workspace_id`. The grid's `?snapshot_id=` and every bulk action share it, so "the
+/// contacts this snapshot shows" and "the contacts this snapshot acts on" cannot drift apart.
+///
+/// Two properties here are requirements, not style:
+///
+/// 1. **It narrows `contacts`; it never supplies ids.** `insert … select contact_id from
+///    selection_snapshot_members` would hit a foreign-key violation the moment a single selected
+///    contact had been deleted since selection — the members table deliberately carries no foreign
+///    key to `contacts` (section 8.6) — and that violation kills the whole action, not one row.
+///    Narrowed, a deleted contact is simply absent.
+/// 2. **It joins the parent with `expires_at > now()`.** Expiry then does not depend on the reaper
+///    having run (section 8.5), and a snapshot whose row is gone narrows to the empty set rather
+///    than to everything.
+pub(crate) fn push_snapshot(q: &mut QueryBuilder<Postgres>, workspace_id: Uuid, snapshot_id: Uuid) {
+    q.push(
+        " and id in (select m.contact_id from selection_snapshot_members m \
+         join selection_snapshots s on s.workspace_id = m.workspace_id and s.id = m.snapshot_id \
+         where m.workspace_id = ",
+    )
+    .push_bind(workspace_id)
+    .push(" and m.snapshot_id = ")
+    .push_bind(snapshot_id)
+    .push(" and s.expires_at > now())");
 }
 
 /// Appends the selection's conditions on `contacts`, after `... where `.
 fn push_selected(q: &mut QueryBuilder<Postgres>, sel: &Selection, excluded: &[Uuid]) {
-    q.push("workspace_id = ").push_bind(sel.workspace_id);
-    if let Some(ids) = &sel.ids {
-        // Literal ids: no snapshot bound (the caller named these contacts) and no filter.
-        q.push(" and id = any(").push_bind(ids.clone()).push(")");
-        return;
+    q.push("workspace_id = ").push_bind(sel.workspace_id());
+    match sel {
+        // Literal ids: the caller named these contacts, and a route refuses `excluded_ids`
+        // alongside them.
+        Selection::Ids { ids, .. } => {
+            q.push(" and id = any(").push_bind(ids.clone()).push(")");
+        }
+        Selection::Snapshot { token, .. } => {
+            push_snapshot(q, token.workspace_id, token.snapshot_id);
+            q.push(" and id <> all(")
+                .push_bind(excluded.to_vec())
+                .push(")");
+        }
     }
-    // The snapshot: only what existed when the token was issued. Remove this and a signup
-    // between the click and the action joins the selection.
-    q.push(" and id <= ").push_bind(sel.as_of);
-    q.push(" and id <> all(")
-        .push_bind(excluded.to_vec())
-        .push(")");
-    push_filter(q, &sel.filter);
 }
 
 /// What a bulk statement did. Both numbers come out of the one statement, so they describe the same
-/// rows: `selected` is what the predicate matched under the `as_of` bound (less the exclusions),
-/// `affected` is how many of those the action actually changed. A count taken separately could
-/// disagree with the action, which is worse than no count.
+/// rows: `selected` is how much of the frozen set still exists, less the exclusions, and `affected`
+/// is how many of those the action actually changed. A count taken separately could disagree with
+/// the action, which is worse than no count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
     pub selected: u64,
@@ -523,7 +578,7 @@ pub async fn tag(
 ) -> ApiResult<Counts> {
     run(db, sel, excluded, |q| {
         q.push("insert into contact_tags (workspace_id, contact_id, tag_id) select ")
-            .push_bind(sel.workspace_id)
+            .push_bind(sel.workspace_id())
             .push(", id, ")
             .push_bind(tag_id)
             .push(" from sel on conflict (contact_id, tag_id) do nothing");
@@ -540,7 +595,7 @@ pub async fn untag(
 ) -> ApiResult<Counts> {
     run(db, sel, excluded, |q| {
         q.push("delete from contact_tags where workspace_id = ")
-            .push_bind(sel.workspace_id)
+            .push_bind(sel.workspace_id())
             .push(" and tag_id = ")
             .push_bind(tag_id)
             .push(" and contact_id in (select id from sel)");
@@ -553,6 +608,15 @@ pub async fn untag(
 /// the confirmation the list requires, and `unsubscribed` is not reversed, because nobody has
 /// asked to be mailed again. `affected` is how many rows were written, so a count below
 /// `selected` tells the user something was skipped.
+///
+/// **Freezing the set is safe here only because this is `on conflict do nothing`** (section 8.3).
+/// Somebody who unsubscribes between the selection and the action is still in the frozen set, so
+/// this statement does run against them; doing nothing to the row they already have is the whole
+/// reason that is harmless. `lists::add_member` is `do update … where status = 'unsubscribed'` —
+/// it revives an unsubscribed membership deliberately, for one named person an admin answers for.
+/// Anyone who later "fixes the asymmetry" by aligning this to that turns freezing into a bulk
+/// re-subscription of people who opted out, with nothing in the tests or the types to object.
+/// Section 15.3 carries the same question to the importer.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
@@ -563,7 +627,7 @@ pub async fn subscribe(
     run(db, sel, excluded, |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at) \
                 select ")
-            .push_bind(sel.workspace_id)
+            .push_bind(sel.workspace_id())
             .push(", id, ")
             .push_bind(list_id)
             .push(", ")
@@ -588,7 +652,7 @@ pub async fn unsubscribe(
             "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
              where status <> 'unsubscribed' and workspace_id = ",
         )
-        .push_bind(sel.workspace_id)
+        .push_bind(sel.workspace_id())
         .push(" and list_id = ")
         .push_bind(list_id)
         .push(" and contact_id in (select id from sel)");
@@ -605,7 +669,7 @@ pub async fn delete(
 ) -> ApiResult<Counts> {
     run(db, sel, excluded, |q| {
         q.push("delete from contacts where workspace_id = ")
-            .push_bind(sel.workspace_id)
+            .push_bind(sel.workspace_id())
             .push(" and id in (select id from sel)");
     })
     .await
@@ -620,19 +684,68 @@ mod tests {
         Secrets::new(&SecretKey([7u8; 32]))
     }
 
-    fn full_filter() -> ContactFilter {
-        ContactFilter {
-            q: Some("acme".into()),
-            list_id: Some(Uuid::now_v7()),
-            list_status: Some(MembershipStatus::Subscribed),
-            tag_id: Some(Uuid::now_v7()),
+    fn token() -> Token {
+        Token {
+            workspace_id: Uuid::now_v7(),
+            snapshot_id: Uuid::now_v7(),
+            issued: 7,
         }
     }
 
     #[test]
-    fn all_four_filter_fields_round_trip() {
-        let s = Selection::now(Uuid::now_v7(), full_filter());
-        assert_eq!(parse(&secrets(), &issue(&secrets(), &s)).unwrap(), s);
+    fn a_token_round_trips() {
+        let t = token();
+        assert_eq!(parse(&secrets(), &issue(&secrets(), &t)).unwrap(), t);
+    }
+
+    /// The statement a bulk action runs, which only its SQL can witness: nothing reachable from a
+    /// test can make the `expires_at` join fire, because the handler refuses an expired snapshot
+    /// before it gets here, and `tests/bulk.rs` drives the join through this module directly.
+    ///
+    /// Two properties. **`contacts` is the driving table** and the members table appears only
+    /// inside `id in (…)`: selecting ids *out of* the members table and inserting them elsewhere
+    /// would hit a foreign-key violation the moment one selected contact had been deleted, which
+    /// kills the whole action rather than one row. And the subquery **joins the parent on
+    /// `expires_at > now()`**, so an unswept expired snapshot narrows to nothing rather than being
+    /// acted on.
+    #[test]
+    fn the_action_narrows_contacts_by_a_live_snapshot() {
+        let sel = Selection::Snapshot {
+            token: token(),
+            filter: serde_json::json!({}),
+        };
+        let mut q = QueryBuilder::<Postgres>::new("select id from contacts where ");
+        push_selected(&mut q, &sel, &[]);
+        let sql = q.into_sql();
+        assert_eq!(
+            sql,
+            "select id from contacts where workspace_id = $1 and id in (select m.contact_id from \
+             selection_snapshot_members m join selection_snapshots s on s.workspace_id = \
+             m.workspace_id and s.id = m.snapshot_id where m.workspace_id = $2 and m.snapshot_id = \
+             $3 and s.expires_at > now()) and id <> all($4)"
+        );
+    }
+
+    /// The guard is unreachable by construction and kept as defence in depth, so the only thing
+    /// left to pin is the arithmetic. It takes no exclusion count: M1a added one back, and under a
+    /// frozen set that refused the most ordinary action on the grid — see `Selection::widened`.
+    #[test]
+    fn a_frozen_set_never_widens() {
+        let sel = Selection::Snapshot {
+            token: Token {
+                issued: 3,
+                ..token()
+            },
+            filter: Value::Null,
+        };
+        for resolved in 0..=3 {
+            assert!(!sel.widened(resolved), "{resolved} of 3");
+        }
+        assert!(sel.widened(4), "the tripwire still works if the set grew");
+
+        let ids = Selection::of_ids(Uuid::now_v7(), vec![Uuid::now_v7(), Uuid::now_v7()]);
+        assert_eq!(ids.issued(), 2);
+        assert!(!ids.widened(2));
     }
 
     #[test]
@@ -673,10 +786,9 @@ mod tests {
 
     #[test]
     fn a_token_from_another_key_is_invalid() {
-        let s = Selection::now(Uuid::now_v7(), ContactFilter::default());
         let other = Secrets::new(&SecretKey([8u8; 32]));
         assert!(matches!(
-            parse(&other, &issue(&secrets(), &s)),
+            parse(&other, &issue(&secrets(), &token())),
             Err(ApiError::Unprocessable("selection-invalid"))
         ));
     }
@@ -702,52 +814,57 @@ mod tests {
 
     /// The payload this struct writes round-trips, and nothing else does.
     ///
-    /// `issued` has no `serde(default)` on purpose: a payload without it is a token from before
-    /// the widening check existed, and it is refused rather than read as some default. That is
-    /// the fail-closed half of the `v1` to `v2` domain bump — a real old token already fails the
-    /// HMAC, and this covers the case where only the payload shape differs.
+    /// **No field has `serde(default)`**, so each of the three is required. A payload missing
+    /// `snapshot_id` is a token from the predicate era; read with a default it would be a
+    /// selection narrowed by nothing, which on `bulk/delete` is the workspace. A real v2 token
+    /// already fails the HMAC under the `v3` label; this covers the case where only the payload's
+    /// shape differs, which is the half a label bump cannot catch.
     #[test]
     fn only_a_payload_this_build_writes_is_read() {
-        let (ws, list) = (Uuid::now_v7(), Uuid::now_v7());
+        let (ws, snapshot) = (Uuid::now_v7(), Uuid::now_v7());
         let full = serde_json::json!({
             "workspace_id": ws,
-            "filter": {"q": null, "list_id": list, "list_status": "subscribed", "tag_id": null},
+            "snapshot_id": snapshot,
+            "issued": 7,
+        });
+        let t = parse(&secrets(), &signed(&full)).unwrap();
+        assert_eq!(t.snapshot_id, snapshot);
+        assert_eq!(t.issued, 7);
+
+        // Each field removed in turn: refused, never defaulted.
+        for field in ["workspace_id", "snapshot_id", "issued"] {
+            let mut short = full.clone();
+            short.as_object_mut().unwrap().remove(field);
+            assert!(
+                matches!(
+                    parse(&secrets(), &signed(&short)),
+                    Err(ApiError::Unprocessable("selection-invalid"))
+                ),
+                "a payload with no {field} was read"
+            );
+        }
+
+        // The v2 payload, signed by this instance under *this* label: the shape alone refuses it,
+        // so a rolling deploy that somehow kept the old key still cannot act on one.
+        let v2 = serde_json::json!({
+            "workspace_id": ws,
+            "filter": {"q": null, "list_id": null, "list_status": null, "tag_id": null},
             "as_of": Uuid::now_v7(),
             "issued": 7,
         });
-        let s = parse(&secrets(), &signed(&full)).unwrap();
-        assert_eq!(s.filter.list_id, Some(list));
-        assert_eq!(s.issued, 7);
-
-        // The pre-`issued` shape, signed by this instance: still refused.
-        let mut old = full.clone();
-        old.as_object_mut().unwrap().remove("issued");
         assert!(matches!(
-            parse(&secrets(), &signed(&old)),
+            parse(&secrets(), &signed(&v2)),
             Err(ApiError::Unprocessable("selection-invalid"))
         ));
 
-        // A signed payload with a field this build does not know is refused, not widened —
-        // inside `filter`, which `ContactFilter` guards …
-        let token = signed(&serde_json::json!({
-            "workspace_id": ws,
-            "filter": {"tag_id_": list},
-            "as_of": Uuid::now_v7(),
-            "issued": 0,
-        }));
-        assert!(matches!(
-            parse(&secrets(), &token),
-            Err(ApiError::Unprocessable("selection-invalid"))
-        ));
-
-        // … and at the top level, which is this struct's own `deny_unknown_fields`. Without it a
-        // payload from another version of this struct parses, and whatever that version meant by
-        // its extra key is silently dropped.
+        // An unknown key at the top level, which is this struct's own `deny_unknown_fields`.
+        // Without it a payload from another version of this struct parses, and whatever that
+        // version meant by its extra key is silently dropped.
         let mut extra = full.clone();
         extra
             .as_object_mut()
             .unwrap()
-            .insert("limit".into(), serde_json::json!(1));
+            .insert("ids".into(), serde_json::json!([Uuid::now_v7()]));
         assert!(matches!(
             parse(&secrets(), &signed(&extra)),
             Err(ApiError::Unprocessable("selection-invalid"))

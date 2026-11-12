@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select filter, size from selection_snapshots where workspace_id = $1 and id = $2 and expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "filter",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "selection_snapshots",
+            "name": "filter"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "selection_snapshots",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "a41aa0fbc653981d318df775caf2c4b5e13cecd99610fd3b92fbabac97113ce8"
+}

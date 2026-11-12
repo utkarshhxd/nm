@@ -319,13 +319,6 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       setFailure(problemMessage(error, "Could not select every matching contact."));
       return;
     }
-    if (!data.selection_token) {
-      // The server answers with no token for a selection a filter cannot express (one naming a
-      // segment). This screen never asks for one, so this is unreachable today, and it stops
-      // being representable once the token carries the snapshot id instead of the filter.
-      setFailure("Could not select every matching contact.");
-      return;
-    }
     setMatched({ key: mine, n: data.selected });
     store.selectAll(data.selection_token, data.selected);
   }
@@ -340,10 +333,18 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       // A filter selection goes as its token and exclusions, ticked rows as their ids: the
       // server takes exactly one of the two, and applies the same rules to both. Each body
       // denies unknown fields, so a route is sent exactly the fields it declares and no more.
+      //
+      // `confirmed_count` is the size the selection was made for — the number this bar showed,
+      // before any unticking — and the server refuses the action if it is not the size of the
+      // frozen set. It is what closes "you confirmed 5,000 and we changed 4,980".
       const excluded = current.mode === "all" ? current.excluded.size : 0;
       const body =
         current.mode === "all"
-          ? { selection_token: current.token, excluded_ids: [...current.excluded] }
+          ? {
+              selection_token: current.token,
+              confirmed_count: current.matched,
+              excluded_ids: [...current.excluded],
+            }
           : { ids: [...current.ids] };
       const params = { path: { workspace_id: id } };
       const { data, error } = await (kind === "tag"

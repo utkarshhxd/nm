@@ -60,6 +60,13 @@ pub struct SortedPageParams {
     pub list_status: Option<MembershipStatus>,
     /// Only contacts with this tag.
     pub tag_id: Option<Uuid>,
+    /// Only the contacts a selection snapshot froze: `snapshot_id` from
+    /// `POST /contacts/selection`, which is how the grid shows "here is what you selected".
+    ///
+    /// It narrows and never widens. A snapshot that has expired, been swept, been superseded, or
+    /// belongs to another workspace holds no contacts here — the page is empty, rather than the
+    /// whole workspace, which is what ignoring the parameter would show.
+    pub snapshot_id: Option<Uuid>,
 }
 
 impl SortedPageParams {

@@ -449,6 +449,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /**
+         * One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is
+         *     how the grid shows what a selection actually holds; a snapshot that has expired, been swept or
+         *     belongs to another workspace shows no contacts rather than all of them.
+         */
         get: operations["list_contacts"];
         put?: never;
         post: operations["create_contact"];
@@ -496,9 +501,9 @@ export interface paths {
          *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
          *     gets a sender blocklisted. Do not "fix" the asymmetry.
          *
-         *     For the same reason this refuses a selection whose filter widened after it was made, as
-         *     `bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe
-         *     afterwards does not un-send. See `refuse_if_widened`.
+         *     It keeps `refuse_if_widened`, as `bulk/delete` does, although a frozen set cannot widen: the
+         *     guard costs one comparison and is the last line if the snapshot join is ever bypassed. Adding
+         *     someone to a list is what makes them mailable, and an unsubscribe afterwards does not un-send.
          */
         post: operations["bulk_subscribe_contacts"];
         delete?: never;
@@ -1066,6 +1071,11 @@ export interface components {
         BlockLevel: "workspace" | "instance";
         /** @description `BulkTarget` and a list. */
         BulkList: {
+            /**
+             * Format: int64
+             * @description See `BulkTarget`.
+             */
+            confirmed_count?: number | null;
             /** @description See `BulkTarget`. */
             excluded_ids?: string[];
             /** @description See `BulkTarget`. */
@@ -1077,8 +1087,8 @@ export interface components {
         };
         /**
          * @description What a bulk action did, as two numbers taken from the same statement. `affected` is how many
-         *     contacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the
-         *     exclusions). `affected` is lower whenever some were already in the wanted state, so the UI can
+         *     contacts it changed; `selected` is how much of the frozen set the action still found, less the
+         *     exclusions. `affected` is lower whenever some were already in the wanted state, so the UI can
          *     say "N of M".
          */
         BulkResult: {
@@ -1086,11 +1096,9 @@ export interface components {
             affected: number;
             /**
              * Format: int64
-             * @description How many the selection stood for when it was made. `selected` above it means the filter
-             *     matched contacts that did not match when the person looked — they existed then, and were
-             *     tagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`
-             *     refuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`
-             *     proceed and the UI says so.
+             * @description How many the selection stood for when it was made. `selected` below it means contacts in
+             *     the frozen set were deleted between the selection and the action, or were excluded; it can
+             *     never be above it, because the set was written down and nothing re-evaluates a predicate.
              */
             issued: number;
             /** Format: int64 */
@@ -1099,6 +1107,11 @@ export interface components {
         };
         /** @description `BulkTarget` and a tag. */
         BulkTag: {
+            /**
+             * Format: int64
+             * @description See `BulkTarget`.
+             */
+            confirmed_count?: number | null;
             /** @description See `BulkTarget`. */
             excluded_ids?: string[];
             /** @description See `BulkTarget`. */
@@ -1118,6 +1131,13 @@ export interface components {
          *     new optional field here a reason to exist.
          */
         BulkTarget: {
+            /**
+             * Format: int64
+             * @description How many contacts the confirmation showed: the selection's `selected`, **before**
+             *     `excluded_ids`. Required with `selection_token`, refused with `ids`, and the action is
+             *     refused if it is not the size of the set that was frozen.
+             */
+            confirmed_count?: number | null;
             /** @description Contacts to leave out of a `selection_token`. At most 10 000. */
             excluded_ids?: string[];
             /**
@@ -1126,8 +1146,8 @@ export interface components {
              */
             ids?: string[] | null;
             /**
-             * @description From `POST /contacts/selection`: every contact its filter matched, as of then, less
-             *     `excluded_ids`. Send this or `ids`, not both and not neither.
+             * @description From `POST /contacts/selection`: the contacts it froze, less `excluded_ids`. Send this or
+             *     `ids`, not both and not neither.
              */
             selection_token?: string | null;
         };
@@ -1815,15 +1835,13 @@ export interface components {
              */
             selected: number;
             /**
-             * @description Valid for one hour. Pass it to a `bulk/*` route.
+             * @description Valid for one hour. Pass it to a `bulk/*` route, with `confirmed_count`.
              *
-             *     `null` when the selection named a `segment_id`. This build's token carries a
-             *     `ContactFilter`, which cannot express a segment's rules, so a token issued for one would
-             *     describe a **wider** set than was frozen — every contact the remaining filter matches. The
-             *     frozen set is `snapshot_id`; the token stops carrying a predicate at all when the bulk
-             *     routes move onto snapshots.
+             *     It names `snapshot_id` and carries no predicate, so it is issued for every selection,
+             *     `segment_id` included: there is no longer any predicate in it that could describe a wider
+             *     set than the one that was frozen.
              */
-            selection_token?: string | null;
+            selection_token: string;
             /**
              * Format: uuid
              * @description The frozen set, by id: exactly the contacts that matched, written down. It expires in an
@@ -3290,6 +3308,15 @@ export interface operations {
                 list_status?: components["schemas"]["MembershipStatus"];
                 /** @description Only contacts with this tag. */
                 tag_id?: string;
+                /**
+                 * @description Only the contacts a selection snapshot froze: `snapshot_id` from
+                 *     `POST /contacts/selection`, which is how the grid shows "here is what you selected".
+                 *
+                 *     It narrows and never widens. A snapshot that has expired, been swept, been superseded, or
+                 *     belongs to another workspace holds no contacts here — the page is empty, rather than the
+                 *     whole workspace, which is what ignoring the parameter would show.
+                 */
+                snapshot_id?: string;
             };
             header?: never;
             path: {
@@ -3418,14 +3445,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted */
+            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nothing was deleted */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3473,14 +3500,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-widened: the filter now matches more contacts than the selection was made for; nobody was added */
+            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nobody was added */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3528,7 +3555,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3576,7 +3610,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3624,7 +3665,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;

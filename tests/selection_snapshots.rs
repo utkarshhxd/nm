@@ -550,9 +550,13 @@ async fn a_selection_over_a_segment_still_resolves_once_its_field_is_archived(po
     assert_eq!(body["selected"], 1, "{body}");
     let snapshot: Uuid = body["snapshot_id"].as_str().unwrap().parse().unwrap();
     assert_eq!(members(&pool, snapshot).await, vec![pro]);
+    // The token names the snapshot and carries no predicate, so a segment selection yields one
+    // like any other. `tests/bulk.rs` acts on it and pins that it reaches exactly the frozen set.
     assert!(
-        body["selection_token"].is_null(),
-        "a token carrying only a filter would describe a wider set than was frozen: {body}"
+        body["selection_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "a selection over a segment must still issue a token: {body}"
     );
 }
 

@@ -337,6 +337,13 @@ pub async fn list(
     );
     q.push_bind(workspace_id);
     push_filter(&mut q, filter);
+    // "Here is what you selected" (spec M1b section 14): the grid reads the frozen set through the
+    // same fragment every bulk action narrows by, so what the snapshot shows and what it acts on
+    // cannot drift apart. It only ever narrows: a snapshot that is expired, swept or another
+    // workspace's matches no contacts at all.
+    if let Some(snapshot_id) = params.snapshot_id {
+        selection::push_snapshot(&mut q, workspace_id, snapshot_id);
+    }
     if let Some((value, id)) = params.after()? {
         match sort {
             ContactSort::Email => {

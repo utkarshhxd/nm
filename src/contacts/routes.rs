@@ -114,6 +114,9 @@ where
     T::deserialize(d).map(Some)
 }
 
+/// One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is
+/// how the grid shows what a selection actually holds; a snapshot that has expired, been swept or
+/// belongs to another workspace shows no contacts rather than all of them.
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{workspace_id}/contacts",
@@ -485,14 +488,12 @@ pub async fn erase_contact(
 /// A materialised selection: the snapshot that was written, and the token for it.
 #[derive(Serialize, ToSchema)]
 pub struct SelectionToken {
-    /// Valid for one hour. Pass it to a `bulk/*` route.
+    /// Valid for one hour. Pass it to a `bulk/*` route, with `confirmed_count`.
     ///
-    /// `null` when the selection named a `segment_id`. This build's token carries a
-    /// `ContactFilter`, which cannot express a segment's rules, so a token issued for one would
-    /// describe a **wider** set than was frozen — every contact the remaining filter matches. The
-    /// frozen set is `snapshot_id`; the token stops carrying a predicate at all when the bulk
-    /// routes move onto snapshots.
-    pub selection_token: Option<String>,
+    /// It names `snapshot_id` and carries no predicate, so it is issued for every selection,
+    /// `segment_id` included: there is no longer any predicate in it that could describe a wider
+    /// set than the one that was frozen.
+    pub selection_token: String,
     /// The frozen set, by id: exactly the contacts that matched, written down. It expires in an
     /// hour, and a new selection by the same person in this workspace supersedes it.
     pub snapshot_id: Uuid,
@@ -535,8 +536,8 @@ pub struct NewSelection {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkTarget {
-    /// From `POST /contacts/selection`: every contact its filter matched, as of then, less
-    /// `excluded_ids`. Send this or `ids`, not both and not neither.
+    /// From `POST /contacts/selection`: the contacts it froze, less `excluded_ids`. Send this or
+    /// `ids`, not both and not neither.
     pub selection_token: Option<String>,
     /// These contacts and no others, e.g. the ticked rows of a table: at most 10 000. Ids that are
     /// not in this workspace select nothing. Cannot be combined with `excluded_ids`.
@@ -544,6 +545,10 @@ pub struct BulkTarget {
     /// Contacts to leave out of a `selection_token`. At most 10 000.
     #[serde(default)]
     pub excluded_ids: Vec<Uuid>,
+    /// How many contacts the confirmation showed: the selection's `selected`, **before**
+    /// `excluded_ids`. Required with `selection_token`, refused with `ids`, and the action is
+    /// refused if it is not the size of the set that was frozen.
+    pub confirmed_count: Option<u64>,
 }
 
 /// `BulkTarget` and a tag.
@@ -557,6 +562,8 @@ pub struct BulkTag {
     /// See `BulkTarget`.
     #[serde(default)]
     pub excluded_ids: Vec<Uuid>,
+    /// See `BulkTarget`.
+    pub confirmed_count: Option<u64>,
     pub tag_id: Uuid,
 }
 
@@ -566,6 +573,7 @@ impl BulkTag {
             selection_token: self.selection_token,
             ids: self.ids,
             excluded_ids: self.excluded_ids,
+            confirmed_count: self.confirmed_count,
         };
         (target, self.tag_id)
     }
@@ -582,6 +590,8 @@ pub struct BulkList {
     /// See `BulkTarget`.
     #[serde(default)]
     pub excluded_ids: Vec<Uuid>,
+    /// See `BulkTarget`.
+    pub confirmed_count: Option<u64>,
     pub list_id: Uuid,
 }
 
@@ -591,24 +601,23 @@ impl BulkList {
             selection_token: self.selection_token,
             ids: self.ids,
             excluded_ids: self.excluded_ids,
+            confirmed_count: self.confirmed_count,
         };
         (target, self.list_id)
     }
 }
 
 /// What a bulk action did, as two numbers taken from the same statement. `affected` is how many
-/// contacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the
-/// exclusions). `affected` is lower whenever some were already in the wanted state, so the UI can
+/// contacts it changed; `selected` is how much of the frozen set the action still found, less the
+/// exclusions. `affected` is lower whenever some were already in the wanted state, so the UI can
 /// say "N of M".
 #[derive(Serialize, ToSchema)]
 pub struct BulkResult {
     pub affected: u64,
     pub selected: u64,
-    /// How many the selection stood for when it was made. `selected` above it means the filter
-    /// matched contacts that did not match when the person looked — they existed then, and were
-    /// tagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`
-    /// refuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`
-    /// proceed and the UI says so.
+    /// How many the selection stood for when it was made. `selected` below it means contacts in
+    /// the frozen set were deleted between the selection and the action, or were excluded; it can
+    /// never be above it, because the set was written down and nothing re-evaluates a predicate.
     pub issued: u64,
     /// Only for `subscribe`: the status the new memberships were written with. `pending` means
     /// the contacts are on a double-opt-in list and not mailable until they confirm, and nothing
@@ -702,9 +711,6 @@ async fn freeze(
         Some(id) => Some(load_rules(&mut conn, workspace_id, id).await?),
         None => None,
     };
-    // The bound is taken before the insert, which may run for seconds, so the token's set is a
-    // subset of the frozen one by creation time rather than a superset of it.
-    let mut selection = Selection::now(workspace_id, filter.clone());
     // The predicate as it was sent, kept for the audit row the bulk action writes: the token
     // carries none, so without this the log would hold a snapshot id that is deleted an hour
     // later. `q` is redacted by that copy, not here.
@@ -721,14 +727,16 @@ async fn freeze(
         selection::MAX_SELECTION,
     )
     .await?;
-    // Signed into the token: this is the number the person is about to be shown, and the only
-    // thing a bulk action can later compare its own resolved count against.
-    selection.issued = snapshot.size;
+    // The token names the frozen set and nothing else, so it is issued whatever the predicate was
+    // — a `segment_id` included. `issued` is the snapshot's own `size`: the number the person is
+    // about to be shown, and what `confirmed_count` is checked against when they act on it.
+    let token = selection::Token {
+        workspace_id,
+        snapshot_id: snapshot.id,
+        issued: snapshot.size,
+    };
     Ok(SelectionToken {
-        selection_token: input
-            .segment_id
-            .is_none()
-            .then(|| selection::issue(&state.secrets, &selection)),
+        selection_token: selection::issue(&state.secrets, &token),
         snapshot_id: snapshot.id,
         selected: snapshot.size,
     })
@@ -736,6 +744,11 @@ async fn freeze(
 
 /// Opens the transaction, authorises, and resolves the token: in that order, so a non-member
 /// learns nothing about whether a token was good. A token for another workspace is a `404`.
+///
+/// The snapshot row is read here, in the action's own transaction, for two things the token cannot
+/// carry: the predicate the audit row records, and the `size` the confirmed count is checked
+/// against. A token whose snapshot is gone — expired, swept, or superseded by a newer selection of
+/// the same person's — is `422 selection-expired`.
 async fn begin_bulk(
     state: &AppState,
     principal: &Principal,
@@ -746,12 +759,50 @@ async fn begin_bulk(
     authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
     selection::check_excluded(&target.excluded_ids)?;
     let selection = match (&target.selection_token, &target.ids) {
-        (Some(token), None) => selection::parse(&state.secrets, token)?,
+        (Some(token), None) => {
+            let token = selection::parse(&state.secrets, token)?;
+            // Before the row is read, so a token for another workspace is a plain `404` and
+            // learns nothing about whether its snapshot is still live.
+            if token.workspace_id != workspace_id {
+                return Err(ApiError::NotFound);
+            }
+            // Issue `03`: the number the person confirmed finally reaches the server. Required,
+            // not optional — the whole gap was that nothing compared it, and a client that may
+            // omit it is a client that is not checked.
+            let Some(confirmed) = target.confirmed_count else {
+                return Err(ApiError::Validation(vec![FieldError::new(
+                    "confirmed_count",
+                    "send the number of contacts the confirmation showed",
+                )]));
+            };
+            let selection = selection::resolve(&mut tx, token).await?;
+            // `resolve` has refused unless `issued` is this snapshot's stored `size`, so this
+            // compares what the person confirmed against `selection_snapshots.size`.
+            if confirmed != selection.issued() {
+                return Err(ApiError::ConflictDetail {
+                    code: "selection-count-mismatch",
+                    detail: format!(
+                        "You confirmed {confirmed} contacts and this selection holds {}, so \
+                         nothing was done. Select again to see what you would be acting on.",
+                        selection.issued(),
+                    ),
+                });
+            }
+            selection
+        }
         (None, Some(ids)) => {
             selection::check_ids(ids)?;
             if !target.excluded_ids.is_empty() {
                 return Err(ApiError::Validation(vec![FieldError::new(
                     "excluded_ids",
+                    "only applies to a selection_token",
+                )]));
+            }
+            // The ids *are* the count, and there is no snapshot to compare one against: a number
+            // accepted here would be a number nothing checks.
+            if target.confirmed_count.is_some() {
+                return Err(ApiError::Validation(vec![FieldError::new(
+                    "confirmed_count",
                     "only applies to a selection_token",
                 )]));
             }
@@ -764,41 +815,38 @@ async fn begin_bulk(
             )]));
         }
     };
-    if selection.workspace_id != workspace_id {
-        return Err(ApiError::NotFound);
-    }
     Ok((tx, selection))
 }
 
-/// Refuses, inside the transaction, when the selection resolved to a wider set than the token was
-/// issued for. The action has already run; returning an error here rolls it back.
+/// Refuses, inside the transaction, when the action resolved to more contacts than the selection
+/// was made for. The action has already run; returning an error here rolls it back.
+///
+/// **This cannot happen** now that the set is written down rather than re-derived (spec section
+/// 8.6): nothing re-evaluates a predicate, so no write by anybody else can add a contact to a
+/// frozen set, and `tests/bulk.rs` asserts the refusal never fires — including with exclusions
+/// that are not in the snapshot, which is the case M1a's arithmetic refused. It is kept because it
+/// costs one comparison and it is the last line if the snapshot join is ever bypassed.
 ///
 /// Applied to `bulk/delete` and `bulk/subscribe`, and the axis is **not** reversible versus
 /// irreversible. It is whether the action manufactures consent that cannot be obtained
 /// retroactively. A delete cannot be undone at all. A subscribe puts people on a list, and being
 /// on a list is what makes someone mailable — unsubscribing removes the row, it does not un-send,
-/// and the send is the thing the person did not consent to. `tag`, `untag` and `unsubscribe`
-/// report the widening instead: none of them lets anyone be mailed who could not be mailed
-/// before.
+/// and the send is the thing the person did not consent to.
 fn refuse_if_widened(
     sel: &Selection,
     counts: Counts,
-    excluded: usize,
     (nothing, doing): (&str, &str),
 ) -> ApiResult<()> {
-    if !sel.widened(counts.selected, excluded) {
+    if !sel.widened(counts.selected) {
         return Ok(());
     }
-    // `selected` counts the match less the exclusions, so the match itself is at most
-    // `selected + excluded`; naming it as an upper bound is what makes it honest.
-    let now = counts.selected.saturating_add(excluded as u64);
     Err(ApiError::ConflictDetail {
         code: "selection-widened",
         detail: format!(
-            "This view matched {} contacts when you selected it and matches up to {} now, so \
-             {nothing}. Contacts that already existed were changed to match it in between. Select \
+            "This selection was made for {} contacts and resolved to {}, so {nothing}. Select \
              again to see what you would be {doing}.",
-            sel.issued, now,
+            sel.issued(),
+            counts.selected,
         ),
     })
 }
@@ -814,17 +862,26 @@ async fn finish_bulk(
     extra: Value,
     (counts, status): (Counts, Option<MembershipStatus>),
 ) -> ApiResult<Json<BulkResult>> {
-    // The search text can be an address or a name, and the audit log outlives an erasure: record
-    // that a search was part of the selection, never what it said. Not a hash either: a hash of
-    // an address falls to a dictionary.
-    let mut filter = json!(selection.filter);
+    // The predicate as the snapshot stored it (section 8.7). The token carries none and the
+    // snapshot is deleted within the hour, so a log row holding only a snapshot id would read
+    // "deleted 417,004 contacts, snapshot 0192…" against a row nobody can ever look up — worse
+    // than M1a had, on the action that cannot be undone.
+    //
     // An explicit id list is recorded as such and as a count, never as the ids: one row, not one
     // per contact, and ids are personal data the log would outlive.
-    let by = if selection.ids.is_some() {
-        "ids"
-    } else {
-        "filter"
+    let (by, mut filter, snapshot_id, ids) = match selection {
+        Selection::Snapshot { token, filter } => (
+            "filter",
+            filter.clone(),
+            Some(token.snapshot_id),
+            None::<usize>,
+        ),
+        Selection::Ids { ids, .. } => ("ids", Value::Null, None, Some(ids.len())),
     };
+    // The search text can be an address or a name, and the audit log outlives an erasure: record
+    // that a search was part of the selection, never what it said. Not a hash either: a hash of
+    // an address falls to a dictionary. The snapshot keeps it unredacted while it lives, because
+    // it is deleted within the hour and the person reading it is the one who typed it.
     if !filter["q"].is_null() {
         filter["q"] = json!("<redacted>");
     }
@@ -832,7 +889,7 @@ async fn finish_bulk(
         &mut *tx,
         meta,
         AuditEvent {
-            workspace_id: Some(selection.workspace_id),
+            workspace_id: Some(selection.workspace_id()),
             actor: principal.actor(),
             action,
             target_type: None,
@@ -840,12 +897,12 @@ async fn finish_bulk(
             metadata: json!({
                 "by": by,
                 "filter": filter,
-                "as_of": selection.as_of,
-                "ids": selection.ids.as_ref().map(Vec::len),
+                "snapshot_id": snapshot_id,
+                "ids": ids,
                 // A count, not the ids, by design (one row, not one per contact): replayed calls with
                 // different exclusions cannot be told apart afterwards. Do not turn this into a list.
                 "excluded": target.excluded_ids.len(),
-                "issued": selection.issued,
+                "issued": selection.issued(),
                 "selected": counts.selected,
                 "affected": counts.affected,
                 "with": extra,
@@ -857,7 +914,7 @@ async fn finish_bulk(
     Ok(Json(BulkResult {
         affected: counts.affected,
         selected: counts.selected,
-        issued: selection.issued,
+        issued: selection.issued(),
         status,
     }))
 }
@@ -872,8 +929,9 @@ async fn finish_bulk(
     responses(
         (status = 200, description = "How many were newly tagged", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_tag_contacts(
@@ -912,8 +970,9 @@ pub async fn bulk_tag_contacts(
     responses(
         (status = 200, description = "How many had the tag", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_untag_contacts(
@@ -950,9 +1009,9 @@ pub async fn bulk_untag_contacts(
 /// action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
 /// gets a sender blocklisted. Do not "fix" the asymmetry.
 ///
-/// For the same reason this refuses a selection whose filter widened after it was made, as
-/// `bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe
-/// afterwards does not un-send. See `refuse_if_widened`.
+/// It keeps `refuse_if_widened`, as `bulk/delete` does, although a frozen set cannot widen: the
+/// guard costs one comparison and is the last line if the snapshot join is ever bypassed. Adding
+/// someone to a list is what makes them mailable, and an unsubscribe afterwards does not un-send.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe",
@@ -963,8 +1022,8 @@ pub async fn bulk_untag_contacts(
         (status = 200, description = "How many memberships were added; contacts already on the list, whatever their status, are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
-        (status = 409, description = "selection-widened: the filter now matches more contacts than the selection was made for; nobody was added"),
-        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nobody was added"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_subscribe_contacts(
@@ -984,12 +1043,7 @@ pub async fn bulk_subscribe_contacts(
     };
     let excluded = &target.excluded_ids;
     let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status).await?;
-    refuse_if_widened(
-        &sel,
-        n,
-        excluded.len(),
-        ("nobody was added to the list", "adding"),
-    )?;
+    refuse_if_widened(&sel, n, ("nobody was added to the list", "adding"))?;
     let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_SUBSCRIBED;
     finish_bulk(
@@ -1014,8 +1068,9 @@ pub async fn bulk_subscribe_contacts(
     responses(
         (status = 200, description = "How many were unsubscribed now; those already unsubscribed or not on the list are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
+        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_unsubscribe_contacts(
@@ -1056,8 +1111,8 @@ pub async fn bulk_unsubscribe_contacts(
         (status = 200, description = "How many were deleted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, or a token for another workspace"),
-        (status = 409, description = "selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted"),
-        (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nothing was deleted"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
 pub async fn bulk_delete_contacts(
@@ -1072,12 +1127,7 @@ pub async fn bulk_delete_contacts(
     // Inside the transaction and after the statement, so the number compared is the one the
     // delete itself resolved rather than a second count that could disagree with it. Returning
     // here drops `tx` and the delete rolls back.
-    refuse_if_widened(
-        &sel,
-        n,
-        input.excluded_ids.len(),
-        ("nothing was deleted", "deleting"),
-    )?;
+    refuse_if_widened(&sel, n, ("nothing was deleted", "deleting"))?;
     let action = actions::CONTACTS_BULK_DELETED;
     finish_bulk(
         tx,

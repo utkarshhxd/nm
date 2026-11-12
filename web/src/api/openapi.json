@@ -1365,6 +1365,7 @@
         "tags": [
           "crate::contacts::routes"
         ],
+        "summary": "One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is\nhow the grid shows what a selection actually holds; a snapshot that has expired, been swept or\nbelongs to another workspace shows no contacts rather than all of them.",
         "operationId": "list_contacts",
         "parameters": [
           {
@@ -1447,6 +1448,16 @@
             "name": "tag_id",
             "in": "query",
             "description": "Only contacts with this tag.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "description": "Only the contacts a selection snapshot froze: `snapshot_id` from\n`POST /contacts/selection`, which is how the grid shows \"here is what you selected\".\n\nIt narrows and never widens. A snapshot that has expired, been swept, been superseded, or\nbelongs to another workspace holds no contacts here — the page is empty, rather than the\nwhole workspace, which is what ignoring the parameter would show.",
             "required": false,
             "schema": {
               "type": "string",
@@ -1572,10 +1583,10 @@
             "description": "not a member, or a token for another workspace"
           },
           "409": {
-            "description": "selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted"
+            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nothing was deleted"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1586,7 +1597,7 @@
           "crate::contacts::routes"
         ],
         "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
-        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.\n\nFor the same reason this refuses a selection whose filter widened after it was made, as\n`bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe\nafterwards does not un-send. See `refuse_if_widened`.",
+        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.\n\nIt keeps `refuse_if_widened`, as `bulk/delete` does, although a frozen set cannot widen: the\nguard costs one comparison and is the last line if the snapshot join is ever bypassed. Adding\nsomeone to a list is what makes them mailable, and an unsubscribe afterwards does not un-send.",
         "operationId": "bulk_subscribe_contacts",
         "parameters": [
           {
@@ -1628,10 +1639,10 @@
             "description": "not a member, no such list, or a token for another workspace"
           },
           "409": {
-            "description": "selection-widened: the filter now matches more contacts than the selection was made for; nobody was added"
+            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nobody was added"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1682,8 +1693,11 @@
           "404": {
             "description": "not a member, no such tag, or a token for another workspace"
           },
+          "409": {
+            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"
+          },
           "422": {
-            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1734,8 +1748,11 @@
           "404": {
             "description": "not a member, no such list, or a token for another workspace"
           },
+          "409": {
+            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"
+          },
           "422": {
-            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1786,8 +1803,11 @@
           "404": {
             "description": "not a member, no such tag, or a token for another workspace"
           },
+          "409": {
+            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"
+          },
           "422": {
-            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -4044,6 +4064,15 @@
           "list_id"
         ],
         "properties": {
+          "confirmed_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "See `BulkTarget`.",
+            "minimum": 0
+          },
           "excluded_ids": {
             "type": "array",
             "items": {
@@ -4079,7 +4108,7 @@
       },
       "BulkResult": {
         "type": "object",
-        "description": "What a bulk action did, as two numbers taken from the same statement. `affected` is how many\ncontacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the\nexclusions). `affected` is lower whenever some were already in the wanted state, so the UI can\nsay \"N of M\".",
+        "description": "What a bulk action did, as two numbers taken from the same statement. `affected` is how many\ncontacts it changed; `selected` is how much of the frozen set the action still found, less the\nexclusions. `affected` is lower whenever some were already in the wanted state, so the UI can\nsay \"N of M\".",
         "required": [
           "affected",
           "selected",
@@ -4094,7 +4123,7 @@
           "issued": {
             "type": "integer",
             "format": "int64",
-            "description": "How many the selection stood for when it was made. `selected` above it means the filter\nmatched contacts that did not match when the person looked — they existed then, and were\ntagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`\nrefuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`\nproceed and the UI says so.",
+            "description": "How many the selection stood for when it was made. `selected` below it means contacts in\nthe frozen set were deleted between the selection and the action, or were excluded; it can\nnever be above it, because the set was written down and nothing re-evaluates a predicate.",
             "minimum": 0
           },
           "selected": {
@@ -4122,6 +4151,15 @@
           "tag_id"
         ],
         "properties": {
+          "confirmed_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "See `BulkTarget`.",
+            "minimum": 0
+          },
           "excluded_ids": {
             "type": "array",
             "items": {
@@ -4159,6 +4197,15 @@
         "type": "object",
         "description": "What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.\n\nThe three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`\ndefaults to empty, so a misspelt `excluded_id` that was quietly ignored would run the action\non exactly the contacts the user meant to spare. `serde(flatten)` cannot be combined with\n`deny_unknown_fields`, so do not factor these back into one flattened struct, and give any\nnew optional field here a reason to exist.",
         "properties": {
+          "confirmed_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many contacts the confirmation showed: the selection's `selected`, **before**\n`excluded_ids`. Required with `selection_token`, refused with `ids`, and the action is\nrefused if it is not the size of the set that was frozen.",
+            "minimum": 0
+          },
           "excluded_ids": {
             "type": "array",
             "items": {
@@ -4183,7 +4230,7 @@
               "string",
               "null"
             ],
-            "description": "From `POST /contacts/selection`: every contact its filter matched, as of then, less\n`excluded_ids`. Send this or `ids`, not both and not neither."
+            "description": "From `POST /contacts/selection`: the contacts it froze, less `excluded_ids`. Send this or\n`ids`, not both and not neither."
           }
         },
         "additionalProperties": false
@@ -6211,6 +6258,7 @@
         "type": "object",
         "description": "A materialised selection: the snapshot that was written, and the token for it.",
         "required": [
+          "selection_token",
           "snapshot_id",
           "selected"
         ],
@@ -6222,11 +6270,8 @@
             "minimum": 0
           },
           "selection_token": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Valid for one hour. Pass it to a `bulk/*` route.\n\n`null` when the selection named a `segment_id`. This build's token carries a\n`ContactFilter`, which cannot express a segment's rules, so a token issued for one would\ndescribe a **wider** set than was frozen — every contact the remaining filter matches. The\nfrozen set is `snapshot_id`; the token stops carrying a predicate at all when the bulk\nroutes move onto snapshots."
+            "type": "string",
+            "description": "Valid for one hour. Pass it to a `bulk/*` route, with `confirmed_count`.\n\nIt names `snapshot_id` and carries no predicate, so it is issued for every selection,\n`segment_id` included: there is no longer any predicate in it that could describe a wider\nset than the one that was frozen."
           },
           "snapshot_id": {
             "type": "string",
