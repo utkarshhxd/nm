@@ -331,13 +331,18 @@ function ListActions({ ws, slug, list }: { ws: string; slug: string; list: List 
       if (!response.ok) throw new Error(problemText(error, KNOWN, "The list could not be deleted."));
     },
     onSuccess: async () => {
+      // Leaving first: this page is still mounted, and invalidating its queries here would
+      // refetch the list, its count and its members from a URL that now answers 404.
+      await navigate({ to: "/w/$slug/lists", params: { slug } });
+      // Dropped rather than invalidated: there is nothing left to refetch, and a cached copy is
+      // what shows a deleted list again for a frame on the way back.
+      for (const k of ["list", "mailable-count", "list-members"]) {
+        qc.removeQueries({ queryKey: [k, ws, list.id] });
+      }
       // Every screen that counts or names a list: the grid's filter, a contact's memberships.
       await Promise.all(
-        ["lists", "contact-lists", "mailable-count", "list-members", "contacts"].map((k) =>
-          qc.invalidateQueries({ queryKey: [k] }),
-        ),
+        ["lists", "contact-lists", "contacts"].map((k) => qc.invalidateQueries({ queryKey: [k] })),
       );
-      await navigate({ to: "/w/$slug/lists", params: { slug } });
     },
   });
 

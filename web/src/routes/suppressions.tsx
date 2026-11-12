@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
 import { api, problemText } from "../api/client";
@@ -17,6 +18,7 @@ import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
+import { useMe } from "../lib/session";
 import { useWorkspace } from "./workspace-layout";
 
 type Suppression = components["schemas"]["Suppression"];
@@ -42,6 +44,8 @@ const KNOWN = {
   "erasure-not-liftable":
     "An erasure cannot be lifted, by anyone. The address was erased on request and can never be mailed again.",
   "suppression-already-lifted": "This suppression was already lifted.",
+  "instance-admin-required":
+    "Only an instance admin can see or change instance-wide suppressions. A workspace admin is not one.",
 };
 
 /** What the row blocks, in words: an erasure tombstone has no address left to show. */
@@ -61,19 +65,57 @@ export default function Suppressions() {
   );
 }
 
-function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: boolean }) {
+/**
+ * The instance-wide list, at `/admin/suppressions`: the same screen against
+ * `/api/v1/admin/suppressions`, which blocks every workspace at once.
+ *
+ * Gated on `is_instance_admin`, which a workspace admin is not — these rows are not any one
+ * workspace's to see or lift, so a workspace admin reaching this URL is told so rather than
+ * shown an empty table. The gate is a courtesy: the routes answer 403 either way.
+ *
+ * It lives outside the workspace layout, so it brings its own page chrome.
+ */
+export function InstanceSuppressions() {
+  const me = useMe();
+  return (
+    <main className="mx-auto max-w-4xl p-8">
+      <div className="flex flex-wrap items-baseline justify-between gap-3">
+        <h1 className="text-2xl font-semibold">NM</h1>
+        {me.data ? <p>Signed in as {me.data.email}</p> : null}
+      </div>
+      <p className="mt-4">
+        <Link className="text-accent-text underline" to="/">
+          Back to your workspaces
+        </Link>
+      </p>
+      {!me.data ? (
+        <p className="mt-4">Loading…</p>
+      ) : !me.data.is_instance_admin ? (
+        <p className="mt-4">
+          Only an instance admin can see instance-wide suppressions. Being an admin of a workspace
+          is not the same thing.
+        </p>
+      ) : (
+        <Page ws={null} canAdd canLift />
+      )}
+    </main>
+  );
+}
+
+/** `ws` is the workspace, or `null` for the instance-wide list. */
+function Page({ ws, canAdd, canLift }: { ws: string | null; canAdd: boolean; canLift: boolean }) {
   const qc = useQueryClient();
   const [showLifted, setShowLifted] = useState(false);
   const list = useInfiniteQuery({
-    queryKey: ["suppressions", ws, showLifted],
+    queryKey: ["suppressions", ws ?? "instance", showLifted],
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam }) => {
-      const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/suppressions", {
-        params: {
-          path: { workspace_id: ws },
-          query: { limit: PAGE, cursor: pageParam, include_lifted: showLifted },
-        },
-      });
+      const query = { limit: PAGE, cursor: pageParam, include_lifted: showLifted };
+      const { data, error } = ws
+        ? await api.GET("/api/v1/workspaces/{workspace_id}/suppressions", {
+            params: { path: { workspace_id: ws }, query },
+          })
+        : await api.GET("/api/v1/admin/suppressions", { params: { query } });
       if (!data) throw new Error(problemText(error, KNOWN, "The suppressions could not be loaded."));
       return data;
     },
@@ -97,15 +139,18 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
   const [note, setNote] = useState("");
   const add = useMutation({
     mutationFn: async () => {
-      const { data, error } = await api.POST("/api/v1/workspaces/{workspace_id}/suppressions", {
-        params: { path: { workspace_id: ws } },
-        body: {
-          scope,
-          reason,
-          ...(scope === "address" ? { email: value.trim() } : { domain: value.trim() }),
-          ...(note.trim() ? { note: note.trim() } : {}),
-        },
-      });
+      const body = {
+        scope,
+        reason,
+        ...(scope === "address" ? { email: value.trim() } : { domain: value.trim() }),
+        ...(note.trim() ? { note: note.trim() } : {}),
+      };
+      const { data, error } = ws
+        ? await api.POST("/api/v1/workspaces/{workspace_id}/suppressions", {
+            params: { path: { workspace_id: ws } },
+            body,
+          })
+        : await api.POST("/api/v1/admin/suppressions", { body });
       if (!data) throw new Error(problemText(error, KNOWN, "The suppression could not be added."));
     },
     onSuccess: async () => {
@@ -122,10 +167,11 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
   const [lifting, setLifting] = useState<Suppression | null>(null);
   const lift = useMutation({
     mutationFn: async (s: Suppression) => {
-      const { data, error } = await api.POST(
-        "/api/v1/workspaces/{workspace_id}/suppressions/{id}/lift",
-        { params: { path: { workspace_id: ws, id: s.id } } },
-      );
+      const { data, error } = ws
+        ? await api.POST("/api/v1/workspaces/{workspace_id}/suppressions/{id}/lift", {
+            params: { path: { workspace_id: ws, id: s.id } },
+          })
+        : await api.POST("/api/v1/admin/suppressions/{id}/lift", { params: { path: { id: s.id } } });
       if (!data) throw new Error(problemText(error, KNOWN, "The suppression could not be lifted."));
     },
     onSuccess: async () => {
@@ -136,11 +182,11 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
 
   return (
     <section className="mt-8">
-      <h2 className="text-xl font-semibold">Suppressions</h2>
+      <h2 className="text-xl font-semibold">{ws ? "Suppressions" : "Instance suppressions"}</h2>
       <p className="mt-2 text-fg-muted">
-        Addresses and domains this workspace will not mail. Instance-wide blocks are not shown here
-        and a workspace admin cannot see them, so an empty list does not mean an address can be
-        mailed. To check one contact, open its Mailing status.
+        {ws
+          ? "Addresses and domains this workspace will not mail. Instance-wide blocks are not shown here and a workspace admin cannot see them, so an empty list does not mean an address can be mailed. To check one contact, open its Mailing status."
+          : "Addresses and domains no workspace on this instance will mail. They block in every workspace, and the people who run those workspaces can neither see nor lift them here."}
       </p>
 
       {canAdd ? (
@@ -221,8 +267,12 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
             {list.error.message}
           </ErrorState>
         ) : rows.length === 0 ? (
-          <EmptyState title="No suppressions in this workspace">
-            Instance-wide blocks are not listed here.
+          <EmptyState
+            title={ws ? "No suppressions in this workspace" : "No instance-wide suppressions"}
+          >
+            {ws
+              ? "Instance-wide blocks are not listed here."
+              : "Each workspace keeps its own list as well, which is not listed here."}
           </EmptyState>
         ) : (
           <>
@@ -321,11 +371,15 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
               {lifting.note ? `, note: “${lifting.note}”` : ""}).
             </p>
             <p>
-              Lifting it makes {lifting.scope === "domain" ? "every address on this domain" : "this address"}{" "}
-              mailable again in this workspace, unless it is also blocked instance-wide, which a workspace admin cannot see or lift here. Someone who opted out, whose mail bounced or who
-              complained did so for a reason: mailing them again can damage your sending reputation
-              and ignores what they asked for. Lift it only if the block was a mistake or you have
-              their fresh consent.
+              Lifting it makes{" "}
+              {lifting.scope === "domain" ? "every address on this domain" : "this address"}{" "}
+              mailable again{" "}
+              {ws
+                ? "in this workspace, unless it is also blocked instance-wide, which a workspace admin cannot see or lift here"
+                : "in every workspace on this instance, each of which may still block it in its own list"}
+              . Someone who opted out, whose mail bounced or who complained did so for a reason:
+              mailing them again can damage your sending reputation and ignores what they asked
+              for. Lift it only if the block was a mistake or you have their fresh consent.
             </p>
             <p>The row stays as history and the lift is recorded in the audit log.</p>
           </>

@@ -456,6 +456,13 @@ test("rename_a_list_then_delete_it_and_say_what_goes_with_it", async () => {
   // The unsubscribed membership from the earlier test is still here, before the delete.
   expect(await memberships(ids.created)).toMatchObject([{ status: "unsubscribed" }]);
 
+  // Nothing asks the server about the list after it is gone. Refreshing this page's own queries
+  // before leaving it refetches the list, its count and its members from a URL that now 404s.
+  const missing: string[] = [];
+  page.on("response", (r) => {
+    if (r.status() === 404 && r.url().includes(`/lists/${ids.list}`)) missing.push(r.url());
+  });
+
   await page.getByRole("button", { name: "Delete list", exact: true }).click();
   const confirm = dialog(page, "Delete this list");
   await expect(confirm).toContainText("Product updates");
@@ -467,6 +474,7 @@ test("rename_a_list_then_delete_it_and_say_what_goes_with_it", async () => {
 
   await expect(page).toHaveURL(new RegExp(`${listsPath}$`));
   await expect(row(page, "Product updates")).toHaveCount(0);
+  expect(missing).toEqual([]);
   expect(await memberships(ids.created)).toEqual([]);
   // The contact itself survived.
   expect((await apiContact(ids.created)).id).toBe(ids.created);

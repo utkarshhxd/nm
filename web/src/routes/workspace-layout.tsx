@@ -53,9 +53,15 @@ export default function WorkspaceLayout() {
           ))}
         </select>
         {me.data.is_instance_admin ? (
-          <Link className={ROW_BUTTON} to="/workspaces/new">
-            New workspace
-          </Link>
+          <>
+            <Link className={ROW_BUTTON} to="/workspaces/new">
+              New workspace
+            </Link>
+            {/* Instance-wide, not this workspace's: a workspace admin never sees this. */}
+            <Link className={ROW_BUTTON} to="/admin/suppressions">
+              Instance suppressions
+            </Link>
+          </>
         ) : null}
       </div>
 

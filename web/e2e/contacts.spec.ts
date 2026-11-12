@@ -199,7 +199,7 @@ test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
     page.getByText(`${(TOTAL - 1).toLocaleString("en-US")} of ${TOTAL.toLocaleString("en-US")} contacts matching`),
   ).toBeVisible();
 
-  await page.getByLabel("Tag to add", { exact: true }).selectOption({ label: "vip" });
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "vip" });
   await page.getByRole("button", { name: "Add tag", exact: true }).click();
   await expect(result()).toContainText(`Tagged ${(TOTAL - 1).toLocaleString("en-US")} contacts`);
   await page.unroute("**/contacts/bulk/tag");
@@ -222,7 +222,7 @@ test("subscribing_to_a_double_opt_in_list_says_pending_and_never_resurrects", as
   await grid().getByRole("checkbox", { name: "Select all loaded contacts" }).check();
   await page.getByRole("button", { name: "Select all contacts matching this view" }).click();
 
-  await page.getByLabel("List to subscribe to", { exact: true }).selectOption({ label: "Newsletter" });
+  await page.getByLabel("List to subscribe to or unsubscribe from", { exact: true }).selectOption({ label: "Newsletter" });
   await page.getByRole("button", { name: "Subscribe to list", exact: true }).click();
   // `pending` is not mailable and nothing in this milestone confirms it: never "subscribed".
   await expect(result()).toContainText("pending");
@@ -254,7 +254,7 @@ test("ticked_rows_are_subscribed_by_id_and_an_unsubscribed_one_is_skipped", asyn
     await page.getByRole("checkbox", { name: `Select ${who}@example.test` }).check();
   }
   await expect(page.getByText("3 contacts selected", { exact: true })).toBeVisible();
-  await page.getByLabel("List to subscribe to", { exact: true }).selectOption({ label: "Announcements" });
+  await page.getByLabel("List to subscribe to or unsubscribe from", { exact: true }).selectOption({ label: "Announcements" });
   await page.getByRole("button", { name: "Subscribe to list", exact: true }).click();
   await expect(result()).toContainText("2 of 3 selected contacts were subscribed");
   await expect(result()).toContainText("already on the list");

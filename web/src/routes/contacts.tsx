@@ -12,6 +12,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "reac
 import { api, problemMessage } from "../api/client";
 import type { components } from "../api/schema";
 import { Button } from "../components/button";
+import { ConfirmDialog } from "../components/confirm-dialog";
 import { ContactForm } from "../components/contact-form";
 import { type Column, DataGrid, type Sort } from "../components/data-grid";
 import { Dialog } from "../components/dialog";
@@ -98,6 +99,10 @@ type Filters = {
 };
 
 type Result = { tone: "ok" | "warn"; text: string };
+
+/** The five bulk routes. Only the last two are destructive enough to be confirmed first. */
+type Kind = "tag" | "untag" | "subscribe" | "unsubscribe" | "delete";
+type Confirming = { kind: "unsubscribe" | "delete"; target: string; name: string };
 
 function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit: boolean }) {
   const queryClient = useQueryClient();
@@ -201,6 +206,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   const [result, setResult] = useState<Result | null>(null);
   const [failure, setFailure] = useState("");
   const [creating, setCreating] = useState(false);
+  const [confirming, setConfirming] = useState<Confirming | null>(null);
   const [busy, setBusy] = useState(false);
   const [counting, setCounting] = useState(false);
   const live = useRef(filterKey);
@@ -218,13 +224,24 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   }, [filterKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selectedCount = selection.mode === "ids" ? selection.ids.size : 0;
+  // How many contacts an action would run on, whichever way they were chosen.
+  const chosen =
+    selection.mode === "ids"
+      ? selection.ids.size
+      : selection.mode === "all"
+        ? selection.matched - selection.excluded.size
+        : 0;
   const firstRun = useRef(true);
+  // A bulk delete clears the selection itself; "Selection cleared" must not be announced in
+  // place of what the delete did.
+  const silentClear = useRef(false);
   useEffect(() => {
     if (firstRun.current) {
       firstRun.current = false;
       return;
     }
-    if (selection.mode === "none") announce("Selection cleared");
+    if (silentClear.current) silentClear.current = false;
+    else if (selection.mode === "none") announce("Selection cleared");
     else if (selection.mode === "ids") announce(`${count(selectedCount, "contact")} selected`);
     else announce("All contacts matching this view selected");
   }, [selection]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -287,38 +304,60 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     store.selectAll(data.selection_token, data.selected);
   }
 
-  async function bulk(kind: "tag" | "subscribe", target: string, name: string) {
+  async function bulk(kind: Kind, target: string, name: string) {
     const current = store.get();
-    if (current.mode === "none" || !target) return;
+    if (current.mode === "none" || (kind !== "delete" && !target)) return;
     setBusy(true);
     setFailure("");
     setResult(null);
     try {
       // A filter selection goes as its token and exclusions, ticked rows as their ids: the
-        // server takes exactly one of the two, and applies the same rules to both.
+      // server takes exactly one of the two, and applies the same rules to both. Each body
+      // denies unknown fields, so a route is sent exactly the fields it declares and no more.
       const body =
         current.mode === "all"
           ? { selection_token: current.token, excluded_ids: [...current.excluded] }
           : { ids: [...current.ids] };
-      const { data, error } =
-        kind === "tag"
-          ? await api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/tag", {
-              params: { path: { workspace_id: id } },
+      const params = { path: { workspace_id: id } };
+      const { data, error } = await (kind === "tag"
+        ? api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/tag", {
+            params,
+            body: { ...body, tag_id: target },
+          })
+        : kind === "untag"
+          ? api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/untag", {
+              params,
               body: { ...body, tag_id: target },
             })
-          : await api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe", {
-              params: { path: { workspace_id: id } },
-              body: { ...body, list_id: target },
-            });
+          : kind === "subscribe"
+            ? api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe", {
+                params,
+                body: { ...body, list_id: target },
+              })
+            : kind === "unsubscribe"
+              ? api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe", {
+                  params,
+                  body: { ...body, list_id: target },
+                })
+              : api.POST("/api/v1/workspaces/{workspace_id}/contacts/bulk/delete", {
+                  params,
+                  body,
+                }));
       if (error || !data) {
         setFailure(problemMessage(error, "The action failed and nothing was changed."));
         return;
       }
+      // Deleting empties the selection: the rows it named are gone, and a stale set of ids is
+      // how a second click lands on contacts that were never chosen.
+      if (kind === "delete") {
+        silentClear.current = true;
+        store.clear();
+      }
       const message = describe(kind, name, data);
       setResult(message);
       announce(message.text);
-      // The table only changes when it is filtered by what the action changed.
-      if (filters.list_id || filters.tag_id) {
+      // The table only changes when rows left it, or when it is filtered by what changed.
+      if (kind === "delete" || filters.list_id || filters.tag_id) {
         await queryClient.invalidateQueries({ queryKey: ["contacts", id] });
       }
     } finally {
@@ -420,21 +459,35 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
               )
             ) : null}
             <BulkAction
-              label="Tag to add"
+              label="Tag to add or remove"
               placeholder="Choose a tag…"
-              action="Add tag"
               options={tags.data ?? []}
               busy={busy}
-              onRun={(target, name) => void bulk("tag", target, name)}
+              actions={[
+                { label: "Add tag", run: (t, n) => void bulk("tag", t, n) },
+                { label: "Remove tag", run: (t, n) => void bulk("untag", t, n) },
+              ]}
             />
             <BulkAction
-              label="List to subscribe to"
+              label="List to subscribe to or unsubscribe from"
               placeholder="Choose a list…"
-              action="Subscribe to list"
               options={lists.data ?? []}
               busy={busy}
-              onRun={(target, name) => void bulk("subscribe", target, name)}
+              actions={[
+                { label: "Subscribe to list", run: (t, n) => void bulk("subscribe", t, n) },
+                {
+                  label: "Unsubscribe from list",
+                  run: (target, name) => setConfirming({ kind: "unsubscribe", target, name }),
+                },
+              ]}
             />
+            <Button
+              variant="danger-ghost"
+              disabled={busy}
+              onClick={() => setConfirming({ kind: "delete", target: "", name: "" })}
+            >
+              Delete contacts
+            </Button>
             <Button variant="ghost" onClick={() => store.clear()}>
               Clear selection
             </Button>
@@ -525,6 +578,53 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         {announcement}
       </div>
 
+      <ConfirmDialog
+        open={confirming !== null}
+        onClose={() => setConfirming(null)}
+        title={
+          confirming?.kind === "delete" ? "Delete these contacts" : "Unsubscribe from this list"
+        }
+        confirmLabel={
+          confirming?.kind === "delete"
+            ? `Delete ${count(chosen, "contact")}`
+            : "Unsubscribe these contacts"
+        }
+        onConfirm={() => {
+          const go = confirming;
+          setConfirming(null);
+          if (go) void bulk(go.kind, go.target, go.name);
+        }}
+      >
+        {confirming?.kind === "delete" ? (
+          <>
+            <p>
+              <strong>{count(chosen, "contact")}</strong> and everything recorded against them —
+              list memberships, tags and custom field values — are deleted. This cannot be
+              undone and there is no copy to restore from.
+            </p>
+            <p>
+              Their addresses are <strong>not suppressed</strong>. Nothing here records that these
+              people were removed, so every address can be added again, by anyone, from an import
+              tomorrow. To stop mailing someone for good, suppress the address instead; to honour
+              an erasure request, erase the contact.
+            </p>
+          </>
+        ) : (
+          <>
+            <p>
+              <strong>{count(chosen, "selected contact")}</strong> are unsubscribed from{" "}
+              <strong className="wrap-anywhere">{confirming?.name}</strong>. Anyone who is not
+              subscribed to it is left alone.
+            </p>
+            <p>
+              This affects <strong>only this list</strong>. It is not an opt-out from the whole
+              workspace, and no contact is changed or deleted. Nothing re-subscribes them in bulk
+              afterwards, so do this only if they asked for it.
+            </p>
+          </>
+        )}
+      </ConfirmDialog>
+
       <Dialog open={creating} onClose={() => setCreating(false)} title="New contact">
         <ContactForm
           ws={id}
@@ -584,24 +684,23 @@ function SearchBox({
   );
 }
 
+/** One picker driving every action that takes what it names. */
 function BulkAction({
   label,
   placeholder,
-  action,
   options,
   busy,
-  onRun,
+  actions,
 }: {
   label: string;
   placeholder: string;
-  action: string;
   options: { id: string; name: string }[];
   busy: boolean;
-  onRun: (id: string, name: string) => void;
+  actions: { label: string; run: (id: string, name: string) => void }[];
 }) {
   const [picked, setPicked] = useState("");
   return (
-    <span className="flex max-w-full items-center gap-2">
+    <span className="flex max-w-full flex-wrap items-center gap-2">
       <Select aria-label={label} value={picked} onChange={(e) => setPicked(e.target.value)}>
         <option value="">{placeholder}</option>
         {options.map((o) => (
@@ -610,13 +709,16 @@ function BulkAction({
           </option>
         ))}
       </Select>
-      <Button
-        variant="outline"
-        disabled={!picked || busy}
-        onClick={() => onRun(picked, options.find((o) => o.id === picked)?.name ?? "")}
-      >
-        {action}
-      </Button>
+      {actions.map((a) => (
+        <Button
+          key={a.label}
+          variant="outline"
+          disabled={!picked || busy}
+          onClick={() => a.run(picked, options.find((o) => o.id === picked)?.name ?? "")}
+        >
+          {a.label}
+        </Button>
+      ))}
     </span>
   );
 }
@@ -628,20 +730,45 @@ function BulkAction({
  * milestone confirms them, so it is never reported as a successful subscribe.
  */
 function describe(
-  kind: "tag" | "subscribe",
+  kind: Kind,
   name: string,
   { affected, selected, status }: components["schemas"]["BulkResult"],
 ): Result {
   const rest = selected - affected;
+  const of = `${affected.toLocaleString()} of ${count(selected, "selected contact")}`;
+  const was = rest === 1 ? "was" : "were";
   if (kind === "tag") {
     return affected === selected
       ? { tone: "ok", text: `Tagged ${count(affected, "contact")} with “${name}”.` }
       : {
           tone: "warn",
-          text: `Tagged ${affected.toLocaleString()} of ${count(selected, "selected contact")} with “${name}”. The other ${rest.toLocaleString()} already had it.`,
+          text: `Tagged ${of} with “${name}”. The other ${rest.toLocaleString()} already had it.`,
         };
   }
-  const of = `${affected.toLocaleString()} of ${count(selected, "selected contact")}`;
+  if (kind === "untag") {
+    return affected === selected
+      ? { tone: "ok", text: `Removed “${name}” from ${count(affected, "contact")}.` }
+      : {
+          tone: "warn",
+          text: `Removed “${name}” from ${of}. The other ${rest.toLocaleString()} did not have it.`,
+        };
+  }
+  if (kind === "unsubscribe") {
+    return affected === selected
+      ? { tone: "ok", text: `Unsubscribed ${count(affected, "contact")} from “${name}”.` }
+      : {
+          tone: "warn",
+          text: `Unsubscribed ${of} from “${name}”. The other ${rest.toLocaleString()} ${was} not subscribed to it.`,
+        };
+  }
+  if (kind === "delete") {
+    return affected === selected
+      ? { tone: "ok", text: `Deleted ${count(affected, "contact")}. No address was suppressed.` }
+      : {
+          tone: "warn",
+          text: `Deleted ${of}. The other ${rest.toLocaleString()} ${was} already gone.`,
+        };
+  }
   const head =
     affected === 0
       ? `${of} were added to “${name}”.`

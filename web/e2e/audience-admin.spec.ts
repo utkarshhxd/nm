@@ -11,14 +11,19 @@ test.describe.configure({ mode: "serial" });
 const SLUG = "audienceco";
 const EDITOR = "editor-aud@example.com";
 const EDITOR_PASSWORD = "editor-aud-password";
+/** A workspace admin who is NOT an instance admin: the two are deliberately different things. */
+const WS_ADMIN = "wsadmin-aud@example.com";
+const WS_ADMIN_PASSWORD = "wsadmin-aud-password";
 
 let admin: BrowserContext;
 let editor: BrowserContext;
+let wsAdmin: BrowserContext;
 let page: Page;
 let editorPage: Page;
+let wsAdminPage: Page;
 let workspaceId = "";
 let csrf = "";
-const ids = { archiveMe: "", purgeMe: "", ada: "" };
+const ids = { archiveMe: "", purgeMe: "", ada: "", list: "", crowd: "", bulkA: "", bulkB: "" };
 
 const base = () => `/api/v1/workspaces/${workspaceId}`;
 
@@ -31,6 +36,17 @@ async function post(path: string, data: unknown, scoped = true): Promise<{ id: s
   return (await res.json()) as { id: string };
 }
 
+async function put(path: string): Promise<void> {
+  const res = await admin.request.put(`${base()}${path}`, { headers: { "X-CSRF-Token": csrf } });
+  expect(res.ok(), `put ${path} -> ${res.status()}`).toBe(true);
+}
+
+const get = async <T>(path: string): Promise<T> =>
+  (await (await admin.request.get(`${base()}${path}`)).json()) as T;
+
+const named = async (path: string) =>
+  (await get<{ data: { name: string; status?: string }[] }>(path)).data;
+
 const attributes = async (contactId: string) =>
   ((await (await admin.request.get(`${base()}/contacts/${contactId}`)).json()) as {
     attributes: Record<string, unknown>;
@@ -40,8 +56,10 @@ test.beforeAll(async ({ browser }) => {
   test.setTimeout(120_000);
   admin = await browser.newContext();
   editor = await browser.newContext();
+  wsAdmin = await browser.newContext();
   page = await admin.newPage();
   editorPage = await editor.newPage();
+  wsAdminPage = await wsAdmin.newPage();
 
   await page.goto("/login");
   await page.getByLabel("Email", { exact: true }).fill(ADMIN_EMAIL);
@@ -64,15 +82,17 @@ test.beforeAll(async ({ browser }) => {
   workspaceId = me.workspaces.find((w) => w.slug === SLUG)?.id ?? "";
   expect(workspaceId).not.toBe("");
 
-  // The editor joins by invitation, as a real one would.
-  const invite = (await post("/invites", { email: EDITOR, role: "editor" })) as unknown as {
-    invite_url: string;
+  // The editor and the workspace admin join by invitation, as real ones would.
+  const join = async (p: Page, email: string, role: string, name: string, password: string) => {
+    const invite = (await post("/invites", { email, role })) as unknown as { invite_url: string };
+    await p.goto(new URL(invite.invite_url).pathname);
+    await p.getByLabel("Your name", { exact: true }).fill(name);
+    await p.getByLabel("Password", { exact: true }).fill(password);
+    await p.getByRole("button", { name: "Accept", exact: true }).click();
+    await expect(p.getByText(`Signed in as ${email}`)).toBeVisible();
   };
-  await editorPage.goto(new URL(invite.invite_url).pathname);
-  await editorPage.getByLabel("Your name", { exact: true }).fill("Ed Itor");
-  await editorPage.getByLabel("Password", { exact: true }).fill(EDITOR_PASSWORD);
-  await editorPage.getByRole("button", { name: "Accept", exact: true }).click();
-  await expect(editorPage.getByText(`Signed in as ${EDITOR}`)).toBeVisible();
+  await join(editorPage, EDITOR, "editor", "Ed Itor", EDITOR_PASSWORD);
+  await join(wsAdminPage, WS_ADMIN, "admin", "Wendy Sadmin", WS_ADMIN_PASSWORD);
 
   ids.archiveMe = (await post("/custom-fields", { key: "region", label: "Region", kind: "text" })).id;
   ids.purgeMe = (await post("/custom-fields", { key: "tier", label: "Tier", kind: "text" })).id;
@@ -85,6 +105,20 @@ test.beforeAll(async ({ browser }) => {
   await post("/tags", { name: "vip" });
   await post("/suppressions", { scope: "address", email: "seeded@example.test", reason: "complained" });
 
+  // Three contacts for the bulk actions, two of whom carry the tag and are on the list: the gap
+  // between "affected" and "selected" is then a real one the screen has to explain.
+  ids.list = (await post("/lists", { name: "Weekly digest", double_optin: false })).id;
+  ids.crowd = (await post("/tags", { name: "crowd" })).id;
+  ids.bulkA = (await post("/contacts", { email: "bulk-a@example.test" })).id;
+  ids.bulkB = (await post("/contacts", { email: "bulk-b@example.test" })).id;
+  await post("/contacts", { email: "bulk-c@example.test" });
+  for (const id of [ids.bulkA, ids.bulkB]) {
+    await put(`/contacts/${id}/tags/${ids.crowd}`);
+    await post(`/contacts/${id}/lists`, { list_id: ids.list });
+  }
+  await post("/contacts", { email: "del-a@example.test" });
+  await post("/contacts", { email: "del-b@example.test" });
+
   // An erasure leaves a tombstone: the one suppression nobody may lift.
   const erased = await post("/contacts", { email: "erased@example.test" });
   const res = await admin.request.post(`${base()}/contacts/${erased.id}/erase`, {
@@ -96,6 +130,7 @@ test.beforeAll(async ({ browser }) => {
 test.afterAll(async () => {
   await admin.close();
   await editor.close();
+  await wsAdmin.close();
 });
 
 const fieldsPath = `/w/${SLUG}/custom-fields`;
@@ -244,6 +279,127 @@ test("an_editor_sees_no_lift_control", async () => {
   await expect(row(editorPage, "Region")).toBeVisible();
   await expect(editorPage.getByRole("button", { name: "New field", exact: true })).toHaveCount(0);
   await expect(editorPage.getByRole("button", { name: /archive|purge/i })).toHaveCount(0);
+});
+
+const contactsPath = `/w/${SLUG}/contacts`;
+const instancePath = "/admin/suppressions";
+const result = () => page.getByTestId("bulk-result");
+
+/** Narrows the grid to one prefix, then ticks every row it loaded. */
+async function selectMatching(q: string, n: number): Promise<void> {
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill(q);
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(n);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await expect(page.getByText(`${n} contacts selected`, { exact: true })).toBeVisible();
+}
+
+test("bulk_untag_over_a_selection", async () => {
+  await selectMatching("bulk-", 3);
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
+  await page.getByRole("button", { name: "Remove tag", exact: true }).click();
+
+  // Two of the three had it. A bare "2" would read as success over the whole selection.
+  await expect(result()).toContainText("2 of 3 selected contacts");
+  await expect(result()).toContainText("crowd");
+  await expect(result()).toContainText("The other 1 did not have it");
+  expect(await named(`/contacts/${ids.bulkA}/tags`)).toEqual([]);
+  expect(await named(`/contacts/${ids.bulkB}/tags`)).toEqual([]);
+});
+
+test("bulk_unsubscribe_names_the_list_and_reports_affected_of_selected", async () => {
+  await selectMatching("bulk-", 3);
+  await page
+    .getByLabel("List to subscribe to or unsubscribe from", { exact: true })
+    .selectOption({ label: "Weekly digest" });
+  await page.getByRole("button", { name: "Unsubscribe from list", exact: true }).click();
+
+  const confirm = page.getByRole("dialog", { name: "Unsubscribe from this list", exact: true });
+  // Which list, and how many: an unsubscribe that did not name the list is unreviewable.
+  await expect(confirm).toContainText("Weekly digest");
+  await expect(confirm).toContainText("3 selected contacts");
+  // Per list, never the workspace-wide opt-out, which is a suppression and not a membership.
+  await expect(confirm).toContainText("only this list");
+  await expect(confirm).not.toContainText(/every list|all mail/i);
+  await confirm.getByRole("button", { name: "Unsubscribe these contacts", exact: true }).click();
+
+  await expect(result()).toContainText("2 of 3 selected contacts");
+  await expect(result()).toContainText("Weekly digest");
+  await expect(result()).toContainText("The other 1 was not subscribed to it");
+  expect(await named(`/contacts/${ids.bulkA}/lists`)).toMatchObject([
+    { name: "Weekly digest", status: "unsubscribed" },
+  ]);
+});
+
+test("bulk_delete_requires_confirmation_naming_the_count", async () => {
+  await selectMatching("del-", 2);
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+
+  const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
+  await expect(confirm).toContainText("2 contacts");
+  await expect(confirm).toContainText("cannot be undone");
+  // Deleting is not erasing: nothing is suppressed, so every address stays usable tomorrow.
+  await expect(confirm).toContainText("not suppressed");
+  await expect(confirm).toContainText("can be added again");
+  await confirm.getByRole("button", { name: "Delete 2 contacts", exact: true }).click();
+
+  await expect(result()).toContainText("Deleted 2 contacts");
+  await expect(row(page, "del-a@example.test")).toHaveCount(0);
+  // The promise the dialog made, checked rather than assumed.
+  const suppressions = await get<{ data: { email: string | null }[] }>("/suppressions");
+  expect(suppressions.data.map((s) => s.email)).not.toContain("del-a@example.test");
+  const again = await admin.request.post(`${base()}/contacts`, {
+    data: { email: "del-a@example.test" },
+    headers: { "X-CSRF-Token": csrf },
+  });
+  expect(again.status()).toBe(201);
+});
+
+test("the_instance_suppression_screen_is_instance_admin_only", async () => {
+  await page.goto(contactsPath);
+  await page.getByRole("link", { name: "Instance suppressions", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Instance suppressions", exact: true })).toBeVisible();
+  await expect(page.getByText("every workspace").first()).toBeVisible();
+
+  await page.getByLabel("Email address", { exact: true }).fill("Everywhere@Example.test");
+  await page.getByLabel("Reason", { exact: true }).selectOption("complained");
+  await page.getByRole("button", { name: "Add suppression", exact: true }).click();
+  await expect(row(page, "everywhere@example.test")).toContainText("Complained");
+
+  // An instance-wide block is not a workspace one, and the workspace screen must not show it.
+  await page.goto(suppressionsPath);
+  await expect(row(page, "everywhere@example.test")).toHaveCount(0);
+
+  await page.goto(instancePath);
+  await row(page, "everywhere@example.test")
+    .getByRole("button", { name: "Lift suppression for everywhere@example.test", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", {
+    name: "Lift the suppression on everywhere@example.test",
+    exact: true,
+  });
+  await expect(dialog).toContainText("every workspace");
+  await dialog.getByRole("button", { name: "Lift suppression", exact: true }).click();
+  await expect(row(page, "everywhere@example.test")).toHaveCount(0);
+});
+
+test("a_workspace_admin_cannot_reach_it", async () => {
+  // An admin of this workspace, with every workspace-level control: the audit log is admin-only.
+  await wsAdminPage.goto(`/w/${SLUG}/audit-log`);
+  await expect(wsAdminPage.getByRole("heading", { name: "Audit log", exact: true })).toBeVisible();
+  await expect(wsAdminPage.getByRole("link", { name: "Instance suppressions" })).toHaveCount(0);
+
+  await wsAdminPage.goto(instancePath);
+  // The gate's own sentence. "Only an instance admin" alone would also match the 403 the list
+  // query would answer with if the gate were gone, so it would not tell the two apart.
+  await expect(
+    wsAdminPage.getByText("Being an admin of a workspace is not the same thing"),
+  ).toBeVisible();
+  await expect(wsAdminPage.getByRole("table")).toHaveCount(0);
+  await expect(wsAdminPage.getByRole("button", { name: "Add suppression" })).toHaveCount(0);
+  // The screen is only a courtesy; the route itself refuses them, and with 403 rather than 404.
+  const refused = await wsAdmin.request.get("/api/v1/admin/suppressions");
+  expect(refused.status()).toBe(403);
 });
 
 test("axe_reports_no_violations_on_all_three_pages", async () => {

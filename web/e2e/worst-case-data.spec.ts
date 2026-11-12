@@ -25,6 +25,8 @@ type Theme = (typeof THEMES)[number];
 
 // The server's limits: names, labels and options 100 characters, an address 254, a note 500.
 const LONG_EMAIL = `${"a".repeat(241)}@example.test`;
+/** The same worst case on the instance-wide screen, which is a different list entirely. */
+const INSTANCE_EMAIL = `${"b".repeat(241)}@example.test`;
 const LONG_NAME = "W".repeat(100); // the widest letter, and nowhere to break
 const LONG_DOMAIN = `${"d".repeat(63)}.${"e".repeat(63)}.${"f".repeat(63)}.test`;
 const LONG_NOTE = "n".repeat(500);
@@ -175,6 +177,11 @@ const SCREENS: Screen[] = [
   { name: "tags", path: () => `/w/${SLUG}/tags`, ready: heading("Tags") },
   { name: "custom fields", path: () => `/w/${SLUG}/custom-fields`, ready: heading("Custom fields") },
   { name: "suppressions", path: () => `/w/${SLUG}/suppressions`, ready: heading("Suppressions") },
+  {
+    name: "instance suppressions",
+    path: () => "/admin/suppressions",
+    ready: heading("Instance suppressions"),
+  },
   { name: "members", path: () => `/w/${SLUG}/members`, ready: heading("Members") },
   { name: "api keys", path: () => `/w/${SLUG}/api-keys`, ready: heading("API keys") },
   { name: "audit log", path: () => `/w/${SLUG}/audit-log`, ready: heading("Audit log") },
@@ -223,6 +230,29 @@ const SCREENS: Screen[] = [
     path: () => `/w/${SLUG}/lists/${ids.list}`,
     ready: heading(LONG_NAME),
     open: opens("Delete list", "Delete this list"),
+  },
+  // The bulk confirmations: the only dialogs whose copy carries a list name, and the only ones
+  // that need a selection before they exist at all.
+  {
+    name: "bulk unsubscribe dialog",
+    path: () => `/w/${SLUG}/contacts`,
+    ready: (p) => p.getByRole("grid", { name: "Contacts" }),
+    open: async (p) => {
+      await p.getByRole("checkbox", { name: `Select ${LONG_EMAIL}`, exact: true }).check();
+      await p
+        .getByLabel("List to subscribe to or unsubscribe from", { exact: true })
+        .selectOption({ label: LONG_NAME });
+      await opens("Unsubscribe from list", "Unsubscribe from this list")(p);
+    },
+  },
+  {
+    name: "bulk delete dialog",
+    path: () => `/w/${SLUG}/contacts`,
+    ready: (p) => p.getByRole("grid", { name: "Contacts" }),
+    open: async (p) => {
+      await p.getByRole("checkbox", { name: `Select ${LONG_EMAIL}`, exact: true }).check();
+      await opens("Delete contacts", "Delete these contacts")(p);
+    },
   },
 ];
 
@@ -357,6 +387,20 @@ test("seed_the_worst_case_data", async () => {
   await post(`/suppressions/${lifted.id}/lift`);
   const erased = await post("/contacts", { email: "erased@example.test" });
   await post(`/contacts/${erased.id}/erase`);
+
+  // Instance-wide, which no workspace screen lists: the same longest address and note again.
+  await send("post", "/api/v1/admin/suppressions", {
+    scope: "address",
+    email: INSTANCE_EMAIL,
+    reason: "unsubscribed_all",
+    note: LONG_NOTE,
+  });
+  await send("post", "/api/v1/admin/suppressions", {
+    scope: "domain",
+    domain: LONG_DOMAIN,
+    reason: "manual",
+    note: "first line\nsecond line",
+  });
 
   // Members and keys with the longest names, so the older M0 screens have something to break on.
   const invite = (await post("/invites", { email: `${"m".repeat(241)}@example.test`, role: "editor" })) as unknown as {

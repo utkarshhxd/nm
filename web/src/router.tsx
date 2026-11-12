@@ -119,6 +119,15 @@ const suppressionsRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/suppressions")),
 });
 
+// Outside the workspace tree on purpose: an instance-wide suppression belongs to no workspace,
+// and it is gated on `is_instance_admin`, which a workspace admin is not. The named export keeps
+// both suppression screens in the one chunk.
+const instanceSuppressionsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/admin/suppressions",
+  component: lazyRouteComponent(() => import("./routes/suppressions"), "InstanceSuppressions"),
+});
+
 const membersRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "members",
@@ -144,6 +153,7 @@ export const router = createRouter({
     accountSecurityRoute,
     inviteRoute,
     newWorkspaceRoute,
+    instanceSuppressionsRoute,
     workspaceRoute.addChildren([
       contactsRoute,
       contactRoute,
