@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use axum::{Json, Router, extract::State, http::StatusCode};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Postgres, Transaction};
@@ -21,6 +26,7 @@ use crate::{
     http::request_meta::RequestMeta,
     lists::{self, MembershipStatus},
     pagination::{Page, sorted::SortedPageParams},
+    segments::load_rules,
     suppressions::{Block, blocking_suppression, erase_address},
     tags,
     workspaces::{roles::Role, validate_timezone},
@@ -476,17 +482,47 @@ pub async fn erase_contact(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The signed token for a selection; see `selection`.
+/// A materialised selection: the snapshot that was written, and the token for it.
 #[derive(Serialize, ToSchema)]
 pub struct SelectionToken {
     /// Valid for one hour. Pass it to a `bulk/*` route.
-    pub selection_token: String,
-    /// How many contacts the filter matches, as of the token's `as_of`. A live count over the
-    /// whole match: deliberately exempt from the 150 ms p95 target, like
-    /// `GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks
-    /// for it when the user asks to select everything, and shows a skeleton until it lands. It is
-    /// never kept as a counter on a table: hand-maintained counters drift.
+    ///
+    /// `null` when the selection named a `segment_id`. This build's token carries a
+    /// `ContactFilter`, which cannot express a segment's rules, so a token issued for one would
+    /// describe a **wider** set than was frozen — every contact the remaining filter matches. The
+    /// frozen set is `snapshot_id`; the token stops carrying a predicate at all when the bulk
+    /// routes move onto snapshots.
+    pub selection_token: Option<String>,
+    /// The frozen set, by id: exactly the contacts that matched, written down. It expires in an
+    /// hour, and a new selection by the same person in this workspace supersedes it.
+    pub snapshot_id: Uuid,
+    /// How many contacts were frozen. Exact for free — it is the materialising insert's own
+    /// `rows_affected` — and deliberately exempt from the 150 ms p95 target, like
+    /// `GET /lists/{id}/mailable-count`: materialising a million ids is measured at 4,887 ms. The
+    /// UI shows a skeleton until it lands. It is never kept as a counter on a table:
+    /// hand-maintained counters drift.
     pub selected: u64,
+}
+
+/// The body of `POST /contacts/selection`: which contacts to freeze.
+///
+/// `ContactFilter`'s fields, spelled out rather than flattened, for the reason `BulkTarget` gives:
+/// `serde(flatten)` cannot be combined with `deny_unknown_fields`, and a misspelt `tag_id_` that
+/// was quietly ignored here would freeze every contact in the workspace.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NewSelection {
+    /// Case-insensitive substring of the address or name; at least 3 characters.
+    pub q: Option<String>,
+    /// Contacts with a membership row on this list, whatever its status.
+    pub list_id: Option<Uuid>,
+    /// Narrows `list_id` to the memberships with this status; refused without a `list_id`.
+    pub list_status: Option<MembershipStatus>,
+    /// Contacts with this tag.
+    pub tag_id: Option<Uuid>,
+    /// A saved segment, whose stored rules narrow the selection further. An id that is not a
+    /// segment of this workspace is a `404`, never read as "no rules".
+    pub segment_id: Option<Uuid>,
 }
 
 /// What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.
@@ -581,50 +617,110 @@ pub struct BulkResult {
     pub status: Option<MembershipStatus>,
 }
 
-/// Freezes "the contacts this filter matches" at this moment. The token holds the filter and a
-/// time bound, not the contacts: contacts created afterwards are never part of it.
+/// Freezes the contacts this predicate matches, by writing their ids down (spec M1b section 8).
+///
+/// The set is decided here, once, and never re-derived: a predicate re-evaluated when the action
+/// runs resolves to whatever the table says then, and a colleague's write inside the hour changes
+/// what the action hits. A contact created afterwards is not in the set; a contact that no longer
+/// matches still is, because the person confirmed *these contacts*, not *this query*; and a
+/// contact deleted in between is simply absent.
+///
+/// Rate-limited per workspace, harder than preview, with `RateLimit` headers on the answer as well
+/// as on the refusal: this is the most expensive call in the product, measured at 4,887 ms and
+/// 158 MB for a million rows.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/selection",
     operation_id = "create_contact_selection",
     params(("workspace_id" = Uuid, Path, description = "Workspace id")),
-    request_body = ContactFilter,
+    request_body = NewSelection,
     responses(
         (status = 200, body = SelectionToken),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
-        (status = 404, description = "not a member, or no such workspace"),
-        (status = 422, description = "a `q` under 3 characters, or a `list_status` without a `list_id`"),
+        (status = 404, description = "not a member, no such workspace, or no such segment"),
+        (status = 422, description = "a `q` under 3 characters, a `list_status` without a \
+            `list_id`, or `selection-too-large`: the predicate matches more than a million \
+            contacts"),
+        (status = 429, description = "rate-limited: too many selections for this workspace"),
     ),
 )]
 pub async fn create_selection(
     State(state): State<AppState>,
     principal: Principal,
     ApiPath(workspace_id): ApiPath<Uuid>,
-    ApiJson(filter): ApiJson<ContactFilter>,
-) -> ApiResult<Json<SelectionToken>> {
+    ApiJson(input): ApiJson<NewSelection>,
+) -> ApiResult<Response> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Editor).await?;
-    if filter.list_status.is_some() && filter.list_id.is_none() {
+    // After `authorize`, so someone who is not in the workspace cannot spend its quota and deny
+    // selections to the people who are.
+    let quota = state.selection_limit.check(workspace_id);
+    if let Some(retry_after_secs) = quota.over {
+        return Ok((
+            quota.headers,
+            ApiError::TooManyRequests { retry_after_secs },
+        )
+            .into_response());
+    }
+    if input.list_status.is_some() && input.list_id.is_none() {
         return Err(ApiError::Validation(vec![FieldError::new(
             "list_status",
             "needs a list_id to narrow",
         )]));
     }
     let filter = ContactFilter {
-        list_id: filter.list_id,
-        list_status: filter.list_status,
-        tag_id: filter.tag_id,
-        ..ContactFilter::with_search(filter.q.as_deref())?
+        list_id: input.list_id,
+        list_status: input.list_status,
+        tag_id: input.tag_id,
+        ..ContactFilter::with_search(input.q.as_deref())?
     };
-    let mut selection = Selection::now(workspace_id, filter);
-    let selected = selection::count(&mut conn, &selection).await?;
+    // A stored segment resolves with archived definitions **included**. Archiving a custom field
+    // keeps every contact's value, so it must not break a saved segment that names the field;
+    // preview and a save use the other resolver, because a *new* rule may not name an archived
+    // field. Nothing builds a `Group` by hand — only `Group::parse` can refuse an empty group or
+    // an unknown field, and a hand-built node can reach an `unreachable!` in the compiler.
+    let rules = match input.segment_id {
+        Some(id) => Some(load_rules(&mut conn, workspace_id, id).await?),
+        None => None,
+    };
+    // The bound is taken before the insert, which may run for seconds, so the token's set is a
+    // subset of the frozen one by creation time rather than a superset of it.
+    let mut selection = Selection::now(workspace_id, filter.clone());
+    let created_by = match &principal {
+        Principal::User { user_id, .. } => Some(*user_id),
+        Principal::ApiKey { .. } => None,
+    };
+    // The predicate as it was sent, kept for the audit row the bulk action writes: the token
+    // carries none, so without this the log would hold a snapshot id that is deleted an hour
+    // later. `q` is redacted by that copy, not here.
+    let filter_doc = serde_json::to_value(&input).map_err(|e| ApiError::Internal(e.into()))?;
+    // The pooled connection goes back before the long write takes its own.
+    drop(conn);
+    let snapshot = selection::materialise(
+        state.pool.clone(),
+        workspace_id,
+        created_by,
+        filter_doc,
+        filter,
+        rules,
+        selection::MAX_SELECTION,
+    )
+    .await?;
     // Signed into the token: this is the number the person is about to be shown, and the only
     // thing a bulk action can later compare its own resolved count against.
-    selection.issued = selected;
-    Ok(Json(SelectionToken {
-        selection_token: selection::issue(&state.secrets, &selection),
-        selected,
-    }))
+    selection.issued = snapshot.size;
+    Ok((
+        quota.headers,
+        Json(SelectionToken {
+            selection_token: input
+                .segment_id
+                .is_none()
+                .then(|| selection::issue(&state.secrets, &selection)),
+            snapshot_id: snapshot.id,
+            selected: snapshot.size,
+        }),
+    )
+        .into_response())
 }
 
 /// Opens the transaction, authorises, and resolves the token: in that order, so a non-member

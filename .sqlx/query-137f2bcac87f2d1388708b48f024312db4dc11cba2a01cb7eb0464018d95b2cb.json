@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into selection_snapshots (id, workspace_id, created_by, filter, size, expires_at) values ($1, $2, $3, $4, 0, now() + make_interval(secs => $5))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "137f2bcac87f2d1388708b48f024312db4dc11cba2a01cb7eb0464018d95b2cb"
+}

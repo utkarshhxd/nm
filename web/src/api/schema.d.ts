@@ -568,8 +568,16 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Freezes "the contacts this filter matches" at this moment. The token holds the filter and a
-         *     time bound, not the contacts: contacts created afterwards are never part of it.
+         * Freezes the contacts this predicate matches, by writing their ids down (spec M1b section 8).
+         * @description The set is decided here, once, and never re-derived: a predicate re-evaluated when the action
+         *     runs resolves to whatever the table says then, and a colleague's write inside the hour changes
+         *     what the action hits. A contact created afterwards is not in the set; a contact that no longer
+         *     matches still is, because the person confirmed *these contacts*, not *this query*; and a
+         *     contact deleted in between is simply absent.
+         *
+         *     Rate-limited per workspace, harder than preview, with `RateLimit` headers on the answer as well
+         *     as on the refusal: this is the most expensive call in the product, measured at 4,887 ms and
+         *     158 MB for a million rows.
          */
         post: operations["create_contact_selection"];
         delete?: never;
@@ -1437,6 +1445,34 @@ export interface components {
             rules: Record<string, never>;
         };
         /**
+         * @description The body of `POST /contacts/selection`: which contacts to freeze.
+         *
+         *     `ContactFilter`'s fields, spelled out rather than flattened, for the reason `BulkTarget` gives:
+         *     `serde(flatten)` cannot be combined with `deny_unknown_fields`, and a misspelt `tag_id_` that
+         *     was quietly ignored here would freeze every contact in the workspace.
+         */
+        NewSelection: {
+            /**
+             * Format: uuid
+             * @description Contacts with a membership row on this list, whatever its status.
+             */
+            list_id?: string | null;
+            list_status?: components["schemas"]["MembershipStatus"] | null;
+            /** @description Case-insensitive substring of the address or name; at least 3 characters. */
+            q?: string | null;
+            /**
+             * Format: uuid
+             * @description A saved segment, whose stored rules narrow the selection further. An id that is not a
+             *     segment of this workspace is a `404`, never read as "no rules".
+             */
+            segment_id?: string | null;
+            /**
+             * Format: uuid
+             * @description Contacts with this tag.
+             */
+            tag_id?: string | null;
+        };
+        /**
          * @description A suppression to add. `scope` decides which of `email` and `domain` is required, and the other
          *     must be absent.
          */
@@ -1767,19 +1803,33 @@ export interface components {
              */
             version: number;
         };
-        /** @description The signed token for a selection; see `selection`. */
+        /** @description A materialised selection: the snapshot that was written, and the token for it. */
         SelectionToken: {
             /**
              * Format: int64
-             * @description How many contacts the filter matches, as of the token's `as_of`. A live count over the
-             *     whole match: deliberately exempt from the 150 ms p95 target, like
-             *     `GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks
-             *     for it when the user asks to select everything, and shows a skeleton until it lands. It is
-             *     never kept as a counter on a table: hand-maintained counters drift.
+             * @description How many contacts were frozen. Exact for free — it is the materialising insert's own
+             *     `rows_affected` — and deliberately exempt from the 150 ms p95 target, like
+             *     `GET /lists/{id}/mailable-count`: materialising a million ids is measured at 4,887 ms. The
+             *     UI shows a skeleton until it lands. It is never kept as a counter on a table:
+             *     hand-maintained counters drift.
              */
             selected: number;
-            /** @description Valid for one hour. Pass it to a `bulk/*` route. */
-            selection_token: string;
+            /**
+             * @description Valid for one hour. Pass it to a `bulk/*` route.
+             *
+             *     `null` when the selection named a `segment_id`. This build's token carries a
+             *     `ContactFilter`, which cannot express a segment's rules, so a token issued for one would
+             *     describe a **wider** set than was frozen — every contact the remaining filter matches. The
+             *     frozen set is `snapshot_id`; the token stops carrying a predicate at all when the bulk
+             *     routes move onto snapshots.
+             */
+            selection_token?: string | null;
+            /**
+             * Format: uuid
+             * @description The frozen set, by id: exactly the contacts that matched, written down. It expires in an
+             *     hour, and a new selection by the same person in this workspace supersedes it.
+             */
+            snapshot_id: string;
         };
         SetupResponse: {
             otpauth_url: string;
@@ -3595,7 +3645,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ContactFilter"];
+                "application/json": components["schemas"]["NewSelection"];
             };
         };
         responses: {
@@ -3614,15 +3664,22 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not a member, or no such workspace */
+            /** @description not a member, no such workspace, or no such segment */
             404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description a `q` under 3 characters, or a `list_status` without a `list_id` */
+            /** @description a `q` under 3 characters, a `list_status` without a `list_id`, or `selection-too-large`: the predicate matches more than a million contacts */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many selections for this workspace */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

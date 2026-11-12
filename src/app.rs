@@ -16,7 +16,7 @@ use crate::{
     error::ApiError,
     http,
     http::csrf,
-    http::rate_limit::{PREVIEW_PER_MINUTE, RateLimiter},
+    http::rate_limit::{PREVIEW_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE},
     http::security_headers::security_headers,
     telemetry,
 };
@@ -32,6 +32,9 @@ pub struct AppState {
     /// Per-workspace cap on `POST /segments/preview`, which a viewer may call on a debounce and
     /// which may hold a pooled connection for 1.5 seconds.
     pub preview_limit: Arc<RateLimiter>,
+    /// Per-workspace cap on `POST /contacts/selection`, the most expensive endpoint in the
+    /// product: it materialises the match, measured at 4,887 ms and 158 MB for a million rows.
+    pub selection_limit: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -44,6 +47,7 @@ impl AppState {
             secrets,
             webauthn,
             preview_limit: Arc::new(RateLimiter::per_minute(PREVIEW_PER_MINUTE)),
+            selection_limit: Arc::new(RateLimiter::per_minute(SELECTION_PER_MINUTE)),
         })
     }
 
@@ -87,6 +91,13 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             .install()?;
         tracing::info!(%addr, "metrics exporter listening");
     }
+    // The selection reaper: its own bounded sweep, because a snapshot is up to 158 MB and its
+    // cascade is measured at 850 ms. Riding a user's request, as the session sweep does, would put
+    // that on the hot path of a stranger's request and would stop sweeping the moment everyone
+    // went home. Started here rather than in `AppState::new`, which every test builds.
+    tokio::spawn(crate::contacts::selection::sweep_expired_snapshots(
+        pool.clone(),
+    ));
     let listener = TcpListener::bind(cfg.listen).await?;
     tracing::info!(addr = %cfg.listen, "listening");
     let state = AppState::new(pool.clone(), cfg)?;

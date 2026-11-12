@@ -1,0 +1,45 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+
+-- A selection snapshot is the frozen set a bulk action runs against (spec M1b section 8). The
+-- predicate is evaluated once, here, and the matching contact ids are written down; the token a
+-- client then carries names this snapshot and nothing about the predicate. Re-evaluating a
+-- predicate when the action runs is what let a second editor's write change what the action hit.
+--
+-- `filter` keeps the predicate for the audit row (section 8.7). The token carries none, so without
+-- this column a `bulk/delete` of 417,004 contacts would be recorded as a snapshot id that is
+-- deleted an hour later — a worse record than M1a had, on the one action that cannot be undone.
+create table selection_snapshots (
+  id uuid primary key,                -- UUIDv7: carries its own issue time, see section 8.5
+  workspace_id uuid not null references workspaces(id) on delete cascade,
+  created_by uuid references users(id) on delete set null,
+  filter jsonb not null,
+  size bigint not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  unique (workspace_id, id)
+);
+-- The reaper's index: one expired snapshot per pass, oldest first (section 8.10).
+create index selection_snapshots_expiry on selection_snapshots (expires_at);
+-- A new selection supersedes the actor's previous live one in the workspace (section 8.4).
+create index selection_snapshots_actor on selection_snapshots (workspace_id, created_by);
+
+-- `unlogged` on purpose: this table is ephemeral, hourly and recreatable. Logged, it would push
+-- ~158 MB per 1M-row selection through WAL and into every base backup. A crash truncates it, which
+-- produces the same "your selection expired, select again" path the one-hour TTL already produces.
+-- The cost is that snapshots do not reach a physical standby.
+--
+-- It is also the first tenant table holding a `contact_id` without a composite foreign key to
+-- `contacts`, against M1a's "unrepresentable, not merely unwritten" (section 8.6). The foreign key
+-- is omitted deliberately: its cascade needs an index on `(workspace_id, contact_id)` that this
+-- primary key cannot serve, so a `bulk/delete` of 1M contacts would do 1M index scans. A dangling
+-- `contact_id` is harmless **because UUIDv7 is never reused** — that clause is load-bearing —
+-- and because a bulk action narrows `contacts` by this table rather than reading ids out of it,
+-- so a dangling row is a no-op rather than a foreign-key violation that kills the whole action.
+create unlogged table selection_snapshot_members (
+  workspace_id uuid not null,
+  snapshot_id uuid not null,
+  contact_id uuid not null,
+  primary key (workspace_id, snapshot_id, contact_id),
+  foreign key (workspace_id, snapshot_id)
+    references selection_snapshots (workspace_id, id) on delete cascade
+);

@@ -34,6 +34,13 @@ use uuid::Uuid;
 /// connections for the 1.5 seconds each preview may cost.
 pub const PREVIEW_PER_MINUTE: u32 = 30;
 
+/// How many selections one workspace may materialise per window. Harder than preview, because a
+/// selection is the more expensive call of the two: measured at 4,887 ms and 158 MB for a 1M-row
+/// match, against preview's 1.5 s of one connection and nothing written. Ten is more than the one
+/// active selection the UI has at a time, and still bounds a workspace to under a minute of
+/// connection time per window.
+pub const SELECTION_PER_MINUTE: u32 = 10;
+
 const WINDOW: Duration = Duration::from_secs(60);
 
 pub struct RateLimiter {

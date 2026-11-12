@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update selection_snapshots set size = $3 where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "15bc239728abf11d59b7bb5dc499a3fb8bad1c3c71e7b5846b1187f812b2a7cd"
+}

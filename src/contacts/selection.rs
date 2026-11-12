@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, Postgres, QueryBuilder};
+use serde_json::Value;
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use super::{ContactFilter, push_filter};
@@ -21,6 +22,7 @@ use crate::{
     crypto::{secrets::Secrets, tokens},
     error::{ApiError, ApiResult, FieldError},
     lists::MembershipStatus,
+    segments::{compile::push_rules, rules::Group},
 };
 
 /// Domain-separation label for the selection-token key: a token can never be replayed as any other
@@ -216,6 +218,227 @@ pub fn check_ids(ids: &[Uuid]) -> ApiResult<()> {
     Ok(())
 }
 
+/// The most contacts one selection may hold. Applied as `limit MAX_SELECTION + 1` in the
+/// materialising insert: if the extra row arrives the transaction rolls back and the refusal says
+/// *more than a million* without naming a count, because naming one needs a second pass that
+/// doubles the work and races with the insert.
+pub const MAX_SELECTION: u64 = 1_000_000;
+
+/// How long a snapshot lives, in seconds. The same hour as the token's [`TTL`], and derived from
+/// it: a snapshot that outlived its token would be dead weight, and one that died first would
+/// refuse a token this instance still considers valid.
+const SNAPSHOT_TTL_SECS: f64 = TTL.as_secs() as f64;
+
+/// The sweep runs this often, deleting at most one expired snapshot each time (section 8.10).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A materialised selection: the frozen set, by id, and how many contacts are in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snapshot {
+    /// `Uuid::now_v7()`, so the issue time comes back out of the id and the TTL can be checked
+    /// before the database is touched (section 8.5).
+    pub id: Uuid,
+    /// The materialising insert's own `rows_affected`, never a separate count: a count taken
+    /// separately could disagree with what was written.
+    pub size: u64,
+}
+
+/// Evaluates the predicate once and writes down the ids it matched, as one transaction.
+///
+/// This is what closes issue `04`. A predicate re-evaluated when the action runs resolves to
+/// whatever the table says *then*: a second editor writing a tag inside the token's hour changes
+/// what the action hits, and no timestamp bound fixes it, because proving a fact was *absent* at
+/// `t` is impossible once the row recording it has been deleted (section 8.1). Identity recorded
+/// has nothing to infer.
+///
+/// Three things here are requirements rather than style:
+///
+/// 1. **The workspace clause is written here.** Neither `push_filter` nor `push_rules` emits one —
+///    the compiler's structural test proves its fragment is more than a workspace clause, and it
+///    cannot prove the caller added one. Without the clause below this materialises every tenant's
+///    contacts into one snapshot.
+/// 2. **The parent row and the members commit together.** A parent that commits alone leaves a
+///    snapshot whose `size` claims N and which holds no members.
+/// 3. **The insert runs in a detached task.** It is measured at 4,887 ms for 1M rows, and a handler
+///    future is dropped when the client disconnects. Detached, the statement finishes on its own
+///    connection rather than being cancelled mid-protocol, which costs the pool a connection.
+///
+/// `filter_doc` is stored verbatim for the audit row the bulk action will write (section 8.7); `q`
+/// is redacted by that copy, not here, so the snapshot stays self-describing while it lives.
+///
+/// `cap` is [`MAX_SELECTION`] for every caller in the product. It is a parameter rather than the
+/// constant so that the refusal above has a test: a million contacts cannot be made in a test, and
+/// a refusal nothing witnesses is the shape of assertion this project keeps finding passes against
+/// broken code.
+pub async fn materialise(
+    pool: PgPool,
+    workspace_id: Uuid,
+    created_by: Option<Uuid>,
+    filter_doc: Value,
+    filter: ContactFilter,
+    rules: Option<Group>,
+    cap: u64,
+) -> ApiResult<Snapshot> {
+    tokio::spawn(async move {
+        materialise_in(
+            pool,
+            workspace_id,
+            created_by,
+            filter_doc,
+            filter,
+            rules,
+            cap,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+}
+
+async fn materialise_in(
+    pool: PgPool,
+    workspace_id: Uuid,
+    created_by: Option<Uuid>,
+    filter_doc: Value,
+    filter: ContactFilter,
+    rules: Option<Group>,
+    cap: u64,
+) -> ApiResult<Snapshot> {
+    let id = Uuid::now_v7();
+    let mut tx = pool.begin().await?;
+    // The actor's previous live selection is superseded: the UI has one active selection at a
+    // time, so the old snapshot is dead weight, and dropping it bounds one person's footprint to
+    // one snapshot of up to 158 MB. Scoped to the actor and the workspace, so it cannot reach a
+    // colleague's. `created_by` is NULL for an API key and `= NULL` matches nothing, so an API
+    // key's snapshots are not superseded; they age out with the TTL like anything else.
+    sqlx::query!(
+        "delete from selection_snapshots where workspace_id = $1 and created_by = $2",
+        workspace_id,
+        created_by,
+    )
+    .execute(&mut *tx)
+    .await?;
+    // `size` is written after the insert, which is the only thing that knows it.
+    sqlx::query!(
+        "insert into selection_snapshots \
+           (id, workspace_id, created_by, filter, size, expires_at) \
+         values ($1, $2, $3, $4, 0, now() + make_interval(secs => $5))",
+        id,
+        workspace_id,
+        created_by,
+        filter_doc,
+        SNAPSHOT_TTL_SECS,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let mut q = members_insert(workspace_id, id, &filter, rules.as_ref(), cap);
+    let size = q.build().execute(&mut *tx).await?.rows_affected();
+    if size > cap {
+        // Rolled back, so neither the parent nor the row over the cap survives.
+        tx.rollback().await?;
+        return Err(ApiError::UnprocessableDetail {
+            code: "selection-too-large",
+            // Built from `cap`, never from a count: naming an exact number needs a second pass
+            // that doubles the work and races with the insert.
+            detail: format!(
+                "more than {} contacts match; narrow the selection and try again",
+                with_separators(cap)
+            ),
+        });
+    }
+    sqlx::query!(
+        "update selection_snapshots set size = $3 where workspace_id = $1 and id = $2",
+        workspace_id,
+        id,
+        i64::try_from(size).unwrap_or(i64::MAX),
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Snapshot { id, size })
+}
+
+/// `1000000` as `1,000,000`. The refusal is a sentence a person reads.
+fn with_separators(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.char_indices() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `insert into selection_snapshot_members … select … from contacts where … limit cap + 1`.
+///
+/// The limit is one past the cap, so one extra row is the whole evidence that the match is too
+/// big — and the only evidence taken, because counting first doubles the work and races with the
+/// insert. It is formatted rather than bound so that the SQL a test reads carries the number.
+fn members_insert(
+    workspace_id: Uuid,
+    snapshot_id: Uuid,
+    filter: &ContactFilter,
+    rules: Option<&Group>,
+    cap: u64,
+) -> QueryBuilder<Postgres> {
+    let mut q = QueryBuilder::<Postgres>::new(
+        "insert into selection_snapshot_members (workspace_id, snapshot_id, contact_id) select ",
+    );
+    q.push_bind(workspace_id)
+        .push(", ")
+        .push_bind(snapshot_id)
+        .push(", id from contacts where workspace_id = ")
+        .push_bind(workspace_id);
+    push_filter(&mut q, filter);
+    if let Some(group) = rules {
+        q.push(" and ");
+        push_rules(&mut q, group);
+    }
+    // A `u64` constant: nothing a request carries reaches this.
+    q.push(format!(" limit {}", cap + 1));
+    q
+}
+
+/// Deletes **one** expired snapshot and its members, and reports whether there was one.
+///
+/// One, not every expired one: a snapshot holds up to 158 MB and its cascade is measured at
+/// 850 ms, so a sweep of the whole backlog is an unbounded amount of work. M0's session sweep —
+/// `delete from sessions where expires_at <= now()`, inline in a user's request — is sized for a
+/// 200-byte row and is not the shape to copy here (section 8.10).
+///
+/// Nothing depends on this having run: a bulk action joins `expires_at > now()` itself, so an
+/// un-reaped snapshot is already unusable. This only reclaims the space.
+pub async fn reap_one_expired(pool: &PgPool) -> sqlx::Result<bool> {
+    let done = sqlx::query!(
+        "delete from selection_snapshots where id = \
+           (select id from selection_snapshots where expires_at <= now() \
+            order by expires_at limit 1)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// The sweep, as its own task: one expired snapshot a minute, for as long as the process runs.
+///
+/// Its own task, not a ride on an existing request, for the two reasons the session sweep cannot
+/// serve (section 8.10): that one runs only while somebody is logged in, so an instance whose
+/// editors go home on Friday would hold every Friday snapshot until Monday; and its cost would
+/// land on the hot path of a stranger's authenticated request.
+pub async fn sweep_expired_snapshots(pool: PgPool) {
+    loop {
+        tokio::time::sleep(SWEEP_INTERVAL).await;
+        match reap_one_expired(&pool).await {
+            Ok(true) => tracing::debug!("reaped an expired selection snapshot"),
+            Ok(false) => {}
+            // Best effort, like the other sweeps: the next pass tries again.
+            Err(e) => tracing::warn!(error = ?e, "selection snapshot sweep failed"),
+        }
+    }
+}
+
 /// How many contacts `sel` matches under its own `as_of` bound. A live count over the whole
 /// match, so as slow as the match is big: the caller asks for it only when the user asks to select
 /// everything.
@@ -396,6 +619,42 @@ mod tests {
     fn all_four_filter_fields_round_trip() {
         let s = Selection::now(Uuid::now_v7(), full_filter());
         assert_eq!(parse(&secrets(), &issue(&secrets(), &s)).unwrap(), s);
+    }
+
+    #[test]
+    fn a_refusal_names_the_cap_in_digits_a_person_reads() {
+        assert_eq!(with_separators(MAX_SELECTION), "1,000,000");
+        assert_eq!(with_separators(2), "2");
+        assert_eq!(with_separators(1_000), "1,000");
+    }
+
+    /// Two properties of the materialising insert that only its SQL can witness.
+    ///
+    /// The **workspace clause**: `push_filter` and `push_rules` both emit fragments that assume
+    /// the caller restricted `contacts.workspace_id`, and a filter with every field `None` adds
+    /// nothing at all. Drop it and the insert materialises every tenant's contacts; the integration
+    /// test for that catches it too, but this names the clause.
+    ///
+    /// The **`limit`**: the cap is enforced by taking one row past it and no more. Removing the
+    /// limit leaves the refusal working — the extra rows still arrive and the transaction still
+    /// rolls back — so nothing observable changes, and a 1M-row selection quietly writes the whole
+    /// match before refusing. This is the only witness there is.
+    #[test]
+    fn the_materialising_insert_scopes_by_workspace_and_takes_one_row_past_the_cap() {
+        let sql = members_insert(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &ContactFilter::default(),
+            None,
+            7,
+        )
+        .into_sql();
+        let sql = sql.as_str();
+        assert!(
+            sql.contains("from contacts where workspace_id = $3"),
+            "{sql}"
+        );
+        assert!(sql.ends_with(" limit 8"), "{sql}");
     }
 
     #[test]
