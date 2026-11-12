@@ -1586,7 +1586,7 @@
           "crate::contacts::routes"
         ],
         "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
-        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.",
+        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.\n\nFor the same reason this refuses a selection whose filter widened after it was made, as\n`bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe\nafterwards does not un-send. See `refuse_if_widened`.",
         "operationId": "bulk_subscribe_contacts",
         "parameters": [
           {
@@ -1626,6 +1626,9 @@
           },
           "404": {
             "description": "not a member, no such list, or a token for another workspace"
+          },
+          "409": {
+            "description": "selection-widened: the filter now matches more contacts than the selection was made for; nobody was added"
           },
           "422": {
             "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
@@ -3780,7 +3783,7 @@
           "issued": {
             "type": "integer",
             "format": "int64",
-            "description": "How many the selection stood for when it was made. `selected` above it means the filter\nmatched contacts that did not match when the person looked — they existed then, and were\ntagged, subscribed or renamed into the view afterwards. `bulk/delete` refuses outright in\nthat case; the reversible actions proceed and the UI says so.",
+            "description": "How many the selection stood for when it was made. `selected` above it means the filter\nmatched contacts that did not match when the person looked — they existed then, and were\ntagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`\nrefuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`\nproceed and the UI says so.",
             "minimum": 0
           },
           "selected": {

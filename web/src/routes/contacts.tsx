@@ -772,8 +772,9 @@ function describe(
   const now = selected + excluded;
   if (now <= issued) return outcome;
   // The view matched more when the action ran than when it was made: those contacts existed all
-  // along and someone tagged, subscribed or renamed them into it in between. `bulk/delete`
-  // refuses outright (409), so only the reversible kinds reach this.
+  // along and someone tagged, subscribed or renamed them into it in between. `bulk/delete` and
+  // `bulk/subscribe` refuse outright (409, shown as the failure), so only tag, untag and
+  // unsubscribe reach this.
   const extra = now - issued;
   return {
     tone: "warn",

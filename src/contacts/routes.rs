@@ -570,8 +570,9 @@ pub struct BulkResult {
     pub selected: u64,
     /// How many the selection stood for when it was made. `selected` above it means the filter
     /// matched contacts that did not match when the person looked — they existed then, and were
-    /// tagged, subscribed or renamed into the view afterwards. `bulk/delete` refuses outright in
-    /// that case; the reversible actions proceed and the UI says so.
+    /// tagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`
+    /// refuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`
+    /// proceed and the UI says so.
     pub issued: u64,
     /// Only for `subscribe`: the status the new memberships were written with. `pending` means
     /// the contacts are on a double-opt-in list and not mailable until they confirm, and nothing
@@ -660,6 +661,39 @@ async fn begin_bulk(
         return Err(ApiError::NotFound);
     }
     Ok((tx, selection))
+}
+
+/// Refuses, inside the transaction, when the selection resolved to a wider set than the token was
+/// issued for. The action has already run; returning an error here rolls it back.
+///
+/// Applied to `bulk/delete` and `bulk/subscribe`, and the axis is **not** reversible versus
+/// irreversible. It is whether the action manufactures consent that cannot be obtained
+/// retroactively. A delete cannot be undone at all. A subscribe puts people on a list, and being
+/// on a list is what makes someone mailable — unsubscribing removes the row, it does not un-send,
+/// and the send is the thing the person did not consent to. `tag`, `untag` and `unsubscribe`
+/// report the widening instead: none of them lets anyone be mailed who could not be mailed
+/// before.
+fn refuse_if_widened(
+    sel: &Selection,
+    counts: Counts,
+    excluded: usize,
+    (nothing, doing): (&str, &str),
+) -> ApiResult<()> {
+    if !sel.widened(counts.selected, excluded) {
+        return Ok(());
+    }
+    // `selected` counts the match less the exclusions, so the match itself is at most
+    // `selected + excluded`; naming it as an upper bound is what makes it honest.
+    let now = counts.selected.saturating_add(excluded as u64);
+    Err(ApiError::ConflictDetail {
+        code: "selection-widened",
+        detail: format!(
+            "This view matched {} contacts when you selected it and matches up to {} now, so \
+             {nothing}. Contacts that already existed were changed to match it in between. Select \
+             again to see what you would be {doing}.",
+            sel.issued, now,
+        ),
+    })
 }
 
 /// The one audit row for a bulk action: what was asked (the filter and its time bound) and what
@@ -808,6 +842,10 @@ pub async fn bulk_untag_contacts(
 /// back in. One admin re-adding one named person is a considered act they answer for; a bulk
 /// action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
 /// gets a sender blocklisted. Do not "fix" the asymmetry.
+///
+/// For the same reason this refuses a selection whose filter widened after it was made, as
+/// `bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe
+/// afterwards does not un-send. See `refuse_if_widened`.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe",
@@ -818,6 +856,7 @@ pub async fn bulk_untag_contacts(
         (status = 200, description = "How many memberships were added; contacts already on the list, whatever their status, are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
+        (status = 409, description = "selection-widened: the filter now matches more contacts than the selection was made for; nobody was added"),
         (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
@@ -838,6 +877,12 @@ pub async fn bulk_subscribe_contacts(
     };
     let excluded = &target.excluded_ids;
     let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status).await?;
+    refuse_if_widened(
+        &sel,
+        n,
+        excluded.len(),
+        ("nobody was added to the list", "adding"),
+    )?;
     let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_SUBSCRIBED;
     finish_bulk(
@@ -920,21 +965,12 @@ pub async fn bulk_delete_contacts(
     // Inside the transaction and after the statement, so the number compared is the one the
     // delete itself resolved rather than a second count that could disagree with it. Returning
     // here drops `tx` and the delete rolls back.
-    if sel.widened(n.selected, input.excluded_ids.len()) {
-        // `selected` counts the match less the exclusions, so the match itself is at most
-        // `selected + excluded`; that is the number worth naming, and naming it as an upper
-        // bound is what makes it honest.
-        let now = n.selected.saturating_add(input.excluded_ids.len() as u64);
-        return Err(ApiError::ConflictDetail {
-            code: "selection-widened",
-            detail: format!(
-                "This view matched {} contacts when you selected it and matches up to {} now, so \
-                 nothing was deleted. Contacts that already existed were changed to match it in \
-                 between. Select again to see what you would be deleting.",
-                sel.issued, now,
-            ),
-        });
-    }
+    refuse_if_widened(
+        &sel,
+        n,
+        input.excluded_ids.len(),
+        ("nothing was deleted", "deleting"),
+    )?;
     let action = actions::CONTACTS_BULK_DELETED;
     finish_bulk(
         tx,

@@ -28,8 +28,9 @@ use crate::{
 ///
 /// `v2` because `Selection` gained a required `issued`, and a `v1` token has none. Bumping the
 /// label refuses every outstanding token as `selection-invalid` — the path the UI already handles
-/// by asking the user to select again — rather than letting an uncounted token through the one
-/// check that stops `bulk/delete` widening. At most one hour of tokens can be outstanding.
+/// by asking the user to select again — rather than letting an uncounted token through the checks
+/// that stop a widened `bulk/delete` or `bulk/subscribe`. At most one hour of tokens can be
+/// outstanding.
 const SELECTION_DOMAIN: &str = "nm:selection:v2";
 
 /// A token older than this is refused. An hour is long enough to read a confirmation dialog and
@@ -131,7 +132,8 @@ impl Selection {
     /// excluded id was **never** in the match — an id that was in the match and has since left
     /// is counted on both sides and cancels out. The UI only ever excludes rows drawn from the
     /// matching view, so it cannot be refused falsely; an API client passing arbitrary ids can
-    /// be, and over-refusing is the safe direction on the one action that cannot be undone.
+    /// be, and over-refusing is the safe direction on the two actions that refuse — a delete
+    /// that cannot be undone, and a subscribe that makes people mailable.
     ///
     /// What it still does not catch is a same-count swap: one contact leaving the match while
     /// another joins leaves `|M1|` unchanged and this returns false. The number that can be

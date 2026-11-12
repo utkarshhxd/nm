@@ -495,6 +495,10 @@ export interface paths {
          *     back in. One admin re-adding one named person is a considered act they answer for; a bulk
          *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
          *     gets a sender blocklisted. Do not "fix" the asymmetry.
+         *
+         *     For the same reason this refuses a selection whose filter widened after it was made, as
+         *     `bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe
+         *     afterwards does not un-send. See `refuse_if_widened`.
          */
         post: operations["bulk_subscribe_contacts"];
         delete?: never;
@@ -1016,8 +1020,9 @@ export interface components {
              * Format: int64
              * @description How many the selection stood for when it was made. `selected` above it means the filter
              *     matched contacts that did not match when the person looked — they existed then, and were
-             *     tagged, subscribed or renamed into the view afterwards. `bulk/delete` refuses outright in
-             *     that case; the reversible actions proceed and the UI says so.
+             *     tagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`
+             *     refuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`
+             *     proceed and the UI says so.
              */
             issued: number;
             /** Format: int64 */
@@ -3267,6 +3272,13 @@ export interface operations {
             };
             /** @description not a member, no such list, or a token for another workspace */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-widened: the filter now matches more contacts than the selection was made for; nobody was added */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

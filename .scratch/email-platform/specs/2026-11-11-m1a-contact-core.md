@@ -404,10 +404,13 @@ So selection is a predicate with a timestamp, not a set:
 The `as_of` bound freezes **creation time only**. The filter itself is re-run against current
 state, so a contact that existed at `as_of` and did not match then does match now if someone has
 since tagged it, subscribed it or renamed it into the search. `issued` is what catches that:
-`bulk/delete` refuses with `409 selection-widened` when the match has grown, inside the
-transaction, so nothing is deleted. The reversible endpoints do not refuse; they return `issued`
-beside `selected` and the UI reports that the view grew. The comparison adds `excluded_ids.len()`
-back to `selected`, because `issued` was counted without exclusions and `selected` with them.
+`bulk/delete` and `bulk/subscribe` refuse with `409 selection-widened` when the match has grown,
+inside the transaction, so nothing is written. They are the two that manufacture consent nobody
+can obtain retroactively — a delete cannot be undone, and being on a list is what makes someone
+mailable, which an unsubscribe afterwards does not un-send. `tag`, `untag` and `unsubscribe` do
+not refuse; they return `issued` beside `selected` and the UI reports that the view grew. The
+comparison adds `excluded_ids.len()` back to `selected`, because `issued` was counted without
+exclusions and `selected` with them.
 
 This bounds how many contacts an action reaches, never which ones: an equal number leaving and
 joining the match is invisible to a count. See

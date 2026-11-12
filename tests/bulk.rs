@@ -1117,3 +1117,33 @@ async fn excluding_an_id_outside_the_match_is_refused_conservatively(pool: PgPoo
     r.assert_status(StatusCode::CONFLICT);
     assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
 }
+
+/// A subscribe is reversible and still refuses, because the axis is not reversibility: putting
+/// someone on a list is what makes them mailable, and unsubscribing afterwards does not un-send.
+#[sqlx::test]
+async fn a_widened_subscribe_is_refused_and_adds_nobody(pool: PgPool) {
+    let (ws, app, _churn, _ids, token) = widened(&pool, "acme").await;
+    let news = list(&app, ws, "News", false).await;
+
+    let body = json!({"selection_token": token, "list_id": news});
+    let r = bulk(&app, ws, "subscribe", body).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:selection-widened");
+    // The refusal names what did not happen, not what did.
+    let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("nobody was added"), "{detail}");
+    // No membership, and no audit row claiming one: the refusal rolls back both, so the log
+    // cannot say a subscribe happened that did not.
+    assert_eq!(
+        count(&pool, "select count(*) from list_memberships").await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "select count(*) from audit_log where action = 'contacts.bulk_subscribed'"
+        )
+        .await,
+        0
+    );
+}
