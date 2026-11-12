@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "@tanstack/react-router";
-import type { ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import { type ReactNode, useState } from "react";
 
-import { api } from "../api/client";
+import { api, problemText } from "../api/client";
 import type { components } from "../api/schema";
 import { Badge } from "../components/badge";
+import { Button } from "../components/button";
+import { ConfirmDialog } from "../components/confirm-dialog";
+import { ContactForm } from "../components/contact-form";
+import { Dialog } from "../components/dialog";
 import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
 import { MembershipBadge } from "../components/membership-badge";
+import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
-import { Alert } from "../lib/ui";
+import { type Role, atLeast } from "../lib/roles";
+import { Alert, ConfirmButton } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
 type Contact = components["schemas"]["Contact"];
 type Definition = components["schemas"]["Definition"];
 type Reason = components["schemas"]["Reason"];
+
+const KNOWN = {
+  "insufficient-role": "Your role cannot change contacts. It takes editor or above.",
+};
 
 const REASON: Record<Reason, string> = {
   unsubscribed_all: "Unsubscribed from everything",
@@ -37,10 +47,25 @@ export default function ContactDetail() {
   const { contactId } = useParams({ from: "/w/$slug/contacts/$contactId" });
   // The layout renders no `Outlet` until the workspace resolves, so this is only a type guard.
   if (!workspace) return null;
-  return <Detail ws={workspace.id} slug={workspace.slug} contactId={contactId} />;
+  return (
+    <Detail ws={workspace.id} slug={workspace.slug} contactId={contactId} role={workspace.role} />
+  );
 }
 
-function Detail({ ws, slug, contactId }: { ws: string; slug: string; contactId: string }) {
+function Detail({
+  ws,
+  slug,
+  contactId,
+  role,
+}: {
+  ws: string;
+  slug: string;
+  contactId: string;
+  role: Role;
+}) {
+  const canEdit = atLeast(role, "editor");
+  // Erasure is admin-only on the server, and a control a viewer or editor cannot use is not shown.
+  const canErase = atLeast(role, "admin");
   // Each section has its own query, so a slow or failed one never blanks the others.
   const contact = useQuery({
     queryKey: ["contact", ws, contactId],
@@ -77,13 +102,152 @@ function Detail({ ws, slug, contactId }: { ws: string; slug: string; contactId: 
       ) : (
         <>
           <Identity contact={contact.data} />
+          {canEdit ? (
+            <Actions ws={ws} slug={slug} contact={contact.data} canErase={canErase} />
+          ) : null}
           <MailingStatus ws={ws} contactId={contactId} />
-          <Lists ws={ws} slug={slug} contactId={contactId} />
-          <Tags ws={ws} contactId={contactId} />
+          <Lists ws={ws} slug={slug} contactId={contactId} canEdit={canEdit} />
+          <Tags ws={ws} contactId={contactId} canEdit={canEdit} />
           <CustomFields ws={ws} contact={contact.data} />
         </>
       )}
     </section>
+  );
+}
+
+/**
+ * Edit, delete and erase. Delete and erase are not two words for one thing: delete removes the
+ * contact and leaves the address usable, erase destroys it and blocks the address for ever. Each
+ * dialog says which one it is, because the two are one click apart.
+ */
+function Actions({
+  ws,
+  slug,
+  contact,
+  canErase,
+}: {
+  ws: string;
+  slug: string;
+  contact: Contact;
+  canErase: boolean;
+}) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [erasing, setErasing] = useState(false);
+
+  const gone = async () => {
+    // The grid, and for an erasure the suppression list and every "can this be mailed" answer.
+    await Promise.all(
+      ["contacts", "suppressions", "contact-eligibility", "mailable-count"].map((k) =>
+        qc.invalidateQueries({ queryKey: [k] }),
+      ),
+    );
+    await navigate({ to: "/w/$slug/contacts", params: { slug }, search: {} });
+  };
+
+  const remove = useMutation({
+    mutationFn: async () => {
+      const { response, error } = await api.DELETE(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}",
+        { params: { path: { workspace_id: ws, id: contact.id } } },
+      );
+      if (!response.ok) throw new Error(problemText(error, KNOWN, "The contact could not be deleted."));
+    },
+    onSuccess: gone,
+  });
+
+  const erase = useMutation({
+    mutationFn: async () => {
+      const { response, error } = await api.POST(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase",
+        { params: { path: { workspace_id: ws, id: contact.id } } },
+      );
+      if (!response.ok) throw new Error(problemText(error, KNOWN, "The contact could not be erased."));
+    },
+    onSuccess: gone,
+  });
+
+  const address = <strong className="wrap-anywhere">{contact.email}</strong>;
+
+  return (
+    <div className="mt-4 flex flex-wrap gap-2">
+      <Button onClick={() => setEditing(true)}>Edit contact</Button>
+      <Button variant="danger-ghost" onClick={() => setDeleting(true)}>
+        Delete contact
+      </Button>
+      {canErase ? (
+        <Button variant="danger-ghost" onClick={() => setErasing(true)}>
+          Erase contact
+        </Button>
+      ) : null}
+
+      <Dialog open={editing} onClose={() => setEditing(false)} title="Edit contact">
+        <ContactForm
+          ws={ws}
+          existing={contact}
+          onCancel={() => setEditing(false)}
+          onDone={async () => {
+            setEditing(false);
+            await Promise.all([
+              qc.invalidateQueries({ queryKey: ["contact", ws, contact.id] }),
+              qc.invalidateQueries({ queryKey: ["contacts", ws] }),
+            ]);
+          }}
+        />
+      </Dialog>
+
+      <ConfirmDialog
+        open={deleting}
+        onClose={() => {
+          setDeleting(false);
+          remove.reset();
+        }}
+        title="Delete this contact"
+        confirmLabel="Delete contact"
+        busy={remove.isPending}
+        error={remove.error?.message}
+        onConfirm={() => remove.mutate()}
+      >
+        <p>{address} is deleted, with its list memberships and its tags.</p>
+        <p>
+          The address is <strong>not suppressed</strong>: it can be added again, by hand or by the
+          next import, and nothing here stops this workspace mailing it in future.
+        </p>
+        <p>
+          This cannot be undone. To honour an erasure request, an admin uses Erase contact
+          instead, which also blocks the address for good.
+        </p>
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={erasing}
+        onClose={() => {
+          setErasing(false);
+          erase.reset();
+        }}
+        title="Erase this contact"
+        confirmLabel="Erase contact permanently"
+        busy={erase.isPending}
+        error={erase.error?.message}
+        onConfirm={() => erase.mutate()}
+      >
+        <p>
+          This is an erasure on request (GDPR). {address}, its list memberships and its tags are
+          destroyed.
+        </p>
+        <p>
+          The address is then <strong>permanently blocked</strong>: it can never be mailed, added
+          or imported into this workspace again, and no one can unblock it — no route lifts an
+          erasure, for any role.
+        </p>
+        <p>
+          This cannot be undone. If you only want this contact gone, use Delete contact: it blocks
+          nothing and the address stays usable.
+        </p>
+      </ConfirmDialog>
+    </div>
   );
 }
 
@@ -171,7 +335,18 @@ function MailingStatus({ ws, contactId }: { ws: string; contactId: string }) {
   );
 }
 
-function Lists({ ws, slug, contactId }: { ws: string; slug: string; contactId: string }) {
+function Lists({
+  ws,
+  slug,
+  contactId,
+  canEdit,
+}: {
+  ws: string;
+  slug: string;
+  contactId: string;
+  canEdit: boolean;
+}) {
+  const qc = useQueryClient();
   const lists = useQuery({
     queryKey: ["contact-lists", ws, contactId],
     queryFn: async () => {
@@ -185,58 +360,166 @@ function Lists({ ws, slug, contactId }: { ws: string; slug: string; contactId: s
     },
     retry: false,
   });
+
+  // Every list in the workspace, for the picker. Only an editor sees one, so only they fetch it.
+  const all = useQuery({
+    queryKey: ["lists", ws],
+    enabled: canEdit,
+    queryFn: async () => {
+      const { data } = await api.GET("/api/v1/workspaces/{workspace_id}/lists", {
+        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+      });
+      return data?.data ?? [];
+    },
+  });
+  /** A membership change moves a list's mailable count, which is counted live elsewhere. */
+  const refresh = async () => {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["contact-lists", ws, contactId] }),
+      qc.invalidateQueries({ queryKey: ["mailable-count"] }),
+      qc.invalidateQueries({ queryKey: ["list-members"] }),
+    ]);
+  };
+
+  const [picked, setPicked] = useState("");
+  const add = useMutation({
+    mutationFn: async (listId: string) => {
+      const { data, error } = await api.POST(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists",
+        {
+          params: { path: { workspace_id: ws, id: contactId } },
+          body: { list_id: listId },
+        },
+      );
+      if (!data) throw new Error(problemText(error, KNOWN, "The contact could not be added to that list."));
+    },
+    onSuccess: async () => {
+      setPicked("");
+      await refresh();
+    },
+  });
+  const unsubscribe = useMutation({
+    mutationFn: async (listId: string) => {
+      const { response, error } = await api.DELETE(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}",
+        { params: { path: { workspace_id: ws, id: contactId, list_id: listId } } },
+      );
+      if (!response.ok) throw new Error(problemText(error, KNOWN, "The contact could not be unsubscribed."));
+    },
+    onSuccess: refresh,
+  });
+
+  // A list the contact is already pending or subscribed on is not offered: adding again does
+  // nothing. An unsubscribed one is, because adding it subscribes them again.
+  const joinable = (all.data ?? []).filter(
+    (l) => !lists.data?.some((m) => m.list_id === l.id && m.status !== "unsubscribed"),
+  );
+
   return (
     <Panel id="lists" title="Lists">
       {lists.isPending ? (
         <Skeleton label="Loading lists" />
       ) : lists.isError ? (
         <Alert>{lists.error.message}</Alert>
-      ) : lists.data.length === 0 ? (
-        <p className="text-fg-muted">Not on any list.</p>
       ) : (
         <>
-          <TableScroller label="Memberships table"><table className="w-full">
-            <thead>
-              <tr className="border-b border-border">
-                <th scope="col" className="py-2 pe-3 text-start font-medium">
-                  List
-                </th>
-                <th scope="col" className="py-2 pe-3 text-start font-medium">
-                  Status
-                </th>
-                <th scope="col" className="py-2 text-start font-medium">
-                  Since
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {lists.data.map((l) => {
-                const since = l.status === "unsubscribed" ? l.unsubscribed_at : l.subscribed_at;
-                return (
-                  <tr key={l.list_id} className="border-b border-border">
-                    <td className="py-2 pe-3 wrap-anywhere">
-                      <Link
-                        to="/w/$slug/lists/$listId"
-                        params={{ slug, listId: l.list_id }}
-                        className="text-accent-text underline"
-                      >
-                        {l.name}
-                      </Link>
-                    </td>
-                    <td className="py-2 pe-3">
-                      <MembershipBadge status={l.status} />
-                      {l.status === "pending" ? (
-                        <span className="ms-2 text-fg-muted">not confirmed, not mailable</span>
+          {lists.data.length === 0 ? (
+            <p className="text-fg-muted">Not on any list.</p>
+          ) : (
+            <TableScroller label="Memberships table"><table className="w-full">
+              <thead>
+                <tr className="border-b border-border">
+                  <th scope="col" className="py-2 pe-3 text-start font-medium">
+                    List
+                  </th>
+                  <th scope="col" className="py-2 pe-3 text-start font-medium">
+                    Status
+                  </th>
+                  <th scope="col" className="py-2 text-start font-medium">
+                    Since
+                  </th>
+                  {canEdit ? (
+                    <th scope="col" className="py-2 text-start font-medium">
+                      <span className="sr-only">Actions</span>
+                    </th>
+                  ) : null}
+                </tr>
+              </thead>
+              <tbody>
+                {lists.data.map((l) => {
+                  const since = l.status === "unsubscribed" ? l.unsubscribed_at : l.subscribed_at;
+                  return (
+                    <tr key={l.list_id} className="border-b border-border">
+                      <td className="py-2 pe-3 wrap-anywhere">
+                        <Link
+                          to="/w/$slug/lists/$listId"
+                          params={{ slug, listId: l.list_id }}
+                          className="text-accent-text underline"
+                        >
+                          {l.name}
+                        </Link>
+                      </td>
+                      <td className="py-2 pe-3">
+                        <MembershipBadge status={l.status} />
+                        {l.status === "pending" ? (
+                          <span className="ms-2 text-fg-muted">not confirmed, not mailable</span>
+                        ) : null}
+                      </td>
+                      <td className="py-2 pe-3 tabular-nums text-fg-muted">
+                        {since ? day.format(new Date(since)) : "—"}
+                      </td>
+                      {canEdit ? (
+                        <td className="py-2">
+                          {l.status === "unsubscribed" ? null : (
+                            <ConfirmButton
+                              action="Unsubscribe"
+                              subject={l.name}
+                              disabled={unsubscribe.isPending}
+                              onConfirm={() => unsubscribe.mutate(l.list_id)}
+                            />
+                          )}
+                        </td>
                       ) : null}
-                    </td>
-                    <td className="py-2 tabular-nums text-fg-muted">
-                      {since ? day.format(new Date(since)) : "—"}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table></TableScroller>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table></TableScroller>
+          )}
+          {canEdit ? (
+            <form
+              className="mt-3 flex flex-wrap items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (picked) add.mutate(picked);
+              }}
+            >
+              <Select
+                aria-label="List to add"
+                value={picked}
+                onChange={(e) => setPicked(e.target.value)}
+              >
+                <option value="">Choose a list…</option>
+                {joinable.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.name}
+                  </option>
+                ))}
+              </Select>
+              <Button type="submit" disabled={!picked} busy={add.isPending}>
+                Add to list
+              </Button>
+            </form>
+          ) : null}
+          {add.error ? <Alert>{add.error.message}</Alert> : null}
+          {unsubscribe.error ? <Alert>{unsubscribe.error.message}</Alert> : null}
+          {canEdit ? (
+            <p className="mt-3 text-fg-muted">
+              Unsubscribing sets the membership to unsubscribed and keeps it: the row stays here
+              and is not deleted, so the opt-out is not lost the next time this contact is
+              imported. Adding the list again subscribes them again.
+            </p>
+          ) : null}
           {lists.data.some((l) => l.status === "pending") ? (
             <p className="mt-3 text-fg-muted">
               Pending means the contact has not confirmed. A pending contact cannot be mailed, and
@@ -249,7 +532,8 @@ function Lists({ ws, slug, contactId }: { ws: string; slug: string; contactId: s
   );
 }
 
-function Tags({ ws, contactId }: { ws: string; contactId: string }) {
+function Tags({ ws, contactId, canEdit }: { ws: string; contactId: string; canEdit: boolean }) {
+  const qc = useQueryClient();
   const tags = useQuery({
     queryKey: ["contact-tags", ws, contactId],
     queryFn: async () => {
@@ -263,24 +547,106 @@ function Tags({ ws, contactId }: { ws: string; contactId: string }) {
     },
     retry: false,
   });
+
+  // Every tag in the workspace, for the picker; only an editor sees one, so only they fetch it.
+  const all = useQuery({
+    queryKey: ["tags", ws],
+    enabled: canEdit,
+    queryFn: async () => {
+      const { data } = await api.GET("/api/v1/workspaces/{workspace_id}/tags", {
+        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+      });
+      return data?.data ?? [];
+    },
+  });
+  const refresh = () => qc.invalidateQueries({ queryKey: ["contact-tags", ws, contactId] });
+
+  const [picked, setPicked] = useState("");
+  const apply = useMutation({
+    mutationFn: async (tagId: string) => {
+      const { response, error } = await api.PUT(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}",
+        { params: { path: { workspace_id: ws, id: contactId, tag_id: tagId } } },
+      );
+      if (!response.ok) throw new Error(problemText(error, KNOWN, "The tag could not be applied."));
+    },
+    onSuccess: async () => {
+      setPicked("");
+      await refresh();
+    },
+  });
+  const remove = useMutation({
+    mutationFn: async (tagId: string) => {
+      const { response, error } = await api.DELETE(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}",
+        { params: { path: { workspace_id: ws, id: contactId, tag_id: tagId } } },
+      );
+      if (!response.ok) throw new Error(problemText(error, KNOWN, "The tag could not be removed."));
+    },
+    onSuccess: refresh,
+  });
+
+  const untaken = (all.data ?? []).filter((t) => !tags.data?.some((had) => had.id === t.id));
+
   return (
     <Panel id="tags" title="Tags">
       {tags.isPending ? (
         <Skeleton label="Loading tags" />
       ) : tags.isError ? (
         <Alert>{tags.error.message}</Alert>
-      ) : tags.data.length === 0 ? (
-        <p className="text-fg-muted">No tags.</p>
       ) : (
-        <ul className="flex flex-wrap gap-2">
-          {tags.data.map((t) => (
-            <li key={t.id}>
-              <Badge variant="accent" wrap>
-                {t.name}
-              </Badge>
-            </li>
-          ))}
-        </ul>
+        <>
+          {tags.data.length === 0 ? (
+            <p className="text-fg-muted">No tags.</p>
+          ) : (
+            <ul className="flex flex-wrap items-center gap-2">
+              {tags.data.map((t) => (
+                <li key={t.id} className="flex max-w-full items-center gap-1">
+                  <Badge variant="accent" wrap>
+                    {t.name}
+                  </Badge>
+                  {canEdit ? (
+                    <Button
+                      variant="ghost"
+                      aria-label={`Remove ${t.name}`}
+                      disabled={remove.isPending}
+                      onClick={() => remove.mutate(t.id)}
+                    >
+                      Remove
+                    </Button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+          {canEdit ? (
+            <form
+              className="mt-3 flex flex-wrap items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (picked) apply.mutate(picked);
+              }}
+            >
+              <Select
+                aria-label="Tag to apply"
+                value={picked}
+                onChange={(e) => setPicked(e.target.value)}
+              >
+                <option value="">Choose a tag…</option>
+                {untaken.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </Select>
+              <Button type="submit" disabled={!picked} busy={apply.isPending}>
+                Apply tag
+              </Button>
+            </form>
+          ) : null}
+          {apply.error ? <Alert>{apply.error.message}</Alert> : null}
+          {remove.error ? <Alert>{remove.error.message}</Alert> : null}
+        </>
       )}
     </Panel>
   );

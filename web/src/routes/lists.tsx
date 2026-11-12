@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
+import { type FormEvent, useState } from "react";
 
-import { api, problemMessage } from "../api/client";
+import { api, problemMessage, problemText } from "../api/client";
 import type { components } from "../api/schema";
 import { Button } from "../components/button";
+import { Checkbox } from "../components/checkbox";
+import { Dialog } from "../components/dialog";
 import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
+import { Alert, Field } from "../components/field";
+import { CONTROL } from "../components/input";
 import { MembershipBadge } from "../components/membership-badge";
 import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
+import { atLeast } from "../lib/roles";
 import { useWorkspace } from "./workspace-layout";
 
 type List = components["schemas"]["List"];
@@ -18,6 +24,10 @@ type List = components["schemas"]["List"];
 const day = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 const link = "text-accent-text underline";
 const th = "py-2 pe-3 text-start font-medium";
+const KNOWN = {
+  "list-name-taken": "A list with that name already exists in this workspace.",
+  "insufficient-role": "Your role cannot create lists. It takes editor or above.",
+};
 
 const optIn = (l: List) => (l.double_optin ? "Double opt-in" : "Single opt-in");
 
@@ -25,10 +35,18 @@ export default function Lists() {
   const { workspace } = useWorkspace();
   // The layout renders no `Outlet` until the workspace resolves, so this is only a type guard.
   if (!workspace) return null;
-  return <AllLists ws={workspace.id} slug={workspace.slug} />;
+  return (
+    <AllLists
+      ws={workspace.id}
+      slug={workspace.slug}
+      canEdit={atLeast(workspace.role, "editor")}
+    />
+  );
 }
 
-function AllLists({ ws, slug }: { ws: string; slug: string }) {
+function AllLists({ ws, slug, canEdit }: { ws: string; slug: string; canEdit: boolean }) {
+  const qc = useQueryClient();
+  const [creating, setCreating] = useState(false);
   const lists = useQuery({
     queryKey: ["lists", ws],
     queryFn: async () => {
@@ -43,7 +61,14 @@ function AllLists({ ws, slug }: { ws: string; slug: string }) {
   });
   return (
     <section className="mt-8">
-      <h2 className="text-xl font-semibold">Lists</h2>
+      <div className="flex flex-wrap items-baseline justify-between gap-3">
+        <h2 className="text-xl font-semibold">Lists</h2>
+        {canEdit ? (
+          <Button variant="solid" onClick={() => setCreating(true)}>
+            New list
+          </Button>
+        ) : null}
+      </div>
       <div className="mt-4">
         {lists.isPending ? (
           <Skeleton label="Loading lists" rows={5} />
@@ -91,7 +116,107 @@ function AllLists({ ws, slug }: { ws: string; slug: string }) {
           </table></TableScroller>
         )}
       </div>
+
+      <Dialog open={creating} onClose={() => setCreating(false)} title="New list">
+        <NewList
+          ws={ws}
+          onCancel={() => setCreating(false)}
+          onDone={async () => {
+            setCreating(false);
+            await qc.invalidateQueries({ queryKey: ["lists", ws] });
+          }}
+        />
+      </Dialog>
     </section>
+  );
+}
+
+/**
+ * Create a list. Double opt-in is on by default, as it is on the server: a new member is then
+ * `pending` and not mailable until they confirm, and nothing in this milestone sends the
+ * confirmation — so the checkbox says it rather than leaving someone to find out.
+ *
+ * Visibility is not offered: it does nothing until the preference center exists.
+ */
+function NewList({
+  ws,
+  onCancel,
+  onDone,
+}: {
+  ws: string;
+  onCancel: () => void;
+  onDone: () => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [doubleOptin, setDoubleOptin] = useState(true);
+
+  const create = useMutation({
+    mutationFn: async () => {
+      const { data, error } = await api.POST("/api/v1/workspaces/{workspace_id}/lists", {
+        params: { path: { workspace_id: ws } },
+        body: {
+          name: name.trim(),
+          description: description.trim(),
+          double_optin: doubleOptin,
+        },
+      });
+      if (!data) throw new Error(problemText(error, KNOWN, "The list could not be created."));
+    },
+    onSuccess: onDone,
+  });
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    create.mutate();
+  }
+
+  return (
+    <form onSubmit={submit} noValidate>
+      <Field
+        id="list-name"
+        label="Name"
+        autoComplete="off"
+        required
+        maxLength={100}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+      />
+      <div className="mt-4">
+        <label className="block font-medium" htmlFor="list-description">
+          Description
+        </label>
+        <textarea
+          id="list-description"
+          rows={2}
+          maxLength={1000}
+          className={`${CONTROL} mt-1 w-full py-2`}
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+        />
+      </div>
+      <div className="mt-4">
+        <label className="flex w-fit items-center gap-2 font-medium">
+          <Checkbox
+            checked={doubleOptin}
+            aria-describedby="list-optin-hint"
+            onChange={(e) => setDoubleOptin(e.target.checked)}
+          />
+          Double opt-in
+        </label>
+        <span id="list-optin-hint" className="mt-1 block text-sm text-fg-muted">
+          A new member stays pending, and cannot be mailed, until they confirm. Nothing sends that
+          confirmation yet, so they stay pending. Turn it off and a new member is subscribed at
+          once.
+        </span>
+      </div>
+      {create.error ? <Alert>{create.error.message}</Alert> : null}
+      <div className="mt-6 flex flex-wrap justify-end gap-3">
+        <Button onClick={onCancel}>Cancel</Button>
+        <Button type="submit" variant="solid" busy={create.isPending}>
+          Create list
+        </Button>
+      </div>
+    </form>
   );
 }
 

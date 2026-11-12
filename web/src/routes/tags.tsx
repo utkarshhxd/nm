@@ -36,7 +36,10 @@ export default function Tags() {
 function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
   const qc = useQueryClient();
   const tags = useInfiniteQuery({
-    queryKey: ["tags", ws],
+    // Under the pickers' key as a prefix, so one invalidation of ["tags", ws] reaches them all.
+    // It cannot BE that key: a cache entry holding this query's pages would be handed to a
+    // picker's `useQuery` as its data, and a page object is not the array a picker maps over.
+    queryKey: ["tags", ws, "all"],
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam }) => {
       const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/tags", {

@@ -12,7 +12,9 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "reac
 import { api, problemMessage } from "../api/client";
 import type { components } from "../api/schema";
 import { Button } from "../components/button";
+import { ContactForm } from "../components/contact-form";
 import { type Column, DataGrid, type Sort } from "../components/data-grid";
+import { Dialog } from "../components/dialog";
 import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
 import { Input } from "../components/input";
@@ -196,6 +198,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   const selection = useSyncExternalStore(store.subscribe, store.get);
   const [result, setResult] = useState<Result | null>(null);
   const [failure, setFailure] = useState("");
+  const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [counting, setCounting] = useState(false);
   const live = useRef(filterKey);
@@ -332,7 +335,14 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
 
   return (
     <section className="mt-8">
-      <h2 className="text-xl font-semibold">Contacts</h2>
+      <div className="flex flex-wrap items-baseline justify-between gap-3">
+        <h2 className="text-xl font-semibold">Contacts</h2>
+        {canEdit ? (
+          <Button variant="solid" onClick={() => setCreating(true)}>
+            New contact
+          </Button>
+        ) : null}
+      </div>
 
       <div className="mt-4">
         <div hidden={selection.mode !== "none"} className="flex flex-wrap items-start gap-3">
@@ -512,6 +522,18 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       <div role="status" aria-live="polite" className="sr-only">
         {announcement}
       </div>
+
+      <Dialog open={creating} onClose={() => setCreating(false)} title="New contact">
+        <ContactForm
+          ws={id}
+          onCancel={() => setCreating(false)}
+          onDone={async () => {
+            setCreating(false);
+            // The new contact is newest-first in the default view, so the grid must refetch.
+            await queryClient.invalidateQueries({ queryKey: ["contacts", id] });
+          }}
+        />
+      </Dialog>
     </section>
   );
 }
