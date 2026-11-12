@@ -3721,23 +3721,44 @@
         ]
       },
       "BulkList": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/BulkTarget"
+        "type": "object",
+        "description": "`BulkTarget` and a list.",
+        "required": [
+          "list_id"
+        ],
+        "properties": {
+          "excluded_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
           },
-          {
-            "type": "object",
-            "required": [
-              "list_id"
+          "ids": {
+            "type": [
+              "array",
+              "null"
             ],
-            "properties": {
-              "list_id": {
-                "type": "string",
-                "format": "uuid"
-              }
-            }
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
+          },
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "selection_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See `BulkTarget`."
           }
-        ]
+        },
+        "additionalProperties": false
       },
       "BulkResult": {
         "type": "object",
@@ -3771,27 +3792,48 @@
         }
       },
       "BulkTag": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/BulkTarget"
+        "type": "object",
+        "description": "`BulkTarget` and a tag.",
+        "required": [
+          "tag_id"
+        ],
+        "properties": {
+          "excluded_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
           },
-          {
-            "type": "object",
-            "required": [
-              "tag_id"
+          "ids": {
+            "type": [
+              "array",
+              "null"
             ],
-            "properties": {
-              "tag_id": {
-                "type": "string",
-                "format": "uuid"
-              }
-            }
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
+          },
+          "selection_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See `BulkTarget`."
+          },
+          "tag_id": {
+            "type": "string",
+            "format": "uuid"
           }
-        ]
+        },
+        "additionalProperties": false
       },
       "BulkTarget": {
         "type": "object",
-        "description": "What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.",
+        "description": "What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.\n\nThe three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`\ndefaults to empty, so a misspelt `excluded_id` that was quietly ignored would run the action\non exactly the contacts the user meant to spare. `serde(flatten)` cannot be combined with\n`deny_unknown_fields`, so do not factor these back into one flattened struct, and give any\nnew optional field here a reason to exist.",
         "properties": {
           "excluded_ids": {
             "type": "array",
@@ -3819,7 +3861,8 @@
             ],
             "description": "From `POST /contacts/selection`: every contact its filter matched, as of then, less\n`excluded_ids`. Send this or `ids`, not both and not neither."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ChallengeResponse": {
         "type": "object",

@@ -992,9 +992,16 @@ export interface components {
          * @enum {string}
          */
         BlockLevel: "workspace" | "instance";
-        BulkList: components["schemas"]["BulkTarget"] & {
+        /** @description `BulkTarget` and a list. */
+        BulkList: {
+            /** @description See `BulkTarget`. */
+            excluded_ids?: string[];
+            /** @description See `BulkTarget`. */
+            ids?: string[] | null;
             /** Format: uuid */
             list_id: string;
+            /** @description See `BulkTarget`. */
+            selection_token?: string | null;
         };
         /**
          * @description What a bulk action did, as two numbers taken from the same statement. `affected` is how many
@@ -1009,11 +1016,26 @@ export interface components {
             selected: number;
             status?: components["schemas"]["MembershipStatus"] | null;
         };
-        BulkTag: components["schemas"]["BulkTarget"] & {
+        /** @description `BulkTarget` and a tag. */
+        BulkTag: {
+            /** @description See `BulkTarget`. */
+            excluded_ids?: string[];
+            /** @description See `BulkTarget`. */
+            ids?: string[] | null;
+            /** @description See `BulkTarget`. */
+            selection_token?: string | null;
             /** Format: uuid */
             tag_id: string;
         };
-        /** @description What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts. */
+        /**
+         * @description What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.
+         *
+         *     The three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`
+         *     defaults to empty, so a misspelt `excluded_id` that was quietly ignored would run the action
+         *     on exactly the contacts the user meant to spare. `serde(flatten)` cannot be combined with
+         *     `deny_unknown_fields`, so do not factor these back into one flattened struct, and give any
+         *     new optional field here a reason to exist.
+         */
         BulkTarget: {
             /** @description Contacts to leave out of a `selection_token`. At most 10 000. */
             excluded_ids?: string[];

@@ -866,3 +866,84 @@ async fn a_selection_filter_with_an_unknown_field_is_422_not_everything(pool: Pg
     }
     assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
 }
+
+/// The typo that would have run the action on exactly the people the user spared: with
+/// `excluded_ids` defaulting to empty, an ignored `excluded_id` deletes the excluded contact.
+#[sqlx::test]
+async fn a_misspelt_excluded_ids_is_422_and_the_spared_contact_survives(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    let token = select(&app, ws, json!({})).await;
+
+    let r = bulk(
+        &app,
+        ws,
+        "delete",
+        json!({"selection_token": token, "excluded_id": [ids[0]]}),
+    )
+    .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
+    let spared: i64 = sqlx::query_scalar("select count(*) from contacts where id = $1")
+        .bind(ids[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(spared, 1, "the contact the user excluded must still exist");
+    assert_eq!(
+        count(
+            &pool,
+            "select count(*) from audit_log where action like 'contacts.bulk_%'"
+        )
+        .await,
+        0
+    );
+}
+
+/// Each of the three bulk body shapes refuses an unknown field, on every route that takes it.
+#[sqlx::test]
+async fn every_bulk_body_refuses_an_unknown_field(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    let news = list(&app, ws, "news", false).await;
+    contacts(&app, ws, "c", 2).await;
+    let token = select(&app, ws, json!({})).await;
+    for (action, extra) in [
+        ("delete", json!({})),                     // BulkTarget
+        ("tag", json!({"tag_id": vip})),           // BulkTag
+        ("untag", json!({"tag_id": vip})),         // BulkTag
+        ("subscribe", json!({"list_id": news})),   // BulkList
+        ("unsubscribe", json!({"list_id": news})), // BulkList
+    ] {
+        let mut body = extra;
+        body["selection_token"] = json!(token);
+        body["bogus"] = json!(1);
+        bulk(&app, ws, action, body)
+            .await
+            .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 2);
+    assert_eq!(count(&pool, "select count(*) from contact_tags").await, 0);
+    assert_eq!(
+        count(&pool, "select count(*) from list_memberships").await,
+        0
+    );
+}
+
+/// Spelling the fields out changed nothing for a correct client: `excluded_ids` present, empty or
+/// absent all work, on a flat body as before.
+#[sqlx::test]
+async fn valid_bodies_are_accepted_with_or_without_excluded_ids(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    let token = select(&app, ws, json!({})).await;
+    let with = json!({"selection_token": token, "tag_id": vip, "excluded_ids": [ids[0]]});
+    assert_eq!(affected(bulk(&app, ws, "tag", with).await).await, 2);
+    let empty = json!({"selection_token": token, "tag_id": vip, "excluded_ids": []});
+    assert_eq!(affected(bulk(&app, ws, "tag", empty).await).await, 1);
+    let absent = json!({"selection_token": token, "tag_id": vip});
+    assert_eq!(affected(bulk(&app, ws, "untag", absent).await).await, 3);
+    let absent = json!({"selection_token": token});
+    assert_eq!(affected(bulk(&app, ws, "delete", absent).await).await, 3);
+}

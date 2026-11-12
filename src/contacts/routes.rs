@@ -490,7 +490,14 @@ pub struct SelectionToken {
 }
 
 /// What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.
+///
+/// The three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`
+/// defaults to empty, so a misspelt `excluded_id` that was quietly ignored would run the action
+/// on exactly the contacts the user meant to spare. `serde(flatten)` cannot be combined with
+/// `deny_unknown_fields`, so do not factor these back into one flattened struct, and give any
+/// new optional field here a reason to exist.
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BulkTarget {
     /// From `POST /contacts/selection`: every contact its filter matched, as of then, less
     /// `excluded_ids`. Send this or `ids`, not both and not neither.
@@ -503,18 +510,54 @@ pub struct BulkTarget {
     pub excluded_ids: Vec<Uuid>,
 }
 
+/// `BulkTarget` and a tag.
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BulkTag {
-    #[serde(flatten)]
-    pub target: BulkTarget,
+    /// See `BulkTarget`.
+    pub selection_token: Option<String>,
+    /// See `BulkTarget`.
+    pub ids: Option<Vec<Uuid>>,
+    /// See `BulkTarget`.
+    #[serde(default)]
+    pub excluded_ids: Vec<Uuid>,
     pub tag_id: Uuid,
 }
 
+impl BulkTag {
+    fn split(self) -> (BulkTarget, Uuid) {
+        let target = BulkTarget {
+            selection_token: self.selection_token,
+            ids: self.ids,
+            excluded_ids: self.excluded_ids,
+        };
+        (target, self.tag_id)
+    }
+}
+
+/// `BulkTarget` and a list.
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BulkList {
-    #[serde(flatten)]
-    pub target: BulkTarget,
+    /// See `BulkTarget`.
+    pub selection_token: Option<String>,
+    /// See `BulkTarget`.
+    pub ids: Option<Vec<Uuid>>,
+    /// See `BulkTarget`.
+    #[serde(default)]
+    pub excluded_ids: Vec<Uuid>,
     pub list_id: Uuid,
+}
+
+impl BulkList {
+    fn split(self) -> (BulkTarget, Uuid) {
+        let target = BulkTarget {
+            selection_token: self.selection_token,
+            ids: self.ids,
+            excluded_ids: self.excluded_ids,
+        };
+        (target, self.list_id)
+    }
 }
 
 /// What a bulk action did, as two numbers taken from the same statement. `affected` is how many
@@ -689,18 +732,19 @@ pub async fn bulk_tag_contacts(
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<BulkTag>,
 ) -> ApiResult<Json<BulkResult>> {
-    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
+    let (target, tag_id) = input.split();
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &target).await?;
     // Checked up front: with no contact to insert for, the foreign key would never object.
-    tags::get(&mut tx, workspace_id, input.tag_id).await?;
-    let n = selection::tag(&mut tx, &sel, &input.target.excluded_ids, input.tag_id).await?;
-    let extra = json!({ "tag_id": input.tag_id });
+    tags::get(&mut tx, workspace_id, tag_id).await?;
+    let n = selection::tag(&mut tx, &sel, &target.excluded_ids, tag_id).await?;
+    let extra = json!({ "tag_id": tag_id });
     let action = actions::CONTACTS_BULK_TAGGED;
     finish_bulk(
         tx,
         &meta,
         &principal,
         action,
-        (&sel, &input.target),
+        (&sel, &target),
         extra,
         (n, None),
     )
@@ -728,17 +772,18 @@ pub async fn bulk_untag_contacts(
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<BulkTag>,
 ) -> ApiResult<Json<BulkResult>> {
-    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
-    tags::get(&mut tx, workspace_id, input.tag_id).await?;
-    let n = selection::untag(&mut tx, &sel, &input.target.excluded_ids, input.tag_id).await?;
-    let extra = json!({ "tag_id": input.tag_id });
+    let (target, tag_id) = input.split();
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &target).await?;
+    tags::get(&mut tx, workspace_id, tag_id).await?;
+    let n = selection::untag(&mut tx, &sel, &target.excluded_ids, tag_id).await?;
+    let extra = json!({ "tag_id": tag_id });
     let action = actions::CONTACTS_BULK_UNTAGGED;
     finish_bulk(
         tx,
         &meta,
         &principal,
         action,
-        (&sel, &input.target),
+        (&sel, &target),
         extra,
         (n, None),
     )
@@ -773,23 +818,24 @@ pub async fn bulk_subscribe_contacts(
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<BulkList>,
 ) -> ApiResult<Json<BulkResult>> {
-    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
-    let list = lists::get(&mut tx, workspace_id, input.list_id).await?;
+    let (target, list_id) = input.split();
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &target).await?;
+    let list = lists::get(&mut tx, workspace_id, list_id).await?;
     let status = if list.double_optin {
         MembershipStatus::Pending
     } else {
         MembershipStatus::Subscribed
     };
-    let excluded = &input.target.excluded_ids;
-    let n = selection::subscribe(&mut tx, &sel, excluded, input.list_id, status).await?;
-    let extra = json!({ "list_id": input.list_id });
+    let excluded = &target.excluded_ids;
+    let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status).await?;
+    let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_SUBSCRIBED;
     finish_bulk(
         tx,
         &meta,
         &principal,
         action,
-        (&sel, &input.target),
+        (&sel, &target),
         extra,
         (n, Some(status)),
     )
@@ -817,18 +863,19 @@ pub async fn bulk_unsubscribe_contacts(
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<BulkList>,
 ) -> ApiResult<Json<BulkResult>> {
-    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input.target).await?;
-    lists::get(&mut tx, workspace_id, input.list_id).await?;
-    let excluded = &input.target.excluded_ids;
-    let n = selection::unsubscribe(&mut tx, &sel, excluded, input.list_id).await?;
-    let extra = json!({ "list_id": input.list_id });
+    let (target, list_id) = input.split();
+    let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &target).await?;
+    lists::get(&mut tx, workspace_id, list_id).await?;
+    let excluded = &target.excluded_ids;
+    let n = selection::unsubscribe(&mut tx, &sel, excluded, list_id).await?;
+    let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_UNSUBSCRIBED;
     finish_bulk(
         tx,
         &meta,
         &principal,
         action,
-        (&sel, &input.target),
+        (&sel, &target),
         extra,
         (n, None),
     )
