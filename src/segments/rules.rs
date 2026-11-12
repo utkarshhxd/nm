@@ -245,6 +245,8 @@ pub enum Op {
     NotMemberOf,
     Has,
     NotHas,
+    HasAny,
+    HasNone,
 }
 
 /// What a field's operators and value are typed by (spec 4.3).
@@ -255,8 +257,8 @@ enum Operand {
     Date,
     DateTime,
     Boolean,
-    // Spec 4.3 does not list these two. A select holds one string, so it gets equality; a
-    // multi-select is a JSON array and `->>` would compare its text, so it gets presence only.
+    // A select holds one string, so it gets equality. A multi-select is a JSON array, so `->>`
+    // text comparison is wrong: it gets `has_any` / `has_none` over a list of values instead.
     Select,
     MultiSelect,
     List,
@@ -282,7 +284,7 @@ impl Operand {
             Operand::Date | Operand::DateTime => &[Before, After, On, InLastDays, IsSet, IsNotSet],
             Operand::Boolean => &[IsTrue, IsFalse, IsSet, IsNotSet],
             Operand::Select => &[Eq, Neq, IsSet, IsNotSet],
-            Operand::MultiSelect => &[IsSet, IsNotSet],
+            Operand::MultiSelect => &[HasAny, HasNone, IsSet, IsNotSet],
             Operand::List => &[MemberOf, NotMemberOf],
             Operand::Tag => &[Has, NotHas],
             Operand::Suppressed => &[IsTrue, IsFalse],
@@ -358,8 +360,18 @@ struct RawGroupNode {
 struct RawRule {
     field: String,
     op: String,
+    #[serde(default, deserialize_with = "present")]
     value: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
     status: Option<String>,
+}
+
+/// Keeps an explicit `null` as `Some(null)` instead of folding it into absent, so the checks
+/// below refuse it and a loaded document always re-serialises to what was loaded.
+fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 impl Group {
@@ -474,6 +486,13 @@ fn check_value(op: Op, operand: Operand, value: Option<&Value>) -> Result<(), &'
                 InLastDays => match v.as_u64() {
                     Some(n) if n <= MAX_DAYS => Ok(()),
                     _ => Err("value must be a whole number of days, at most 36500"),
+                },
+                // Empty is refused for the reason an empty rule set is: `has_any: []` is false for
+                // everyone and `has_none: []` is true for everyone.
+                HasAny | HasNone => match v.as_array() {
+                    Some(a) if a.is_empty() => Err("value must not be an empty list"),
+                    Some(a) if a.iter().all(Value::is_string) => Ok(()),
+                    _ => Err("value must be a list of strings"),
                 },
                 MemberOf | NotMemberOf | Has | NotHas => v
                     .as_str()
@@ -590,10 +609,14 @@ mod tests {
             "EMAIL",
             "",
             "contacts.id",
+            // Attribute keys match exactly: a different case is a miss, not a fuzzy hit.
+            "attr:Plan",
+            "attr:plan ",
         ] {
             let err = parse(all(vec![json!({"field": field, "op": "eq", "value": "x"})]))
                 .expect_err(field);
             assert_eq!(err, RuleError::UnknownField(field.to_owned()), "{field}");
+            assert_eq!(err.code(), "unknown-field", "{field}");
         }
     }
 
@@ -749,25 +772,89 @@ mod tests {
     }
 
     #[test]
-    fn every_refusal_has_its_own_problem_type() {
+    fn every_refusal_has_its_own_pinned_problem_type() {
+        // The strings are the public contract (`urn:nm:problem:<code>`), so each is spelled out.
         let errors = [
-            RuleError::Malformed,
-            RuleError::EmptyRules,
-            RuleError::TooDeep,
-            RuleError::TooManyRules,
-            RuleError::GroupTooLarge,
-            RuleError::UnknownField(String::new()),
-            RuleError::NotYetAvailable(String::new()),
-            RuleError::InvalidOperator {
-                field: String::new(),
-                op: String::new(),
-            },
-            RuleError::InvalidValue {
-                field: String::new(),
-                why: "",
-            },
+            (RuleError::Malformed, "malformed-rules"),
+            (RuleError::EmptyRules, "empty-rules"),
+            (RuleError::TooDeep, "rules-too-deep"),
+            (RuleError::TooManyRules, "too-many-rules"),
+            (RuleError::GroupTooLarge, "group-too-large"),
+            (RuleError::UnknownField(String::new()), "unknown-field"),
+            (
+                RuleError::NotYetAvailable(String::new()),
+                "not-yet-available",
+            ),
+            (
+                RuleError::InvalidOperator {
+                    field: String::new(),
+                    op: String::new(),
+                },
+                "invalid-operator",
+            ),
+            (
+                RuleError::InvalidValue {
+                    field: String::new(),
+                    why: "",
+                },
+                "invalid-value",
+            ),
         ];
-        let codes: std::collections::HashSet<_> = errors.iter().map(RuleError::code).collect();
-        assert_eq!(codes.len(), errors.len());
+        for (err, code) in &errors {
+            assert_eq!(err.code(), *code);
+        }
+        let distinct: std::collections::HashSet<_> = errors.iter().map(|(_, c)| c).collect();
+        assert_eq!(distinct.len(), errors.len());
+    }
+
+    #[test]
+    fn a_multi_select_takes_has_any_and_has_none_over_a_non_empty_list_of_strings() {
+        for op in ["has_any", "has_none"] {
+            let ok = json!({"field": "attr:interests", "op": op, "value": ["a", "b"]});
+            let parsed = parse(all(vec![ok.clone()])).unwrap();
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), all(vec![ok]));
+            for bad in [
+                json!([]),
+                json!("a"),
+                json!(["a", 1]),
+                json!([null]),
+                json!(null),
+            ] {
+                let err = parse(all(vec![
+                    json!({"field": "attr:interests", "op": op, "value": bad}),
+                ]))
+                .expect_err("bad value");
+                assert_eq!(err.code(), "invalid-value", "{op} {bad}");
+            }
+            let missing = parse(all(vec![json!({"field": "attr:interests", "op": op})]));
+            assert_eq!(missing.expect_err("no value").code(), "invalid-value");
+        }
+        for op in ["is_set", "is_not_set"] {
+            let ok = json!({"field": "attr:interests", "op": op});
+            assert!(parse(all(vec![ok])).is_ok());
+        }
+        // The list operators belong to multi_select only.
+        for field in ["email", "attr:tier", "attr:plan", "tag"] {
+            let err = parse(all(vec![
+                json!({"field": field, "op": "has_any", "value": ["a"]}),
+            ]))
+            .expect_err(field);
+            assert_eq!(err.code(), "invalid-operator", "{field}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_null_is_refused_so_a_document_round_trips_exactly() {
+        // Absent and null are different documents; folding one into the other would let the rule
+        // builder corrupt a segment by loading and saving it.
+        let null_value = json!({"field": "email", "op": "is_set", "value": null});
+        assert_eq!(code(all(vec![null_value])), "invalid-value");
+        let null_value = json!({"field": "email", "op": "eq", "value": null});
+        assert_eq!(code(all(vec![null_value])), "invalid-value");
+        let null_status = json!({"field": "list", "op": "member_of", "value": ID, "status": null});
+        assert_eq!(code(all(vec![null_status])), "malformed-rules");
+        let absent = all(vec![json!({"field": "email", "op": "is_set"})]);
+        let parsed = parse(absent.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), absent);
     }
 }

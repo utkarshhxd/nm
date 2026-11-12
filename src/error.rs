@@ -339,6 +339,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unprocessable_detail_renders_a_422_problem_with_its_own_detail() {
+        let (s, v) = problem(ApiError::UnprocessableDetail {
+            code: "unknown-field",
+            detail: "unknown field `emial`".to_owned(),
+        })
+        .await;
+        assert_eq!(s, 422);
+        assert_eq!(v["type"], "urn:nm:problem:unknown-field");
+        assert_eq!(v["status"], 422);
+        assert_eq!(v["detail"], "unknown field `emial`");
+        assert!(v.get("errors").is_none());
+    }
+
+    #[tokio::test]
     async fn row_not_found_is_404_but_other_sqlx_errors_are_500() {
         let (s, v) = problem(sqlx::Error::RowNotFound.into()).await;
         assert_eq!(s, 404);
