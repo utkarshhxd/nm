@@ -101,6 +101,24 @@ const listRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/lists"), "ListDetail"),
 });
 
+const tagsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "tags",
+  component: lazyRouteComponent(() => import("./routes/tags")),
+});
+
+const customFieldsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "custom-fields",
+  component: lazyRouteComponent(() => import("./routes/custom-fields")),
+});
+
+const suppressionsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "suppressions",
+  component: lazyRouteComponent(() => import("./routes/suppressions")),
+});
+
 const membersRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "members",
@@ -131,6 +149,9 @@ export const router = createRouter({
       contactRoute,
       listsRoute,
       listRoute,
+      tagsRoute,
+      customFieldsRoute,
+      suppressionsRoute,
       membersRoute,
       apiKeysRoute,
       auditLogRoute,

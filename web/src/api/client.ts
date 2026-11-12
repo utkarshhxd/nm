@@ -42,6 +42,15 @@ export function problemType(error: unknown): string {
   return typeof type === "string" ? type : "";
 }
 
+/**
+ * The sentence for a refusal: `known` maps a problem code (`tag-name-taken`) to wording written for
+ * this screen, because the server's own `detail` is only the code with its dashes removed.
+ */
+export function problemText(error: unknown, known: Record<string, string>, fallback: string): string {
+  const code = problemType(error).replace("urn:nm:problem:", "");
+  return known[code] ?? problemMessage(error, fallback);
+}
+
 /** True only for the 401 that means "you have no session", never for a rejected credential. */
 async function isUnauthenticated(response: Response): Promise<boolean> {
   if (!response.headers.get("content-type")?.includes("application/problem+json")) {
