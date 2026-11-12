@@ -924,3 +924,41 @@ fn the_patch_schema_is_nullable_only_where_null_means_something() {
         "{required}"
     );
 }
+
+/// A purge takes `for update` on its own (archived) field row, then reads `segments` with a plain
+/// select (no row lock), then updates `contacts`. A save takes `for share` on the NON-archived
+/// definitions, then writes `segments`. They share no lock, so neither can wait on the other and
+/// there is no cycle to deadlock on. This holds a save open and shows the purge of another field
+/// neither waits for it nor fails: a purge that started locking more than its own field (the
+/// workspace's definitions, say) would queue behind the save and meet it in a cycle.
+#[sqlx::test]
+async fn a_purge_does_not_wait_for_a_save_in_flight(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let old = create_field(&app, ws, "old").await;
+    create_field(&app, ws, "plan").await;
+    app.delete(&format!("{}/{old}", fields(ws)))
+        .await
+        .assert_status_ok();
+
+    let mut tx = pool.begin().await.unwrap();
+    let doc = plan_is("pro");
+    nm::segments::parse_new_rules(&mut tx, ws, &doc)
+        .await
+        .expect("a save holds its definitions");
+    sqlx::query(
+        "insert into segments (id, workspace_id, name, rules) values ($1, $2, 'saving', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(&doc)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let purge = app.post(&format!("{}/{old}/purge", fields(ws)));
+    let r = tokio::time::timeout(Duration::from_secs(3), purge.into_future())
+        .await
+        .expect("the purge waited for a save that shares no lock with it");
+    r.assert_status_ok();
+    tx.commit().await.unwrap();
+}
