@@ -149,11 +149,23 @@ unsalted means one sweep covers every user at once.
   Every `create` caller is inside a transaction, where a "best-effort" delete would abort the
   sign-in.
 - **Run the full test suite as `cargo test -- --test-threads=4`.** The dev container reports 16
-  CPUs but the WSL2 VM is capped near 3.9 GB, and each `#[sqlx::test]` costs an argon2 at
-  m=19456 KiB plus its own database. Unthrottled, it killed the Docker engine three times. CI is
-  unaffected.
+  CPUs but the WSL2 VM is capped at 4 GB by the host's `~/.wslconfig`, and each `#[sqlx::test]`
+  costs an argon2 at m=19456 KiB plus its own database. CI is unaffected.
+  **Corrected during M1a:** `--test-threads` alone does not protect the engine. The crashes
+  happen in the *compile* phase, while rustc links the integration-test binaries in parallel —
+  the engine dies before a single test runs, so a test-phase limit cannot help. `scripts/dev.sh`
+  now sets `CARGO_BUILD_JOBS=2` for every command it runs, which is the actual fix; the
+  `--test-threads=4` limit stays for the argon2 cost at run time. Raising `memory=` in the host's
+  `~/.wslconfig` would remove both constraints.
 - A full-suite run occasionally dies with `error reading contents of migration directory` — the
   Windows bind mount under concurrent compilation. Re-run once before investigating.
+- **The e2e suite runs the UI that is compiled into the binary, not the one in `web/dist`.**
+  `src/http/web_ui.rs` embeds `web/dist` with `rust-embed`, so a UI change needs
+  `pnpm -C web build` **and then** `cargo build --release --bin nm` before `pnpm -C web e2e`.
+  Rebuild only the web and the e2e silently tests the previous UI: a fix looks like it did not
+  work, and a defect you just introduced looks fine. It cost the Task 16 reviewer one false
+  negative and one false positive in a single session. If an e2e result makes no sense, check the
+  binary's timestamp before anything else.
 
 ---
 

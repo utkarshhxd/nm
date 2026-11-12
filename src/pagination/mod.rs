@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult, FieldError};
 
+pub mod sorted;
+
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
 

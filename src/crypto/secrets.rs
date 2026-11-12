@@ -35,6 +35,15 @@ pub enum SecretsError {
 /// The version and key id are authenticated as associated data.
 pub struct Secrets {
     cipher: Aes256Gcm,
+    /// Kept only to derive purpose-specific subkeys (`derive_key`); never exposed or formatted.
+    master: [u8; 32],
+}
+
+/// Wipes the master-key copy; the AES key schedule is wiped by `aes-gcm`'s `zeroize` feature.
+impl Drop for Secrets {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.master);
+    }
 }
 
 /// Hand-written so the key can never reach a log through `{:?}`.
@@ -48,7 +57,18 @@ impl Secrets {
     pub fn new(key: &SecretKey) -> Secrets {
         Secrets {
             cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(key.0)),
+            master: key.0,
         }
+    }
+
+    /// A 32-byte key for one purpose: HMAC-SHA256 of `label` under the master key. A distinct label
+    /// gives an unrelated key, so a value keyed for one purpose can never be replayed as another.
+    ///
+    /// `Zeroizing`, like the two key holders it derives from: a subkey is as good as the master
+    /// for everything signed under its label, and a bare `[u8; 32]` would be left in whatever
+    /// stack slot or moved-from copy the optimiser chose.
+    pub(crate) fn derive_key(&self, label: &str) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(super::tokens::hmac_sha256(&self.master, label.as_bytes()))
     }
 
     /// Encrypts under a fresh random nonce, so equal plaintexts give different blobs.

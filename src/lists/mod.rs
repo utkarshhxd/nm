@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Lists: the named sets of contacts a campaign is sent to, and each contact's subscription status
+//! on each one. An unsubscribe is a membership row kept with `unsubscribed`, never a deleted row.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgConnection;
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::error::{ApiError, ApiResult, FieldError};
+
+pub mod routes;
+
+/// Stored as text under a `check` constraint, not a Postgres enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+/// What a membership row says. It means the same on every list: `Pending` is written only on a
+/// double-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here
+/// depends on the list's setting. A `Pending` row can outlive the list's
+/// double opt-in being switched off: it still means "not confirmed" and is not mailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum MembershipStatus {
+    Pending,
+    Subscribed,
+    Unsubscribed,
+}
+
+impl MembershipStatus {
+    /// Only `Subscribed` may be mailed. The send-time view must agree with this.
+    pub fn is_mailable(self) -> bool {
+        self == MembershipStatus::Subscribed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct List {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    /// `true`: a new member is `pending` until they confirm. `false`: a new member is
+    /// `subscribed` at once.
+    pub double_optin: bool,
+    /// Unused until the preference center, which shows the `public` lists as topics.
+    pub visibility: Visibility,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One list a contact is on, as the contact's page shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ContactList {
+    pub list_id: Uuid,
+    pub name: String,
+    pub status: MembershipStatus,
+    pub subscribed_at: Option<DateTime<Utc>>,
+    pub unsubscribed_at: Option<DateTime<Utc>>,
+}
+
+/// A contact's standing on one list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ListMember {
+    pub contact_id: Uuid,
+    pub email: String,
+    pub status: MembershipStatus,
+    /// Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
+    pub subscribed_at: Option<DateTime<Utc>>,
+    /// Set only while the status is `unsubscribed`.
+    pub unsubscribed_at: Option<DateTime<Utc>>,
+}
+
+/// Trimmed, 1..=100 characters, no control characters.
+pub(crate) fn validate_name(raw: &str) -> Result<String, FieldError> {
+    let name = raw.trim();
+    if (1..=100).contains(&name.chars().count()) && !name.chars().any(char::is_control) {
+        return Ok(name.to_owned());
+    }
+    Err(FieldError::new(
+        "name",
+        "must be 1-100 characters with no control characters",
+    ))
+}
+
+/// At most 1000 characters; line breaks are allowed.
+pub(crate) fn validate_description(raw: &str) -> Result<String, FieldError> {
+    let text = raw.trim();
+    if text.chars().count() <= 1000 && !text.chars().any(|c| c.is_control() && c != '\n') {
+        return Ok(text.to_owned());
+    }
+    Err(FieldError::new(
+        "description",
+        "must be at most 1000 characters with no control characters",
+    ))
+}
+
+/// The list, or `404` if it is not in this workspace.
+pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResult<List> {
+    sqlx::query_as!(
+        List,
+        r#"select id, name, description, double_optin, visibility as "visibility: Visibility",
+                  created_at, updated_at
+           from lists where workspace_id = $1 and id = $2"#,
+        workspace_id,
+        id,
+    )
+    .fetch_one(db)
+    .await
+    .map_err(Into::into)
+}
+
+/// Puts the contact on the list and returns the status that was written: `Subscribed` on a
+/// single-opt-in list, `Pending` on a double-opt-in one. The caller passes the transaction and has
+/// already authorised the actor. `404` if either id is not in this workspace.
+///
+/// A contact who is already `pending` or `subscribed` is left as it is: adding someone twice must
+/// not demote a confirmed subscriber back to `pending`. An `unsubscribed` one is let back in, as a
+/// fresh member (so `unsubscribed_at` is cleared; the audit log keeps the history).
+pub async fn add_member(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    list_id: Uuid,
+    contact_id: Uuid,
+) -> ApiResult<MembershipStatus> {
+    let double_optin = sqlx::query_scalar!(
+        "select double_optin from lists where workspace_id = $1 and id = $2",
+        workspace_id,
+        list_id,
+    )
+    .fetch_one(&mut *db)
+    .await?;
+    let status = if double_optin {
+        MembershipStatus::Pending
+    } else {
+        MembershipStatus::Subscribed
+    };
+    let written = sqlx::query_scalar!(
+        r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at)
+           values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end)
+           on conflict (contact_id, list_id) do update
+           set status = excluded.status, subscribed_at = excluded.subscribed_at,
+               unsubscribed_at = null
+           where list_memberships.status = 'unsubscribed'
+           returning status as "status: MembershipStatus""#,
+        workspace_id,
+        contact_id,
+        list_id,
+        status as MembershipStatus,
+    )
+    .fetch_optional(&mut *db)
+    .await
+    // The list exists in this workspace, so the only foreign key left to fail is the contact's.
+    .map_err(|e| match e.as_database_error() {
+        Some(d) if d.is_foreign_key_violation() => ApiError::NotFound,
+        _ => e.into(),
+    })?;
+    match written {
+        Some(s) => Ok(s),
+        None => Ok(sqlx::query_scalar!(
+            r#"select status as "status: MembershipStatus" from list_memberships
+               where workspace_id = $1 and contact_id = $2 and list_id = $3"#,
+            workspace_id,
+            contact_id,
+            list_id,
+        )
+        .fetch_one(db)
+        .await?),
+    }
+}
+
+/// Marks the membership `unsubscribed` and stamps `unsubscribed_at`; the row stays. Doing it again
+/// keeps the first stamp. `404` if the contact was never on this list, or it is not in this
+/// workspace.
+pub async fn remove_member(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    list_id: Uuid,
+    contact_id: Uuid,
+) -> ApiResult<()> {
+    let done = sqlx::query!(
+        "update list_memberships \
+         set status = 'unsubscribed', \
+             unsubscribed_at = case when status = 'unsubscribed' then unsubscribed_at else now() end \
+         where workspace_id = $1 and list_id = $2 and contact_id = $3",
+        workspace_id,
+        list_id,
+        contact_id,
+    )
+    .execute(db)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(ApiError::NotFound);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_subscribed_is_mailable() {
+        assert!(MembershipStatus::Subscribed.is_mailable());
+        assert!(!MembershipStatus::Pending.is_mailable());
+        assert!(!MembershipStatus::Unsubscribed.is_mailable());
+    }
+
+    #[test]
+    fn names_are_trimmed_and_bounded() {
+        assert_eq!(validate_name("  News  ").unwrap(), "News");
+        for bad in ["", "   ", "a\nb", &"x".repeat(101)] {
+            assert!(validate_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_description("a\nb").is_ok());
+        assert!(validate_description("a\0b").is_err());
+    }
+}

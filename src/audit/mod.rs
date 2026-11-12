@@ -27,6 +27,31 @@ pub mod actions {
     pub const INVITE_ACCEPTED: &str = "invite.accepted";
     pub const API_KEY_CREATED: &str = "api_key.created";
     pub const API_KEY_REVOKED: &str = "api_key.revoked";
+    pub const CUSTOM_FIELD_CREATED: &str = "custom_field.created";
+    pub const CUSTOM_FIELD_UPDATED: &str = "custom_field.updated";
+    pub const CUSTOM_FIELD_ARCHIVED: &str = "custom_field.archived";
+    pub const CUSTOM_FIELD_PURGED: &str = "custom_field.purged";
+    pub const CONTACT_CREATED: &str = "contact.created";
+    pub const CONTACT_UPDATED: &str = "contact.updated";
+    pub const CONTACT_DELETED: &str = "contact.deleted";
+    pub const CONTACT_ERASED: &str = "contact.erased";
+    pub const CONTACTS_BULK_TAGGED: &str = "contacts.bulk_tagged";
+    pub const CONTACTS_BULK_UNTAGGED: &str = "contacts.bulk_untagged";
+    pub const CONTACTS_BULK_SUBSCRIBED: &str = "contacts.bulk_subscribed";
+    pub const CONTACTS_BULK_UNSUBSCRIBED: &str = "contacts.bulk_unsubscribed";
+    pub const CONTACTS_BULK_DELETED: &str = "contacts.bulk_deleted";
+    pub const LIST_CREATED: &str = "list.created";
+    pub const LIST_UPDATED: &str = "list.updated";
+    pub const LIST_DELETED: &str = "list.deleted";
+    pub const LIST_MEMBER_ADDED: &str = "list.member_added";
+    pub const LIST_MEMBER_REMOVED: &str = "list.member_removed";
+    pub const TAG_CREATED: &str = "tag.created";
+    pub const TAG_UPDATED: &str = "tag.updated";
+    pub const TAG_DELETED: &str = "tag.deleted";
+    pub const TAG_APPLIED: &str = "tag.applied";
+    pub const TAG_REMOVED: &str = "tag.removed";
+    pub const SUPPRESSION_CREATED: &str = "suppression.created";
+    pub const SUPPRESSION_LIFTED: &str = "suppression.lifted";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

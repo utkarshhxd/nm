@@ -98,7 +98,7 @@ pub(crate) fn validate_name(name: &str) -> Result<String, FieldError> {
 }
 
 /// Returns the zone's canonical name.
-fn validate_timezone(tz: &str) -> Result<&'static str, FieldError> {
+pub(crate) fn validate_timezone(tz: &str) -> Result<&'static str, FieldError> {
     tz.parse::<Tz>().map(|t| t.name()).map_err(|_| {
         FieldError::new(
             "timezone",

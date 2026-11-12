@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type Page, expect, test } from "@playwright/test";
 
+import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
 const TEAMMATE = "teammate@example.com";
@@ -167,11 +168,7 @@ test("workspace screens have no serious accessibility violations", async ({ page
   for (const { path, ready } of screens) {
     await page.goto(path);
     await expect(page.getByRole("heading", { name: ready, exact: true })).toBeVisible();
-    const { violations } = await new AxeBuilder({ page }).analyze();
-    const serious = violations
-      .filter((v) => v.impact === "serious" || v.impact === "critical")
-      .map((v) => `${v.id} (${v.impact}): ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`);
-    expect(serious, `accessibility violations on ${path}`).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), path, { seriousOnly: true });
   }
 });
 

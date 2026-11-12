@@ -7,6 +7,11 @@ use axum::{
     response::Response,
 };
 
+// No `script-src`, so scripts fall back to `default-src 'self'`: an inline script is blocked.
+// That is why web/public/theme.js, which must run before first paint, is an external blocking
+// <script src> and not inline in index.html. Do not inline it, and do not add a script hash here:
+// a hash ties this header to the script's exact bytes, so a later edit would silently break the
+// theme in production. web/e2e/support/app.ts serves this same CSP to catch an inlined script.
 const HEADERS: [(HeaderName, &str); 4] = [
     (
         header::CONTENT_SECURITY_POLICY,

@@ -48,6 +48,12 @@ pub enum ApiError {
     NotFound,
     /// 409 with the given problem code.
     Conflict(&'static str),
+    /// 409 with a problem code and a detail built at the call site, for a refusal whose whole
+    /// point is the numbers in it.
+    ConflictDetail { code: &'static str, detail: String },
+    /// 422 with the given problem code, for a request that is well-formed but cannot be acted on
+    /// and is not one field's fault (an expired selection token).
+    Unprocessable(&'static str),
     /// 429 `rate-limited` plus a `Retry-After` header.
     TooManyRequests { retry_after_secs: u64 },
     /// 415 `unsupported-media-type`: a JSON endpoint got another content type.
@@ -101,6 +107,12 @@ impl IntoResponse for ApiError {
                 "resource not found".to_owned(),
             ),
             ApiError::Conflict(code) => (StatusCode::CONFLICT, *code, humanise(code)),
+            ApiError::ConflictDetail { code, detail } => {
+                (StatusCode::CONFLICT, *code, detail.clone())
+            }
+            ApiError::Unprocessable(code) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, *code, humanise(code))
+            }
             ApiError::TooManyRequests { retry_after_secs } => {
                 retry_after = Some(*retry_after_secs);
                 (

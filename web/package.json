@@ -11,7 +11,7 @@
     "typecheck": "tsc -b",
     "gen:api": "cargo run -q -- openapi > src/api/openapi.json && pnpm gen:schema",
     "gen:schema": "openapi-typescript src/api/openapi.json -o src/api/schema.d.ts && node -e \"const fs=require('node:fs'),f='src/api/schema.d.ts';fs.writeFileSync(f,['// SPDX-License-Identifier: AGPL-3.0-only',fs.readFileSync(f,'utf8')].join(String.fromCharCode(10)))\"",
-    "test": "node --test scripts/*.test.mjs",
+    "test": "node --test scripts/*.test.mjs && playwright test --config playwright.unit.config.ts",
     "check:bundle": "node scripts/check-bundle.mjs",
     "check:licenses": "node scripts/check-licenses.mjs",
     "e2e": "playwright test"
@@ -20,6 +20,7 @@
     "@simplewebauthn/browser": "14.0.0",
     "@tanstack/react-query": "5.107.1",
     "@tanstack/react-router": "1.170.46",
+    "@tanstack/react-virtual": "3.14.26",
     "openapi-fetch": "0.17.0",
     "qrcode": "1.5.4",
     "react": "19.3.1",

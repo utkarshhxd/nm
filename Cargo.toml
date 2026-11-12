@@ -24,6 +24,7 @@ chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive"] }
 cookie = "0.18.2"
 figment = { version = "0.10.19", features = ["env", "toml"] }
+hmac = "0.13.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 mime_guess = "2.0.5"
@@ -40,11 +41,13 @@ totp-rs = { version = "6.0.0", default-features = false, features = ["otpauth", 
 tower = "0.5.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+unicode-normalization = "0.1.26"
 url = { version = "2.5.8", features = ["serde"] }
 utoipa = { version = "6.0.0", features = ["uuid", "chrono"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 uuid = { version = "1.29.1", features = ["v7", "serde"] }
 webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+zeroize = "1.9.1"
 
 # Keeps argon2 fast in debug and test builds.
 [profile.dev.package."*"]

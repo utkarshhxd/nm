@@ -47,6 +47,12 @@ bash scripts/dev.sh cargo deny check
 bash scripts/check-spdx.sh
 ```
 
+## Domain vocabulary and decisions
+
+`GLOSSARY.md` defines the domain terms (contact, list, suppression, eligible, and so on); use them as
+written. `docs/adr/` records the decisions that are expensive to reverse, each with the alternative
+it rejected and what it costs if wrong.
+
 ## Web UI
 
 The React UI in `web/` is compiled into the binary from `web/dist`, so `cargo build` after
@@ -58,7 +64,8 @@ Node and pnpm live in the dev container too:
 - `bash scripts/dev.sh pnpm --dir web install`
 - `bash scripts/dev.sh pnpm --dir web build` — typecheck, bundle, then write the `.br`/`.gz`
   copies the server serves
-- `bash scripts/dev.sh pnpm --dir web check:bundle` — initial JS must stay under 150 KB gzipped
+- `bash scripts/dev.sh pnpm --dir web check:bundle` — initial JS must stay under 150 KB gzipped, and
+  every other JS chunk (each lazily loaded route) under 50 KB gzipped on its own
 - `bash scripts/dev.sh pnpm --dir web check:licenses` — production dependency licenses
 - `bash scripts/dev.sh pnpm --dir web gen:api` — regenerate **both** `src/api/openapi.json`
   (from the server) and `src/api/schema.d.ts` (from that JSON). Run this, not half of it: CI

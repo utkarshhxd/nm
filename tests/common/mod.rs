@@ -108,6 +108,9 @@ impl TestApp {
     pub fn post(&self, p: &str) -> TestRequest {
         self.with_csrf(self.server.post(p))
     }
+    pub fn put(&self, p: &str) -> TestRequest {
+        self.with_csrf(self.server.put(p))
+    }
     pub fn patch(&self, p: &str) -> TestRequest {
         self.with_csrf(self.server.patch(p))
     }

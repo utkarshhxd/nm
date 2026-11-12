@@ -53,13 +53,24 @@ export default function WorkspaceLayout() {
           ))}
         </select>
         {me.data.is_instance_admin ? (
-          <Link className={ROW_BUTTON} to="/workspaces/new">
-            New workspace
-          </Link>
+          <>
+            <Link className={ROW_BUTTON} to="/workspaces/new">
+              New workspace
+            </Link>
+            {/* Instance-wide, not this workspace's: a workspace admin never sees this. */}
+            <Link className={ROW_BUTTON} to="/admin/suppressions">
+              Instance suppressions
+            </Link>
+          </>
         ) : null}
       </div>
 
       <nav className="mt-4 flex flex-wrap gap-4" aria-label="Workspace">
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/contacts" label="Contacts" />
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/lists" label="Lists" />
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/tags" label="Tags" />
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/custom-fields" label="Custom fields" />
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/suppressions" label="Suppressions" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/members" label="Members" />
         {admin ? (
           <>
@@ -85,7 +96,15 @@ function WorkspaceLink({
   label,
 }: {
   slug: string;
-  to: "/w/$slug/members" | "/w/$slug/api-keys" | "/w/$slug/audit-log";
+  to:
+    | "/w/$slug/contacts"
+    | "/w/$slug/lists"
+    | "/w/$slug/tags"
+    | "/w/$slug/custom-fields"
+    | "/w/$slug/suppressions"
+    | "/w/$slug/members"
+    | "/w/$slug/api-keys"
+    | "/w/$slug/audit-log";
   label: string;
 }) {
   return (

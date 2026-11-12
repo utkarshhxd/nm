@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 
 import { api, problemMessage, problemType } from "../api/client";
+import { TableScroller } from "../components/table-scroller";
 import { ROLES, type Role, atLeast, canAssign } from "../lib/roles";
 import { useMe } from "../lib/session";
 import { Alert, BUTTON, CARD, ConfirmButton, CopyButton, Field, SELECT } from "../lib/ui";
@@ -106,7 +107,7 @@ function MemberList({ id, myRole }: { id: string; myRole: Role }) {
         <Alert>The members could not be loaded. Reload the page to try again.</Alert>
       ) : null}
       {members.data ? (
-        <table className="mt-4 w-full text-left">
+        <TableScroller label="Members table"><table className="mt-4 w-full text-left">
           <thead>
             <tr className="border-b border-gray-300 dark:border-gray-700">
               <th scope="col">Email</th>
@@ -121,8 +122,8 @@ function MemberList({ id, myRole }: { id: string; myRole: Role }) {
           <tbody>
             {members.data.map((member) => (
               <tr className="border-b border-gray-300 dark:border-gray-700" key={member.user_id}>
-                <td className="py-2">{member.email}</td>
-                <td className="py-2">{member.display_name}</td>
+                <td className="py-2 wrap-anywhere">{member.email}</td>
+                <td className="py-2 wrap-anywhere">{member.display_name}</td>
                 <td className="py-2">
                   <select
                     className={SELECT}
@@ -158,7 +159,7 @@ function MemberList({ id, myRole }: { id: string; myRole: Role }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></TableScroller>
       ) : null}
     </section>
   );

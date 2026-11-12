@@ -2154,6 +2154,7 @@ dependencies = [
  "clap",
  "cookie",
  "figment",
+ "hmac",
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
@@ -2170,12 +2171,14 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "zeroize",
 ]
 
 [[package]]

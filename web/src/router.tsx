@@ -51,6 +51,83 @@ const workspaceRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/workspace-layout")),
 });
 
+const text = (value: unknown) => (typeof value === "string" && value !== "" ? value : undefined);
+
+const pick = <T extends string>(value: unknown, allowed: readonly T[]) =>
+  allowed.find((a) => a === value);
+
+type ContactsSearch = {
+  q?: string | undefined;
+  sort?: "created" | "email" | undefined;
+  dir?: "asc" | "desc" | undefined;
+  list_id?: string | undefined;
+  list_status?: "pending" | "subscribed" | "unsubscribed" | undefined;
+  tag_id?: string | undefined;
+};
+
+// The view lives in the URL, so it can be linked and the back button works. An unknown value is
+// dropped rather than rejected: a hand-edited link still opens.
+const contactsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "contacts",
+  // Optional keys, so a plain link to the contacts page need not spell out an empty search.
+  validateSearch: (search: Record<string, unknown>): ContactsSearch => ({
+    q: text(search["q"]),
+    sort: pick(search["sort"], ["created", "email"]),
+    dir: pick(search["dir"], ["asc", "desc"]),
+    list_id: text(search["list_id"]),
+    list_status: pick(search["list_status"], ["pending", "subscribed", "unsubscribed"]),
+    tag_id: text(search["tag_id"]),
+  }),
+  component: lazyRouteComponent(() => import("./routes/contacts")),
+});
+
+const contactRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "contacts/$contactId",
+  component: lazyRouteComponent(() => import("./routes/contact-detail")),
+});
+
+const listsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "lists",
+  component: lazyRouteComponent(() => import("./routes/lists")),
+});
+
+// The named export, so the one lists chunk serves both screens.
+const listRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "lists/$listId",
+  component: lazyRouteComponent(() => import("./routes/lists"), "ListDetail"),
+});
+
+const tagsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "tags",
+  component: lazyRouteComponent(() => import("./routes/tags")),
+});
+
+const customFieldsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "custom-fields",
+  component: lazyRouteComponent(() => import("./routes/custom-fields")),
+});
+
+const suppressionsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "suppressions",
+  component: lazyRouteComponent(() => import("./routes/suppressions")),
+});
+
+// Outside the workspace tree on purpose: an instance-wide suppression belongs to no workspace,
+// and it is gated on `is_instance_admin`, which a workspace admin is not. The named export keeps
+// both suppression screens in the one chunk.
+const instanceSuppressionsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/admin/suppressions",
+  component: lazyRouteComponent(() => import("./routes/suppressions"), "InstanceSuppressions"),
+});
+
 const membersRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "members",
@@ -76,7 +153,19 @@ export const router = createRouter({
     accountSecurityRoute,
     inviteRoute,
     newWorkspaceRoute,
-    workspaceRoute.addChildren([membersRoute, apiKeysRoute, auditLogRoute]),
+    instanceSuppressionsRoute,
+    workspaceRoute.addChildren([
+      contactsRoute,
+      contactRoute,
+      listsRoute,
+      listRoute,
+      tagsRoute,
+      customFieldsRoute,
+      suppressionsRoute,
+      membersRoute,
+      apiKeysRoute,
+      auditLogRoute,
+    ]),
   ]),
 });
 

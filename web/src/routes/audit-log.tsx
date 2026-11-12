@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { api, problemMessage } from "../api/client";
 import type { components } from "../api/schema";
+import { TableScroller } from "../components/table-scroller";
 import { Alert, CARD, ROW_BUTTON } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
@@ -98,7 +99,7 @@ function AuditLogPage({ id }: { id: string }) {
     <section className={CARD}>
       <h2 className="text-xl font-semibold">Audit log</h2>
       {error ? <Alert>{error}</Alert> : null}
-      <table className="mt-4 w-full text-left">
+      <TableScroller label="Audit log table"><table className="mt-4 w-full text-left">
         <thead>
           <tr className="border-b border-gray-300 dark:border-gray-700">
             <th scope="col">Time</th>
@@ -119,7 +120,7 @@ function AuditLogPage({ id }: { id: string }) {
             </tr>
           ))}
         </tbody>
-      </table>
+      </table></TableScroller>
       {busy ? <p className="mt-4">Loading…</p> : null}
       {!busy && entries.length === 0 ? <p className="mt-4">Nothing recorded yet.</p> : null}
       {cursor ? (

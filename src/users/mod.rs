@@ -2,6 +2,7 @@
 
 use serde_json::json;
 use sqlx::{PgConnection, PgExecutor, PgPool};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use crate::{
@@ -23,12 +24,20 @@ pub struct User {
     pub totp_enabled: bool,
 }
 
-/// Trim and lowercase; 3..=254 characters; exactly one `@`; non-empty local part; a domain
+/// Trim, normalise to Unicode NFC, lowercase and re-normalise (lowercasing can emit a
+/// non-NFC sequence), so every spelling of an address maps to one string and normalising twice
+/// changes nothing; 3..=254 characters of that normalised form; exactly one `@`; non-empty local part; a domain
 /// containing a `.`. Control characters (so NUL, which Postgres rejects in `text` and `jsonb`)
 /// and whitespace are rejected outright rather than stripped: such an address is never valid,
 /// and silently altering it could point a login at a different account.
 pub fn normalize_email(raw: &str) -> Result<String, FieldError> {
-    let email = raw.trim().to_lowercase();
+    let email: String = raw
+        .trim()
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .nfc()
+        .collect();
     let bad = || FieldError::new("email", "must be a valid email address");
     let len = email.chars().count();
     if !(3..=254).contains(&len) || email.chars().any(|c| c.is_control() || c.is_whitespace()) {
@@ -190,4 +199,69 @@ pub async fn disable_mfa(db: &PgPool, email: &str) -> ApiResult<()> {
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_email;
+
+    #[test]
+    fn normalises_unicode_forms_to_one_string() {
+        // U+00E9 vs U+0065 U+0301: the same address typed two ways.
+        assert_eq!(
+            normalize_email("jos\u{e9}@example.com").unwrap(),
+            normalize_email("jose\u{301}@example.com").unwrap()
+        );
+    }
+
+    #[test]
+    fn lowercasing_can_create_a_composable_pair() {
+        // No precomposed capital T-diaeresis exists, so the first NFC leaves "T"+U+0308 alone;
+        // lowercasing yields "t"+U+0308, which composes to U+1E97. Only the second NFC unifies
+        // the two spellings.
+        assert_eq!(
+            normalize_email("T\u{308}@example.com").unwrap(),
+            normalize_email("\u{1e97}@example.com").unwrap()
+        );
+    }
+
+    // Regression guard only: the pre-change `trim().to_lowercase()` also satisfied this.
+    #[test]
+    fn normalising_twice_changes_nothing() {
+        for raw in [
+            "\u{130}nfo@example.com",
+            "JOSE\u{301}@Example.COM",
+            "\u{3a3}A@example.com",
+            "a\u{3a3}.@example.com",
+            "\u{1e9e}@example.com",
+            "\u{fb01}x@example.com",
+            "\u{212b}@example.com",
+        ] {
+            let once = normalize_email(raw).unwrap();
+            assert_eq!(normalize_email(&once).unwrap(), once, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn length_counts_normalised_characters() {
+        // 126 decomposed e-acute is 252 chars raw but 126 once composed.
+        let local = "e\u{301}".repeat(126);
+        assert!(normalize_email(&format!("{local}@x.co")).is_ok());
+        let long = "a".repeat(250);
+        assert!(normalize_email(&format!("{long}@x.co")).is_err());
+    }
+
+    #[test]
+    fn still_rejects_what_it_rejected_before() {
+        for bad in [
+            "",
+            "a@b",
+            "no-at-sign.com",
+            "a@@b.com",
+            "a b@example.com",
+            "a\0@b.com",
+        ] {
+            assert!(normalize_email(bad).is_err(), "{bad} should be rejected");
+        }
+    }
 }

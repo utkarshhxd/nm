@@ -5,6 +5,38 @@
  */
 
 export interface paths {
+    "/api/v1/admin/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_instance_suppressions"];
+        put?: never;
+        post: operations["create_instance_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/suppressions/{id}/lift": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["lift_instance_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -410,6 +442,487 @@ export interface paths {
         patch: operations["change_role"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_contacts"];
+        put?: never;
+        post: operations["create_contact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * A hard delete of every contact in the selection. Like `DELETE /contacts/{id}` it writes no
+         *     suppression: the addresses may be added again. It is not erasure.
+         */
+        post: operations["bulk_delete_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in
+         *     list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
+         *     promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
+         * @description This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
+         *     back in. One admin re-adding one named person is a considered act they answer for; a bulk
+         *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
+         *     gets a sender blocklisted. Do not "fix" the asymmetry.
+         *
+         *     For the same reason this refuses a selection whose filter widened after it was made, as
+         *     `bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe
+         *     afterwards does not un-send. See `refuse_if_widened`.
+         */
+        post: operations["bulk_subscribe_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/tag": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Tags every contact in the selection. */
+        post: operations["bulk_tag_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Unsubscribes every member of the selection from a list. */
+        post: operations["bulk_unsubscribe_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/untag": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Takes a tag off every contact in the selection. */
+        post: operations["bulk_untag_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/selection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Freezes "the contacts this filter matches" at this moment. The token holds the filter and a
+         *     time bound, not the contacts: contacts created afterwards are never part of it.
+         */
+        post: operations["create_contact_selection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_contact"];
+        put?: never;
+        post?: never;
+        /**
+         * A hard delete. It writes no suppression: the address may be added again. Erasing a person for
+         *     GDPR is a different, admin-only action.
+         */
+        delete: operations["delete_contact"];
+        options?: never;
+        head?: never;
+        patch: operations["update_contact"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Computed on the server because the answer can depend on an instance-wide block that a
+         *     workspace's own suppression list does not contain and its admins cannot read. It discloses only
+         *     the verdict for this one contact.
+         */
+        get: operations["contact_eligibility"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * GDPR erasure: deletes the contact, its list memberships and its tags, and leaves a block that
+         *     keeps the address from being mailed or added again. Admin only, and not reversible: no route
+         *     lifts it. A mistake is fixed with `DELETE`, which blocks nothing.
+         */
+        post: operations["erase_contact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_contact_lists"];
+        put?: never;
+        /** The same as `POST /lists/{id}/members`, from the contact's side. */
+        post: operations["add_contact_to_list"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,
+         *     and keeps the membership.
+         */
+        delete: operations["remove_contact_from_list"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_contact_tags"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Idempotent: applying a tag the contact already has is a `204` and changes nothing. */
+        put: operations["apply_tag"];
+        post?: never;
+        delete: operations["remove_tag"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/custom-fields": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_custom_fields"];
+        put?: never;
+        post: operations["create_custom_field"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["archive_custom_field"];
+        options?: never;
+        head?: never;
+        patch: operations["update_custom_field"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}/purge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["purge_custom_field"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_lists"];
+        put?: never;
+        post: operations["create_list"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_list"];
+        put?: never;
+        post?: never;
+        /**
+         * A hard delete. It takes every membership of the list with it, unsubscribed ones included: the
+         *     list itself is gone, so there is nothing left to be unsubscribed from.
+         */
+        delete: operations["delete_list"];
+        options?: never;
+        head?: never;
+        patch: operations["update_list"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/mailable-count": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How many members of the list may be emailed right now: subscribed and not suppressed, counted
+         *     over the `mailable_list_members` view, the one definition of eligibility. Deliberately exempt
+         *     from the 150 ms p95 target (1.4 s warm over 1.43M mailable contacts), so the UI fetches it on
+         *     its own. It is counted live, never kept as a counter on the list: hand-maintained counters
+         *     drift.
+         */
+        get: operations["mailable_count"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_list_members"];
+        put?: never;
+        /**
+         * Adding someone who is already `pending` or `subscribed` changes nothing; adding an
+         *     `unsubscribed` one subscribes them again.
+         */
+        post: operations["add_list_member"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unsubscribes; it does not delete the membership. */
+        delete: operations["remove_list_member"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_suppressions"];
+        put?: never;
+        post: operations["create_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/suppressions/{id}/lift": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-enables mailing someone who opted out, bounced or complained, so it takes admin. The row
+         *     stays, with `lifted_at` set, and the audit row names the reason it was lifted from.
+         */
+        post: operations["lift_suppression"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_tags"];
+        put?: never;
+        post: operations["create_tag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/tags/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** A hard delete. The tag comes off every contact that had it; the contacts stay. */
+        delete: operations["delete_tag"];
+        options?: never;
+        head?: never;
+        patch: operations["update_tag"];
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -435,6 +948,11 @@ export interface components {
             name: string;
             prefix: string;
             role: components["schemas"]["Role"];
+        };
+        Archived: {
+            field: components["schemas"]["Definition"];
+            /** @description States, so no client has to guess, that deleting did not delete data. */
+            note: string;
         };
         /**
          * @description One audit row, as stored. `metadata` is returned verbatim, which is why writers must never put
@@ -463,6 +981,88 @@ export interface components {
             target_id?: string | null;
             target_type?: string | null;
         };
+        /**
+         * @description The standing block that stops one address being mailed, and nothing else about it: not the
+         *     row's id, note or who made it, and never another address.
+         */
+        Block: {
+            level: components["schemas"]["BlockLevel"];
+            reason: components["schemas"]["Reason"];
+            /** @description Whether it blocks this one address or every address on its domain. */
+            scope: components["schemas"]["Scope"];
+        };
+        /**
+         * @description Whose block it is: this workspace's own, or one set instance-wide that every workspace inherits.
+         * @enum {string}
+         */
+        BlockLevel: "workspace" | "instance";
+        /** @description `BulkTarget` and a list. */
+        BulkList: {
+            /** @description See `BulkTarget`. */
+            excluded_ids?: string[];
+            /** @description See `BulkTarget`. */
+            ids?: string[] | null;
+            /** Format: uuid */
+            list_id: string;
+            /** @description See `BulkTarget`. */
+            selection_token?: string | null;
+        };
+        /**
+         * @description What a bulk action did, as two numbers taken from the same statement. `affected` is how many
+         *     contacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the
+         *     exclusions). `affected` is lower whenever some were already in the wanted state, so the UI can
+         *     say "N of M".
+         */
+        BulkResult: {
+            /** Format: int64 */
+            affected: number;
+            /**
+             * Format: int64
+             * @description How many the selection stood for when it was made. `selected` above it means the filter
+             *     matched contacts that did not match when the person looked — they existed then, and were
+             *     tagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`
+             *     refuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`
+             *     proceed and the UI says so.
+             */
+            issued: number;
+            /** Format: int64 */
+            selected: number;
+            status?: components["schemas"]["MembershipStatus"] | null;
+        };
+        /** @description `BulkTarget` and a tag. */
+        BulkTag: {
+            /** @description See `BulkTarget`. */
+            excluded_ids?: string[];
+            /** @description See `BulkTarget`. */
+            ids?: string[] | null;
+            /** @description See `BulkTarget`. */
+            selection_token?: string | null;
+            /** Format: uuid */
+            tag_id: string;
+        };
+        /**
+         * @description What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.
+         *
+         *     The three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`
+         *     defaults to empty, so a misspelt `excluded_id` that was quietly ignored would run the action
+         *     on exactly the contacts the user meant to spare. `serde(flatten)` cannot be combined with
+         *     `deny_unknown_fields`, so do not factor these back into one flattened struct, and give any
+         *     new optional field here a reason to exist.
+         */
+        BulkTarget: {
+            /** @description Contacts to leave out of a `selection_token`. At most 10 000. */
+            excluded_ids?: string[];
+            /**
+             * @description These contacts and no others, e.g. the ticked rows of a table: at most 10 000. Ids that are
+             *     not in this workspace select nothing. Cannot be combined with `excluded_ids`.
+             */
+            ids?: string[] | null;
+            /**
+             * @description From `POST /contacts/selection`: every contact its filter matched, as of then, less
+             *     `excluded_ids`. Send this or `ids`, not both and not neither.
+             */
+            selection_token?: string | null;
+        };
         ChallengeResponse: {
             /**
              * Format: uuid
@@ -486,6 +1086,59 @@ export interface components {
             /** @description Shown only here. */
             recovery_codes: string[];
         };
+        Contact: {
+            /** @description Custom field values by field key. Values of archived fields stay readable here. */
+            attributes: unknown;
+            /** Format: date-time */
+            created_at: string;
+            email: string;
+            first_name: string;
+            /** Format: uuid */
+            id: string;
+            last_name: string;
+            timezone?: string | null;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /**
+         * @description Which contacts a list shows. It is embedded in a signed selection token later, so its
+         *     serialised form is part of that token's payload: renaming a field, or adding one (the payload is
+         *     not tolerant of a missing field), would make tokens already issued fail to decode, as a
+         *     `422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.
+         */
+        ContactFilter: {
+            /**
+             * Format: uuid
+             * @description Contacts with a membership row on this list, whatever its status: a `pending` or
+             *     `unsubscribed` member is still a member here. A list of another workspace matches nothing.
+             */
+            list_id?: string | null;
+            list_status?: components["schemas"]["MembershipStatus"] | null;
+            /** @description Case-insensitive substring of the address or name. */
+            q?: string | null;
+            /**
+             * Format: uuid
+             * @description Contacts with this tag. A tag of another workspace matches nothing.
+             */
+            tag_id?: string | null;
+        };
+        /** @description One list a contact is on, as the contact's page shows it. */
+        ContactList: {
+            /** Format: uuid */
+            list_id: string;
+            name: string;
+            status: components["schemas"]["MembershipStatus"];
+            /** Format: date-time */
+            subscribed_at?: string | null;
+            /** Format: date-time */
+            unsubscribed_at?: string | null;
+        };
+        /**
+         * @description What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,
+         *     `contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.
+         * @enum {string}
+         */
+        ContactSort: "created" | "email";
         /** @description The one response that carries the key. */
         CreatedApiKey: {
             /** Format: date-time */
@@ -513,9 +1166,36 @@ export interface components {
             id: string;
             name: string;
         };
+        Definition: {
+            /**
+             * Format: date-time
+             * @description Set when the field was deleted. Contacts keep their values until the field is purged.
+             */
+            archived_at?: string | null;
+            /** Format: uuid */
+            id: string;
+            key: string;
+            kind: components["schemas"]["FieldKind"];
+            label: string;
+            /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
+            options: string[];
+        };
+        /** @enum {string} */
+        Dir: "asc" | "desc";
         DisableRequest: {
             password: string;
         };
+        /** @description Whether a contact may be mailed, and if a standing block stops it, which one. */
+        Eligibility: {
+            blocked_by?: components["schemas"]["Block"] | null;
+            /** @description `false` exactly when `blocked_by` is set. */
+            mailable: boolean;
+        };
+        /**
+         * @description How a field's value is typed, stored as snake_case text (a `check` constraint, not an enum).
+         * @enum {string}
+         */
+        FieldKind: "text" | "number" | "date" | "datetime" | "boolean" | "select" | "multi_select";
         FinishRequest: {
             /** Format: uuid */
             challenge_id: string;
@@ -543,6 +1223,40 @@ export interface components {
             invited_by?: string | null;
             role: components["schemas"]["Role"];
         };
+        List: {
+            /** Format: date-time */
+            created_at: string;
+            description: string;
+            /**
+             * @description `true`: a new member is `pending` until they confirm. `false`: a new member is
+             *     `subscribed` at once.
+             */
+            double_optin: boolean;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** @description Unused until the preference center, which shows the `public` lists as topics. */
+            visibility: components["schemas"]["Visibility"];
+        };
+        /** @description A contact's standing on one list. */
+        ListMember: {
+            /** Format: uuid */
+            contact_id: string;
+            email: string;
+            status: components["schemas"]["MembershipStatus"];
+            /**
+             * Format: date-time
+             * @description Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
+             */
+            subscribed_at?: string | null;
+            /**
+             * Format: date-time
+             * @description Set only while the status is `unsubscribed`.
+             */
+            unsubscribed_at?: string | null;
+        };
         LoginRequest: {
             email: string;
             password: string;
@@ -555,6 +1269,10 @@ export interface components {
              *     `POST /api/v1/auth/login/totp` (the cookie set is then a 10-minute pending session).
              */
             status: string;
+        };
+        MailableCount: {
+            /** Format: int64 */
+            count: number;
         };
         MeResponse: {
             /** @description Send as `X-CSRF-Token` on unsafe requests. */
@@ -586,16 +1304,88 @@ export interface components {
             /** Format: uuid */
             user_id: string;
         };
+        Membership: {
+            /** Format: uuid */
+            contact_id: string;
+            /** Format: uuid */
+            list_id: string;
+            status: components["schemas"]["MembershipStatus"];
+        };
+        /**
+         * @description What a membership row says. It means the same on every list: `Pending` is written only on a
+         *     double-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here
+         *     depends on the list's setting. A `Pending` row can outlive the list's
+         *     double opt-in being switched off: it still means "not confirmed" and is not mailable.
+         * @enum {string}
+         */
+        MembershipStatus: "pending" | "subscribed" | "unsubscribed";
         NewApiKey: {
             name: string;
             /** @description `viewer`, `editor` or `admin`, and no higher than the caller's own role. */
             role: components["schemas"]["Role"];
         };
+        /** @description A contact to insert. Nothing here is trusted: `create` validates every field. */
+        NewContact: {
+            /** @description Custom field values by field key; see `validate_attributes` for what each kind accepts. */
+            attributes?: unknown;
+            /** @description Normalised (trimmed, NFC, lowercased) before it is stored. */
+            email: string;
+            first_name?: string | null;
+            last_name?: string | null;
+            /** @description An IANA time zone such as `Europe/London`. */
+            timezone?: string | null;
+        };
+        NewContactList: {
+            /** Format: uuid */
+            list_id: string;
+        };
+        NewCustomField: {
+            /**
+             * @description `^[a-z][a-z0-9_]{0,62}$`. The JSONB key every contact's value is stored under; it cannot
+             *     change afterwards.
+             */
+            key: string;
+            kind: components["schemas"]["FieldKind"];
+            label: string;
+            /** @description Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind. */
+            options?: string[] | null;
+        };
         NewInvite: {
             email: string;
             role: components["schemas"]["Role"];
         };
+        NewList: {
+            description?: string | null;
+            /** @description Default `true`. */
+            double_optin?: boolean | null;
+            /** @description Unique in the workspace. */
+            name: string;
+            visibility?: components["schemas"]["Visibility"] | null;
+        };
+        NewMember: {
+            /** Format: uuid */
+            contact_id: string;
+        };
         NewPasskey: {
+            name: string;
+        };
+        /**
+         * @description A suppression to add. `scope` decides which of `email` and `domain` is required, and the other
+         *     must be absent.
+         */
+        NewSuppression: {
+            /** @description Required for `domain`, such as `spam.example`. Matches that exact domain only: subdomains are NOT covered (`spam.example` leaves `mail.spam.example` mailable). */
+            domain?: string | null;
+            /** @description Required for `address`. Normalised (trimmed, NFC, lowercased) before it is stored. */
+            email?: string | null;
+            /** @description Up to 500 characters; line breaks are allowed. */
+            note?: string | null;
+            /** @description Anything but `gdpr_erasure`, which only erasing a contact writes. */
+            reason: components["schemas"]["Reason"];
+            scope: components["schemas"]["Scope"];
+        };
+        NewTag: {
+            /** @description Unique in the workspace. 1-100 characters. */
             name: string;
         };
         NewWorkspace: {
@@ -639,6 +1429,53 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_Contact: {
+            data: {
+                /** @description Custom field values by field key. Values of archived fields stay readable here. */
+                attributes: unknown;
+                /** Format: date-time */
+                created_at: string;
+                email: string;
+                first_name: string;
+                /** Format: uuid */
+                id: string;
+                last_name: string;
+                timezone?: string | null;
+                /** Format: date-time */
+                updated_at: string;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_ContactList: {
+            data: {
+                /** Format: uuid */
+                list_id: string;
+                name: string;
+                status: components["schemas"]["MembershipStatus"];
+                /** Format: date-time */
+                subscribed_at?: string | null;
+                /** Format: date-time */
+                unsubscribed_at?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Definition: {
+            data: {
+                /**
+                 * Format: date-time
+                 * @description Set when the field was deleted. Contacts keep their values until the field is purged.
+                 */
+                archived_at?: string | null;
+                /** Format: uuid */
+                id: string;
+                key: string;
+                kind: components["schemas"]["FieldKind"];
+                label: string;
+                /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
+                options: string[];
+            }[];
+            next_cursor?: string | null;
+        };
         Page_InviteSummary: {
             data: {
                 /** Format: date-time */
@@ -651,6 +1488,45 @@ export interface components {
                 /** Format: uuid */
                 invited_by?: string | null;
                 role: components["schemas"]["Role"];
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_List: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                description: string;
+                /**
+                 * @description `true`: a new member is `pending` until they confirm. `false`: a new member is
+                 *     `subscribed` at once.
+                 */
+                double_optin: boolean;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** Format: date-time */
+                updated_at: string;
+                /** @description Unused until the preference center, which shows the `public` lists as topics. */
+                visibility: components["schemas"]["Visibility"];
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_ListMember: {
+            data: {
+                /** Format: uuid */
+                contact_id: string;
+                email: string;
+                status: components["schemas"]["MembershipStatus"];
+                /**
+                 * Format: date-time
+                 * @description Null while `pending`, and after an unsubscribe is undone on a double-opt-in list.
+                 */
+                subscribed_at?: string | null;
+                /**
+                 * Format: date-time
+                 * @description Set only while the status is `unsubscribed`.
+                 */
+                unsubscribed_at?: string | null;
             }[];
             next_cursor?: string | null;
         };
@@ -678,6 +1554,46 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_Suppression: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                created_by_user_id?: string | null;
+                /** @description Domain scope only. */
+                domain?: string | null;
+                /** @description Address scope only; null on an erasure tombstone, whose plaintext was destroyed. */
+                email?: string | null;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * Format: date-time
+                 * @description Set when lifted. A lifted row stays, as history.
+                 */
+                lifted_at?: string | null;
+                /** Format: uuid */
+                lifted_by_user_id?: string | null;
+                note?: string | null;
+                reason: components["schemas"]["Reason"];
+                scope: components["schemas"]["Scope"];
+                /**
+                 * Format: uuid
+                 * @description Null for an instance-wide suppression, which applies to every workspace.
+                 */
+                workspace_id?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Tag: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                id: string;
+                name: string;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Workspace: {
             data: {
                 /** Format: uuid */
@@ -699,27 +1615,138 @@ export interface components {
             last_used_at?: string | null;
             name: string;
         };
+        Purged: {
+            /**
+             * Format: int64
+             * @description Contacts whose value for the field was removed.
+             */
+            affected: number;
+        };
+        /**
+         * @description Why an address is blocked. Stored as text under a `check` constraint, not a Postgres enum.
+         * @enum {string}
+         */
+        Reason: "unsubscribed_all" | "bounced" | "complained" | "manual" | "gdpr_erasure";
         /**
          * @description A member's role, stored as lowercase text. Variants run from least to most privileged:
          *     `authorize` compares roles with `<`, so the order here is load-bearing.
          * @enum {string}
          */
         Role: "viewer" | "editor" | "admin" | "owner";
+        /** @enum {string} */
+        Scope: "address" | "domain";
         /** @description Exactly one of the two. */
         SecondFactorRequest: {
             code?: string | null;
             recovery_code?: string | null;
+        };
+        /** @description The signed token for a selection; see `selection`. */
+        SelectionToken: {
+            /**
+             * Format: int64
+             * @description How many contacts the filter matches, as of the token's `as_of`. A live count over the
+             *     whole match: deliberately exempt from the 150 ms p95 target, like
+             *     `GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks
+             *     for it when the user asks to select everything, and shows a skeleton until it lands. It is
+             *     never kept as a counter on a table: hand-maintained counters drift.
+             */
+            selected: number;
+            /** @description Valid for one hour. Pass it to a `bulk/*` route. */
+            selection_token: string;
         };
         SetupResponse: {
             otpauth_url: string;
             /** @description Base32 secret, shown only here. */
             secret: string;
         };
+        /** @description A suppression as the API shows it. There is deliberately no hash field here. */
+        Suppression: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            created_by_user_id?: string | null;
+            /** @description Domain scope only. */
+            domain?: string | null;
+            /** @description Address scope only; null on an erasure tombstone, whose plaintext was destroyed. */
+            email?: string | null;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: date-time
+             * @description Set when lifted. A lifted row stays, as history.
+             */
+            lifted_at?: string | null;
+            /** Format: uuid */
+            lifted_by_user_id?: string | null;
+            note?: string | null;
+            reason: components["schemas"]["Reason"];
+            scope: components["schemas"]["Scope"];
+            /**
+             * Format: uuid
+             * @description Null for an instance-wide suppression, which applies to every workspace.
+             */
+            workspace_id?: string | null;
+        };
+        Tag: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
+        /**
+         * @description A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit
+         *     `null` removes it. The address cannot change, so `email` is an unknown field here and is
+         *     rejected, not ignored.
+         */
+        UpdateContact: {
+            /**
+             * @description Merged into the stored attributes key by key: a key left out keeps its value. A key set to
+             *     `null` is removed, also for an archived field; any other value for an archived field is
+             *     refused. `attributes` itself cannot be `null`.
+             */
+            attributes?: unknown;
+            /** @description `null` clears it to an empty string. */
+            first_name?: string | null;
+            /** @description `null` clears it to an empty string. */
+            last_name?: string | null;
+            /** @description An IANA time zone such as `Europe/London`. `null` clears it. */
+            timezone?: string | null;
+        };
+        /**
+         * @description `key` is immutable, so an unknown field (`key` included) is rejected, not ignored. `kind` is
+         *     accepted only so that a change can be refused with a message that says why.
+         */
+        UpdateCustomField: {
+            kind?: components["schemas"]["FieldKind"] | null;
+            label?: string | null;
+            options?: string[] | null;
+        };
+        /** @description A field left out is left alone. */
+        UpdateList: {
+            description?: string | null;
+            /**
+             * @description Only decides the status of members added from now on. A member already `pending` stays
+             *     `pending` (not mailable) when this is switched off.
+             */
+            double_optin?: boolean | null;
+            name?: string | null;
+            visibility?: components["schemas"]["Visibility"] | null;
+        };
+        UpdateTag: {
+            /** @description Unique in the workspace. 1-100 characters. */
+            name: string;
+        };
         /** @description The slug cannot change in M0, so an unknown field (`slug` included) is rejected, not ignored. */
         UpdateWorkspace: {
             name?: string | null;
             timezone?: string | null;
         };
+        /**
+         * @description Stored as text under a `check` constraint, not a Postgres enum.
+         * @enum {string}
+         */
+        Visibility: "public" | "private";
         /** @description A workspace as one caller sees it: `role` is the caller's own. */
         Workspace: {
             /** Format: uuid */
@@ -738,6 +1765,136 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_instance_suppressions: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+                /** @description Also list the ones that were lifted (default: only the ones in force). */
+                include_lifted?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Instance-wide suppressions, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Suppression"];
+                };
+            };
+            /** @description instance-admin-required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_instance_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSuppression"];
+            };
+        };
+        responses: {
+            /** @description An instance-wide suppression: it blocks in every workspace */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description instance-admin-required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-exists: that address or domain is already blocked instance-wide */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    lift_instance_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Suppression id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The suppression, now lifted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description instance-admin-required; or erasure-not-liftable: nobody lifts an erasure */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such instance-wide suppression */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-already-lifted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -1911,6 +3068,1781 @@ export interface operations {
             };
             /** @description last-owner */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_contacts: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. Only valid with the same `sort`. */
+                cursor?: string;
+                /** @description Default `created`. */
+                sort?: components["schemas"]["ContactSort"];
+                /** @description Default `desc` for `created`, `asc` for `email`. */
+                dir?: components["schemas"]["Dir"];
+                /** @description Case-insensitive substring of the address or name, at least 3 characters. */
+                q?: string;
+                /** @description Only contacts with a membership on this list, whatever its status. */
+                list_id?: string;
+                /** @description Only with `list_id`: narrows it to memberships with this status. */
+                list_status?: components["schemas"]["MembershipStatus"];
+                /** @description Only contacts with this tag. */
+                tag_id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first unless `sort` says otherwise */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Contact"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewContact"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Contact"];
+                };
+            };
+            /** @description insufficient-role: creating a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description email-taken; or address-erased: this address was erased and can never be added again */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid address, name, time zone or attribute */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_delete_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkTarget"];
+            };
+        };
+        responses: {
+            /** @description How many were deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_subscribe_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkList"];
+            };
+        };
+        responses: {
+            /** @description How many memberships were added; contacts already on the list, whatever their status, are not counted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such list, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-widened: the filter now matches more contacts than the selection was made for; nobody was added */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_tag_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkTag"];
+            };
+        };
+        responses: {
+            /** @description How many were newly tagged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such tag, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_unsubscribe_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkList"];
+            };
+        };
+        responses: {
+            /** @description How many were unsubscribed now; those already unsubscribed or not on the list are not counted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such list, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    bulk_untag_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkTag"];
+            };
+        };
+        responses: {
+            /** @description How many had the tag */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkResult"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such tag, or a token for another workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_contact_selection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContactFilter"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SelectionToken"];
+                };
+            };
+            /** @description insufficient-role: bulk actions take editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a `q` under 3 characters, or a `list_status` without a `list_id` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Contact"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. Nothing is suppressed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateContact"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Contact"];
+                };
+            };
+            /** @description insufficient-role: editing a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name, time zone or attribute, or an unknown field such as `email` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    contact_eligibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Eligibility"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    erase_contact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Erased. The address can never be added again */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: erasing a contact takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_contact_lists: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every list the contact has a membership on, whatever its status, newest list first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ContactList"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    add_contact_to_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewContactList"];
+            };
+        };
+        responses: {
+            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            /** @description insufficient-role: changing a contact's lists takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact or list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_contact_from_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+                /** @description List id */
+                list_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unsubscribed. The membership stays, as `unsubscribed` */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: changing a contact's lists takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or the contact was never on this list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_contact_tags: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tags on the contact, newest tag first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Tag"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    apply_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+                /** @description Tag id */
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The contact has the tag */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: tagging a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such contact or tag in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+                /** @description Tag id */
+                tag_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tag is off the contact */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: untagging a contact takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or the contact did not have this tag */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_custom_fields: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first, archived fields included */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Definition"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewCustomField"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Definition"];
+                };
+            };
+            /** @description insufficient-role: creating a field takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description key-taken, even by an archived field */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid key, label or options */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    archive_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Custom field id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Archived. Every contact keeps its value */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Archived"];
+                };
+            };
+            /** @description insufficient-role: archiving a field takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such field in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Custom field id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateCustomField"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Definition"];
+                };
+            };
+            /** @description insufficient-role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such field in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid label or options, an unknown field such as `key`, or a kind change */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    purge_custom_field: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Custom field id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every contact's value for the field was removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Purged"];
+                };
+            };
+            /** @description insufficient-role: purging takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such field in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description field-not-archived */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_lists: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_List"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewList"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List"];
+                };
+            };
+            /** @description insufficient-role: creating a list takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description list-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name or description */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List"];
+                };
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, with its memberships */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a list takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_list: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateList"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List"];
+                };
+            };
+            /** @description insufficient-role: editing a list takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description list-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name or description, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mailable_count: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MailableCount"];
+                };
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_list_members: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every status, newest contact first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ListMember"];
+                };
+            };
+            /** @description not a member, or no such list in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    add_list_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewMember"];
+            };
+        };
+        responses: {
+            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            /** @description insufficient-role: changing a list's members takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such list or contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    remove_list_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description List id */
+                id: string;
+                /** @description Contact id */
+                contact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unsubscribed. The membership stays, as `unsubscribed` */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: changing a list's members takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or the contact was never on this list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_suppressions: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+                /** @description Also list the ones that were lifted (default: only the ones in force). */
+                include_lifted?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This workspace's own suppressions, newest first. Instance-wide ones are not listed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Suppression"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSuppression"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description insufficient-role: adding a suppression takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-exists: that address or domain is already blocked */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    lift_suppression: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Suppression id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The suppression, now lifted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suppression"];
+                };
+            };
+            /** @description insufficient-role: lifting takes admin; or erasure-not-liftable: nobody lifts an erasure */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such suppression in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description suppression-already-lifted */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_tags: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Tag"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTag"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Tag"];
+                };
+            };
+            /** @description insufficient-role: creating a tag takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description tag-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Tag id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, and removed from every contact */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a tag takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such tag in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_tag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Tag id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateTag"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Tag"];
+                };
+            };
+            /** @description insufficient-role: renaming a tag takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such tag in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description tag-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name, or an unknown field */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

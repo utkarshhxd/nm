@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update suppressions set lifted_at = now(), lifted_by_user_id = $2 where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7d4cf3f43ba21e82a79eba4e9476b8038296df37a4d46627909ed4e5d46cadda"
+}

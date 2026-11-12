@@ -1,0 +1,90 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, key, label, kind as \"kind: FieldKind\", options as \"options: Jsonb<Vec<String>>\",\n                  archived_at\n           from custom_fields\n           where workspace_id = $1 and ($2::uuid is null or id < $2)\n           order by id desc limit $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "label",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "label"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "kind: FieldKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "options: Jsonb<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "options"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "archived_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "custom_fields",
+            "name": "archived_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "00a7bff7d194d0118ca1ff5a1b65e44c9e6b02239d86a36b9b0daac5d55a0760"
+}

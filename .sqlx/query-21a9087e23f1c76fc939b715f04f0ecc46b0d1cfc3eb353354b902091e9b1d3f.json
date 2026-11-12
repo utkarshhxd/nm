@@ -1,0 +1,149 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, workspace_id, scope as \"scope: Scope\", email, domain,\n                  reason as \"reason: Reason\", note, created_at, created_by_user_id,\n                  lifted_at, lifted_by_user_id\n           from suppressions where id = $2 and workspace_id is not distinct from $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "scope: Scope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "scope"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "email",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "email"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "domain"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "reason: Reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "note",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by_user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "created_by_user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "lifted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "lifted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "lifted_by_user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "lifted_by_user_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "21a9087e23f1c76fc939b715f04f0ecc46b0d1cfc3eb353354b902091e9b1d3f"
+}

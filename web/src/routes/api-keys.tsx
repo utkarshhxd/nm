@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 
 import { api, problemMessage, problemType } from "../api/client";
+import { TableScroller } from "../components/table-scroller";
 import { ROLES, type Role, canAssign } from "../lib/roles";
 import { Alert, BUTTON, CARD, ConfirmButton, CopyButton, Field, ROW_BUTTON, SELECT } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
@@ -93,7 +94,7 @@ function ApiKeyList({ id, myRole }: { id: string; myRole: Role }) {
         <Alert>The API keys could not be loaded. Reload the page to try again.</Alert>
       ) : null}
       {keys.data && keys.data.length > 0 ? (
-        <table className="mt-4 w-full text-left">
+        <TableScroller label="API keys table"><table className="mt-4 w-full text-left">
           <thead>
             <tr className="border-b border-gray-300 dark:border-gray-700">
               <th scope="col">Name</th>
@@ -109,7 +110,7 @@ function ApiKeyList({ id, myRole }: { id: string; myRole: Role }) {
           <tbody>
             {keys.data.map((key) => (
               <tr className="border-b border-gray-300 dark:border-gray-700" key={key.id}>
-                <td className="py-2">{key.name}</td>
+                <td className="py-2 wrap-anywhere">{key.name}</td>
                 <td className="py-2">{key.role}</td>
                 <td className="py-2 font-mono">nm_{key.prefix}</td>
                 <td className="py-2">{day(key.created_at)}</td>
@@ -124,7 +125,7 @@ function ApiKeyList({ id, myRole }: { id: string; myRole: Role }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></TableScroller>
       ) : null}
       {keys.data && keys.data.length === 0 ? <p className="mt-4">No API keys yet.</p> : null}
 

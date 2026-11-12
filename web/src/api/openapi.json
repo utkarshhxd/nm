@@ -10,6 +10,141 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/v1/admin/suppressions": {
+      "get": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "list_instance_suppressions",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_lifted",
+            "in": "query",
+            "description": "Also list the ones that were lifted (default: only the ones in force).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Instance-wide suppressions, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "instance-admin-required"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "create_instance_suppression",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSuppression"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "An instance-wide suppression: it blocks in every workspace",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "instance-admin-required"
+          },
+          "409": {
+            "description": "suppression-exists: that address or domain is already blocked instance-wide"
+          },
+          "422": {
+            "description": "an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/suppressions/{id}/lift": {
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "lift_instance_suppression",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Suppression id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The suppression, now lifted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "instance-admin-required; or erasure-not-liftable: nobody lifts an erasure"
+          },
+          "404": {
+            "description": "no such instance-wide suppression"
+          },
+          "409": {
+            "description": "suppression-already-lifted"
+          }
+        }
+      }
+    },
     "/api/v1/auth/login": {
       "post": {
         "tags": [
@@ -1224,6 +1359,2185 @@
           }
         }
       }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts": {
+      "get": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "list_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`. Only valid with the same `sort`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "Default `created`.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ContactSort"
+            }
+          },
+          {
+            "name": "dir",
+            "in": "query",
+            "description": "Default `desc` for `created`, `asc` for `email`.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Dir"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-insensitive substring of the address or name, at least 3 characters.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "list_id",
+            "in": "query",
+            "description": "Only contacts with a membership on this list, whatever its status.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "list_status",
+            "in": "query",
+            "description": "Only with `list_id`: narrows it to memberships with this status.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/MembershipStatus"
+            }
+          },
+          {
+            "name": "tag_id",
+            "in": "query",
+            "description": "Only contacts with this tag.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first unless `sort` says otherwise",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Contact"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id`"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "create_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewContact"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "email-taken; or address-erased: this address was erased and can never be added again"
+          },
+          "422": {
+            "description": "invalid address, name, time zone or attribute"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "A hard delete of every contact in the selection. Like `DELETE /contacts/{id}` it writes no\nsuppression: the addresses may be added again. It is not erasure.",
+        "operationId": "bulk_delete_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTarget"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many were deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, or a token for another workspace"
+          },
+          "409": {
+            "description": "selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
+        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.\n\nFor the same reason this refuses a selection whose filter widened after it was made, as\n`bulk/delete` does: adding someone to a list is what makes them mailable, and an unsubscribe\nafterwards does not un-send. See `refuse_if_widened`.",
+        "operationId": "bulk_subscribe_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many memberships were added; contacts already on the list, whatever their status, are not counted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such list, or a token for another workspace"
+          },
+          "409": {
+            "description": "selection-widened: the filter now matches more contacts than the selection was made for; nobody was added"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/tag": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Tags every contact in the selection.",
+        "operationId": "bulk_tag_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many were newly tagged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such tag, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/unsubscribe": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Unsubscribes every member of the selection from a list.",
+        "operationId": "bulk_unsubscribe_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many were unsubscribed now; those already unsubscribed or not on the list are not counted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such list, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/bulk/untag": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Takes a tag off every contact in the selection.",
+        "operationId": "bulk_untag_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "How many had the tag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, no such tag, or a token for another workspace"
+          },
+          "422": {
+            "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/selection": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Freezes \"the contacts this filter matches\" at this moment. The token holds the filter and a\ntime bound, not the contacts: contacts created afterwards are never part of it.",
+        "operationId": "create_contact_selection",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContactFilter"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SelectionToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: bulk actions take editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a `q` under 3 characters, or a `list_status` without a `list_id`"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}": {
+      "get": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "get_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "A hard delete. It writes no suppression: the address may be added again. Erasing a person for\nGDPR is a different, admin-only action.",
+        "operationId": "delete_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. Nothing is suppressed"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "operationId": "update_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateContact"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Contact"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "invalid name, time zone or attribute, or an unknown field such as `email`"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
+      "get": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Computed on the server because the answer can depend on an instance-wide block that a\nworkspace's own suppression list does not contain and its admins cannot read. It discloses only\nthe verdict for this one contact.",
+        "operationId": "contact_eligibility",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Eligibility"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/erase": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "GDPR erasure: deletes the contact, its list memberships and its tags, and leaves a block that\nkeeps the address from being mailed or added again. Admin only, and not reversible: no route\nlifts it. A mistake is fixed with `DELETE`, which blocks nothing.",
+        "operationId": "erase_contact",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Erased. The address can never be added again"
+          },
+          "403": {
+            "description": "insufficient-role: erasing a contact takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "list_contact_lists",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every list the contact has a membership on, whatever its status, newest list first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ContactList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "The same as `POST /lists/{id}/members`, from the contact's side.",
+        "operationId": "add_contact_to_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewContactList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: changing a contact's lists takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact or list in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}": {
+      "delete": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,\nand keeps the membership.",
+        "operationId": "remove_contact_from_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "list_id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unsubscribed. The membership stays, as `unsubscribed`"
+          },
+          "403": {
+            "description": "insufficient-role: changing a contact's lists takes editor"
+          },
+          "404": {
+            "description": "not a member, or the contact was never on this list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags": {
+      "get": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "list_contact_tags",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tags on the contact, newest tag first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Tag"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/tags/{tag_id}": {
+      "put": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "summary": "Idempotent: applying a tag the contact already has is a `204` and changes nothing.",
+        "operationId": "apply_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tag_id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The contact has the tag"
+          },
+          "403": {
+            "description": "insufficient-role: tagging a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such contact or tag in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "remove_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "tag_id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The tag is off the contact"
+          },
+          "403": {
+            "description": "insufficient-role: untagging a contact takes editor"
+          },
+          "404": {
+            "description": "not a member, or the contact did not have this tag"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/custom-fields": {
+      "get": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "list_custom_fields",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first, archived fields included",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Definition"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "create_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewCustomField"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Definition"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a field takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "key-taken, even by an archived field"
+          },
+          "422": {
+            "description": "invalid key, label or options"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}": {
+      "delete": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "archive_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom field id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Archived. Every contact keeps its value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Archived"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: archiving a field takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such field in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "update_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom field id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCustomField"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Definition"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role"
+          },
+          "404": {
+            "description": "not a member, or no such field in this workspace"
+          },
+          "422": {
+            "description": "invalid label or options, an unknown field such as `key`, or a kind change"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/custom-fields/{id}/purge": {
+      "post": {
+        "tags": [
+          "crate::custom_fields::routes"
+        ],
+        "operationId": "purge_custom_field",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Custom field id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every contact's value for the field was removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Purged"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: purging takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such field in this workspace"
+          },
+          "409": {
+            "description": "field-not-archived"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "list_lists",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_List"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "create_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/List"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a list takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "list-name-taken"
+          },
+          "422": {
+            "description": "invalid name or description"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "get_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/List"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "A hard delete. It takes every membership of the list with it, unsubscribed ones included: the\nlist itself is gone, so there is nothing left to be unsubscribed from.",
+        "operationId": "delete_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, with its memberships"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a list takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "update_list",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/List"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a list takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          },
+          "409": {
+            "description": "list-name-taken"
+          },
+          "422": {
+            "description": "invalid name or description, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/mailable-count": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "How many members of the list may be emailed right now: subscribed and not suppressed, counted\nover the `mailable_list_members` view, the one definition of eligibility. Deliberately exempt\nfrom the 150 ms p95 target (1.4 s warm over 1.43M mailable contacts), so the UI fetches it on\nits own. It is counted live, never kept as a counter on the list: hand-maintained counters\ndrift.",
+        "operationId": "mailable_count",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MailableCount"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members": {
+      "get": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "operationId": "list_list_members",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every status, newest contact first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ListMember"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such list in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "Adding someone who is already `pending` or `subscribed` changes nothing; adding an\n`unsubscribed` one subscribes them again.",
+        "operationId": "add_list_member",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewMember"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: changing a list's members takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such list or contact in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}": {
+      "delete": {
+        "tags": [
+          "crate::lists::routes"
+        ],
+        "summary": "Unsubscribes; it does not delete the membership.",
+        "operationId": "remove_list_member",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "List id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "contact_id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unsubscribed. The membership stays, as `unsubscribed`"
+          },
+          "403": {
+            "description": "insufficient-role: changing a list's members takes editor"
+          },
+          "404": {
+            "description": "not a member, or the contact was never on this list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/suppressions": {
+      "get": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "list_suppressions",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_lifted",
+            "in": "query",
+            "description": "Also list the ones that were lifted (default: only the ones in force).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This workspace's own suppressions, newest first. Instance-wide ones are not listed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Suppression"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "operationId": "create_suppression",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSuppression"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: adding a suppression takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "suppression-exists: that address or domain is already blocked"
+          },
+          "422": {
+            "description": "an invalid or missing field, `gdpr_erasure` as the reason, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/suppressions/{id}/lift": {
+      "post": {
+        "tags": [
+          "crate::suppressions::routes"
+        ],
+        "summary": "Re-enables mailing someone who opted out, bounced or complained, so it takes admin. The row\nstays, with `lifted_at` set, and the audit row names the reason it was lifted from.",
+        "operationId": "lift_suppression",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Suppression id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The suppression, now lifted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suppression"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: lifting takes admin; or erasure-not-liftable: nobody lifts an erasure"
+          },
+          "404": {
+            "description": "not a member, or no such suppression in this workspace"
+          },
+          "409": {
+            "description": "suppression-already-lifted"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/tags": {
+      "get": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "list_tags",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Tag"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "create_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a tag takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "tag-name-taken"
+          },
+          "422": {
+            "description": "invalid name, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/tags/{id}": {
+      "delete": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "summary": "A hard delete. The tag comes off every contact that had it; the contacts stay.",
+        "operationId": "delete_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, and removed from every contact"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a tag takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such tag in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::tags::routes"
+        ],
+        "operationId": "update_tag",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Tag id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: renaming a tag takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such tag in this workspace"
+          },
+          "409": {
+            "description": "tag-name-taken"
+          },
+          "422": {
+            "description": "invalid name, or an unknown field"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1293,6 +3607,22 @@
           },
           "role": {
             "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "Archived": {
+        "type": "object",
+        "required": [
+          "field",
+          "note"
+        ],
+        "properties": {
+          "field": {
+            "$ref": "#/components/schemas/Definition"
+          },
+          "note": {
+            "type": "string",
+            "description": "States, so no client has to guess, that deleting did not delete data."
           }
         }
       },
@@ -1367,6 +3697,186 @@
           }
         }
       },
+      "Block": {
+        "type": "object",
+        "description": "The standing block that stops one address being mailed, and nothing else about it: not the\nrow's id, note or who made it, and never another address.",
+        "required": [
+          "reason",
+          "level",
+          "scope"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/BlockLevel"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope",
+            "description": "Whether it blocks this one address or every address on its domain."
+          }
+        }
+      },
+      "BlockLevel": {
+        "type": "string",
+        "description": "Whose block it is: this workspace's own, or one set instance-wide that every workspace inherits.",
+        "enum": [
+          "workspace",
+          "instance"
+        ]
+      },
+      "BulkList": {
+        "type": "object",
+        "description": "`BulkTarget` and a list.",
+        "required": [
+          "list_id"
+        ],
+        "properties": {
+          "excluded_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
+          },
+          "ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
+          },
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "selection_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See `BulkTarget`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "BulkResult": {
+        "type": "object",
+        "description": "What a bulk action did, as two numbers taken from the same statement. `affected` is how many\ncontacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the\nexclusions). `affected` is lower whenever some were already in the wanted state, so the UI can\nsay \"N of M\".",
+        "required": [
+          "affected",
+          "selected",
+          "issued"
+        ],
+        "properties": {
+          "affected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "issued": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many the selection stood for when it was made. `selected` above it means the filter\nmatched contacts that did not match when the person looked — they existed then, and were\ntagged, subscribed or renamed into the view afterwards. `bulk/delete` and `bulk/subscribe`\nrefuse outright in that case (see `refuse_if_widened`); `tag`, `untag` and `unsubscribe`\nproceed and the UI says so.",
+            "minimum": 0
+          },
+          "selected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MembershipStatus",
+                "description": "Only for `subscribe`: the status the new memberships were written with. `pending` means\nthe contacts are on a double-opt-in list and not mailable until they confirm, and nothing\nin this milestone confirms them: `affected` is not a count of people who can be mailed."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "BulkTag": {
+        "type": "object",
+        "description": "`BulkTarget` and a tag.",
+        "required": [
+          "tag_id"
+        ],
+        "properties": {
+          "excluded_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
+          },
+          "ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "See `BulkTarget`."
+          },
+          "selection_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "See `BulkTarget`."
+          },
+          "tag_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "BulkTarget": {
+        "type": "object",
+        "description": "What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.\n\nThe three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`\ndefaults to empty, so a misspelt `excluded_id` that was quietly ignored would run the action\non exactly the contacts the user meant to spare. `serde(flatten)` cannot be combined with\n`deny_unknown_fields`, so do not factor these back into one flattened struct, and give any\nnew optional field here a reason to exist.",
+        "properties": {
+          "excluded_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Contacts to leave out of a `selection_token`. At most 10 000."
+          },
+          "ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "These contacts and no others, e.g. the ticked rows of a table: at most 10 000. Ids that are\nnot in this workspace select nothing. Cannot be combined with `excluded_ids`."
+          },
+          "selection_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "From `POST /contacts/selection`: every contact its filter matched, as of then, less\n`excluded_ids`. Send this or `ids`, not both and not neither."
+          }
+        },
+        "additionalProperties": false
+      },
       "ChallengeResponse": {
         "type": "object",
         "required": [
@@ -1436,6 +3946,134 @@
             "description": "Shown only here."
           }
         }
+      },
+      "Contact": {
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "first_name",
+          "last_name",
+          "attributes",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "attributes": {
+            "description": "Custom field values by field key. Values of archived fields stay readable here."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "email": {
+            "type": "string"
+          },
+          "first_name": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_name": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ContactFilter": {
+        "type": "object",
+        "description": "Which contacts a list shows. It is embedded in a signed selection token later, so its\nserialised form is part of that token's payload: renaming a field, or adding one (the payload is\nnot tolerant of a missing field), would make tokens already issued fail to decode, as a\n`422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.",
+        "properties": {
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Contacts with a membership row on this list, whatever its status: a `pending` or\n`unsubscribed` member is still a member here. A list of another workspace matches nothing."
+          },
+          "list_status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MembershipStatus",
+                "description": "Narrows `list_id` to the memberships with this status. Meaningless without `list_id`: the\nhandler refuses it, and `list` ignores it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "q": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Case-insensitive substring of the address or name."
+          },
+          "tag_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Contacts with this tag. A tag of another workspace matches nothing."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ContactList": {
+        "type": "object",
+        "description": "One list a contact is on, as the contact's page shows it.",
+        "required": [
+          "list_id",
+          "name",
+          "status"
+        ],
+        "properties": {
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
+          },
+          "subscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "unsubscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "ContactSort": {
+        "type": "string",
+        "description": "What a contact list is ordered by. Only keys with an index (`contacts_keyset_created`,\n`contacts_keyset_email`) are offered: a sort by name would sort the whole workspace per page.",
+        "enum": [
+          "created",
+          "email"
+        ]
       },
       "CreatedApiKey": {
         "type": "object",
@@ -1518,6 +4156,53 @@
           }
         }
       },
+      "Definition": {
+        "type": "object",
+        "required": [
+          "id",
+          "key",
+          "label",
+          "kind",
+          "options"
+        ],
+        "properties": {
+          "archived_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set when the field was deleted. Contacts keep their values until the field is purged."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FieldKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
+          }
+        }
+      },
+      "Dir": {
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ]
+      },
       "DisableRequest": {
         "type": "object",
         "required": [
@@ -1528,6 +4213,43 @@
             "type": "string"
           }
         }
+      },
+      "Eligibility": {
+        "type": "object",
+        "description": "Whether a contact may be mailed, and if a standing block stops it, which one.",
+        "required": [
+          "mailable"
+        ],
+        "properties": {
+          "blocked_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "The block that stops this address, whether it is this workspace's or the whole instance's.\nIt says nothing about any other address. A list membership that is `pending` or\n`unsubscribed` is a separate reason a contact is not mailed on that list, and is not here."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mailable": {
+            "type": "boolean",
+            "description": "`false` exactly when `blocked_by` is set."
+          }
+        }
+      },
+      "FieldKind": {
+        "type": "string",
+        "description": "How a field's value is typed, stored as snake_case text (a `check` constraint, not an enum).",
+        "enum": [
+          "text",
+          "number",
+          "date",
+          "datetime",
+          "boolean",
+          "select",
+          "multi_select"
+        ]
       },
       "FinishRequest": {
         "type": "object",
@@ -1609,6 +4331,83 @@
           }
         }
       },
+      "List": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "double_optin",
+          "visibility",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string"
+          },
+          "double_optin": {
+            "type": "boolean",
+            "description": "`true`: a new member is `pending` until they confirm. `false`: a new member is\n`subscribed` at once."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/Visibility",
+            "description": "Unused until the preference center, which shows the `public` lists as topics."
+          }
+        }
+      },
+      "ListMember": {
+        "type": "object",
+        "description": "A contact's standing on one list.",
+        "required": [
+          "contact_id",
+          "email",
+          "status"
+        ],
+        "properties": {
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
+          },
+          "subscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Null while `pending`, and after an unsubscribe is undone on a double-opt-in list."
+          },
+          "unsubscribed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set only while the status is `unsubscribed`."
+          }
+        }
+      },
       "LoginRequest": {
         "type": "object",
         "required": [
@@ -1643,6 +4442,19 @@
           "status": {
             "type": "string",
             "description": "`ok` once signed in; `mfa_required` when a second factor must follow at\n`POST /api/v1/auth/login/totp` (the cookie set is then a 10-minute pending session)."
+          }
+        }
+      },
+      "MailableCount": {
+        "type": "object",
+        "required": [
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -1746,6 +4558,36 @@
           }
         }
       },
+      "Membership": {
+        "type": "object",
+        "required": [
+          "contact_id",
+          "list_id",
+          "status"
+        ],
+        "properties": {
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MembershipStatus"
+          }
+        }
+      },
+      "MembershipStatus": {
+        "type": "string",
+        "description": "What a membership row says. It means the same on every list: `Pending` is written only on a\ndouble-opt-in list, `Subscribed` is written at once on a single-opt-in one, and nothing here\ndepends on the list's setting. A `Pending` row can outlive the list's\ndouble opt-in being switched off: it still means \"not confirmed\" and is not mailable.",
+        "enum": [
+          "pending",
+          "subscribed",
+          "unsubscribed"
+        ]
+      },
       "NewApiKey": {
         "type": "object",
         "required": [
@@ -1762,6 +4604,86 @@
           }
         }
       },
+      "NewContact": {
+        "type": "object",
+        "description": "A contact to insert. Nothing here is trusted: `create` validates every field.",
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "attributes": {
+            "description": "Custom field values by field key; see `validate_attributes` for what each kind accepts."
+          },
+          "email": {
+            "type": "string",
+            "description": "Normalised (trimmed, NFC, lowercased) before it is stored."
+          },
+          "first_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An IANA time zone such as `Europe/London`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewContactList": {
+        "type": "object",
+        "required": [
+          "list_id"
+        ],
+        "properties": {
+          "list_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewCustomField": {
+        "type": "object",
+        "required": [
+          "key",
+          "label",
+          "kind"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "`^[a-z][a-z0-9_]{0,62}$`. The JSONB key every contact's value is stored under; it cannot\nchange afterwards."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FieldKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "options": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind."
+          }
+        },
+        "additionalProperties": false
+      },
       "NewInvite": {
         "type": "object",
         "required": [
@@ -1777,6 +4699,56 @@
           }
         }
       },
+      "NewList": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "double_optin": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default `true`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace."
+          },
+          "visibility": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Visibility",
+                "description": "Default `private`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewMember": {
+        "type": "object",
+        "required": [
+          "contact_id"
+        ],
+        "properties": {
+          "contact_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
       "NewPasskey": {
         "type": "object",
         "required": [
@@ -1787,6 +4759,58 @@
             "type": "string"
           }
         }
+      },
+      "NewSuppression": {
+        "type": "object",
+        "description": "A suppression to add. `scope` decides which of `email` and `domain` is required, and the other\nmust be absent.",
+        "required": [
+          "scope",
+          "reason"
+        ],
+        "properties": {
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for `domain`, such as `spam.example`. Matches that exact domain only: subdomains are NOT covered (`spam.example` leaves `mail.spam.example` mailable)."
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for `address`. Normalised (trimmed, NFC, lowercased) before it is stored."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Up to 500 characters; line breaks are allowed."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason",
+            "description": "Anything but `gdpr_erasure`, which only erasing a contact writes."
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope"
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewTag": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace. 1-100 characters."
+          }
+        },
+        "additionalProperties": false
       },
       "NewWorkspace": {
         "type": "object",
@@ -1952,6 +4976,176 @@
           }
         }
       },
+      "Page_Contact": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "email",
+                "first_name",
+                "last_name",
+                "attributes",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "attributes": {
+                  "description": "Custom field values by field key. Values of archived fields stay readable here."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "email": {
+                  "type": "string"
+                },
+                "first_name": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "last_name": {
+                  "type": "string"
+                },
+                "timezone": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_ContactList": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One list a contact is on, as the contact's page shows it.",
+              "required": [
+                "list_id",
+                "name",
+                "status"
+              ],
+              "properties": {
+                "list_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/MembershipStatus"
+                },
+                "subscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "unsubscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Definition": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "key",
+                "label",
+                "kind",
+                "options"
+              ],
+              "properties": {
+                "archived_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Set when the field was deleted. Contacts keep their values until the field is purged."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/components/schemas/FieldKind"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_InviteSummary": {
         "type": "object",
         "required": [
@@ -1995,6 +5189,117 @@
                 },
                 "role": {
                   "$ref": "#/components/schemas/Role"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_List": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "description",
+                "double_optin",
+                "visibility",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "double_optin": {
+                  "type": "boolean",
+                  "description": "`true`: a new member is `pending` until they confirm. `false`: a new member is\n`subscribed` at once."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "visibility": {
+                  "$ref": "#/components/schemas/Visibility",
+                  "description": "Unused until the preference center, which shows the `public` lists as topics."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_ListMember": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A contact's standing on one list.",
+              "required": [
+                "contact_id",
+                "email",
+                "status"
+              ],
+              "properties": {
+                "contact_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "email": {
+                  "type": "string"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/MembershipStatus"
+                },
+                "subscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Null while `pending`, and after an unsubscribe is undone on a double-opt-in list."
+                },
+                "unsubscribed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Set only while the status is `unsubscribed`."
                 }
               }
             }
@@ -2099,6 +5404,137 @@
           }
         }
       },
+      "Page_Suppression": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A suppression as the API shows it. There is deliberately no hash field here.",
+              "required": [
+                "id",
+                "scope",
+                "reason",
+                "created_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "created_by_user_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
+                "domain": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Domain scope only."
+                },
+                "email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Address scope only; null on an erasure tombstone, whose plaintext was destroyed."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "lifted_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "Set when lifted. A lifted row stays, as history."
+                },
+                "lifted_by_user_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "reason": {
+                  "$ref": "#/components/schemas/Reason"
+                },
+                "scope": {
+                  "$ref": "#/components/schemas/Scope"
+                },
+                "workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid",
+                  "description": "Null for an instance-wide suppression, which applies to every workspace."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Tag": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "created_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Workspace": {
         "type": "object",
         "required": [
@@ -2174,6 +5610,30 @@
           }
         }
       },
+      "Purged": {
+        "type": "object",
+        "required": [
+          "affected"
+        ],
+        "properties": {
+          "affected": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Contacts whose value for the field was removed."
+          }
+        }
+      },
+      "Reason": {
+        "type": "string",
+        "description": "Why an address is blocked. Stored as text under a `check` constraint, not a Postgres enum.",
+        "enum": [
+          "unsubscribed_all",
+          "bounced",
+          "complained",
+          "manual",
+          "gdpr_erasure"
+        ]
+      },
       "Role": {
         "type": "string",
         "description": "A member's role, stored as lowercase text. Variants run from least to most privileged:\n`authorize` compares roles with `<`, so the order here is load-bearing.",
@@ -2182,6 +5642,13 @@
           "editor",
           "admin",
           "owner"
+        ]
+      },
+      "Scope": {
+        "type": "string",
+        "enum": [
+          "address",
+          "domain"
         ]
       },
       "SecondFactorRequest": {
@@ -2202,6 +5669,26 @@
           }
         }
       },
+      "SelectionToken": {
+        "type": "object",
+        "description": "The signed token for a selection; see `selection`.",
+        "required": [
+          "selection_token",
+          "selected"
+        ],
+        "properties": {
+          "selected": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many contacts the filter matches, as of the token's `as_of`. A live count over the\nwhole match: deliberately exempt from the 150 ms p95 target, like\n`GET /lists/{id}/mailable-count`, because counting ten million rows is slow. The UI asks\nfor it when the user asks to select everything, and shows a skeleton until it lands. It is\nnever kept as a counter on a table: hand-maintained counters drift.",
+            "minimum": 0
+          },
+          "selection_token": {
+            "type": "string",
+            "description": "Valid for one hour. Pass it to a `bulk/*` route."
+          }
+        }
+      },
       "SetupResponse": {
         "type": "object",
         "required": [
@@ -2217,6 +5704,216 @@
             "description": "Base32 secret, shown only here."
           }
         }
+      },
+      "Suppression": {
+        "type": "object",
+        "description": "A suppression as the API shows it. There is deliberately no hash field here.",
+        "required": [
+          "id",
+          "scope",
+          "reason",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by_user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Domain scope only."
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Address scope only; null on an erasure tombstone, whose plaintext was destroyed."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lifted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Set when lifted. A lifted row stays, as history."
+          },
+          "lifted_by_user_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope"
+          },
+          "workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Null for an instance-wide suppression, which applies to every workspace."
+          }
+        }
+      },
+      "Tag": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateContact": {
+        "type": "object",
+        "description": "A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit\n`null` removes it. The address cannot change, so `email` is an unknown field here and is\nrejected, not ignored.",
+        "properties": {
+          "attributes": {
+            "description": "Merged into the stored attributes key by key: a key left out keeps its value. A key set to\n`null` is removed, also for an archived field; any other value for an archived field is\nrefused. `attributes` itself cannot be `null`."
+          },
+          "first_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears it to an empty string."
+          },
+          "last_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears it to an empty string."
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An IANA time zone such as `Europe/London`. `null` clears it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateCustomField": {
+        "type": "object",
+        "description": "`key` is immutable, so an unknown field (`key` included) is rejected, not ignored. `kind` is\naccepted only so that a change can be refused with a message that says why.",
+        "properties": {
+          "kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FieldKind",
+                "description": "Must equal the field's current kind: changing it is not supported yet."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "options": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateList": {
+        "type": "object",
+        "description": "A field left out is left alone.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "double_optin": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Only decides the status of members added from now on. A member already `pending` stays\n`pending` (not mailable) when this is switched off."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visibility": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Visibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateTag": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace. 1-100 characters."
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateWorkspace": {
         "type": "object",
@@ -2236,6 +5933,14 @@
           }
         },
         "additionalProperties": false
+      },
+      "Visibility": {
+        "type": "string",
+        "description": "Stored as text under a `check` constraint, not a Postgres enum.",
+        "enum": [
+          "public",
+          "private"
+        ]
       },
       "Workspace": {
         "type": "object",

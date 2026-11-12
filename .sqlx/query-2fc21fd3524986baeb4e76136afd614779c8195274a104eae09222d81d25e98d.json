@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into lists (id, workspace_id, name, description, double_optin, visibility) values ($1, $2, $3, $4, coalesce($5, true), coalesce($6, 'private'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2fc21fd3524986baeb4e76136afd614779c8195274a104eae09222d81d25e98d"
+}
