@@ -13,6 +13,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{PW, TestApp, add_member, create_user, create_workspace};
 use nm::{
+    audit::Actor,
     contacts::{
         ContactFilter,
         selection::{MAX_SELECTION, materialise, reap_one_expired},
@@ -97,6 +98,35 @@ async fn selection(app: &TestApp, ws: Uuid, body: Value) -> (Uuid, u64) {
         body["snapshot_id"].as_str().unwrap().parse().unwrap(),
         body["selected"].as_u64().unwrap(),
     )
+}
+
+/// An editor API key for the workspace, as `(id, key)`.
+async fn make_key(owner: &TestApp, ws: Uuid) -> (Uuid, String) {
+    let r = owner
+        .post(&format!("{}/api-keys", base(ws)))
+        .json(&json!({"name": "ci", "role": "editor"}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let body = r.json::<Value>();
+    (
+        body["id"].as_str().unwrap().parse().unwrap(),
+        body["key"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// A selection made by an API key (Bearer, no cookie), as its snapshot id.
+async fn key_selection(anon: &TestApp, ws: Uuid, key: &str) -> Uuid {
+    let r = anon
+        .post(&format!("{}/contacts/selection", base(ws)))
+        .add_header("authorization", format!("Bearer {key}"))
+        .json(&json!({}))
+        .await;
+    r.assert_status_ok();
+    r.json::<Value>()["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 /// The frozen set, straight from the table, in id order.
@@ -208,7 +238,7 @@ async fn the_cap_refuses_without_claiming_an_exact_count_and_writes_nothing(pool
     let err = materialise(
         pool.clone(),
         ws,
-        None,
+        Actor::System,
         json!({}),
         ContactFilter::default(),
         None,
@@ -239,6 +269,24 @@ async fn the_cap_refuses_without_claiming_an_exact_count_and_writes_nothing(pool
 
     // And the cap the endpoint applies is the spec's million, not the test's two.
     assert_eq!(MAX_SELECTION, 1_000_000);
+
+    // A refusal past the quota check still carries the `RateLimit` headers the endpoint's
+    // contract promises, and the quota it spent. A 404 for an unresolvable segment carries them
+    // too: both are answers to a request that was counted.
+    let r = select(&app, ws, json!({"q": "ab"})).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        r.header("ratelimit-limit").to_str().unwrap(),
+        SELECTION_PER_MINUTE.to_string(),
+        "a 422 dropped the headers the contract promises"
+    );
+    let r = select(&app, ws, json!({"segment_id": Uuid::now_v7()})).await;
+    r.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(
+        r.header("ratelimit-limit").to_str().unwrap(),
+        SELECTION_PER_MINUTE.to_string(),
+        "a 404 dropped the headers the contract promises"
+    );
 }
 
 /// One selection per person per workspace: the UI has one active selection at a time, so the old
@@ -288,6 +336,81 @@ async fn a_new_selection_supersedes_only_the_actors_previous_one_in_that_workspa
     assert!(
         stored_size(&pool, across).await.is_some(),
         "the same person's selection in another workspace was deleted"
+    );
+}
+
+/// An API key is an actor too, and its selections supersede each other. They cannot ride
+/// `created_by`: that column takes a user, and NULL never equals NULL, so every key in the
+/// workspace would share one pile that is never superseded — 600 live snapshots an hour at the
+/// rate limit, against a reaper that clears 60.
+#[sqlx::test]
+async fn an_api_key_supersedes_only_its_own_previous_selection(pool: PgPool) {
+    let (ws, owner) = workspace(&pool, "acme").await;
+    contact(&owner, ws, "a@ex.test").await;
+    let (_, first_key) = make_key(&owner, ws).await;
+    let (_, second_key) = make_key(&owner, ws).await;
+    let anon = TestApp::new(pool.clone()).await;
+
+    let mine = key_selection(&anon, ws, &first_key).await;
+    let theirs = key_selection(&anon, ws, &second_key).await;
+    let (users, _) = selection(&owner, ws, json!({})).await;
+    assert!(
+        stored_size(&pool, mine).await.is_some(),
+        "another key's selection superseded this one"
+    );
+
+    let second = key_selection(&anon, ws, &first_key).await;
+
+    assert_eq!(
+        stored_size(&pool, mine).await,
+        None,
+        "a key's own previous selection was not superseded"
+    );
+    assert!(
+        members(&pool, mine).await.is_empty(),
+        "the parent went but its members stayed"
+    );
+    assert!(stored_size(&pool, second).await.is_some(), "the new one");
+    assert!(
+        stored_size(&pool, theirs).await.is_some(),
+        "another key's selection in the same workspace was deleted"
+    );
+    assert!(
+        stored_size(&pool, users).await.is_some(),
+        "a user's selection was deleted by a key's"
+    );
+    // The identity is recorded in the column that can hold it, not in the user one.
+    let (by_user, by_key): (Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("select created_by, created_by_key from selection_snapshots where id = $1")
+            .bind(second)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(by_user, None, "a key is not a user");
+    assert!(by_key.is_some(), "the key was not recorded");
+}
+
+/// `selection_snapshot_members` is `unlogged` (section 7): ~158 MB per million rows would
+/// otherwise go through WAL and into every base backup. The consequence is that a crash truncates
+/// the table, which is the same "select again" path the TTL already produces — so the decision is
+/// only safe while the TTL path exists, and only real while this holds.
+#[sqlx::test]
+async fn the_members_table_is_unlogged_and_the_parent_is_not(pool: PgPool) {
+    let both: Vec<(String, String)> = sqlx::query_as(
+        "select relname::text, relpersistence::text from pg_class \
+         where relname in ('selection_snapshots', 'selection_snapshot_members') \
+         order by relname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        both,
+        vec![
+            // The parent is ordinary, so "u" below is not simply what every table here answers.
+            ("selection_snapshot_members".to_owned(), "u".to_owned()),
+            ("selection_snapshots".to_owned(), "p".to_owned()),
+        ]
     );
 }
 

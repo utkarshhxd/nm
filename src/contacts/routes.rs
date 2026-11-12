@@ -662,6 +662,25 @@ pub async fn create_selection(
         )
             .into_response());
     }
+    // Every answer from here carries the `RateLimit` headers, refusals included. The quota was
+    // spent whatever the outcome, and `422 selection-too-large` is exactly the moment a client
+    // needs to know how many attempts are left before it narrows the filter and tries again.
+    Ok(
+        match freeze(&state, &principal, workspace_id, input, conn).await {
+            Ok(body) => (quota.headers, Json(body)).into_response(),
+            Err(e) => (quota.headers, e).into_response(),
+        },
+    )
+}
+
+/// `create_selection` past the role check and the quota: validate, resolve, materialise, sign.
+async fn freeze(
+    state: &AppState,
+    principal: &Principal,
+    workspace_id: Uuid,
+    input: NewSelection,
+    mut conn: sqlx::pool::PoolConnection<Postgres>,
+) -> ApiResult<SelectionToken> {
     if input.list_status.is_some() && input.list_id.is_none() {
         return Err(ApiError::Validation(vec![FieldError::new(
             "list_status",
@@ -686,10 +705,6 @@ pub async fn create_selection(
     // The bound is taken before the insert, which may run for seconds, so the token's set is a
     // subset of the frozen one by creation time rather than a superset of it.
     let mut selection = Selection::now(workspace_id, filter.clone());
-    let created_by = match &principal {
-        Principal::User { user_id, .. } => Some(*user_id),
-        Principal::ApiKey { .. } => None,
-    };
     // The predicate as it was sent, kept for the audit row the bulk action writes: the token
     // carries none, so without this the log would hold a snapshot id that is deleted an hour
     // later. `q` is redacted by that copy, not here.
@@ -699,7 +714,7 @@ pub async fn create_selection(
     let snapshot = selection::materialise(
         state.pool.clone(),
         workspace_id,
-        created_by,
+        principal.actor(),
         filter_doc,
         filter,
         rules,
@@ -709,18 +724,14 @@ pub async fn create_selection(
     // Signed into the token: this is the number the person is about to be shown, and the only
     // thing a bulk action can later compare its own resolved count against.
     selection.issued = snapshot.size;
-    Ok((
-        quota.headers,
-        Json(SelectionToken {
-            selection_token: input
-                .segment_id
-                .is_none()
-                .then(|| selection::issue(&state.secrets, &selection)),
-            snapshot_id: snapshot.id,
-            selected: snapshot.size,
-        }),
-    )
-        .into_response())
+    Ok(SelectionToken {
+        selection_token: input
+            .segment_id
+            .is_none()
+            .then(|| selection::issue(&state.secrets, &selection)),
+        snapshot_id: snapshot.id,
+        selected: snapshot.size,
+    })
 }
 
 /// Opens the transaction, authorises, and resolves the token: in that order, so a non-member

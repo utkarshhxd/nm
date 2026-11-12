@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from selection_snapshots where workspace_id = $1 and created_by is not distinct from $2::uuid and created_by_key is not distinct from $3::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4772e23e8507fb62571f58871a6cb43bca119596817843256d90a10b1578b7a5"
+}

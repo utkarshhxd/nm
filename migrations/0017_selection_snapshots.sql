@@ -11,7 +11,13 @@
 create table selection_snapshots (
   id uuid primary key,                -- UUIDv7: carries its own issue time, see section 8.5
   workspace_id uuid not null references workspaces(id) on delete cascade,
+  -- Exactly one of these is set: a selection is made by a signed-in user or by an API key, and
+  -- a new selection supersedes only that same actor's previous one. One nullable `created_by`
+  -- cannot carry a key, and NULL does not compare equal to NULL, so every key in a workspace
+  -- would share one unsuperseded pile: at 10 selections a minute that is 600 live snapshots an
+  -- hour against a reaper that clears 60.
   created_by uuid references users(id) on delete set null,
+  created_by_key uuid references api_keys(id) on delete set null,
   filter jsonb not null,
   size bigint not null,
   created_at timestamptz not null default now(),
@@ -21,7 +27,8 @@ create table selection_snapshots (
 -- The reaper's index: one expired snapshot per pass, oldest first (section 8.10).
 create index selection_snapshots_expiry on selection_snapshots (expires_at);
 -- A new selection supersedes the actor's previous live one in the workspace (section 8.4).
-create index selection_snapshots_actor on selection_snapshots (workspace_id, created_by);
+create index selection_snapshots_actor
+  on selection_snapshots (workspace_id, created_by, created_by_key);
 
 -- `unlogged` on purpose: this table is ephemeral, hourly and recreatable. Logged, it would push
 -- ~158 MB per 1M-row selection through WAL and into every base backup. A crash truncates it, which

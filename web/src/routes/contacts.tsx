@@ -319,6 +319,13 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       setFailure(problemMessage(error, "Could not select every matching contact."));
       return;
     }
+    if (!data.selection_token) {
+      // The server answers with no token for a selection a filter cannot express (one naming a
+      // segment). This screen never asks for one, so this is unreachable today, and it stops
+      // being representable once the token carries the snapshot id instead of the filter.
+      setFailure("Could not select every matching contact.");
+      return;
+    }
     setMatched({ key: mine, n: data.selected });
     store.selectAll(data.selection_token, data.selected);
   }

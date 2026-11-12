@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use super::{ContactFilter, push_filter};
 use crate::{
+    audit::Actor,
     crypto::{secrets::Secrets, tokens},
     error::{ApiError, ApiResult, FieldError},
     lists::MembershipStatus,
@@ -273,23 +274,14 @@ pub struct Snapshot {
 pub async fn materialise(
     pool: PgPool,
     workspace_id: Uuid,
-    created_by: Option<Uuid>,
+    actor: Actor,
     filter_doc: Value,
     filter: ContactFilter,
     rules: Option<Group>,
     cap: u64,
 ) -> ApiResult<Snapshot> {
     tokio::spawn(async move {
-        materialise_in(
-            pool,
-            workspace_id,
-            created_by,
-            filter_doc,
-            filter,
-            rules,
-            cap,
-        )
-        .await
+        materialise_in(pool, workspace_id, actor, filter_doc, filter, rules, cap).await
     })
     .await
     .map_err(|e| ApiError::Internal(e.into()))?
@@ -298,34 +290,43 @@ pub async fn materialise(
 async fn materialise_in(
     pool: PgPool,
     workspace_id: Uuid,
-    created_by: Option<Uuid>,
+    actor: Actor,
     filter_doc: Value,
     filter: ContactFilter,
     rules: Option<Group>,
     cap: u64,
 ) -> ApiResult<Snapshot> {
+    let (created_by, created_by_key) = columns(actor);
     let id = Uuid::now_v7();
     let mut tx = pool.begin().await?;
     // The actor's previous live selection is superseded: the UI has one active selection at a
     // time, so the old snapshot is dead weight, and dropping it bounds one person's footprint to
-    // one snapshot of up to 158 MB. Scoped to the actor and the workspace, so it cannot reach a
-    // colleague's. `created_by` is NULL for an API key and `= NULL` matches nothing, so an API
-    // key's snapshots are not superseded; they age out with the TTL like anything else.
+    // one snapshot of up to 158 MB.
+    //
+    // Matched on the actor's real identity, whichever class it is, and `is not distinct from` so
+    // that the NULL half of the pair compares. Matching on `created_by` alone would supersede
+    // nothing for an API key (NULL never equals NULL), and collapsing both to one nullable column
+    // would give every key in the workspace a single shared slot, so two keys selecting at once
+    // would destroy each other's snapshots — a correctness bug traded for a disk one.
     sqlx::query!(
-        "delete from selection_snapshots where workspace_id = $1 and created_by = $2",
+        "delete from selection_snapshots where workspace_id = $1 \
+         and created_by is not distinct from $2::uuid \
+         and created_by_key is not distinct from $3::uuid",
         workspace_id,
         created_by,
+        created_by_key,
     )
     .execute(&mut *tx)
     .await?;
     // `size` is written after the insert, which is the only thing that knows it.
     sqlx::query!(
         "insert into selection_snapshots \
-           (id, workspace_id, created_by, filter, size, expires_at) \
-         values ($1, $2, $3, $4, 0, now() + make_interval(secs => $5))",
+           (id, workspace_id, created_by, created_by_key, filter, size, expires_at) \
+         values ($1, $2, $3, $4, $5, 0, now() + make_interval(secs => $6))",
         id,
         workspace_id,
         created_by,
+        created_by_key,
         filter_doc,
         SNAPSHOT_TTL_SECS,
     )
@@ -356,6 +357,19 @@ async fn materialise_in(
     .await?;
     tx.commit().await?;
     Ok(Snapshot { id, size })
+}
+
+/// `(created_by, created_by_key)` for an actor: exactly one is set, so the pair is the actor's
+/// identity and two actors of different classes can never collide.
+///
+/// `System` makes no selection — nothing in the product calls this without a request behind it —
+/// and an unattributed snapshot is simply never superseded; it ages out with the TTL.
+fn columns(actor: Actor) -> (Option<Uuid>, Option<Uuid>) {
+    match actor {
+        Actor::User(id) => (Some(id), None),
+        Actor::ApiKey(id) => (None, Some(id)),
+        Actor::System => (None, None),
+    }
 }
 
 /// `1000000` as `1,000,000`. The refusal is a sentence a person reads.
