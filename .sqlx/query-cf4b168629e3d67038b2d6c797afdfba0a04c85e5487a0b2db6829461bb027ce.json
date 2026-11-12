@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update segments set name = coalesce($3, name), description = coalesce($4, description), version = case when $5::jsonb is not null and $5::jsonb is distinct from rules then version + 1 else version end, rules = coalesce($5::jsonb, rules), updated_at = now() where workspace_id = $1 and id = $2 returning version",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "segments",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cf4b168629e3d67038b2d6c797afdfba0a04c85e5487a0b2db6829461bb027ce"
+}

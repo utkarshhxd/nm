@@ -45,6 +45,9 @@ pub mod actions {
     pub const LIST_DELETED: &str = "list.deleted";
     pub const LIST_MEMBER_ADDED: &str = "list.member_added";
     pub const LIST_MEMBER_REMOVED: &str = "list.member_removed";
+    pub const SEGMENT_CREATED: &str = "segment.created";
+    pub const SEGMENT_UPDATED: &str = "segment.updated";
+    pub const SEGMENT_DELETED: &str = "segment.deleted";
     pub const TAG_CREATED: &str = "tag.created";
     pub const TAG_UPDATED: &str = "tag.updated";
     pub const TAG_DELETED: &str = "tag.deleted";

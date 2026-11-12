@@ -2676,7 +2676,7 @@
             "description": "not a member, or no such field in this workspace"
           },
           "409": {
-            "description": "field-not-archived"
+            "description": "field-not-archived, or field-in-use: a segment still names it, and the problem lists which"
           }
         }
       }
@@ -3153,6 +3153,260 @@
           },
           "404": {
             "description": "not a member, or the contact was never on this list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/segments": {
+      "get": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "operationId": "list_segments",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Segment"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "operationId": "create_segment",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSegment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Segment"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a segment takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "segment-name-taken"
+          },
+          "422": {
+            "description": "invalid name or description, or a refused rule document (malformed-rules, empty-rules, unknown-field, ...)"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/segments/{id}": {
+      "get": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "operationId": "get_segment",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Segment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Segment"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such segment in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "summary": "A hard delete. A segment is only a saved question: no contact is touched.",
+        "operationId": "delete_segment",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Segment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a segment takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such segment in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "operationId": "update_segment",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Segment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSegment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Segment"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a segment takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such segment in this workspace"
+          },
+          "409": {
+            "description": "segment-name-taken"
+          },
+          "422": {
+            "description": "invalid name or description, an unknown field, or a rule document that is not a whole, valid one"
           }
         }
       }
@@ -4760,6 +5014,30 @@
           }
         }
       },
+      "NewSegment": {
+        "type": "object",
+        "required": [
+          "name",
+          "rules"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace."
+          },
+          "rules": {
+            "type": "object",
+            "description": "The whole rule document, `{match, rules}`."
+          }
+        },
+        "additionalProperties": false
+      },
       "NewSuppression": {
         "type": "object",
         "description": "A suppression to add. `scope` decides which of `email` and `domain` is required, and the other\nmust be absent.",
@@ -5404,6 +5682,71 @@
           }
         }
       },
+      "Page_Segment": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "description",
+                "rules",
+                "version",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "created_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "rules": {
+                  "type": "object",
+                  "description": "The rule document, `{match, rules}`. Replaced as a whole on every edit."
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "version": {
+                  "type": "integer",
+                  "format": "int32",
+                  "description": "Starts at 1 and moves only when an edit changes `rules`: a rename leaves it alone."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Suppression": {
         "type": "object",
         "required": [
@@ -5669,6 +6012,54 @@
           }
         }
       },
+      "Segment": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "rules",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rules": {
+            "type": "object",
+            "description": "The rule document, `{match, rules}`. Replaced as a whole on every edit."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Starts at 1 and moves only when an edit changes `rules`: a rename leaves it alone."
+          }
+        }
+      },
       "SelectionToken": {
         "type": "object",
         "description": "The signed token for a selection; see `selection`.",
@@ -5898,6 +6289,34 @@
                 "type": "null"
               }
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateSegment": {
+        "type": "object",
+        "description": "A merge patch (RFC 7386) of everything but `rules`: a field left out is left alone, `null`\nclears `description`. `rules` is the exception: it is **replaced as a whole**, never merged\ninto the stored document. A patch carrying `rules` must carry the entire document; a partial\none is `422`, because merging `{\"match\": \"any\"}` into the old document would flip the\nconnective and silently keep the old rules.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears it to an empty string."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cannot be `null`."
+          },
+          "rules": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The whole replacement document. `null` is refused, not ignored."
           }
         },
         "additionalProperties": false

@@ -363,7 +363,8 @@ pub async fn archive_custom_field(
         (status = 200, description = "Every contact's value for the field was removed", body = Purged),
         (status = 403, description = "insufficient-role: purging takes admin"),
         (status = 404, description = "not a member, or no such field in this workspace"),
-        (status = 409, description = "field-not-archived"),
+        (status = 409, description = "field-not-archived, or field-in-use: a segment still names \
+            it, and the problem lists which"),
     ),
 )]
 pub async fn purge_custom_field(
@@ -377,6 +378,30 @@ pub async fn purge_custom_field(
     let field = load(&mut tx, workspace_id, id).await?;
     if field.archived_at.is_none() {
         return Err(ApiError::Conflict("field-not-archived"));
+    }
+    // A segment naming the key would be left unusable, with no way to repair it: the field it
+    // names would be gone. `$.**` walks every nesting level of the rule document. One more than
+    // is listed, to know whether the list is cut short.
+    let naming = sqlx::query_scalar!(
+        "select name from segments where workspace_id = $1 \
+         and jsonb_path_exists(rules, '$.** ? (@.field == $f)', \
+                               jsonb_build_object('f', 'attr:' || $2::text)) \
+         order by name limit 11",
+        workspace_id,
+        field.key,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if !naming.is_empty() {
+        let listed: Vec<_> = naming.iter().take(10).map(|n| format!("`{n}`")).collect();
+        let more = if naming.len() > 10 { ", and more" } else { "" };
+        return Err(ApiError::ConflictDetail {
+            code: "field-in-use",
+            detail: format!(
+                "segments still name this field: {}{more}. Edit or delete them first",
+                listed.join(", ")
+            ),
+        });
     }
     // shortcut: one statement in one transaction, holding a row lock per contact until it
     // commits; batch it if a single workspace ever holds enough contacts for that to hurt.

@@ -854,6 +854,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/segments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_segments"];
+        put?: never;
+        post: operations["create_segment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/segments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_segment"];
+        put?: never;
+        post?: never;
+        /** A hard delete. A segment is only a saved question: no contact is touched. */
+        delete: operations["delete_segment"];
+        options?: never;
+        head?: never;
+        patch: operations["update_segment"];
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/suppressions": {
         parameters: {
             query?: never;
@@ -1369,6 +1402,13 @@ export interface components {
         NewPasskey: {
             name: string;
         };
+        NewSegment: {
+            description?: string | null;
+            /** @description Unique in the workspace. */
+            name: string;
+            /** @description The whole rule document, `{match, rules}`. */
+            rules: Record<string, never>;
+        };
         /**
          * @description A suppression to add. `scope` decides which of `email` and `domain` is required, and the other
          *     must be absent.
@@ -1554,6 +1594,28 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_Segment: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                created_by?: string | null;
+                description: string;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** @description The rule document, `{match, rules}`. Replaced as a whole on every edit. */
+                rules: Record<string, never>;
+                /** Format: date-time */
+                updated_at: string;
+                /**
+                 * Format: int32
+                 * @description Starts at 1 and moves only when an edit changes `rules`: a rename leaves it alone.
+                 */
+                version: number;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Suppression: {
             data: {
                 /** Format: date-time */
@@ -1639,6 +1701,25 @@ export interface components {
         SecondFactorRequest: {
             code?: string | null;
             recovery_code?: string | null;
+        };
+        Segment: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            created_by?: string | null;
+            description: string;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @description The rule document, `{match, rules}`. Replaced as a whole on every edit. */
+            rules: Record<string, never>;
+            /** Format: date-time */
+            updated_at: string;
+            /**
+             * Format: int32
+             * @description Starts at 1 and moves only when an edit changes `rules`: a rename leaves it alone.
+             */
+            version: number;
         };
         /** @description The signed token for a selection; see `selection`. */
         SelectionToken: {
@@ -1732,6 +1813,21 @@ export interface components {
             double_optin?: boolean | null;
             name?: string | null;
             visibility?: components["schemas"]["Visibility"] | null;
+        };
+        /**
+         * @description A merge patch (RFC 7386) of everything but `rules`: a field left out is left alone, `null`
+         *     clears `description`. `rules` is the exception: it is **replaced as a whole**, never merged
+         *     into the stored document. A patch carrying `rules` must carry the entire document; a partial
+         *     one is `422`, because merging `{"match": "any"}` into the old document would flip the
+         *     connective and silently keep the old rules.
+         */
+        UpdateSegment: {
+            /** @description `null` clears it to an empty string. */
+            description?: string | null;
+            /** @description Cannot be `null`. */
+            name?: string | null;
+            /** @description The whole replacement document. `null` is refused, not ignored. */
+            rules?: Record<string, never> | null;
         };
         UpdateTag: {
             /** @description Unique in the workspace. 1-100 characters. */
@@ -4131,7 +4227,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description field-not-archived */
+            /** @description field-not-archived, or field-in-use: a segment still names it, and the problem lists which */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4510,6 +4606,226 @@ export interface operations {
             };
             /** @description not a member, or the contact was never on this list */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_segments: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Segment"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_segment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSegment"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Segment"];
+                };
+            };
+            /** @description insufficient-role: creating a segment takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description segment-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name or description, or a refused rule document (malformed-rules, empty-rules, unknown-field, ...) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_segment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Segment id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Segment"];
+                };
+            };
+            /** @description not a member, or no such segment in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_segment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Segment id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a segment takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such segment in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_segment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Segment id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateSegment"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Segment"];
+                };
+            };
+            /** @description insufficient-role: editing a segment takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such segment in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description segment-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid name or description, an unknown field, or a rule document that is not a whole, valid one */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

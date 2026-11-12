@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select name from segments where workspace_id = $1 and jsonb_path_exists(rules, '$.** ? (@.field == $f)', jsonb_build_object('f', 'attr:' || $2::text)) order by name limit 11",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "segments",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6d6891e94f59d2aeb4502f7f0d2157c0f8cf531fbe936c99a4138983fbe25d27"
+}
