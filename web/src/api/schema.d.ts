@@ -1012,6 +1012,14 @@ export interface components {
         BulkResult: {
             /** Format: int64 */
             affected: number;
+            /**
+             * Format: int64
+             * @description How many the selection stood for when it was made. `selected` above it means the filter
+             *     matched contacts that did not match when the person looked — they existed then, and were
+             *     tagged, subscribed or renamed into the view afterwards. `bulk/delete` refuses outright in
+             *     that case; the reversible actions proceed and the UI says so.
+             */
+            issued: number;
             /** Format: int64 */
             selected: number;
             status?: components["schemas"]["MembershipStatus"] | null;
@@ -3204,6 +3212,13 @@ export interface operations {
             };
             /** @description not a member, or a token for another workspace */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

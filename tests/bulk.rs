@@ -209,6 +209,7 @@ fn token_aged(app: &TestApp, ws: Uuid, age: std::time::Duration) -> String {
         filter: ContactFilter::default(),
         as_of: Uuid::new_v7(Timestamp::from_unix(NoContext, secs, 0)),
         ids: None,
+        issued: 0,
     };
     issue(&app.state.secrets, &sel)
 }
@@ -946,4 +947,97 @@ async fn valid_bodies_are_accepted_with_or_without_excluded_ids(pool: PgPool) {
     assert_eq!(affected(bulk(&app, ws, "untag", absent).await).await, 3);
     let absent = json!({"selection_token": token});
     assert_eq!(affected(bulk(&app, ws, "delete", absent).await).await, 3);
+}
+
+/// Tags every contact in `ids` with `tag`, as a second editor would.
+async fn apply_tag(app: &TestApp, ws: Uuid, tag: Uuid, ids: &[Uuid]) {
+    for id in ids {
+        app.put(&format!("{}/contacts/{id}/tags/{tag}", base(ws)))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+}
+
+/// One contact tagged `churn`, a token for `tag_id = churn`, then the other three tagged too.
+/// Every one of the four existed before `as_of`, so the snapshot does not exclude them: only the
+/// issue-time count can tell that the view widened.
+async fn widened(pool: &PgPool, slug: &str) -> (Uuid, TestApp, Uuid, Vec<Uuid>, String) {
+    let (ws, app) = workspace(pool, slug).await;
+    let churn = tag(&app, ws, "churn").await;
+    let ids = contacts(&app, ws, "c", 4).await;
+    apply_tag(&app, ws, churn, &ids[..1]).await;
+
+    let r = app
+        .post(&format!("{}/contacts/selection", base(ws)))
+        .json(&json!({"tag_id": churn}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["selected"].as_u64().unwrap(), 1);
+    let token = r.json::<Value>()["selection_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    apply_tag(&app, ws, churn, &ids[1..]).await;
+    (ws, app, churn, ids, token)
+}
+
+/// The snapshot freezes creation time, not the filter: `push_filter` reads tags, memberships and
+/// names as they are when the action runs. A contact that existed at `as_of` and was tagged
+/// afterwards therefore matches. On `bulk/delete` that is unrecoverable and the person confirmed
+/// a smaller number, so it is refused and the transaction rolls back.
+#[sqlx::test]
+async fn a_delete_whose_view_widened_is_refused_and_deletes_nothing(pool: PgPool) {
+    let (ws, app, _churn, _ids, token) = widened(&pool, "acme").await;
+
+    let r = bulk(&app, ws, "delete", json!({"selection_token": token})).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:selection-widened");
+    // The refusal names both numbers: a count with no denominator cannot explain itself.
+    let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains('1') && detail.contains('4'), "{detail}");
+
+    // Nothing was deleted, and no audit row claims otherwise.
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 4);
+    assert_eq!(
+        count(
+            &pool,
+            "select count(*) from audit_log where action = 'contacts.bulk_deleted'"
+        )
+        .await,
+        0
+    );
+}
+
+/// The reversible kinds proceed, because they can be undone and the gap is already their subject.
+/// The response carries the issue-time count beside the resolved one, so the UI can say the view
+/// widened rather than report four as a plain success.
+#[sqlx::test]
+async fn a_widened_untag_proceeds_and_reports_both_counts(pool: PgPool) {
+    let (ws, app, churn, _ids, token) = widened(&pool, "acme").await;
+
+    let r = bulk(
+        &app,
+        ws,
+        "untag",
+        json!({"selection_token": token, "tag_id": churn}),
+    )
+    .await;
+    r.assert_status_ok();
+    let body = r.json::<Value>();
+    assert_eq!(body["issued"].as_u64().unwrap(), 1);
+    assert_eq!(body["selected"].as_u64().unwrap(), 4);
+    assert_eq!(body["affected"].as_u64().unwrap(), 4);
+    assert_eq!(tagged(&pool, churn).await.len(), 0);
+}
+
+/// An id list names its contacts, so it has no filter to re-run and can only shrink. The widening
+/// check must never fire on one.
+#[sqlx::test]
+async fn an_id_list_delete_is_never_refused_as_widened(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    let body = json!({"ids": [ids[0], ids[1]]});
+    assert_eq!(affected(bulk(&app, ws, "delete", body).await).await, 2);
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 1);
 }

@@ -1571,6 +1571,9 @@
           "404": {
             "description": "not a member, or a token for another workspace"
           },
+          "409": {
+            "description": "selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted"
+          },
           "422": {
             "description": "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"
           }
@@ -3765,12 +3768,19 @@
         "description": "What a bulk action did, as two numbers taken from the same statement. `affected` is how many\ncontacts it changed; `selected` is how many the selection matched (as of its `as_of`, less the\nexclusions). `affected` is lower whenever some were already in the wanted state, so the UI can\nsay \"N of M\".",
         "required": [
           "affected",
-          "selected"
+          "selected",
+          "issued"
         ],
         "properties": {
           "affected": {
             "type": "integer",
             "format": "int64",
+            "minimum": 0
+          },
+          "issued": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many the selection stood for when it was made. `selected` above it means the filter\nmatched contacts that did not match when the person looked — they existed then, and were\ntagged, subscribed or renamed into the view afterwards. `bulk/delete` refuses outright in\nthat case; the reversible actions proceed and the UI says so.",
             "minimum": 0
           },
           "selected": {

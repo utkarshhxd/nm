@@ -19,19 +19,13 @@ import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
 import { useMe } from "../lib/session";
+import { REASON } from "../lib/suppressions";
 import { useWorkspace } from "./workspace-layout";
 
 type Suppression = components["schemas"]["Suppression"];
 type Reason = components["schemas"]["Reason"];
 type Scope = components["schemas"]["Scope"];
 
-const REASON: Record<Reason, string> = {
-  unsubscribed_all: "Unsubscribed from everything",
-  bounced: "Bounced",
-  complained: "Complained",
-  manual: "Blocked manually",
-  gdpr_erasure: "Erased on request (GDPR)",
-};
 /** What a person may add: an erasure is only ever written by erasing a contact. */
 const ADDABLE = (Object.keys(REASON) as Reason[]).filter((r) => r !== "gdpr_erasure");
 

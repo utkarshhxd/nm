@@ -63,8 +63,12 @@ impl Secrets {
 
     /// A 32-byte key for one purpose: HMAC-SHA256 of `label` under the master key. A distinct label
     /// gives an unrelated key, so a value keyed for one purpose can never be replayed as another.
-    pub(crate) fn derive_key(&self, label: &str) -> [u8; 32] {
-        super::tokens::hmac_sha256(&self.master, label.as_bytes())
+    ///
+    /// `Zeroizing`, like the two key holders it derives from: a subkey is as good as the master
+    /// for everything signed under its label, and a bare `[u8; 32]` would be left in whatever
+    /// stack slot or moved-from copy the optimiser chose.
+    pub(crate) fn derive_key(&self, label: &str) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(super::tokens::hmac_sha256(&self.master, label.as_bytes()))
     }
 
     /// Encrypts under a fresh random nonce, so equal plaintexts give different blobs.

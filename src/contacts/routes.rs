@@ -568,6 +568,11 @@ impl BulkList {
 pub struct BulkResult {
     pub affected: u64,
     pub selected: u64,
+    /// How many the selection stood for when it was made. `selected` above it means the filter
+    /// matched contacts that did not match when the person looked — they existed then, and were
+    /// tagged, subscribed or renamed into the view afterwards. `bulk/delete` refuses outright in
+    /// that case; the reversible actions proceed and the UI says so.
+    pub issued: u64,
     /// Only for `subscribe`: the status the new memberships were written with. `pending` means
     /// the contacts are on a double-opt-in list and not mailable until they confirm, and nothing
     /// in this milestone confirms them: `affected` is not a count of people who can be mailed.
@@ -610,8 +615,11 @@ pub async fn create_selection(
         tag_id: filter.tag_id,
         ..ContactFilter::with_search(filter.q.as_deref())?
     };
-    let selection = Selection::now(workspace_id, filter);
+    let mut selection = Selection::now(workspace_id, filter);
     let selected = selection::count(&mut conn, &selection).await?;
+    // Signed into the token: this is the number the person is about to be shown, and the only
+    // thing a bulk action can later compare its own resolved count against.
+    selection.issued = selected;
     Ok(Json(SelectionToken {
         selection_token: selection::issue(&state.secrets, &selection),
         selected,
@@ -696,6 +704,7 @@ async fn finish_bulk(
                 // A count, not the ids, by design (one row, not one per contact): replayed calls with
                 // different exclusions cannot be told apart afterwards. Do not turn this into a list.
                 "excluded": target.excluded_ids.len(),
+                "issued": selection.issued,
                 "selected": counts.selected,
                 "affected": counts.affected,
                 "with": extra,
@@ -707,6 +716,7 @@ async fn finish_bulk(
     Ok(Json(BulkResult {
         affected: counts.affected,
         selected: counts.selected,
+        issued: selection.issued,
         status,
     }))
 }
@@ -894,6 +904,7 @@ pub async fn bulk_unsubscribe_contacts(
         (status = 200, description = "How many were deleted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, or a token for another workspace"),
+        (status = 409, description = "selection-widened: the filter now matches more contacts than the selection was made for; nothing was deleted"),
         (status = 422, description = "selection-expired, selection-invalid, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
@@ -906,6 +917,20 @@ pub async fn bulk_delete_contacts(
 ) -> ApiResult<Json<BulkResult>> {
     let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &input).await?;
     let n = selection::delete(&mut tx, &sel, &input.excluded_ids).await?;
+    // Inside the transaction and after the statement, so the number compared is the one the
+    // delete itself resolved rather than a second count that could disagree with it. Returning
+    // here drops `tx` and the delete rolls back.
+    if sel.widened(n.selected) {
+        return Err(ApiError::ConflictDetail {
+            code: "selection-widened",
+            detail: format!(
+                "This view matched {} contacts when you selected it and {} now, so nothing was \
+                 deleted. Contacts that already existed were changed to match it in between. \
+                 Select again to see what you would be deleting.",
+                sel.issued, n.selected,
+            ),
+        });
+    }
     let action = actions::CONTACTS_BULK_DELETED;
     finish_bulk(
         tx,

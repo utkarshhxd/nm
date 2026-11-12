@@ -751,12 +751,36 @@ function BulkAction({
 }
 
 /**
- * What a bulk action did, in words that cannot be mistaken for more. `affected` is how many it
- * changed and `selected` how many it was aimed at; they differ whenever some were already done.
- * A `pending` subscribe wrote rows that are not mailable until confirmed and nothing in this
- * milestone confirms them, so it is never reported as a successful subscribe.
+ * What a bulk action did, in words that cannot be mistaken for more, plus the one thing the
+ * per-kind wording cannot know: whether the view itself grew between the selection and the
+ * action.
  */
 function describe(
+  kind: Kind,
+  name: string,
+  result: components["schemas"]["BulkResult"],
+  promised?: number,
+): Result {
+  const outcome = describeOutcome(kind, name, result, promised);
+  const { selected, issued } = result;
+  if (selected <= issued) return outcome;
+  // The view matched more when the action ran than when it was made: those contacts existed all
+  // along and someone tagged, subscribed or renamed them into it in between. `bulk/delete`
+  // refuses outright (409), so only the reversible kinds reach this.
+  const extra = selected - issued;
+  return {
+    tone: "warn",
+    text: `${outcome.text} This view matched ${count(issued, "contact")} when you selected it and ${selected.toLocaleString()} when the action ran: ${extra.toLocaleString()} ${extra === 1 ? "was" : "were"} changed to match it in between.`,
+  };
+}
+
+/**
+ * The outcome in that action's own terms. `affected` is how many it changed and `selected` how
+ * many it was aimed at; they differ whenever some were already done. A `pending` subscribe wrote
+ * rows that are not mailable until confirmed and nothing in this milestone confirms them, so it
+ * is never reported as a successful subscribe.
+ */
+function describeOutcome(
   kind: Kind,
   name: string,
   { affected, selected, status }: components["schemas"]["BulkResult"],
@@ -796,6 +820,15 @@ function describe(
     const want = promised ?? selected;
     const short = want - affected;
     const them = short === 1 ? "it" : "them";
+    // More than was confirmed. The server refuses a widened filter selection before it deletes
+    // anything, so this is a backstop, not the main defence — and it is the direction that
+    // cannot be undone, so it says what happened rather than reading as success.
+    if (short < 0) {
+      return {
+        tone: "warn",
+        text: `Deleted ${affected.toLocaleString()} contacts — more than the ${count(want, "contact")} you confirmed. Contacts that already existed were changed to match this view after you selected it. No address was suppressed.`,
+      };
+    }
     return short > 0
       ? {
           tone: "warn",

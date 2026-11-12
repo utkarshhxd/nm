@@ -25,7 +25,12 @@ use crate::{
 
 /// Domain-separation label for the selection-token key: a token can never be replayed as any other
 /// HMAC'd value, nor the reverse.
-const SELECTION_DOMAIN: &str = "nm:selection:v1";
+///
+/// `v2` because `Selection` gained a required `issued`, and a `v1` token has none. Bumping the
+/// label refuses every outstanding token as `selection-invalid` — the path the UI already handles
+/// by asking the user to select again — rather than letting an uncounted token through the one
+/// check that stops `bulk/delete` widening. At most one hour of tokens can be outstanding.
+const SELECTION_DOMAIN: &str = "nm:selection:v2";
 
 /// A token older than this is refused. An hour is long enough to read a confirmation dialog and
 /// short enough that "everyone matching X, as of this morning" is not acted on tomorrow.
@@ -58,12 +63,27 @@ pub struct Selection {
     /// still scoped by `workspace_id`, so an id from another workspace selects nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ids: Option<Vec<Uuid>>,
+    /// How many contacts this selection stood for when it was made: the live count for a filter,
+    /// the number of ids for an id list.
+    ///
+    /// This is what the person was shown before they confirmed, carried inside the signature so
+    /// the server can compare it with what the predicate resolves to when the action runs. The
+    /// `as_of` bound freezes creation time only — `push_filter` reads list memberships, tags and
+    /// names as they are now — so a contact that existed at `as_of` and did not match then does
+    /// match now if someone has since tagged it or added it to the list. Without this number
+    /// nothing notices.
+    ///
+    /// Required, not optional: an uncounted token is one the widening check cannot be run on.
+    pub issued: u64,
 }
 
 impl Selection {
-    /// A selection of exactly these contacts, as of now.
+    /// A selection of exactly these contacts, as of now. `issued` is how many were named; the
+    /// resolved count can only be lower (an id from another workspace matches nothing), so an id
+    /// selection can never widen.
     pub fn of_ids(workspace_id: Uuid, ids: Vec<Uuid>) -> Selection {
         Selection {
+            issued: ids.len() as u64,
             ids: Some(ids),
             ..Selection::now(workspace_id, ContactFilter::default())
         }
@@ -79,12 +99,30 @@ impl Selection {
             filter,
             as_of: Uuid::now_v7(),
             ids: None,
+            // The count is not known until the filter has been run; the caller that issues a
+            // token sets it from `count` before signing. A selection that is never signed (the
+            // tests' own, and `of_ids`, which overrides it) is never compared against it.
+            issued: 0,
         }
+    }
+
+    /// True when the predicate resolved to more contacts than the selection was made for.
+    ///
+    /// Only a filter can widen, and only because `push_filter` reads current state: the people
+    /// who joined the match were already there at `as_of`, and someone tagged them, subscribed
+    /// them or renamed them into the search afterwards.
+    ///
+    /// Equal counts are not proof the same contacts matched. One contact leaving the match while
+    /// another joins it leaves the count unchanged and this returns false. Catching that needs
+    /// the set of ids the filter matched at issue time, which is exactly what a predicate
+    /// selection exists not to carry — see `docs/adr/0003-selection-is-a-snapshotted-predicate.md`.
+    pub fn widened(&self, selected: u64) -> bool {
+        selected > self.issued
     }
 }
 
 fn mac(secrets: &Secrets, payload: &[u8]) -> [u8; 32] {
-    tokens::hmac_sha256(&secrets.derive_key(SELECTION_DOMAIN), payload)
+    tokens::hmac_sha256(secrets.derive_key(SELECTION_DOMAIN).as_slice(), payload)
 }
 
 /// `base64url(json).base64url(hmac)`. Signed, not encrypted: it carries no secret, but a client
@@ -353,24 +391,39 @@ mod tests {
         )
     }
 
-    /// `ContactFilter` refuses unknown fields on the way in; a token's payload goes back through
-    /// the same struct. A token issued before that was added has exactly the four fields this
-    /// struct always wrote (absent ones as null), so it must still be read.
+    /// The payload this struct writes round-trips, and nothing else does.
+    ///
+    /// `issued` has no `serde(default)` on purpose: a payload without it is a token from before
+    /// the widening check existed, and it is refused rather than read as some default. That is
+    /// the fail-closed half of the `v1` to `v2` domain bump — a real old token already fails the
+    /// HMAC, and this covers the case where only the payload shape differs.
     #[test]
-    fn a_token_issued_before_deny_unknown_fields_still_parses() {
+    fn only_a_payload_this_build_writes_is_read() {
         let (ws, list) = (Uuid::now_v7(), Uuid::now_v7());
-        let token = signed(&serde_json::json!({
+        let full = serde_json::json!({
             "workspace_id": ws,
             "filter": {"q": null, "list_id": list, "list_status": "subscribed", "tag_id": null},
             "as_of": Uuid::now_v7(),
-        }));
-        let s = parse(&secrets(), &token).unwrap();
+            "issued": 7,
+        });
+        let s = parse(&secrets(), &signed(&full)).unwrap();
         assert_eq!(s.filter.list_id, Some(list));
+        assert_eq!(s.issued, 7);
+
+        // The pre-`issued` shape, signed by this instance: still refused.
+        let mut old = full.clone();
+        old.as_object_mut().unwrap().remove("issued");
+        assert!(matches!(
+            parse(&secrets(), &signed(&old)),
+            Err(ApiError::Unprocessable("selection-invalid"))
+        ));
+
         // And a signed payload with a field this build does not know is refused, not widened.
         let token = signed(&serde_json::json!({
             "workspace_id": ws,
             "filter": {"tag_id_": list},
             "as_of": Uuid::now_v7(),
+            "issued": 0,
         }));
         assert!(matches!(
             parse(&secrets(), &token),

@@ -27,7 +27,7 @@ const SUPPRESSION_DOMAIN: &str = "nm:suppression:v1";
 /// dictionary and a leaked table would name who complained or asked to be erased.
 pub fn suppression_hmac(secrets: &Secrets, normalised_email: &str) -> [u8; 32] {
     tokens::hmac_sha256(
-        &secrets.derive_key(SUPPRESSION_DOMAIN),
+        secrets.derive_key(SUPPRESSION_DOMAIN).as_slice(),
         normalised_email.as_bytes(),
     )
 }

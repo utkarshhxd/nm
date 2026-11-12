@@ -35,6 +35,7 @@ const ids = {
   herd: "",
   predC: "",
   raceA: "",
+  churn: "",
 };
 
 const base = () => `/api/v1/workspaces/${workspaceId}`;
@@ -138,6 +139,14 @@ test.beforeAll(async ({ browser }) => {
     if (letter === "c") ids.predC = c.id;
     await put(`/contacts/${c.id}/tags/${ids.herd}`);
     await post(`/contacts/${c.id}/lists`, { list_id: ids.list });
+  }
+
+  // Four for the widening case, two of them tagged: the filter can then be widened from outside
+  // the browser, over the API, exactly as a second editor would.
+  ids.churn = (await post("/tags", { name: "churn" })).id;
+  for (const letter of ["a", "b", "c", "d"]) {
+    const c = await post("/contacts", { email: `wide-${letter}@example.test` });
+    if (letter === "a" || letter === "b") await put(`/contacts/${c.id}/tags/${ids.churn}`);
   }
 
   ids.raceA = (await post("/contacts", { email: "race-a@example.test" })).id;
@@ -371,7 +380,10 @@ test("bulk_delete_requires_confirmation_naming_the_count", async () => {
   await confirm.getByRole("button", { name: "Delete 2 contacts", exact: true }).click();
 
   await expect(result()).toContainText("Deleted 2 contacts");
-  // The bulk bar and its button are gone with the selection; focus is on the outcome, not <body>.
+  // The bulk bar and its button are gone with the selection, so focus has nowhere to return to
+  // and is put on the outcome instead of falling to <body>.
+  await expect(page.getByRole("region", { name: "Bulk actions" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Delete contacts", exact: true })).toHaveCount(0);
   await expect(result()).toBeFocused();
   await expect(row(page, "del-a@example.test")).toHaveCount(0);
   // The promise the dialog made, checked rather than assumed.
@@ -483,6 +495,47 @@ test("a_delete_that_lost_a_race_is_measured_against_what_it_promised", async () 
   await confirm.getByRole("button", { name: "Delete 3 contacts", exact: true }).click();
   await expect(result()).toContainText("2 of the 3 contacts you confirmed");
   await expect(result()).toContainText("someone else");
+});
+
+test("a_delete_whose_view_widened_is_refused_and_names_both_numbers", async () => {
+  // A tag filter, so the match can be changed from outside this page. The snapshot bounds
+  // creation time only: every contact here existed before the token was issued, so nothing but
+  // the issue-time count can tell that the view grew.
+  await page.goto(contactsPath);
+  await page.getByLabel("Filter by tag", { exact: true }).selectOption({ label: "churn" });
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("All 2 contacts matching this view are selected.")).toBeVisible();
+
+  // A second editor tags the other two.
+  for (const letter of ["c", "d"]) {
+    const found = await get<{ data: { id: string }[] }>(`/contacts?q=wide-${letter}@`);
+    await put(`/contacts/${found.data[0]?.id}/tags/${ids.churn}`);
+  }
+
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
+  await expect(confirm.getByRole("paragraph").first()).toContainText("2 contacts");
+  await confirm.getByRole("button", { name: "Delete 2 contacts", exact: true }).click();
+
+  // Refused, with both numbers, and nothing deleted.
+  const alert = page.getByRole("alert").filter({ hasText: "nothing was deleted" });
+  await expect(alert).toBeVisible();
+  await expect(alert).toContainText("2 contacts when you selected it");
+  await expect(alert).toContainText("4");
+  const left = await get<{ data: { email: string }[] }>("/contacts?q=wide-");
+  expect(left.data).toHaveLength(4);
+
+  // A reversible action over the same widened token proceeds, and says the view grew rather
+  // than reporting four as a plain success.
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "churn" });
+  await page.getByRole("button", { name: "Remove tag", exact: true }).click();
+  await expect(result()).toContainText("2 contacts when you selected it");
+  await expect(result()).toContainText("4 when the action ran");
+  await expect(result()).toContainText("were changed to match it in between");
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {

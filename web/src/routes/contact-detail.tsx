@@ -18,23 +18,15 @@ import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
 import { type Role, atLeast } from "../lib/roles";
+import { REASON } from "../lib/suppressions";
 import { Alert, ConfirmButton } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
 type Contact = components["schemas"]["Contact"];
 type Definition = components["schemas"]["Definition"];
-type Reason = components["schemas"]["Reason"];
 
 const KNOWN = {
   "insufficient-role": "Your role cannot change contacts. It takes editor or above.",
-};
-
-const REASON: Record<Reason, string> = {
-  unsubscribed_all: "Unsubscribed from everything",
-  bounced: "Bounced",
-  complained: "Complained",
-  manual: "Blocked manually",
-  gdpr_erasure: "Erased on request (GDPR)",
 };
 
 const day = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
@@ -212,8 +204,9 @@ function Actions({
       >
         <p>{address} is deleted, with its list memberships and its tags.</p>
         <p>
-          The address is <strong>not suppressed</strong>: it can be added again, by hand or by the
-          next import, and nothing here stops this workspace mailing it in future.
+          The address is <strong>not suppressed</strong> by this: it can be added again, by hand
+          or by the next import. Deleting does not unblock it either — a suppression already on
+          this address outlives the contact and still stops this workspace mailing it.
         </p>
         <p>
           This cannot be undone. To honour an erasure request, an admin uses Erase contact
@@ -519,7 +512,8 @@ function Lists({
             <p className="mt-3 text-fg-muted">
               Unsubscribing sets the membership to unsubscribed and keeps it: the row stays here
               and is not deleted, so the opt-out is not lost the next time this contact is
-              imported. Adding the list again subscribes them again.
+              imported. Adding the list again subscribes them, or marks them pending on a
+              double opt-in list, which cannot be mailed until they confirm.
             </p>
           ) : null}
           {lists.data.some((l) => l.status === "pending") ? (
