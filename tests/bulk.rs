@@ -843,3 +843,26 @@ async fn count_in(pool: &PgPool, ws: Uuid) -> i64 {
         .await
         .unwrap()
 }
+
+/// An unknown key in a filter must be a refusal. Ignored, `{"tag_id_": ...}` is a filter with
+/// every field empty, which matches every contact in the workspace; handed to `bulk/delete` that
+/// deletes them all.
+#[sqlx::test]
+async fn a_selection_filter_with_an_unknown_field_is_422_not_everything(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let vip = tag(&app, ws, "vip").await;
+    contacts(&app, ws, "c", 3).await;
+    for bad in [
+        json!({"tag_id_": vip}),
+        json!({"tag": vip}),
+        json!({"tag_id": vip, "extra": 1}),
+    ] {
+        let r = app
+            .post(&format!("{}/contacts/selection", base(ws)))
+            .json(&bad)
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.json::<Value>().get("selection_token").is_none());
+    }
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
+}

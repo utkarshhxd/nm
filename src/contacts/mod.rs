@@ -241,7 +241,10 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 /// serialised form is part of that token's payload: renaming a field, or adding one (the payload is
 /// not tolerant of a missing field), would make tokens already issued fail to decode, as a
 /// `422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.
+// Unknown fields are refused: this is the body of `POST /contacts/selection`, and a misspelt
+// `tag_id_` ignored would be an all-`None` filter, which matches every contact in the workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContactFilter {
     /// Case-insensitive substring of the address or name.
     pub q: Option<String>,

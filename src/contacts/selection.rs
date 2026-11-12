@@ -343,4 +343,38 @@ mod tests {
             ));
         }
     }
+
+    fn signed(payload: &serde_json::Value) -> String {
+        let payload = serde_json::to_vec(payload).unwrap();
+        format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&payload),
+            URL_SAFE_NO_PAD.encode(mac(&secrets(), &payload))
+        )
+    }
+
+    /// `ContactFilter` refuses unknown fields on the way in; a token's payload goes back through
+    /// the same struct. A token issued before that was added has exactly the four fields this
+    /// struct always wrote (absent ones as null), so it must still be read.
+    #[test]
+    fn a_token_issued_before_deny_unknown_fields_still_parses() {
+        let (ws, list) = (Uuid::now_v7(), Uuid::now_v7());
+        let token = signed(&serde_json::json!({
+            "workspace_id": ws,
+            "filter": {"q": null, "list_id": list, "list_status": "subscribed", "tag_id": null},
+            "as_of": Uuid::now_v7(),
+        }));
+        let s = parse(&secrets(), &token).unwrap();
+        assert_eq!(s.filter.list_id, Some(list));
+        // And a signed payload with a field this build does not know is refused, not widened.
+        let token = signed(&serde_json::json!({
+            "workspace_id": ws,
+            "filter": {"tag_id_": list},
+            "as_of": Uuid::now_v7(),
+        }));
+        assert!(matches!(
+            parse(&secrets(), &token),
+            Err(ApiError::Unprocessable("selection-invalid"))
+        ));
+    }
 }
