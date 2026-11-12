@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 
 import { api, problemText } from "../api/client";
@@ -18,6 +18,7 @@ import { useWorkspace } from "./workspace-layout";
 type Tag = components["schemas"]["Tag"];
 
 const day = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+const PAGE = 200;
 const th = "py-2 pe-3 text-start font-medium";
 const KNOWN = {
   "tag-name-taken": "A tag with that name already exists.",
@@ -33,18 +34,20 @@ export default function Tags() {
 
 function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
   const qc = useQueryClient();
-  const tags = useQuery({
+  const tags = useInfiniteQuery({
     queryKey: ["tags", ws],
-    queryFn: async () => {
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) => {
       const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/tags", {
-        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+        params: { path: { workspace_id: ws }, query: { limit: PAGE, cursor: pageParam } },
       });
       if (!data) throw new Error(problemText(error, KNOWN, "The tags could not be loaded."));
-      // shortcut: the first 200 tags only; add "Load more" when a workspace has more.
-      return data.data;
+      return data;
     },
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     retry: false,
   });
+  const rows = tags.data?.pages.flatMap((p) => p.data) ?? [];
   const refresh = () => qc.invalidateQueries({ queryKey: ["tags", ws] });
 
   const [name, setName] = useState("");
@@ -117,11 +120,11 @@ function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
       <div className="mt-6">
         {tags.isPending ? (
           <Skeleton label="Loading tags" rows={5} />
-        ) : tags.isError ? (
+        ) : tags.isError && rows.length === 0 ? (
           <ErrorState title="The tags could not be loaded." onRetry={() => void tags.refetch()}>
             {tags.error.message}
           </ErrorState>
-        ) : tags.data.length === 0 ? (
+        ) : rows.length === 0 ? (
           <EmptyState title="No tags yet">Tags you create will appear here.</EmptyState>
         ) : (
           <table className="w-full">
@@ -142,7 +145,7 @@ function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
               </tr>
             </thead>
             <tbody>
-              {tags.data.map((t) => (
+              {rows.map((t) => (
                 <tr key={t.id} className="border-b border-border">
                   <td className="py-2 pe-3">{t.name}</td>
                   <td className="py-2 pe-3 tabular-nums text-fg-muted">
@@ -174,6 +177,16 @@ function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
             </tbody>
           </table>
         )}
+        {tags.isFetchNextPageError ? (
+          <p role="alert" className="mt-3">
+            More tags could not be loaded.
+          </p>
+        ) : null}
+        {tags.hasNextPage ? (
+          <Button className="mt-3" busy={tags.isFetchingNextPage} onClick={() => void tags.fetchNextPage()}>
+            Load more tags
+          </Button>
+        ) : null}
       </div>
 
       <Dialog

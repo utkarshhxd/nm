@@ -321,7 +321,7 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
             </p>
             <p>
               Lifting it makes {lifting.scope === "domain" ? "every address on this domain" : "this address"}{" "}
-              mailable again in this workspace. Someone who opted out, whose mail bounced or who
+              mailable again in this workspace, unless it is also blocked instance-wide, which a workspace admin cannot see or lift here. Someone who opted out, whose mail bounced or who
               complained did so for a reason: mailing them again can damage your sending reputation
               and ignores what they asked for. Lift it only if the block was a mistake or you have
               their fresh consent.

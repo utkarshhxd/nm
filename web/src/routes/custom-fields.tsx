@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 
 import { api, problemText } from "../api/client";
@@ -34,6 +34,7 @@ const KINDS: [FieldKind, string][] = [
 const kindLabel = (k: FieldKind) => KINDS.find(([v]) => v === k)?.[1] ?? k;
 const hasOptions = (k: FieldKind) => k === "select" || k === "multi_select";
 
+const PAGE = 200;
 const th = "py-2 pe-3 text-start font-medium";
 const KNOWN = {
   "insufficient-role": "Your role cannot change custom fields. It takes admin.",
@@ -50,19 +51,21 @@ export default function CustomFields() {
 
 function Fields({ ws, admin }: { ws: string; admin: boolean }) {
   const qc = useQueryClient();
-  // The same key and shape as the contact page's query, so the two share one cache entry.
-  const fields = useQuery({
-    queryKey: ["custom-fields", ws],
-    queryFn: async () => {
+  // Under the contact page's key as a prefix, so one invalidation of ["custom-fields", ws] reaches both.
+  const fields = useInfiniteQuery({
+    queryKey: ["custom-fields", ws, "all"],
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) => {
       const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/custom-fields", {
-        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+        params: { path: { workspace_id: ws }, query: { limit: PAGE, cursor: pageParam } },
       });
       if (!data) throw new Error(problemText(error, KNOWN, "The custom fields could not be loaded."));
-      // shortcut: the first 200 fields only; add "Load more" when a workspace has more.
-      return data.data;
+      return data;
     },
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     retry: false,
   });
+  const rows = fields.data?.pages.flatMap((p) => p.data) ?? [];
   const refresh = () => qc.invalidateQueries({ queryKey: ["custom-fields", ws] });
 
   // `null` is closed; `"new"` is the create form; a field is the edit form for it.
@@ -128,11 +131,11 @@ function Fields({ ws, admin }: { ws: string; admin: boolean }) {
       <div className="mt-4">
         {fields.isPending ? (
           <Skeleton label="Loading custom fields" rows={5} />
-        ) : fields.isError ? (
+        ) : fields.isError && rows.length === 0 ? (
           <ErrorState title="The custom fields could not be loaded." onRetry={() => void fields.refetch()}>
             {fields.error.message}
           </ErrorState>
-        ) : fields.data.length === 0 ? (
+        ) : rows.length === 0 ? (
           <EmptyState title="No custom fields yet">Fields you create will appear here.</EmptyState>
         ) : (
           <table className="w-full">
@@ -162,7 +165,7 @@ function Fields({ ws, admin }: { ws: string; admin: boolean }) {
               </tr>
             </thead>
             <tbody>
-              {fields.data.map((f) => (
+              {rows.map((f) => (
                 <tr key={f.id} className="border-b border-border">
                   <td className="py-2 pe-3">{f.label}</td>
                   <td className="py-2 pe-3">
@@ -216,6 +219,20 @@ function Fields({ ws, admin }: { ws: string; admin: boolean }) {
             </tbody>
           </table>
         )}
+        {fields.isFetchNextPageError ? (
+          <p role="alert" className="mt-3">
+            More fields could not be loaded.
+          </p>
+        ) : null}
+        {fields.hasNextPage ? (
+          <Button
+            className="mt-3"
+            busy={fields.isFetchingNextPage}
+            onClick={() => void fields.fetchNextPage()}
+          >
+            Load more fields
+          </Button>
+        ) : null}
       </div>
 
       <Dialog
@@ -351,6 +368,7 @@ function FieldForm({
             <Select
               id="field-kind"
               className="mt-1 w-full"
+              aria-describedby="field-kind-hint"
               value={kind}
               onChange={(e) => setKind(e.target.value as FieldKind)}
             >
@@ -360,6 +378,9 @@ function FieldForm({
                 </option>
               ))}
             </Select>
+            <span id="field-kind-hint" className="mt-1 block text-sm text-fg-muted">
+              The type cannot change afterwards: converting stored values is not supported yet.
+            </span>
           </div>
         </>
       )}

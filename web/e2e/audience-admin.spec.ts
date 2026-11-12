@@ -259,3 +259,30 @@ test("axe_reports_no_violations_on_all_three_pages", async () => {
     expect(violations, path).toEqual([]);
   }
 });
+
+test("axe_reports_no_violations_with_each_destructive_dialog_open", async () => {
+  const scan = async (name: string) => {
+    const dialog = page.getByRole("dialog", { name, exact: true });
+    await expect(dialog).toBeVisible();
+    const { violations } = await new AxeBuilder({ page }).analyze();
+    expect(violations, name).toEqual([]);
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+  };
+
+  await page.goto(fieldsPath);
+  await row(page, "Plan").getByRole("button", { name: "Archive Plan", exact: true }).click();
+  await scan("Archive the field Plan");
+  await row(page, "Region").getByRole("button", { name: "Purge values of Region", exact: true }).click();
+  await scan("Purge the values of Region");
+
+  await page.goto(suppressionsPath);
+  await row(page, "seeded@example.test")
+    .getByRole("button", { name: "Lift suppression for seeded@example.test", exact: true })
+    .click();
+  await scan("Lift the suppression on seeded@example.test");
+
+  await page.goto(`/w/${SLUG}/tags`);
+  await row(page, "vip").getByRole("button", { name: "Delete vip", exact: true }).click();
+  await scan("Delete the tag vip");
+});
