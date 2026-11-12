@@ -479,6 +479,7 @@ async fn all_four_filter_fields_apply(pool: PgPool) {
 async fn excluded_ids_are_bounded(pool: PgPool) {
     let (ws, app) = workspace(&pool, "acme").await;
     contacts(&app, ws, "c", 2).await;
+    let vip = tag(&app, ws, "vip").await;
     let token = select(&app, ws, json!({})).await;
     let ids = |n: usize| (0..n).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
 
@@ -492,12 +493,15 @@ async fn excluded_ids_are_bounded(pool: PgPool) {
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(count(&pool, "select count(*) from contacts").await, 2);
 
-    // Exactly the cap is fine.
+    // Exactly the cap passes the check and the action runs over the two that match. Tag rather
+    // than delete: ten thousand ids that are not in the match are exactly the case the delete
+    // bound refuses conservatively, which
+    // `excluding_an_id_outside_the_match_is_refused_conservatively` pins on its own.
     let r = bulk(
         &app,
         ws,
-        "delete",
-        json!({"selection_token": token, "excluded_ids": ids(MAX_EXCLUDED)}),
+        "tag",
+        json!({"selection_token": token, "tag_id": vip, "excluded_ids": ids(MAX_EXCLUDED)}),
     )
     .await;
     assert_eq!(affected(r).await, 2);
@@ -1040,4 +1044,76 @@ async fn an_id_list_delete_is_never_refused_as_widened(pool: PgPool) {
     let body = json!({"ids": [ids[0], ids[1]]});
     assert_eq!(affected(bulk(&app, ws, "delete", body).await).await, 2);
     assert_eq!(count(&pool, "select count(*) from contacts").await, 1);
+}
+
+/// N1: `selected` is counted after the exclusions and `issued` was counted without them, so
+/// comparing the two directly let a widening of up to `excluded_ids.len()` through. Here the
+/// token stands for two contacts, a third is tagged into the view afterwards, and one of the two
+/// is unticked — the confirmation reads "Delete 1 contact". Before the adjustment this deleted
+/// the contact nobody ever selected and answered 200.
+#[sqlx::test]
+async fn an_exclusion_cannot_buy_room_for_a_widening(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let churn = tag(&app, ws, "churn").await;
+    let ids = contacts(&app, ws, "c", 4).await;
+    apply_tag(&app, ws, churn, &ids[..2]).await;
+
+    let r = app
+        .post(&format!("{}/contacts/selection", base(ws)))
+        .json(&json!({"tag_id": churn}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["selected"].as_u64().unwrap(), 2);
+    let token = r.json::<Value>()["selection_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A third contact, which was never in the view, is tagged into it.
+    apply_tag(&app, ws, churn, &ids[2..3]).await;
+
+    let body = json!({"selection_token": token, "excluded_ids": [ids[0]]});
+    let r = bulk(&app, ws, "delete", body).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:selection-widened");
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 4);
+}
+
+/// The other half of that adjustment: an excluded id that was in the match and has since left it
+/// is counted on both sides and cancels out, so the ordinary case — which is the only one the UI
+/// can produce, because it only ever excludes rows drawn from the matching view — is not refused.
+#[sqlx::test]
+async fn an_excluded_id_that_left_the_match_is_not_a_false_refusal(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let churn = tag(&app, ws, "churn").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    apply_tag(&app, ws, churn, &ids).await;
+
+    let token = select(&app, ws, json!({"tag_id": churn})).await;
+    // The contact the user unticked loses the tag before the action runs.
+    app.delete(&format!("{}/contacts/{}/tags/{churn}", base(ws), ids[0]))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let body = json!({"selection_token": token, "excluded_ids": [ids[0]]});
+    assert_eq!(affected(bulk(&app, ws, "delete", body).await).await, 2);
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 1);
+}
+
+/// The documented over-refusal, pinned on purpose rather than found later as a bug: an id that
+/// was **never** in the match is the one thing that makes the bound conservative. Only an API
+/// client can do this; the UI excludes rows it is showing.
+#[sqlx::test]
+async fn excluding_an_id_outside_the_match_is_refused_conservatively(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let churn = tag(&app, ws, "churn").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    apply_tag(&app, ws, churn, &ids[..2]).await;
+
+    let token = select(&app, ws, json!({"tag_id": churn})).await;
+    // ids[2] carries no tag, so it is not in the match at all.
+    let body = json!({"selection_token": token, "excluded_ids": [ids[2]]});
+    let r = bulk(&app, ws, "delete", body).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
 }

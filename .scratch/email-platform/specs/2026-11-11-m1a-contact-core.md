@@ -392,7 +392,8 @@ people who were never selected.
 So selection is a predicate with a timestamp, not a set:
 
 - `POST /contacts/selection` takes the active filter and returns a token signed with the existing
-  `crypto::tokens` HMAC, encoding `{workspace_id, filter, as_of}`.
+  `crypto::tokens` HMAC, encoding `{workspace_id, filter, as_of, issued}`. `issued` is the live
+  count at that moment: the number the person is about to be shown.
 - `as_of` is a UUIDv7 upper bound, so the snapshot is enforced as `id <= $as_of` — free, because
   ids are already time-ordered.
 - Bulk endpoints take `{selection_token, excluded_ids}` and re-resolve the predicate under that
@@ -400,8 +401,20 @@ So selection is a predicate with a timestamp, not a set:
 - A token is rejected if its workspace does not match the authorised one, or if it is older than
   one hour.
 
+The `as_of` bound freezes **creation time only**. The filter itself is re-run against current
+state, so a contact that existed at `as_of` and did not match then does match now if someone has
+since tagged it, subscribed it or renamed it into the search. `issued` is what catches that:
+`bulk/delete` refuses with `409 selection-widened` when the match has grown, inside the
+transaction, so nothing is deleted. The reversible endpoints do not refuse; they return `issued`
+beside `selected` and the UI reports that the view grew. The comparison adds `excluded_ids.len()`
+back to `selected`, because `issued` was counted without exclusions and `selected` with them.
+
+This bounds how many contacts an action reaches, never which ones: an equal number leaving and
+joining the match is invisible to a count. See
+`docs/adr/0003-selection-is-a-snapshotted-predicate.md`.
+
 Every bulk endpoint returns the count it actually affected, which may be lower than the count the
-UI showed. The UI says so.
+UI showed, and the UI reports both.
 
 ### 8.3 Bulk operations write one audit row
 

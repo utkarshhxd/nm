@@ -920,14 +920,18 @@ pub async fn bulk_delete_contacts(
     // Inside the transaction and after the statement, so the number compared is the one the
     // delete itself resolved rather than a second count that could disagree with it. Returning
     // here drops `tx` and the delete rolls back.
-    if sel.widened(n.selected) {
+    if sel.widened(n.selected, input.excluded_ids.len()) {
+        // `selected` counts the match less the exclusions, so the match itself is at most
+        // `selected + excluded`; that is the number worth naming, and naming it as an upper
+        // bound is what makes it honest.
+        let now = n.selected.saturating_add(input.excluded_ids.len() as u64);
         return Err(ApiError::ConflictDetail {
             code: "selection-widened",
             detail: format!(
-                "This view matched {} contacts when you selected it and {} now, so nothing was \
-                 deleted. Contacts that already existed were changed to match it in between. \
-                 Select again to see what you would be deleting.",
-                sel.issued, n.selected,
+                "This view matched {} contacts when you selected it and matches up to {} now, so \
+                 nothing was deleted. Contacts that already existed were changed to match it in \
+                 between. Select again to see what you would be deleting.",
+                sel.issued, now,
             ),
         });
     }

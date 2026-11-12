@@ -333,6 +333,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       // A filter selection goes as its token and exclusions, ticked rows as their ids: the
       // server takes exactly one of the two, and applies the same rules to both. Each body
       // denies unknown fields, so a route is sent exactly the fields it declares and no more.
+      const excluded = current.mode === "all" ? current.excluded.size : 0;
       const body =
         current.mode === "all"
           ? { selection_token: current.token, excluded_ids: [...current.excluded] }
@@ -374,7 +375,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         // The bar that held the button is about to unmount; focus goes to the outcome.
         toFocus.current = true;
       }
-      const message = describe(kind, name, data, promised);
+      const message = describe(kind, name, data, promised, excluded);
       setResult(message);
       announce(message.text);
       // The table only changes when rows left it, or when it is filtered by what changed.
@@ -760,17 +761,23 @@ function describe(
   name: string,
   result: components["schemas"]["BulkResult"],
   promised?: number,
+  excluded = 0,
 ): Result {
   const outcome = describeOutcome(kind, name, result, promised);
   const { selected, issued } = result;
-  if (selected <= issued) return outcome;
+  // `selected` is the match less the exclusions and `issued` is the whole match at issue time,
+  // so they are not the same quantity: comparing them directly misses any widening smaller than
+  // the number of rows the user unticked. The match now is at most `selected + excluded`, which
+  // is both the right thing to compare and the right number to show.
+  const now = selected + excluded;
+  if (now <= issued) return outcome;
   // The view matched more when the action ran than when it was made: those contacts existed all
   // along and someone tagged, subscribed or renamed them into it in between. `bulk/delete`
   // refuses outright (409), so only the reversible kinds reach this.
-  const extra = selected - issued;
+  const extra = now - issued;
   return {
     tone: "warn",
-    text: `${outcome.text} This view matched ${count(issued, "contact")} when you selected it and ${selected.toLocaleString()} when the action ran: ${extra.toLocaleString()} ${extra === 1 ? "was" : "were"} changed to match it in between.`,
+    text: `${outcome.text} This view matched ${count(issued, "contact")} when you selected it and matches up to ${now.toLocaleString()} now: ${extra.toLocaleString()} ${extra === 1 ? "was" : "were"} changed to match it in between.`,
   };
 }
 

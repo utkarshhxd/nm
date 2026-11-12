@@ -46,7 +46,13 @@ pub const MAX_IDS: usize = 10_000;
 
 /// What a signed token carries. The field names are part of the token format: renaming one
 /// invalidates tokens already issued.
+///
+/// `deny_unknown_fields` so the payload shape is fail-closed on its own, and not only because
+/// someone remembered to bump `SELECTION_DOMAIN`. A signed payload carrying a key this build does
+/// not know is a payload from a different version of this struct, and the one thing a selection
+/// must never do is resolve to more contacts than the version that issued it meant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Selection {
     pub workspace_id: Uuid,
     pub filter: ContactFilter,
@@ -112,12 +118,29 @@ impl Selection {
     /// who joined the match were already there at `as_of`, and someone tagged them, subscribed
     /// them or renamed them into the search afterwards.
     ///
-    /// Equal counts are not proof the same contacts matched. One contact leaving the match while
-    /// another joins it leaves the count unchanged and this returns false. Catching that needs
-    /// the set of ids the filter matched at issue time, which is exactly what a predicate
-    /// selection exists not to carry — see `docs/adr/0003-selection-is-a-snapshotted-predicate.md`.
-    pub fn widened(&self, selected: u64) -> bool {
-        selected > self.issued
+    /// `selected` and `issued` are **not the same quantity**, which is why `excluded` is a
+    /// parameter and not the caller's business to forget. `issued` is the whole match at issue
+    /// time, counted with no exclusions (`count` passes `&[]`); `selected` is the match at run
+    /// time *less* the excluded ids. Comparing them directly lets a widening of up to
+    /// `excluded.len()` through, and `MAX_EXCLUDED` is 10 000 — ten thousand contacts deleted
+    /// under a confirmation that read "Delete 1 contact".
+    ///
+    /// Writing `M0` for the match at issue time and `M1` for the match now:
+    /// `|M1| = selected + |M1 ∩ E| ≤ selected + |E|`, so refusing when `selected + |E| > |M0|`
+    /// guarantees `|M1| ≤ |M0|` whenever it does not refuse. It over-refuses only when an
+    /// excluded id was **never** in the match — an id that was in the match and has since left
+    /// is counted on both sides and cancels out. The UI only ever excludes rows drawn from the
+    /// matching view, so it cannot be refused falsely; an API client passing arbitrary ids can
+    /// be, and over-refusing is the safe direction on the one action that cannot be undone.
+    ///
+    /// What it still does not catch is a same-count swap: one contact leaving the match while
+    /// another joins leaves `|M1|` unchanged and this returns false. The number that can be
+    /// substituted that way is bounded by how many contacts left the match inside the one-hour
+    /// window, which is not a small number by construction. Catching it needs the set of ids the
+    /// filter matched at issue time, which is exactly what a predicate selection exists not to
+    /// carry — see `docs/adr/0003-selection-is-a-snapshotted-predicate.md`.
+    pub fn widened(&self, selected: u64, excluded: usize) -> bool {
+        selected.saturating_add(excluded as u64) > self.issued
     }
 }
 
@@ -418,7 +441,8 @@ mod tests {
             Err(ApiError::Unprocessable("selection-invalid"))
         ));
 
-        // And a signed payload with a field this build does not know is refused, not widened.
+        // A signed payload with a field this build does not know is refused, not widened —
+        // inside `filter`, which `ContactFilter` guards …
         let token = signed(&serde_json::json!({
             "workspace_id": ws,
             "filter": {"tag_id_": list},
@@ -427,6 +451,19 @@ mod tests {
         }));
         assert!(matches!(
             parse(&secrets(), &token),
+            Err(ApiError::Unprocessable("selection-invalid"))
+        ));
+
+        // … and at the top level, which is this struct's own `deny_unknown_fields`. Without it a
+        // payload from another version of this struct parses, and whatever that version meant by
+        // its extra key is silently dropped.
+        let mut extra = full.clone();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("limit".into(), serde_json::json!(1));
+        assert!(matches!(
+            parse(&secrets(), &signed(&extra)),
             Err(ApiError::Unprocessable("selection-invalid"))
         ));
     }

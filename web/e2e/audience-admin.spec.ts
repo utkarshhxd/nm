@@ -510,22 +510,30 @@ test("a_delete_whose_view_widened_is_refused_and_names_both_numbers", async () =
     .click();
   await expect(page.getByText("All 2 contacts matching this view are selected.")).toBeVisible();
 
-  // A second editor tags the other two.
-  for (const letter of ["c", "d"]) {
-    const found = await get<{ data: { id: string }[] }>(`/contacts?q=wide-${letter}@`);
-    await put(`/contacts/${found.data[0]?.id}/tags/${ids.churn}`);
-  }
+  // A second editor tags exactly one more. One is the point: the widening has to be no larger
+  // than the number of rows the user unticks, or the bound catches it without the adjustment and
+  // this test proves nothing.
+  const found = await get<{ data: { id: string }[] }>("/contacts?q=wide-c@");
+  await put(`/contacts/${found.data[0]?.id}/tags/${ids.churn}`);
+
+  // Untick one. This is what used to buy room for the widening: the confirmation then reads
+  // "Delete 1 contact" while the server compared a count taken after the exclusions against one
+  // taken without them.
+  await page.getByRole("checkbox", { name: "Select wide-a@example.test", exact: true }).uncheck();
+  await expect(
+    page.getByText("1 of 2 contacts matching this view are selected (1 left out)."),
+  ).toBeVisible();
 
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
   const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
-  await expect(confirm.getByRole("paragraph").first()).toContainText("2 contacts");
-  await confirm.getByRole("button", { name: "Delete 2 contacts", exact: true }).click();
+  await expect(confirm.getByRole("paragraph").first()).toContainText("1 contact");
+  await confirm.getByRole("button", { name: "Delete 1 contact", exact: true }).click();
 
   // Refused, with both numbers, and nothing deleted.
   const alert = page.getByRole("alert").filter({ hasText: "nothing was deleted" });
   await expect(alert).toBeVisible();
   await expect(alert).toContainText("2 contacts when you selected it");
-  await expect(alert).toContainText("4");
+  await expect(alert).toContainText("matches up to 3 now");
   const left = await get<{ data: { email: string }[] }>("/contacts?q=wide-");
   expect(left.data).toHaveLength(4);
 
@@ -534,8 +542,10 @@ test("a_delete_whose_view_widened_is_refused_and_names_both_numbers", async () =
   await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "churn" });
   await page.getByRole("button", { name: "Remove tag", exact: true }).click();
   await expect(result()).toContainText("2 contacts when you selected it");
-  await expect(result()).toContainText("4 when the action ran");
-  await expect(result()).toContainText("were changed to match it in between");
+  // The reversible kinds compare the same two unlike numbers, so the exclusion is added back
+  // here too: without it this reads as a plain success over three contacts.
+  await expect(result()).toContainText("matches up to 3 now");
+  await expect(result()).toContainText("changed to match it in between");
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {

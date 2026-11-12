@@ -6,7 +6,9 @@ Status: accepted (M1a). Spec: `.scratch/email-platform/specs/2026-11-11-m1a-cont
 
 A bulk action takes a signed selection token, not a list of ids and not a filter. `POST /contacts/selection` takes the active filter and returns a token (HMAC under `nm:selection:v2`) encoding `{workspace_id, filter, as_of, issued}`. `as_of` is a UUIDv7 upper bound, so the snapshot is enforced as `id <= $as_of`; ids are already time-ordered, so the bound costs nothing. Bulk endpoints take `{selection_token, excluded_ids}` and re-resolve the predicate under that bound. A token is rejected if its workspace differs from the authorised one, or if it is older than one hour.
 
-`issued` is the live count at issue time, signed into the token, and every bulk endpoint compares it with the count the predicate resolves to when the action runs. A `bulk/delete` that resolves to **more** is refused with `409 selection-widened` naming both numbers, inside the transaction, so nothing is deleted; the reversible kinds (tag, untag, subscribe, unsubscribe) proceed and return `issued` beside `selected` so the UI can say the view widened.
+`issued` is the live count at issue time, signed into the token. **`bulk/delete` is the only endpoint that compares it**: a delete whose predicate resolves to more is refused with `409 selection-widened`, inside the transaction, so nothing is deleted. The reversible kinds (tag, untag, subscribe, unsubscribe) do not refuse; they return `issued` beside `selected` and the browser compares, so the result says the view widened.
+
+The comparison adds the exclusions back: `issued` is the whole match at issue time and `selected` is the match at run time *less* `excluded_ids`, so it refuses when `selected + excluded_ids.len() > issued`. Comparing the two raw numbers let a widening of up to `MAX_EXCLUDED` (10 000) through.
 
 Every bulk endpoint returns the count it actually affected, which may be lower than the count the UI showed. One audit row records the action, predicate, `as_of`, `issued` and both counts.
 
@@ -21,7 +23,11 @@ The snapshot bounds creation time only. A contact that existed at `as_of` and wa
 
 An earlier version of this ADR said the UI reporting the affected count was the mitigation. It was not: the UI only warned when fewer contacts were affected than confirmed, so a filter that *widened* was reported as a plain success. A selection matching one contact, widened to four by a second editor applying a tag, deleted all four under a button reading "Delete 1 contact". That is why `issued` is now in the token and compared server-side.
 
-What the comparison does not catch is a **same-count swap**: one contact leaving the match while another joins it leaves `selected` unchanged, so an equal count is not proof the same contacts matched. Catching that needs the materialised set of ids the filter matched at issue time — which is exactly what this decision exists not to carry, because "all 2.3 million matching" cannot be a list. The residual exposure is therefore a swap inside the one-hour window, on contacts that already existed; it is bounded by the TTL and by `selected` never exceeding what the person was shown. The same limit is recorded at `Selection::widened` in `src/contacts/selection.rs`.
+What the comparison does not catch is a **same-count swap**: one contact leaving the match while another joins it leaves the count unchanged, so an equal count is not proof the same contacts matched. Catching that needs the materialised set of ids the filter matched at issue time — which is exactly what this decision exists not to carry, because "all 2.3 million matching" cannot be a list.
+
+So what the check does buy is one sentence and no more: **no more contacts are acted on than the person was shown.** It buys nothing about *which* ones. The number that can be substituted is bounded by how many contacts left the match inside the one-hour window, and nothing makes that small — an import that retags a segment could swap all of them. The TTL bounds how long the window is open, not how much can move inside it. The same limit is recorded at `Selection::widened` in `src/contacts/selection.rs`.
+
+The adjusted comparison over-refuses in one case: an `excluded_ids` entry that was **never** in the match (an id that was in it and has since left cancels out on both sides). Only an API client can produce that; the UI excludes rows drawn from the matching view. Over-refusing is the safe direction on the one action that cannot be undone.
 
 The one-hour expiry means a long-open page must ask again.
 
