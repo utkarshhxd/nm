@@ -783,3 +783,60 @@ Expected: `0`.
 ```bash
 git commit -m "ci: per-chunk budget; docs: glossary and the M1a decision records"
 ```
+
+---
+
+### Task 16: The contact and list write paths
+
+Added after the whole-branch review found the UI ships read-only: Tasks 12-14 each passed their
+own brief, and this plan never assigned create, edit, delete, erase or membership management to
+any of them. A fresh install cannot add a contact or honour an erasure request through the web
+app. The API for all of it already exists and is tested.
+
+**Files:** `web/src/routes/contacts.tsx`, `contact-detail.tsx`, `lists.tsx`; new dialogs as needed
+in `web/src/components/`. Test: `web/e2e/contacts-crud.spec.ts`.
+
+- [ ] **Step 1: Write the failing e2e**, which spec §14 requires and which could not be written
+      before because nothing existed to drive:
+
+```ts
+create_a_contact_then_find_it_in_the_grid
+edit_a_contact_and_see_the_change
+delete_a_contact_and_it_leaves_the_grid
+erase_a_contact_is_admin_only_and_names_what_it_destroys
+an_editor_sees_no_erase_control
+create_a_list_then_add_a_contact_to_it
+remove_a_membership_leaves_it_unsubscribed_not_deleted
+apply_and_remove_a_tag_on_one_contact
+axe_reports_no_violations_with_each_dialog_open
+```
+
+- [ ] **Step 2: Run them and watch them fail.**
+- [ ] **Step 3: Implement**, reusing `ConfirmDialog`, `Dialog` and the existing primitives.
+      Erase is admin-only and its confirmation says the contact is deleted and the address
+      permanently blocked, matching the suppression lift dialog's standard. Removing a membership
+      sets `unsubscribed`; say that rather than "remove".
+- [ ] **Step 4: Rebuild web AND release, run the e2e, report both bundle numbers.**
+- [ ] **Step 5: Commit.**
+
+### Task 17: The remaining bulk actions and the instance suppression screen
+
+**Files:** `web/src/routes/contacts.tsx`, new `web/src/routes/admin-suppressions.tsx`,
+`web/src/router.tsx`. Test: extend `web/e2e/audience-admin.spec.ts`.
+
+- [ ] **Step 1: Write the failing tests:**
+
+```ts
+bulk_untag_over_a_selection
+bulk_unsubscribe_names_the_list_and_reports_affected_of_selected
+bulk_delete_requires_confirmation_naming_the_count
+the_instance_suppression_screen_is_instance_admin_only
+a_workspace_admin_cannot_reach_it
+```
+
+- [ ] **Step 2: Run them and watch them fail.**
+- [ ] **Step 3: Implement.** `bulk/delete` is irreversible: its confirmation names the count and
+      says no suppression is written, so the addresses stay usable. The instance screen drives the
+      existing `/api/v1/admin/suppressions` routes and is gated on `is_instance_admin`.
+- [ ] **Step 4: Rebuild web AND release, run the e2e, report bundle numbers.**
+- [ ] **Step 5: Commit.**
