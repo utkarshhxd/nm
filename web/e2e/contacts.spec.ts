@@ -341,6 +341,58 @@ test("axe_reports_no_violations", async () => {
   ).toEqual([]);
 });
 
+/**
+ * Interaction to Next Paint against the project's 200 ms target, on the heaviest page in the
+ * product. INP is the worst interaction's duration (the 98th percentile once there are 50 or
+ * more, and this is far fewer), so the largest `event` entry with an `interactionId` is it.
+ * The CPU is throttled 4x, the usual stand-in for a mid-range phone, so a pass here is not a pass
+ * on a developer's machine only. Chromium rounds durations to 8 ms and drops those under the
+ * observer's 16 ms floor; an interaction that fast is not near 200 ms either way.
+ */
+test("inp_on_the_contacts_route_stays_under_200ms", async () => {
+  const INP_TARGET_MS = 200;
+  const cdp = await context.newCDPSession(page);
+  await open();
+  expect(await page.evaluate(() => PerformanceObserver.supportedEntryTypes.includes("event"))).toBe(true);
+  await page.evaluate(() => {
+    type Timing = PerformanceEventTiming & { interactionId: number };
+    const seen: Timing[] = [];
+    (window as unknown as { __inp: Timing[] }).__inp = seen;
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries() as Timing[]) {
+        if (entry.interactionId > 0) seen.push(entry);
+      }
+    }).observe({ type: "event", durationThreshold: 16, buffered: true } as PerformanceObserverInit);
+  });
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 });
+  try {
+    // What a person does here: tick a row, tick all, sort, search, move through the grid.
+    // Clicked, not checked: the select-all box is indeterminate after a single tick, and Playwright
+    // insists a checkbox ends up where it asked.
+    const all = grid().getByRole("checkbox", { name: "Select all loaded contacts" });
+    await rows().first().getByRole("checkbox").click();
+    await rows().first().getByRole("checkbox").click();
+    await all.click();
+    await all.click();
+    await grid().getByRole("button", { name: "Email", exact: true }).click();
+    await expect(rows().first()).toContainText(FIRST);
+    await page.getByRole("searchbox", { name: "Search contacts", exact: true }).pressSequentially("user", { delay: 50 });
+    await expect(rows().first()).toContainText("user");
+    await rows().first().focus();
+    for (let n = 0; n < 10; n++) await page.keyboard.press("ArrowDown");
+    // Let the observer's queue and the last paint flush.
+    await page.waitForTimeout(500);
+  } finally {
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
+  }
+  const durations = await page.evaluate(() =>
+    (window as unknown as { __inp: PerformanceEventTiming[] }).__inp.map((e) => e.duration),
+  );
+  const inp = Math.max(0, ...durations);
+  test.info().annotations.push({ type: "inp", description: `${inp} ms over ${durations.length} slow events` });
+  expect(inp, `INP ${inp} ms against a target of ${INP_TARGET_MS} ms`).toBeLessThan(INP_TARGET_MS);
+});
+
 test("the_browser_holds_at_most_2000_rows_however_far_you_scroll", async () => {
   test.setTimeout(180_000);
   await open();

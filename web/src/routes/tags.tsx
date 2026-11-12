@@ -12,6 +12,7 @@ import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
 import { Field } from "../components/field";
 import { Skeleton } from "../components/skeleton";
+import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
 import { useWorkspace } from "./workspace-layout";
 
@@ -127,7 +128,7 @@ function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
         ) : rows.length === 0 ? (
           <EmptyState title="No tags yet">Tags you create will appear here.</EmptyState>
         ) : (
-          <table className="w-full">
+          <TableScroller label="Tags table"><table className="w-full">
             <caption className="sr-only">Tags</caption>
             <thead>
               <tr className="border-b border-border">
@@ -147,7 +148,7 @@ function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
             <tbody>
               {rows.map((t) => (
                 <tr key={t.id} className="border-b border-border">
-                  <td className="py-2 pe-3">{t.name}</td>
+                  <td className="py-2 pe-3 wrap-anywhere">{t.name}</td>
                   <td className="py-2 pe-3 tabular-nums text-fg-muted">
                     {day.format(new Date(t.created_at))}
                   </td>
@@ -175,7 +176,7 @@ function AllTags({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></TableScroller>
         )}
         {tags.isFetchNextPageError ? (
           <p role="alert" className="mt-3">

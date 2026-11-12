@@ -15,6 +15,7 @@ import { Alert, Field } from "../components/field";
 import { CONTROL } from "../components/input";
 import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
+import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
 import { useWorkspace } from "./workspace-layout";
 
@@ -138,7 +139,7 @@ function Fields({ ws, admin }: { ws: string; admin: boolean }) {
         ) : rows.length === 0 ? (
           <EmptyState title="No custom fields yet">Fields you create will appear here.</EmptyState>
         ) : (
-          <table className="w-full">
+          <TableScroller label="Custom fields table"><table className="w-full">
             <caption className="sr-only">Custom fields</caption>
             <thead>
               <tr className="border-b border-border">
@@ -167,12 +168,12 @@ function Fields({ ws, admin }: { ws: string; admin: boolean }) {
             <tbody>
               {rows.map((f) => (
                 <tr key={f.id} className="border-b border-border">
-                  <td className="py-2 pe-3">{f.label}</td>
-                  <td className="py-2 pe-3">
+                  <td className="py-2 pe-3 wrap-anywhere">{f.label}</td>
+                  <td className="py-2 pe-3 wrap-anywhere">
                     <code>{f.key}</code>
                   </td>
                   <td className="py-2 pe-3">{kindLabel(f.kind)}</td>
-                  <td className="py-2 pe-3">{f.options.length ? f.options.join(", ") : "—"}</td>
+                  <td className="py-2 pe-3 wrap-anywhere">{f.options.length ? f.options.join(", ") : "—"}</td>
                   <td className="py-2 pe-3">
                     {f.archived_at ? (
                       <Badge variant="warning" glyph="ring">
@@ -217,7 +218,7 @@ function Fields({ ws, admin }: { ws: string; admin: boolean }) {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></TableScroller>
         )}
         {fields.isFetchNextPageError ? (
           <p role="alert" className="mt-3">

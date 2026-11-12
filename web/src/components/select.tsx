@@ -6,5 +6,5 @@ import { CONTROL } from "./input";
 
 /** The native <select>: the only control that gets the OS picker on a phone and a screen reader's support for free. */
 export function Select({ className, ...rest }: ComponentProps<"select">) {
-  return <select className={`${CONTROL}${className ? ` ${className}` : ""}`} {...rest} />;
+  return <select className={`${CONTROL} max-w-full min-w-0${className ? ` ${className}` : ""}`} {...rest} />;
 }

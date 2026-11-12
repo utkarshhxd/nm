@@ -45,11 +45,12 @@ const count = (n: number, noun: string) => `${n.toLocaleString()} ${noun}${n ===
 
 // The link is out of the tab order: the row is the grid's one tab stop, and Enter on it follows the link.
 const columns = (slug: string): Column<Contact>[] => [
-  { id: "name", header: "Name", width: "20ch", cell: (c) => fullName(c) || "—" },
+  { id: "name", header: "Name", width: "20ch", title: fullName, cell: (c) => fullName(c) || "—" },
   {
     id: "email",
     header: "Email",
     sortable: true,
+    title: (c) => c.email,
     cell: (c) => (
       <Link
         to="/w/$slug/contacts/$contactId"
@@ -576,7 +577,7 @@ function BulkAction({
 }) {
   const [picked, setPicked] = useState("");
   return (
-    <span className="inline-flex items-center gap-2">
+    <span className="flex max-w-full items-center gap-2">
       <Select aria-label={label} value={picked} onChange={(e) => setPicked(e.target.value)}>
         <option value="">{placeholder}</option>
         {options.map((o) => (

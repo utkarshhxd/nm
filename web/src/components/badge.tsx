@@ -20,19 +20,22 @@ const GLYPH: Record<BadgeGlyph, string> = { dot: "●", ring: "○", slash: "⊘
 
 /**
  * A status or a tag. Non-interactive; a removable tag is a Badge with a real <button> inside it.
- * The text is the full status word, never an abbreviation.
+ * The text is the full status word, never an abbreviation. `wrap` is for text a user typed, which
+ * may be any length: it breaks anywhere rather than running out of its container.
  */
 export function Badge({
   variant = "neutral",
   glyph,
+  wrap,
   className,
   children,
   ...rest
-}: ComponentProps<"span"> & { variant?: BadgeVariant; glyph?: BadgeGlyph }) {
+}: ComponentProps<"span"> & { variant?: BadgeVariant; glyph?: BadgeGlyph; wrap?: boolean }) {
   return (
     <span
       className={
-        "inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 text-xs font-medium " +
+        "inline-flex items-center gap-1 rounded-full px-2 text-xs font-medium " +
+        (wrap ? "max-w-full wrap-anywhere " : "whitespace-nowrap ") +
         `${VARIANT[variant]}${className ? ` ${className}` : ""}`
       }
       {...rest}

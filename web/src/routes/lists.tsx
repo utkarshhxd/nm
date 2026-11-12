@@ -10,6 +10,7 @@ import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
 import { MembershipBadge } from "../components/membership-badge";
 import { Skeleton } from "../components/skeleton";
+import { TableScroller } from "../components/table-scroller";
 import { useWorkspace } from "./workspace-layout";
 
 type List = components["schemas"]["List"];
@@ -53,7 +54,7 @@ function AllLists({ ws, slug }: { ws: string; slug: string }) {
         ) : lists.data.length === 0 ? (
           <EmptyState title="No lists yet">Lists you create will appear here.</EmptyState>
         ) : (
-          <table className="w-full">
+          <TableScroller label="Lists table"><table className="w-full">
             <caption className="sr-only">Lists</caption>
             <thead>
               <tr className="border-b border-border">
@@ -74,7 +75,7 @@ function AllLists({ ws, slug }: { ws: string; slug: string }) {
             <tbody>
               {lists.data.map((l) => (
                 <tr key={l.id} className="border-b border-border">
-                  <td className="py-2 pe-3">
+                  <td className="py-2 pe-3 wrap-anywhere">
                     <Link to="/w/$slug/lists/$listId" params={{ slug, listId: l.id }} className={link}>
                       {l.name}
                     </Link>
@@ -87,7 +88,7 @@ function AllLists({ ws, slug }: { ws: string; slug: string }) {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></TableScroller>
         )}
       </div>
     </section>
@@ -135,7 +136,7 @@ function Detail({ ws, slug, listId }: { ws: string; slug: string; listId: string
         </EmptyState>
       ) : (
         <>
-          <h2 className="mt-4 text-xl font-semibold">{list.data.name}</h2>
+          <h2 className="mt-4 text-xl font-semibold wrap-anywhere">{list.data.name}</h2>
           <Settings list={list.data} />
           {/* Its own component and query: the count is slow on a big list and blocks nothing. */}
           <MailableCount ws={ws} listId={listId} />
@@ -257,7 +258,7 @@ function Members({ ws, slug, listId }: { ws: string; slug: string; listId: strin
           <p className="text-fg-muted">Nobody is on this list yet.</p>
         ) : (
           <>
-            <table className="w-full">
+            <TableScroller label="List members table"><table className="w-full">
               <caption className="sr-only">Members</caption>
               <thead>
                 <tr className="border-b border-border">
@@ -272,7 +273,7 @@ function Members({ ws, slug, listId }: { ws: string; slug: string; listId: strin
               <tbody>
                 {rows.map((m) => (
                   <tr key={m.contact_id} className="border-b border-border">
-                    <td className="py-2 pe-3">
+                    <td className="py-2 pe-3 wrap-anywhere">
                       <Link
                         to="/w/$slug/contacts/$contactId"
                         params={{ slug, contactId: m.contact_id }}
@@ -287,7 +288,7 @@ function Members({ ws, slug, listId }: { ws: string; slug: string; listId: strin
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></TableScroller>
             {members.isFetchNextPageError ? (
               <p role="alert" className="mt-3">
                 More members could not be loaded.

@@ -11,6 +11,7 @@ import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
 import { MembershipBadge } from "../components/membership-badge";
 import { Skeleton } from "../components/skeleton";
+import { TableScroller } from "../components/table-scroller";
 import { Alert } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
@@ -102,8 +103,8 @@ function Identity({ contact }: { contact: Contact }) {
   const facts = [name, contact.timezone, `Added ${day.format(new Date(contact.created_at))}`];
   return (
     <div className="mt-4">
-      <h2 className="text-xl font-semibold">{contact.email}</h2>
-      <p className="mt-1 text-fg-muted">{facts.filter(Boolean).join(" · ")}</p>
+      <h2 className="text-xl font-semibold wrap-anywhere">{contact.email}</h2>
+      <p className="mt-1 text-fg-muted wrap-anywhere">{facts.filter(Boolean).join(" · ")}</p>
     </div>
   );
 }
@@ -194,7 +195,7 @@ function Lists({ ws, slug, contactId }: { ws: string; slug: string; contactId: s
         <p className="text-fg-muted">Not on any list.</p>
       ) : (
         <>
-          <table className="w-full">
+          <TableScroller label="Memberships table"><table className="w-full">
             <thead>
               <tr className="border-b border-border">
                 <th scope="col" className="py-2 pe-3 text-start font-medium">
@@ -213,7 +214,7 @@ function Lists({ ws, slug, contactId }: { ws: string; slug: string; contactId: s
                 const since = l.status === "unsubscribed" ? l.unsubscribed_at : l.subscribed_at;
                 return (
                   <tr key={l.list_id} className="border-b border-border">
-                    <td className="py-2 pe-3">
+                    <td className="py-2 pe-3 wrap-anywhere">
                       <Link
                         to="/w/$slug/lists/$listId"
                         params={{ slug, listId: l.list_id }}
@@ -235,7 +236,7 @@ function Lists({ ws, slug, contactId }: { ws: string; slug: string; contactId: s
                 );
               })}
             </tbody>
-          </table>
+          </table></TableScroller>
           {lists.data.some((l) => l.status === "pending") ? (
             <p className="mt-3 text-fg-muted">
               Pending means the contact has not confirmed. A pending contact cannot be mailed, and
@@ -274,7 +275,9 @@ function Tags({ ws, contactId }: { ws: string; contactId: string }) {
         <ul className="flex flex-wrap gap-2">
           {tags.data.map((t) => (
             <li key={t.id}>
-              <Badge variant="accent">{t.name}</Badge>
+              <Badge variant="accent" wrap>
+                {t.name}
+              </Badge>
             </li>
           ))}
         </ul>
@@ -318,7 +321,7 @@ function show(def: Definition, value: unknown, timezone: string | null | undefin
         <ul className="flex flex-wrap gap-2">
           {value.map((v) => (
             <li key={String(v)}>
-              <Badge>{String(v)}</Badge>
+              <Badge wrap>{String(v)}</Badge>
             </li>
           ))}
         </ul>
@@ -359,7 +362,7 @@ function CustomFields({ ws, contact }: { ws: string; contact: Contact }) {
       ) : shown.length === 0 ? (
         <p className="text-fg-muted">This workspace has no custom fields.</p>
       ) : (
-        <dl className="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-1">
+        <dl className="grid grid-cols-[minmax(0,max-content)_minmax(0,1fr)] gap-x-6 gap-y-1">
           {shown.map((d) => {
             const value = values[d.key];
             return (
@@ -377,8 +380,8 @@ function CustomFields({ ws, contact }: { ws: string; contact: Contact }) {
 function FieldRow({ def, children }: { def: Definition; children: ReactNode }) {
   return (
     <>
-      <dt className="text-fg-muted">{def.label}</dt>
-      <dd>
+      <dt className="text-fg-muted wrap-anywhere">{def.label}</dt>
+      <dd className="wrap-anywhere">
         {children}
         {def.archived_at ? <span className="ms-2 text-fg-muted">(archived field)</span> : null}
       </dd>

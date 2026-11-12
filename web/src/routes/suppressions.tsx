@@ -15,6 +15,7 @@ import { Alert, Field } from "../components/field";
 import { CONTROL } from "../components/input";
 import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
+import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
 import { useWorkspace } from "./workspace-layout";
 
@@ -225,7 +226,7 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
           </EmptyState>
         ) : (
           <>
-            <table className="w-full">
+            <TableScroller label="Suppressions table"><table className="w-full">
               <caption className="sr-only">Suppressions</caption>
               <thead>
                 <tr className="border-b border-border">
@@ -251,7 +252,7 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
                   <tr key={s.id} className="border-b border-border align-top">
                     <td className="py-2 pe-3 break-all">{target(s)}</td>
                     <td className="py-2 pe-3">{REASON[s.reason]}</td>
-                    <td className="py-2 pe-3 whitespace-pre-line">{s.note ?? "—"}</td>
+                    <td className="py-2 pe-3 whitespace-pre-line wrap-anywhere">{s.note ?? "—"}</td>
                     <td className="py-2 pe-3 tabular-nums text-fg-muted">
                       {day.format(new Date(s.created_at))}
                     </td>
@@ -281,7 +282,7 @@ function Page({ ws, canAdd, canLift }: { ws: string; canAdd: boolean; canLift: b
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></TableScroller>
             {list.isFetchNextPageError ? (
               <p role="alert" className="mt-3">
                 More suppressions could not be loaded.

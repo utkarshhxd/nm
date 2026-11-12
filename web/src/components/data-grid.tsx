@@ -25,6 +25,8 @@ export type Column<T> = {
   sortable?: boolean;
   /** Dropped when the grid's own container is under 40rem, not the viewport. */
   narrowHidden?: boolean;
+  /** The full value, for a cell that truncates: the cell shows an ellipsis and this on hover. */
+  title?: (row: T) => string;
   cell: (row: T) => ReactNode;
 };
 
@@ -371,6 +373,7 @@ const GridRow = memo(function GridRow<T>({
         <td
           key={c.id}
           aria-colindex={n + 1 + (selecting ? 1 : 0)}
+          title={c.title?.(row)}
           className={`truncate px-3${c.narrowHidden ? " @max-[40rem]:hidden" : ""}`}
         >
           {c.cell(row)}
