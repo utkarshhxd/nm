@@ -1234,6 +1234,16 @@ async fn previewing_a_rule_on_an_archived_field_is_refused(pool: PgPool) {
     let r = preview(&app, ws, &plan_is("pro")).await;
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(problem_type(&r), "urn:nm:problem:unknown-field");
+    // The refusal still reports the quota it spent. A document is refused *after* the window has
+    // been counted against, and the rule builder calling this on a debounce is exactly the client
+    // that needs to know how little is left; the endpoint's contract promises these headers on
+    // every answer past the check, not only on the 429.
+    assert_eq!(
+        r.header("ratelimit-limit").to_str().unwrap(),
+        PREVIEW_PER_MINUTE.to_string(),
+        "a 422 dropped the headers the contract promises"
+    );
+    assert!(r.maybe_header("ratelimit-remaining").is_some(), "{:?}", r);
 }
 
 /// Preview is the first endpoint outside sign-in with a rate limit: an arbitrary document, a

@@ -468,15 +468,25 @@ pub async fn preview_segment(
         )
             .into_response());
     }
+    // Every answer from here carries the `RateLimit` headers, refusals included. The quota was
+    // spent whatever the outcome, and a rule builder that is being told `422 unknown-field` on a
+    // debounce is exactly the client that needs to know how little of its window is left.
+    Ok(match counted(&state, workspace_id, &input.rules).await {
+        Ok(preview) => (quota.headers, Json(preview)).into_response(),
+        Err(e) => (quota.headers, e).into_response(),
+    })
+}
+
+/// `preview_segment` past the role check and the quota: parse the document, then count it.
+async fn counted(state: &AppState, workspace_id: Uuid, rules: &Value) -> ApiResult<Preview> {
     let mut conn = state.pool.acquire().await?;
-    let group = parse_new_rules(&mut conn, workspace_id, &input.rules).await?;
+    let group = parse_new_rules(&mut conn, workspace_id, rules).await?;
     drop(conn);
-    let counted = super::preview::preview(
+    super::preview::preview(
         &state.pool,
         workspace_id,
         &group,
         state.config.preview_timeout_ms,
     )
-    .await?;
-    Ok((quota.headers, Json(counted)).into_response())
+    .await
 }
