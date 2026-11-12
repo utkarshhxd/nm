@@ -11,6 +11,9 @@ import type { ReactNode } from "react";
  */
 export function TableScroller({ label, children }: { label: string; children: ReactNode }) {
   return (
+    // tabIndex is unconditional on purpose: a scroll region must be keyboard-reachable when it
+    // overflows, and measuring that needs a ResizeObserver. One spare Tab stop is the safe error;
+    // do not make it conditional without keeping that guarantee.
     <div role="region" aria-label={label} tabIndex={0} className="relative overflow-x-auto">
       {children}
     </div>

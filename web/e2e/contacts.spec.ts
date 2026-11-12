@@ -388,7 +388,9 @@ test("inp_on_the_contacts_route_stays_under_200ms", async () => {
   const durations = await page.evaluate(() =>
     (window as unknown as { __inp: PerformanceEventTiming[] }).__inp.map((e) => e.duration),
   );
-  const inp = Math.max(0, ...durations);
+  // An observer that recorded nothing would otherwise read as an INP of 0 and pass.
+  expect(durations.length, "the observer saw no interactions").toBeGreaterThan(0);
+  const inp = Math.max(...durations);
   test.info().annotations.push({ type: "inp", description: `${inp} ms over ${durations.length} slow events` });
   expect(inp, `INP ${inp} ms against a target of ${INP_TARGET_MS} ms`).toBeLessThan(INP_TARGET_MS);
 });
