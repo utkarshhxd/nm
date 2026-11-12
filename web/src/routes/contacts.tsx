@@ -102,7 +102,18 @@ type Result = { tone: "ok" | "warn"; text: string };
 
 /** The five bulk routes. Only the last two are destructive enough to be confirmed first. */
 type Kind = "tag" | "untag" | "subscribe" | "unsubscribe" | "delete";
-type Confirming = { kind: "unsubscribe" | "delete"; target: string; name: string };
+type Confirming = {
+  kind: "unsubscribe" | "delete";
+  target: string;
+  name: string;
+  /**
+   * How many contacts the dialog said it would act on, read when it opened. A delete is measured
+   * against this and not against the server's `selected`: those two always agree (both come out
+   * of the one statement), so a contact someone else deleted while the dialog was open would
+   * otherwise leave the person told "deleted 4,980" after agreeing to 5,000, with nothing said.
+   */
+  promised: number;
+};
 
 function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit: boolean }) {
   const queryClient = useQueryClient();
@@ -204,6 +215,8 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   const store = useMemo(createSelection, []);
   const selection = useSyncExternalStore(store.subscribe, store.get);
   const [result, setResult] = useState<Result | null>(null);
+  const resultRef = useRef<HTMLParagraphElement>(null);
+  const toFocus = useRef(false);
   const [failure, setFailure] = useState("");
   const [creating, setCreating] = useState(false);
   const [confirming, setConfirming] = useState<Confirming | null>(null);
@@ -231,6 +244,12 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       : selection.mode === "all"
         ? selection.matched - selection.excluded.size
         : 0;
+  useEffect(() => {
+    if (!result || !toFocus.current) return;
+    toFocus.current = false;
+    resultRef.current?.focus();
+  }, [result]);
+
   const firstRun = useRef(true);
   // A bulk delete clears the selection itself; "Selection cleared" must not be announced in
   // place of what the delete did.
@@ -304,7 +323,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     store.selectAll(data.selection_token, data.selected);
   }
 
-  async function bulk(kind: Kind, target: string, name: string) {
+  async function bulk(kind: Kind, target: string, name: string, promised?: number) {
     const current = store.get();
     if (current.mode === "none" || (kind !== "delete" && !target)) return;
     setBusy(true);
@@ -352,8 +371,10 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       if (kind === "delete") {
         silentClear.current = true;
         store.clear();
+        // The bar that held the button is about to unmount; focus goes to the outcome.
+        toFocus.current = true;
       }
-      const message = describe(kind, name, data);
+      const message = describe(kind, name, data, promised);
       setResult(message);
       announce(message.text);
       // The table only changes when rows left it, or when it is filtered by what changed.
@@ -462,7 +483,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
               label="Tag to add or remove"
               placeholder="Choose a tag…"
               options={tags.data ?? []}
-              busy={busy}
+              disabled={busy || chosen === 0}
               actions={[
                 { label: "Add tag", run: (t, n) => void bulk("tag", t, n) },
                 { label: "Remove tag", run: (t, n) => void bulk("untag", t, n) },
@@ -472,19 +493,22 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
               label="List to subscribe to or unsubscribe from"
               placeholder="Choose a list…"
               options={lists.data ?? []}
-              busy={busy}
+              disabled={busy || chosen === 0}
               actions={[
                 { label: "Subscribe to list", run: (t, n) => void bulk("subscribe", t, n) },
                 {
                   label: "Unsubscribe from list",
-                  run: (target, name) => setConfirming({ kind: "unsubscribe", target, name }),
+                  run: (target, name) =>
+                    setConfirming({ kind: "unsubscribe", target, name, promised: chosen }),
                 },
               ]}
             />
             <Button
               variant="danger-ghost"
-              disabled={busy}
-              onClick={() => setConfirming({ kind: "delete", target: "", name: "" })}
+              disabled={busy || chosen === 0}
+              onClick={() =>
+                setConfirming({ kind: "delete", target: "", name: "", promised: chosen })
+              }
             >
               Delete contacts
             </Button>
@@ -497,6 +521,8 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
 
       {result ? (
         <p
+          ref={resultRef}
+          tabIndex={-1}
           data-testid="bulk-result"
           className={
             "mt-3 rounded-md border-s-4 p-3 " +
@@ -586,21 +612,21 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         }
         confirmLabel={
           confirming?.kind === "delete"
-            ? `Delete ${count(chosen, "contact")}`
+            ? `Delete ${count(confirming.promised, "contact")}`
             : "Unsubscribe these contacts"
         }
         onConfirm={() => {
           const go = confirming;
           setConfirming(null);
-          if (go) void bulk(go.kind, go.target, go.name);
+          if (go) void bulk(go.kind, go.target, go.name, go.promised);
         }}
       >
         {confirming?.kind === "delete" ? (
           <>
             <p>
-              <strong>{count(chosen, "contact")}</strong> and everything recorded against them —
-              list memberships, tags and custom field values — are deleted. This cannot be
-              undone and there is no copy to restore from.
+              <strong>{count(confirming.promised, "contact")}</strong> and everything recorded
+              against them — list memberships, tags and custom field values — are deleted. This
+              cannot be undone and there is no copy to restore from.
             </p>
             <p>
               Their addresses are <strong>not suppressed</strong>. Nothing here records that these
@@ -612,7 +638,8 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         ) : (
           <>
             <p>
-              <strong>{count(chosen, "selected contact")}</strong> are unsubscribed from{" "}
+              <strong>{count(confirming?.promised ?? 0, "selected contact")}</strong> are
+              unsubscribed from{" "}
               <strong className="wrap-anywhere">{confirming?.name}</strong>. Anyone who is not
               subscribed to it is left alone.
             </p>
@@ -689,13 +716,13 @@ function BulkAction({
   label,
   placeholder,
   options,
-  busy,
+  disabled,
   actions,
 }: {
   label: string;
   placeholder: string;
   options: { id: string; name: string }[];
-  busy: boolean;
+  disabled: boolean;
   actions: { label: string; run: (id: string, name: string) => void }[];
 }) {
   const [picked, setPicked] = useState("");
@@ -713,7 +740,7 @@ function BulkAction({
         <Button
           key={a.label}
           variant="outline"
-          disabled={!picked || busy}
+          disabled={!picked || disabled}
           onClick={() => a.run(picked, options.find((o) => o.id === picked)?.name ?? "")}
         >
           {a.label}
@@ -733,6 +760,7 @@ function describe(
   kind: Kind,
   name: string,
   { affected, selected, status }: components["schemas"]["BulkResult"],
+  promised?: number,
 ): Result {
   const rest = selected - affected;
   const of = `${affected.toLocaleString()} of ${count(selected, "selected contact")}`;
@@ -762,12 +790,18 @@ function describe(
         };
   }
   if (kind === "delete") {
-    return affected === selected
-      ? { tone: "ok", text: `Deleted ${count(affected, "contact")}. No address was suppressed.` }
-      : {
+    // Against the dialog's number, not the server's: `affected` and `selected` are taken from
+    // the one statement and always agree, so a row someone else removed between the dialog
+    // opening and the delete running shows up here or nowhere.
+    const want = promised ?? selected;
+    const short = want - affected;
+    const them = short === 1 ? "it" : "them";
+    return short > 0
+      ? {
           tone: "warn",
-          text: `Deleted ${of}. The other ${rest.toLocaleString()} ${was} already gone.`,
-        };
+          text: `Deleted ${affected.toLocaleString()} of the ${count(want, "contact")} you confirmed. The other ${short.toLocaleString()} ${short === 1 ? "was" : "were"} already gone — someone else deleted or changed ${them} first. No address was suppressed.`,
+        }
+      : { tone: "ok", text: `Deleted ${count(affected, "contact")}. No address was suppressed.` };
   }
   const head =
     affected === 0

@@ -23,7 +23,18 @@ let editorPage: Page;
 let wsAdminPage: Page;
 let workspaceId = "";
 let csrf = "";
-const ids = { archiveMe: "", purgeMe: "", ada: "", list: "", crowd: "", bulkA: "", bulkB: "" };
+const ids = {
+  archiveMe: "",
+  purgeMe: "",
+  ada: "",
+  list: "",
+  crowd: "",
+  bulkA: "",
+  bulkB: "",
+  herd: "",
+  predC: "",
+  raceA: "",
+};
 
 const base = () => `/api/v1/workspaces/${workspaceId}`;
 
@@ -118,6 +129,19 @@ test.beforeAll(async ({ browser }) => {
   }
   await post("/contacts", { email: "del-a@example.test" });
   await post("/contacts", { email: "del-b@example.test" });
+
+  // Three more, all tagged and all on the list, for the snapshotted-predicate path.
+  ids.herd = (await post("/tags", { name: "herd" })).id;
+  for (const letter of ["a", "b", "c"]) {
+    const c = await post("/contacts", { email: `pred-${letter}@example.test` });
+    if (letter === "c") ids.predC = c.id;
+    await put(`/contacts/${c.id}/tags/${ids.herd}`);
+    await post(`/contacts/${c.id}/lists`, { list_id: ids.list });
+  }
+
+  ids.raceA = (await post("/contacts", { email: "race-a@example.test" })).id;
+  await post("/contacts", { email: "race-b@example.test" });
+  await post("/contacts", { email: "race-c@example.test" });
 
   // An erasure leaves a tombstone: the one suppression nobody may lift.
   const erased = await post("/contacts", { email: "erased@example.test" });
@@ -336,7 +360,9 @@ test("bulk_delete_requires_confirmation_naming_the_count", async () => {
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
 
   const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
-  await expect(confirm).toContainText("2 contacts");
+  // The sentence, not the button: "Delete 2 contacts" on the button satisfies a whole-dialog
+  // substring check on its own, so that check passes with the count in the copy made up.
+  await expect(confirm.getByRole("paragraph").first()).toContainText("2 contacts");
   await expect(confirm).toContainText("cannot be undone");
   // Deleting is not erasing: nothing is suppressed, so every address stays usable tomorrow.
   await expect(confirm).toContainText("not suppressed");
@@ -344,6 +370,8 @@ test("bulk_delete_requires_confirmation_naming_the_count", async () => {
   await confirm.getByRole("button", { name: "Delete 2 contacts", exact: true }).click();
 
   await expect(result()).toContainText("Deleted 2 contacts");
+  // The bulk bar and its button are gone with the selection; focus is on the outcome, not <body>.
+  await expect(result()).toBeFocused();
   await expect(row(page, "del-a@example.test")).toHaveCount(0);
   // The promise the dialog made, checked rather than assumed.
   const suppressions = await get<{ data: { email: string | null }[] }>("/suppressions");
@@ -353,6 +381,107 @@ test("bulk_delete_requires_confirmation_naming_the_count", async () => {
     headers: { "X-CSRF-Token": csrf },
   });
   expect(again.status()).toBe(201);
+});
+
+test("an_empty_selection_offers_no_action_to_run_on_it", async () => {
+  // "All matching", less every row: the bar still shows, and nothing may be run from it.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select bulk-a@example.test", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("All 3 contacts matching this view are selected.")).toBeVisible();
+  for (const letter of ["a", "b", "c"]) {
+    await page
+      .getByRole("checkbox", { name: `Select bulk-${letter}@example.test`, exact: true })
+      .uncheck();
+  }
+  await expect(
+    page.getByText("0 of 3 contacts matching this view are selected (3 left out)."),
+  ).toBeVisible();
+
+  await expect(page.getByRole("button", { name: "Delete contacts", exact: true })).toBeDisabled();
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
+  await expect(page.getByRole("button", { name: "Remove tag", exact: true })).toBeDisabled();
+});
+
+test("a_predicate_selection_spares_the_excluded_contact_in_all_three_actions", async () => {
+  // The path that matters: a signed token and the rows ticked back off, never a list of ids.
+  // When this went wrong earlier in this milestone it would have swept the whole workspace.
+  type Body = { selection_token?: string; excluded_ids?: string[]; ids?: string[] };
+  const bodies: Record<string, Body> = {};
+  for (const kind of ["untag", "unsubscribe", "delete"]) {
+    await page.route(`**/contacts/bulk/${kind}`, async (route) => {
+      bodies[kind] = route.request().postDataJSON();
+      await route.continue();
+    });
+  }
+
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("pred-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select pred-a@example.test", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("All 3 contacts matching this view are selected.")).toBeVisible();
+  await page.getByRole("checkbox", { name: "Select pred-c@example.test", exact: true }).uncheck();
+  await expect(
+    page.getByText("2 of 3 contacts matching this view are selected (1 left out)."),
+  ).toBeVisible();
+
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "herd" });
+  await page.getByRole("button", { name: "Remove tag", exact: true }).click();
+  await expect(result()).toContainText("Removed “herd” from 2 contacts");
+  expect(await named(`/contacts/${ids.predC}/tags`)).toMatchObject([{ name: "herd" }]);
+
+  await page
+    .getByLabel("List to subscribe to or unsubscribe from", { exact: true })
+    .selectOption({ label: "Weekly digest" });
+  await page.getByRole("button", { name: "Unsubscribe from list", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Unsubscribe from this list", exact: true })
+    .getByRole("button", { name: "Unsubscribe these contacts", exact: true })
+    .click();
+  await expect(result()).toContainText("Unsubscribed 2 contacts from “Weekly digest”");
+  expect(await named(`/contacts/${ids.predC}/lists`)).toMatchObject([{ status: "subscribed" }]);
+
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Delete these contacts", exact: true })
+    .getByRole("button", { name: "Delete 2 contacts", exact: true })
+    .click();
+  await expect(result()).toContainText("Deleted 2 contacts");
+  // The one left out is still here, with everything it had; the other two are gone.
+  const left = await get<{ data: { email: string }[] }>("/contacts?q=pred-");
+  expect(left.data.map((c) => c.email)).toEqual(["pred-c@example.test"]);
+
+  for (const kind of ["untag", "unsubscribe", "delete"]) {
+    expect(typeof bodies[kind]?.selection_token, kind).toBe("string");
+    expect(bodies[kind]?.excluded_ids, kind).toHaveLength(1);
+    expect(bodies[kind]?.ids, kind).toBeUndefined();
+    await page.unroute(`**/contacts/bulk/${kind}`);
+  }
+});
+
+test("a_delete_that_lost_a_race_is_measured_against_what_it_promised", async () => {
+  await selectMatching("race-", 3);
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
+  await expect(confirm.getByRole("paragraph").first()).toContainText("3 contacts");
+
+  // Someone else removes one of the three while the dialog is open. The server's own two
+  // numbers agree whatever happens, so only the promise can show the gap.
+  const gone = await admin.request.delete(`${base()}/contacts/${ids.raceA}`, {
+    headers: { "X-CSRF-Token": csrf },
+  });
+  expect(gone.ok(), `delete -> ${gone.status()}`).toBe(true);
+
+  await confirm.getByRole("button", { name: "Delete 3 contacts", exact: true }).click();
+  await expect(result()).toContainText("2 of the 3 contacts you confirmed");
+  await expect(result()).toContainText("someone else");
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {
@@ -441,4 +570,17 @@ test("axe_reports_no_violations_with_each_destructive_dialog_open", async () => 
   await page.goto(`/w/${SLUG}/tags`);
   await row(page, "vip").getByRole("button", { name: "Delete vip", exact: true }).click();
   await scan("Delete the tag vip");
+
+  // The bulk confirmations, which need a selection before they exist at all.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByLabel("List to subscribe to or unsubscribe from", { exact: true })
+    .selectOption({ label: "Weekly digest" });
+  await page.getByRole("button", { name: "Unsubscribe from list", exact: true }).click();
+  await scan("Unsubscribe from this list");
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  await scan("Delete these contacts");
 });
