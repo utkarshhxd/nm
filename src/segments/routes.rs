@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use axum::{Json, Router, extract::State, http::StatusCode};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{Segment, parse_new_rules, parse_unchanged_rules};
+use super::{Segment, parse_new_rules, parse_unchanged_rules, preview::Preview};
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
@@ -23,6 +28,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/workspaces/{workspace_id}/segments",
             axum::routing::get(list_segments).post(create_segment),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/segments/preview",
+            axum::routing::post(preview_segment),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/segments/{id}",
@@ -408,4 +417,60 @@ pub async fn delete_segment(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The body of `POST /segments/preview`: a rule document that need not be saved, or savable.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewRequest {
+    /// The whole rule document, `{match, rules}`.
+    #[schema(value_type = Object)]
+    pub rules: Value,
+}
+
+/// Counts the contacts a rule document matches, without saving it. A read: `viewer` (section 13).
+///
+/// Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.
+/// The document is arbitrary, the caller needs only `viewer`, each call may hold a pooled
+/// connection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.
+///
+/// The document is parsed against the **live** definitions (`parse_new_rules`), like a save and
+/// unlike a load: previewing is how a new rule is written, and a new rule may not name an
+/// archived field. Nothing builds a rule by hand — `Group::parse` is the only way in, and a
+/// hand-built node can reach an `unreachable!` in the compiler.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/segments/preview",
+    operation_id = "preview_segment",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = PreviewRequest,
+    responses(
+        (status = 200, description = "`exact` is false when `count` is the planner's estimate, \
+            and `count` is null when the document filters on a custom attribute", body = Preview),
+        (status = 404, description = "not a member, or no such workspace"),
+        (status = 422, description = "a refused rule document (malformed-rules, empty-rules, \
+            unknown-field, ...)"),
+        (status = 429, description = "rate-limited: too many previews for this workspace"),
+    ),
+)]
+pub async fn preview_segment(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<PreviewRequest>,
+) -> ApiResult<Response> {
+    authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
+    let quota = state.preview_limit.check(workspace_id);
+    if let Some(retry_after_secs) = quota.over {
+        return Ok((
+            quota.headers,
+            ApiError::TooManyRequests { retry_after_secs },
+        )
+            .into_response());
+    }
+    let mut conn = state.pool.acquire().await?;
+    let group = parse_new_rules(&mut conn, workspace_id, &input.rules).await?;
+    drop(conn);
+    let counted = super::preview::preview(&state.pool, workspace_id, &group).await?;
+    Ok((quota.headers, Json(counted)).into_response())
 }

@@ -9,8 +9,16 @@ use tokio::net::TcpListener;
 use webauthn_rs::Webauthn;
 
 use crate::{
-    auth::passkeys, config::Config, crypto::secrets::Secrets, db, error::ApiError, http,
-    http::csrf, http::security_headers::security_headers, telemetry,
+    auth::passkeys,
+    config::Config,
+    crypto::secrets::Secrets,
+    db,
+    error::ApiError,
+    http,
+    http::csrf,
+    http::rate_limit::{PREVIEW_PER_MINUTE, RateLimiter},
+    http::security_headers::security_headers,
+    telemetry,
 };
 
 #[derive(Clone)]
@@ -21,6 +29,9 @@ pub struct AppState {
     /// The WebAuthn relying party, derived from `public_url`. `None` when that host is not a domain
     /// name (an IP address), where passkeys cannot work; use `webauthn()`.
     pub webauthn: Option<Arc<Webauthn>>,
+    /// Per-workspace cap on `POST /segments/preview`, which a viewer may call on a debounce and
+    /// which may hold a pooled connection for 1.5 seconds.
+    pub preview_limit: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -32,6 +43,7 @@ impl AppState {
             config: Arc::new(config),
             secrets,
             webauthn,
+            preview_limit: Arc::new(RateLimiter::per_minute(PREVIEW_PER_MINUTE)),
         })
     }
 

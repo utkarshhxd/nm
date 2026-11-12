@@ -5,6 +5,7 @@
 //! is both a rule and a group, and `compile` turns such a tree into parameterised SQL.
 
 pub mod compile;
+pub mod preview;
 pub mod routes;
 pub mod rules;
 

@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use common::{PW, TestApp, add_member, create_user, create_workspace};
 use nm::{
     error::ApiError,
+    http::rate_limit::PREVIEW_PER_MINUTE,
     segments::{load_rules, parse_new_rules},
     workspaces::roles::Role,
 };
@@ -961,4 +962,265 @@ async fn a_purge_does_not_wait_for_a_save_in_flight(pool: PgPool) {
         .expect("the purge waited for a save that shares no lock with it");
     r.assert_status_ok();
     tx.commit().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// `POST /segments/preview` (spec M1b sections 5, 6, 12 and 13).
+
+fn preview_path(ws: Uuid) -> String {
+    format!("{}/preview", segments(ws))
+}
+
+async fn preview(app: &TestApp, ws: Uuid, rules: &Value) -> axum_test::TestResponse {
+    app.post(&preview_path(ws))
+        .json(&json!({ "rules": rules }))
+        .await
+}
+
+async fn insert_contact(pool: &PgPool, ws: Uuid, email: &str, first_name: &str, attrs: Value) {
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name, attributes) \
+         values ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(email)
+    .bind(first_name)
+    .bind(attrs)
+    .execute(pool)
+    .await
+    .expect("insert contact");
+}
+
+/// A document the count cannot finish inside its 1500 ms budget, built only out of what the rule
+/// language allows: 50 `not_contains` rules (the parser's maximum, in groups of at most 20)
+/// against 10 000 contacts whose `first_name` is 400 `a`s. Each rule asks for 200 `a`s followed
+/// by a letter that is not there, so `ilike` restarts at every position of every row; every rule
+/// is true of every row, so `all` cannot short-circuit and every one of them is evaluated.
+/// **Measured on the dev container: 18.3 s uncapped**, against a 1500 ms timeout — so a preview
+/// that comes back in a couple of seconds was cut off, not merely slow.
+///
+/// Every contact matches, so the true count is the whole fixture: the planner's estimate can be
+/// held against a number that is known, which is what catches an `EXPLAIN` of the `count(*)`
+/// (`Plan Rows: 1` at every node).
+///
+/// `first_name`, not an attribute: an `attr:` rule is answered with `null` before any query runs.
+fn expensive_rules() -> Value {
+    let rule = |i: usize| {
+        json!({
+            "field": "first_name",
+            "op": "not_contains",
+            "value": format!("{}b{i}", "a".repeat(200)),
+        })
+    };
+    // `all`, not `any`: every rule is true of every row, so an `or` would short-circuit on the
+    // first one and the document would cost a fiftieth of what it must.
+    let group = |from: usize, to: usize| json!({"group": {"match": "all", "rules": (from..to).map(rule).collect::<Vec<_>>()}});
+    json!({"match": "all", "rules": [group(0, 20), group(20, 40), group(40, 50)]})
+}
+
+async fn fill_for_expensive_preview(pool: &PgPool, ws: Uuid) {
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name) \
+         select gen_random_uuid(), $1, 'c' || g || '@acme.com', repeat('a', 400) \
+         from generate_series(1, 10000) g",
+    )
+    .bind(ws)
+    .execute(pool)
+    .await
+    .expect("fill contacts");
+    // So the fallback's estimate is a real one. Without statistics the planner answers from its
+    // defaults, and this test could not tell a row estimate from a made-up one.
+    sqlx::query("analyze contacts")
+        .execute(pool)
+        .await
+        .expect("analyze");
+}
+
+/// A cheap document is counted exactly, by a viewer, and only within the workspace asked about:
+/// the compiler emits no `workspace_id` clause of its own, so the count query must write one.
+#[sqlx::test]
+async fn a_cheap_preview_is_exact_and_counts_only_this_workspaces_contacts(pool: PgPool) {
+    let (ws, _admin) = workspace(&pool, "acme").await;
+    let (other, _) = workspace(&pool, "globex").await;
+    insert_contact(&pool, ws, "a@acme.com", "Ann", json!({})).await;
+    insert_contact(&pool, ws, "b@acme.com", "Ann", json!({})).await;
+    insert_contact(&pool, ws, "c@acme.com", "Bob", json!({})).await;
+    insert_contact(&pool, other, "d@globex.com", "Ann", json!({})).await;
+
+    let viewer = client(&pool, "viewer@acme.com", ws, Role::Viewer).await;
+    let r = preview(&viewer, ws, &first_name_is("Ann")).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body["count"], 2, "the other workspace's Ann is not counted");
+    assert_eq!(body["exact"], true);
+    assert!(body["took_ms"].is_u64(), "{body}");
+    assert_eq!(
+        r.header("ratelimit-limit").to_str().unwrap(),
+        PREVIEW_PER_MINUTE.to_string(),
+        "the headers are on the answer, not only on the refusal"
+    );
+
+    // Nothing was saved: a preview is a read of an unsaved document.
+    assert_eq!(count(&pool).await, 0);
+}
+
+/// The count runs under `SET LOCAL statement_timeout = '1500ms'`, so an expensive document
+/// answers with the planner's estimate instead of hanging.
+///
+/// `exact: false` on its own would pass vacuously if the timeout never engaged — `SET LOCAL`
+/// outside a transaction is a WARNING that leaves the timeout at `0` — so this also asserts
+/// *when* the answer came back: at the budget, not at the 18.3 s the count really needs, and not
+/// before the budget either, which is what an implementation that treats any error as "estimate"
+/// would do.
+#[sqlx::test]
+async fn an_expensive_preview_times_out_and_falls_back_to_an_estimate(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    fill_for_expensive_preview(&pool, ws).await;
+
+    let r = preview(&app, ws, &expensive_rules()).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body["exact"], false, "{body}");
+    assert!(
+        body["count"]
+            .as_i64()
+            .is_some_and(|n| (5_000..=20_000).contains(&n)),
+        "the fallback reports the planner's row estimate, near the 10 000 contacts that match, \
+         and not the one row an `EXPLAIN` of the `count(*)` would report: {body}"
+    );
+    let took = body["took_ms"].as_u64().expect("took_ms");
+    assert!(
+        (1500..5_000).contains(&took),
+        "the preview must have run until the 1500 ms timeout cut it off: not finished early, and \
+         not run to completion (18.3 s uncapped). took_ms = {took}"
+    );
+}
+
+/// `SET LOCAL` reverts when the transaction ends, including the transaction `statement_timeout`
+/// aborted. The connection goes back to the pool with the server's own setting.
+#[sqlx::test]
+async fn a_timed_out_preview_leaves_no_timeout_behind_on_the_pool(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    fill_for_expensive_preview(&pool, ws).await;
+    let r = preview(&app, ws, &expensive_rules()).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["exact"], false, "the preview timed out");
+
+    // Held at the same time, so these are three different connections, the timed-out one among
+    // them. The pool `#[sqlx::test]` hands out allows 20.
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(pool.acquire().await.expect("acquire"));
+    }
+    for conn in &mut held {
+        let timeout: String = sqlx::query_scalar("show statement_timeout")
+            .fetch_one(&mut **conn)
+            .await
+            .expect("show statement_timeout");
+        assert_eq!(
+            timeout, "0",
+            "the preview's timeout outlived its transaction"
+        );
+    }
+    drop(held);
+
+    // And behaviourally: a statement that outlasts the preview's budget is not cut off.
+    sqlx::query("select pg_sleep(1.8)")
+        .execute(&pool)
+        .await
+        .expect("a normal query is not subject to the preview's 1500 ms timeout");
+}
+
+/// Section 6 ships no attribute index, so the planner has no statistics for `->>` and its
+/// estimate measured 66x low. A document naming any attribute is answered with no number at all,
+/// at any depth, and never with a planner figure.
+#[sqlx::test]
+async fn a_document_filtering_on_an_attribute_is_never_given_a_number(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    create_field(&app, ws, "plan").await;
+    insert_contact(&pool, ws, "a@acme.com", "Ann", json!({"plan": "pro"})).await;
+    insert_contact(&pool, ws, "b@acme.com", "Bob", json!({"plan": "pro"})).await;
+
+    // An exact count here would be 2, and a planner estimate a number of its own; both are wrong.
+    for doc in [
+        plan_is("pro"),
+        json!({"match": "all", "rules": [
+            {"field": "first_name", "op": "eq", "value": "Ann"},
+            {"group": {"match": "any", "rules": [{"field": "attr:plan", "op": "is_set"}]}},
+        ]}),
+    ] {
+        let r = preview(&app, ws, &doc).await;
+        r.assert_status_ok();
+        let body: Value = r.json();
+        assert!(body["count"].is_null(), "{doc} got a number: {body}");
+        assert_eq!(body["exact"], false, "{body}");
+    }
+}
+
+/// A preview is how a new rule is written, so it resolves like a save and not like a load: an
+/// archived field may not be named.
+#[sqlx::test]
+async fn previewing_a_rule_on_an_archived_field_is_refused(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let field = create_field(&app, ws, "plan").await;
+    preview(&app, ws, &plan_is("pro")).await.assert_status_ok();
+
+    app.delete(&format!("{}/{field}", fields(ws)))
+        .await
+        .assert_status_ok();
+
+    let r = preview(&app, ws, &plan_is("pro")).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&r), "urn:nm:problem:unknown-field");
+}
+
+/// Preview is the first endpoint outside sign-in with a rate limit: an arbitrary document, a
+/// viewer, up to 1.5 s of a pooled connection, called on a debounce as someone types.
+#[sqlx::test]
+async fn preview_is_rate_limited_per_workspace_and_reports_its_headers(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (other, _) = workspace(&pool, "globex").await;
+    // The same signed-in admin in both workspaces, so what differs is the workspace alone.
+    sqlx::query(
+        "insert into memberships (workspace_id, user_id, role) \
+         select $1, user_id, 'admin' from memberships where workspace_id = $2",
+    )
+    .bind(other)
+    .bind(ws)
+    .execute(&pool)
+    .await
+    .expect("second membership");
+
+    for i in 1..=PREVIEW_PER_MINUTE {
+        let r = preview(&app, ws, &first_name_is("Ann")).await;
+        r.assert_status_ok();
+        assert_eq!(
+            r.header("ratelimit-remaining").to_str().unwrap(),
+            (PREVIEW_PER_MINUTE - i).to_string(),
+            "request {i} of {PREVIEW_PER_MINUTE}"
+        );
+    }
+    let r = preview(&app, ws, &first_name_is("Ann")).await;
+    r.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(problem_type(&r), "urn:nm:problem:rate-limited");
+    assert_eq!(r.header("ratelimit-remaining").to_str().unwrap(), "0");
+    assert_eq!(
+        r.header("ratelimit-limit").to_str().unwrap(),
+        PREVIEW_PER_MINUTE.to_string()
+    );
+    let reset: u64 = r
+        .header("ratelimit-reset")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&reset), "reset = {reset}");
+    let retry: u64 = r.header("retry-after").to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&retry), "retry-after = {retry}");
+
+    // The window is per workspace: the same person, one workspace along, is not refused.
+    preview(&app, other, &first_name_is("Ann"))
+        .await
+        .assert_status_ok();
 }

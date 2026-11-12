@@ -3266,6 +3266,59 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/segments/preview": {
+      "post": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "summary": "Counts the contacts a rule document matches, without saving it. A read: `viewer` (section 13).",
+        "description": "Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.\nThe document is arbitrary, the caller needs only `viewer`, each call may hold a pooled\nconnection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.\n\nThe document is parsed against the **live** definitions (`parse_new_rules`), like a save and\nunlike a load: previewing is how a new rule is written, and a new rule may not name an\narchived field. Nothing builds a rule by hand — `Group::parse` is the only way in, and a\nhand-built node can reach an `unreachable!` in the compiler.",
+        "operationId": "preview_segment",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`exact` is false when `count` is the planner's estimate, and `count` is null when the document filters on a custom attribute",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Preview"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a refused rule document (malformed-rules, empty-rules, unknown-field, ...)"
+          },
+          "429": {
+            "description": "rate-limited: too many previews for this workspace"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/segments/{id}": {
       "get": {
         "tags": [
@@ -5952,6 +6005,47 @@
             "type": "string"
           }
         }
+      },
+      "Preview": {
+        "type": "object",
+        "description": "How many contacts a rule document matches.",
+        "required": [
+          "exact",
+          "took_ms"
+        ],
+        "properties": {
+          "count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The matching contacts, or `null` when no honest number can be given — the document filters\non a custom attribute, which has no statistics (section 6). The rule builder shows \"too\nmany to count exactly\" for `null`."
+          },
+          "exact": {
+            "type": "boolean",
+            "description": "`false` when `count` is the planner's estimate, or when there is no count at all."
+          },
+          "took_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "PreviewRequest": {
+        "type": "object",
+        "description": "The body of `POST /segments/preview`: a rule document that need not be saved, or savable.",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "object",
+            "description": "The whole rule document, `{match, rules}`."
+          }
+        },
+        "additionalProperties": false
       },
       "Purged": {
         "type": "object",

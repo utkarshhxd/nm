@@ -6,6 +6,7 @@ use crate::{app::AppState, error::ApiError};
 
 pub mod csrf;
 mod health;
+pub mod rate_limit;
 pub mod request_meta;
 pub mod security_headers;
 pub mod web_ui;

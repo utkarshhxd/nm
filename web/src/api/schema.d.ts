@@ -870,6 +870,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/segments/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Counts the contacts a rule document matches, without saving it. A read: `viewer` (section 13).
+         * @description Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.
+         *     The document is arbitrary, the caller needs only `viewer`, each call may hold a pooled
+         *     connection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.
+         *
+         *     The document is parsed against the **live** definitions (`parse_new_rules`), like a save and
+         *     unlike a load: previewing is how a new rule is written, and a new rule may not name an
+         *     archived field. Nothing builds a rule by hand — `Group::parse` is the only way in, and a
+         *     hand-built node can reach an `unreachable!` in the compiler.
+         */
+        post: operations["preview_segment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/segments/{id}": {
         parameters: {
             query?: never;
@@ -1676,6 +1703,25 @@ export interface components {
             /** Format: date-time */
             last_used_at?: string | null;
             name: string;
+        };
+        /** @description How many contacts a rule document matches. */
+        Preview: {
+            /**
+             * Format: int64
+             * @description The matching contacts, or `null` when no honest number can be given — the document filters
+             *     on a custom attribute, which has no statistics (section 6). The rule builder shows "too
+             *     many to count exactly" for `null`.
+             */
+            count?: number | null;
+            /** @description `false` when `count` is the planner's estimate, or when there is no count at all. */
+            exact: boolean;
+            /** Format: int64 */
+            took_ms: number;
+        };
+        /** @description The body of `POST /segments/preview`: a rule document that need not be saved, or savable. */
+        PreviewRequest: {
+            /** @description The whole rule document, `{match, rules}`. */
+            rules: Record<string, never>;
         };
         Purged: {
             /**
@@ -4706,6 +4752,54 @@ export interface operations {
             };
             /** @description invalid name or description, or a refused rule document (malformed-rules, empty-rules, unknown-field, ...) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    preview_segment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description `exact` is false when `count` is the planner's estimate, and `count` is null when the document filters on a custom attribute */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Preview"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a refused rule document (malformed-rules, empty-rules, unknown-field, ...) */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many previews for this workspace */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
