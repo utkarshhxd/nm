@@ -14,6 +14,7 @@ pub mod http;
 pub mod lists;
 pub mod openapi;
 pub mod pagination;
+pub mod segments;
 pub mod suppressions;
 pub mod tags;
 pub mod telemetry;

@@ -54,6 +54,9 @@ pub enum ApiError {
     /// 422 with the given problem code, for a request that is well-formed but cannot be acted on
     /// and is not one field's fault (an expired selection token).
     Unprocessable(&'static str),
+    /// 422 with a problem code and a detail built at the call site, for a refusal that must name
+    /// what was refused (a segment rule's unknown field, a limit and its number).
+    UnprocessableDetail { code: &'static str, detail: String },
     /// 429 `rate-limited` plus a `Retry-After` header.
     TooManyRequests { retry_after_secs: u64 },
     /// 415 `unsupported-media-type`: a JSON endpoint got another content type.
@@ -112,6 +115,9 @@ impl IntoResponse for ApiError {
             }
             ApiError::Unprocessable(code) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, *code, humanise(code))
+            }
+            ApiError::UnprocessableDetail { code, detail } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, *code, detail.clone())
             }
             ApiError::TooManyRequests { retry_after_secs } => {
                 retry_after = Some(*retry_after_secs);
