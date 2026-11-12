@@ -369,8 +369,9 @@ pub async fn list(
 }
 
 /// Makes `%`, `_` and `\` in a search term match themselves: unescaped, `___` would match every
-/// row and no index could narrow it.
-fn escape_like(term: &str) -> String {
+/// row and no index could narrow it. The segment compiler escapes its `contains` / `starts_with` /
+/// `ends_with` values with this same function, so "search" and "segment" cannot drift apart.
+pub(crate) fn escape_like(term: &str) -> String {
     term.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
