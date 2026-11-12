@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Locator, type Page, expect, test } from "@playwright/test";
 
+import { axeProblems } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
 /**
@@ -134,12 +135,7 @@ function layoutProblems(): string[] {
 /** The three checks, on whatever is on screen. */
 async function sound(where: string): Promise<string[]> {
   const found = (await page.evaluate(layoutProblems)).map((p) => `${where}: ${p}`);
-  const { violations, passes } = await new AxeBuilder({ page }).analyze();
-  // A scan that checked nothing would pass every page.
-  if (passes.length === 0) found.push(`${where}: axe ran no rules`);
-  for (const v of violations) {
-    found.push(`${where}: axe ${v.id} (${v.impact}): ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`);
-  }
+  found.push(...(await axeProblems(new AxeBuilder({ page }), where)));
   return found;
 }
 
@@ -544,8 +540,7 @@ test("the_older_m0_screens_hold_up_under_the_new_text_scale", async () => {
       await anon.reload();
       await expect(anon.getByRole("heading", { name: "Sign in" })).toBeVisible();
       expect(await anon.evaluate(layoutProblems)).toEqual([]);
-      const { violations } = await new AxeBuilder({ page: anon }).analyze();
-      found.push(...violations.map((v) => `login (${theme}): axe ${v.id}`));
+      found.push(...(await axeProblems(new AxeBuilder({ page: anon }), `login (${theme})`)));
     }
   } finally {
     await anon.context().close();

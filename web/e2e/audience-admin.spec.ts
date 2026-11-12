@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Page, expect, test } from "@playwright/test";
 
+import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
 /** One workspace with an admin and an editor, seeded once over the API and shared in order. */
@@ -540,13 +541,7 @@ test("axe_reports_no_violations_on_all_three_pages", async () => {
     await page.goto(path);
     await expect(page.getByText(ready, { exact: true }).first()).toBeVisible();
     await expect(page.getByRole("status").filter({ hasText: /^Loading/ })).toHaveCount(0);
-    const { violations, passes } = await new AxeBuilder({ page }).analyze();
-    // A scan that checked nothing passes every page, and because it does not fail, nobody finds
-    // out it stopped checking. To reproduce that state: `withTags(["no-such-tag"])` is a valid
-    // `runOnly` that matches no rule, so axe runs none and returns empty. `withRules([])` does
-    // not work — axe rejects it with "runOnly.values must be a non-empty array".
-    expect(passes.length, `${path}: axe ran no rules`).toBeGreaterThan(0);
-    expect(violations, path).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), path);
   }
 });
 
@@ -554,10 +549,7 @@ test("axe_reports_no_violations_with_each_destructive_dialog_open", async () => 
   const scan = async (name: string) => {
     const dialog = page.getByRole("dialog", { name, exact: true });
     await expect(dialog).toBeVisible();
-    const { violations, passes } = await new AxeBuilder({ page }).analyze();
-    // As above: a scan that checked nothing would pass every dialog.
-    expect(passes.length, `${name}: axe ran no rules`).toBeGreaterThan(0);
-    expect(violations, name).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), name);
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
   };

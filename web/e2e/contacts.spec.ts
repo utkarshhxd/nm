@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Locator, type Page, expect, test } from "@playwright/test";
 
+import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
 /**
@@ -335,10 +336,7 @@ test("aria_rowindex_is_set_on_every_rendered_row", async () => {
 test("axe_reports_no_violations", async () => {
   await open();
   await page.getByRole("checkbox", { name: "Select all loaded contacts" }).check();
-  const { violations } = await new AxeBuilder({ page }).analyze();
-  expect(
-    violations.map((v) => `${v.id} (${v.impact}): ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`),
-  ).toEqual([]);
+  await expectNoViolations(new AxeBuilder({ page }), "the contacts grid, every row selected");
 });
 
 /**

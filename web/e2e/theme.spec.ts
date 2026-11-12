@@ -4,6 +4,7 @@ import AxeBuilder from "@axe-core/playwright";
 import type { Page } from "@playwright/test";
 
 import { SAMPLE, expect, test } from "./support/app";
+import { expectNoViolations } from "./support/axe";
 
 type Theme = "light" | "dark";
 type Frame = { theme: string | undefined; background: string };
@@ -105,13 +106,11 @@ test("both_themes_pass_axe_on_a_sample_page", async ({ browser, app }) => {
     await page.goto(app + SAMPLE);
     await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
 
-    const closed = await new AxeBuilder({ page }).analyze();
-    expect(closed.violations, `${theme}, dialog closed`).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), `${theme}, dialog closed`);
 
     await page.getByRole("button", { name: "Invite someone" }).click();
     await expect(page.getByRole("dialog", { name: "Invite someone" })).toBeVisible();
-    const open = await new AxeBuilder({ page }).analyze();
-    expect(open.violations, `${theme}, dialog open`).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), `${theme}, dialog open`);
     await context.close();
   }
 });

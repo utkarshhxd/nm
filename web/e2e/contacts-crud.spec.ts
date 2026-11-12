@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Page, expect, test } from "@playwright/test";
 
+import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
 /**
@@ -382,9 +383,7 @@ test("axe_reports_no_violations_with_each_dialog_open", async () => {
   const scan = async (name: string) => {
     await expect(dialog(page, name)).toBeVisible();
     await expect(page.getByRole("status").filter({ hasText: /^Loading/ })).toHaveCount(0);
-    const { violations, passes } = await new AxeBuilder({ page }).analyze();
-    expect(passes.length, `${name}: axe ran no rules`).toBeGreaterThan(0);
-    expect(violations, name).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), name);
     await page.keyboard.press("Escape");
     await expect(dialog(page, name)).toBeHidden();
   };

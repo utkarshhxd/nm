@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Page, expect, test } from "@playwright/test";
 
+import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
 /** One small workspace, seeded once through the API and shared by the tests, which only read it. */
@@ -204,8 +205,7 @@ test("axe_reports_no_violations_on_both_pages", async () => {
     await expect(page.getByText(ready, { exact: true }).first()).toBeVisible();
     // Every skeleton has resolved, so axe sees the page and not its placeholder.
     await expect(page.getByRole("status").filter({ hasText: /^(Loading|Counting)/ })).toHaveCount(0);
-    const { violations } = await new AxeBuilder({ page }).analyze();
-    expect(violations, path).toEqual([]);
+    await expectNoViolations(new AxeBuilder({ page }), path);
   }
 });
 
