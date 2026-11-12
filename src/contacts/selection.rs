@@ -128,12 +128,23 @@ impl Selection {
     ///
     /// Writing `M0` for the match at issue time and `M1` for the match now:
     /// `|M1| = selected + |M1 ∩ E| ≤ selected + |E|`, so refusing when `selected + |E| > |M0|`
-    /// guarantees `|M1| ≤ |M0|` whenever it does not refuse. It over-refuses only when an
-    /// excluded id was **never** in the match — an id that was in the match and has since left
-    /// is counted on both sides and cancels out. The UI only ever excludes rows drawn from the
-    /// matching view, so it cannot be refused falsely; an API client passing arbitrary ids can
-    /// be, and over-refusing is the safe direction on the two actions that refuse — a delete
-    /// that cannot be undone, and a subscribe that makes people mailable.
+    /// guarantees `|M1| ≤ |M0|` whenever it does not refuse. State it the stronger way round,
+    /// because that is what it buys: `selected ≤ |M0| - |E|`, so an action never touches more
+    /// contacts than the number the confirmation dialog named. `|M1| ≤ |M0|` is the corollary.
+    ///
+    /// It over-refuses whenever an excluded id is not in `M1`, and **the UI can produce that** —
+    /// an earlier version of this comment said only an API client could, and that was wrong.
+    /// Two ways, both ending in a refusal of a selection that never widened. The grid applies
+    /// the filter but not the `as_of` bound, which lives only in `push_selected`, so a contact
+    /// created after the token and matching the filter is drawn as a ticked row on the next
+    /// refetch; unticking it excludes an id `M1` never held. And an excluded id that has left
+    /// the match only cancels out when nothing joined in the same window — a same-count swap
+    /// with an exclusion is refused too, although the count did not change.
+    ///
+    /// Over-refusing is the safe direction on the two actions that refuse — a delete that cannot
+    /// be undone, and a subscribe that makes people mailable — and it costs the user a fresh
+    /// selection. `tests/bulk.rs` pins the isolated leave-the-match case; neither path above is
+    /// covered.
     ///
     /// What it still does not catch is a same-count swap: one contact leaving the match while
     /// another joins leaves `|M1|` unchanged and this returns false. The number that can be

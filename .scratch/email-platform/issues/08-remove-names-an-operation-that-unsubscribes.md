@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # "Remove" is the name of an operation that unsubscribes
 

@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # Contact search cost at ten million rows
 

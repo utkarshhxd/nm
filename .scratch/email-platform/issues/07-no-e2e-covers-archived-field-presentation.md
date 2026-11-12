@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # No e2e covers how an archived custom field is presented
 

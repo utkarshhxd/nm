@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # The count a person confirmed never reaches the server
 

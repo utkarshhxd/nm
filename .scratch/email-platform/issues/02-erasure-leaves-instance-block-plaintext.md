@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # Erasing a contact leaves its address in plaintext on any instance-wide block
 

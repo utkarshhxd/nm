@@ -33,7 +33,14 @@ So what the check does buy is one sentence and no more: **no more contacts are a
 
 That limit applies to `bulk/subscribe` as much as to `bulk/delete`, so be precise about what refusing a widened subscribe achieves: it makes the action **no-worse-than-shown, not safe**. A same-count swap still puts contacts on a list who were never selected, with no widening to refuse and nothing in the response to notice it, and the next campaign mails them. The guard counts; it does not identify. `.scratch/email-platform/issues/04-same-count-swap-is-unbounded.md` is the real blocker for M1b's importer — an import that retags a segment is exactly the write that performs the swap — and this refusal is not a substitute for fixing it.
 
-The adjusted comparison over-refuses in one case: an `excluded_ids` entry that was **never** in the match (an id that was in it and has since left cancels out on both sides). Only an API client can produce that; the UI excludes rows drawn from the matching view. Over-refusing is the safe direction on both actions that refuse: a delete cannot be undone, and a subscribe makes people mailable.
+State what the comparison enforces the stronger way round, because `|M1| ≤ |M0|` is only its corollary: **no action touches more contacts than `issued - excluded_ids.len()`** — the number the confirmation dialog showed. The raw comparison already gave `selected ≤ issued`; adding the exclusions back is what makes the dialog's number the bound.
+
+It over-refuses whenever an excluded id is not in the run-time match, and **the UI can produce that**. An earlier version of this ADR said only an API client could, which was wrong, and it is recorded here rather than quietly corrected because this document has three times claimed a property the code did not have. Two UI paths, neither of which widened anything:
+
+- The contacts grid applies the filter but **not** the `as_of` bound, which lives only in `push_selected`. The query client's `refetchOnWindowFocus` is on, so a contact created after the token and matching the filter is drawn as a ticked row when the tab regains focus. Unticking it excludes an id the match never held, and a selection of two is refused with "matches up to 3 now" — a number no selection ever stood for.
+- An excluded id that has left the match cancels out on both sides only when nothing joined the match in the same window. A same-count swap with an exclusion is refused too, although `|M1| = |M0|`.
+
+Both over-refuse, which is the safe direction on a delete that cannot be undone and a subscribe that makes people mailable; the cost is that the user must select again. `tests/bulk.rs` pins the isolated leave-the-match case, so nothing in the suite contradicts this — or covers either path above.
 
 The one-hour expiry means a long-open page must ask again.
 

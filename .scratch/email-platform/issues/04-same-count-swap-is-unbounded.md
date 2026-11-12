@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # A selection can swap which contacts it means without changing how many
 

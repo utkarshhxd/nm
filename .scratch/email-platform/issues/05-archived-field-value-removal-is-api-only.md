@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # Removing one contact's value for an archived custom field is API-only
 

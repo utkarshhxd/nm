@@ -1,5 +1,4 @@
 Status: needs-triage
-Labels: needs-triage
 
 # Two list-side membership routes have no UI caller
 

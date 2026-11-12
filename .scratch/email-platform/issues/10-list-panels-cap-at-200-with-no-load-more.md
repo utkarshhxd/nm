@@ -1,17 +1,26 @@
 Status: needs-triage
-Labels: needs-triage
 
 # Several panels load 200 rows and stop, with no Load more
 
-Found in M1a task 17 review. Each site already carries a `shortcut:` comment saying so, which is
-this repo's convention for a known limit rather than an oversight.
+Found in M1a task 17 review; the sentence below was corrected after the PR gate review, which
+found that four of the nine sites carry no `shortcut:` comment -- and they are the four this issue
+calls the worse case.
 
 ## The sites
 
-- `web/src/routes/contact-detail.tsx` -- the contact's Lists, Tags and custom-field panels
-- `web/src/components/contact-form.tsx` -- the custom field definitions the form renders
-- `web/src/routes/lists.tsx` -- the all-lists query (`["lists", ws, "all"]`)
-- the list and tag pickers on the contacts grid and on contact detail
+Five carry a `shortcut:` comment, this repo's convention for a known limit rather than an
+oversight:
+
+- `web/src/routes/contact-detail.tsx:350`, `:540`, `:706` -- the contact's Lists, Tags and
+  custom-field panels
+- `web/src/components/contact-form.tsx:123` -- the custom field definitions the form renders
+- `web/src/routes/lists.tsx:60` -- the all-lists query (`["lists", ws, "all"]`)
+
+Four carry none, so there the cap is undocumented as well as silent -- the list and tag pickers,
+which are the ones a bulk action is chosen from:
+
+- `web/src/routes/contacts.tsx:153` and `:162` -- the pickers on the contacts grid
+- `web/src/routes/contact-detail.tsx:365` and `:553` -- the pickers on contact detail
 
 All request `limit: 200` and render what comes back. None renders a "Load more", and none tells
 the reader there is a tail.
@@ -34,4 +43,6 @@ Two different answers, which should not be conflated:
   the larger piece of work.
 
 Until either lands, the honest interim is one line of text under a capped list saying it is
-showing the first 200.
+showing the first 200. Cheaper still, and worth doing first because it is a comment-only change:
+give the four picker queries the `shortcut:` comment the other five already have, so the cap is at
+least documented where someone reads the code.
