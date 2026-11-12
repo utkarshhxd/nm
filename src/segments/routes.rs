@@ -471,6 +471,12 @@ pub async fn preview_segment(
     let mut conn = state.pool.acquire().await?;
     let group = parse_new_rules(&mut conn, workspace_id, &input.rules).await?;
     drop(conn);
-    let counted = super::preview::preview(&state.pool, workspace_id, &group).await?;
+    let counted = super::preview::preview(
+        &state.pool,
+        workspace_id,
+        &group,
+        state.config.preview_timeout_ms,
+    )
+    .await?;
     Ok((quota.headers, Json(counted)).into_response())
 }

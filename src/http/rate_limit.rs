@@ -64,7 +64,11 @@ impl RateLimiter {
     /// Counts one request against `key` and reports whether it may proceed. A refused request is
     /// counted too: the limit is on what arrives, not on what is served.
     pub fn check(&self, key: Uuid) -> Quota {
-        let now = Instant::now();
+        self.check_at(key, Instant::now())
+    }
+
+    /// `check` with the clock passed in, so a test can move time instead of sleeping a window.
+    fn check_at(&self, key: Uuid, now: Instant) -> Quota {
         // A poisoned lock here would mean a panic while holding it, which the block below cannot
         // do; recovering beats turning every later preview into a 500.
         let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
@@ -75,7 +79,8 @@ impl RateLimiter {
             ends: now + WINDOW,
             used: 0,
         });
-        window.used += 1;
+        // Unreachable at 4.29e9 requests in one window, but a debug build would panic on it.
+        window.used = window.used.saturating_add(1);
         let left = window.ends.saturating_duration_since(now);
         // Rounded up, so a reset is never reported as 0 seconds away while the window still holds.
         let reset = left.as_secs() + u64::from(left.subsec_nanos() > 0);
@@ -94,6 +99,19 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_counter_starts_again_in_the_next_window() {
+        let limiter = RateLimiter::per_minute(1);
+        let key = Uuid::now_v7();
+        let start = Instant::now();
+        assert!(limiter.check_at(key, start).over.is_none());
+        assert!(limiter.check_at(key, start).over.is_some(), "the second");
+        let next = start + WINDOW + Duration::from_secs(1);
+        let after = limiter.check_at(key, next);
+        assert!(after.over.is_none(), "the window has passed");
+        assert_eq!(after.headers["ratelimit-remaining"], "0", "one of one used");
+    }
 
     #[test]
     fn a_workspace_is_refused_past_its_limit_and_another_is_not() {

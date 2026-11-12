@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, QueryBuilder};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -40,8 +40,15 @@ use crate::error::{ApiError, ApiResult};
 /// Postgres' `query_canceled`, which is what `statement_timeout` raises.
 const QUERY_CANCELED: &str = "57014";
 
-/// Section 5's budget. A literal, never a bound parameter: `SET` takes no placeholders.
-const COUNT_TIMEOUT: &str = "set local statement_timeout = '1500ms'";
+/// `set local statement_timeout = <milliseconds>`, which is section 5's budget
+/// (`Config::preview_timeout_ms` defaults to 1500 ms).
+///
+/// **The injection audit `AssertSqlSafe` asks for:** the only interpolated value is a `u64` from
+/// `Config`, so the statement can differ from this literal only in its digits. Nothing a request
+/// carries reaches it. `SET` takes no placeholders, which is why it is formatted at all.
+fn timeout_statement(timeout_ms: u64) -> AssertSqlSafe<String> {
+    AssertSqlSafe(format!("set local statement_timeout = {timeout_ms}"))
+}
 
 /// How many contacts a rule document matches.
 #[derive(Debug, Serialize, ToSchema)]
@@ -60,15 +67,20 @@ pub struct Preview {
 /// A document with any `attr:` rule gets **no number**. Section 6 ships no attribute index, so
 /// Postgres has no statistics for `->>` and falls back to a default selectivity — measured 66×
 /// low against a true count of 66,666. A planner figure there would be worse than none.
-pub async fn preview(pool: &PgPool, workspace_id: Uuid, group: &Group) -> ApiResult<Preview> {
+pub async fn preview(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    group: &Group,
+    timeout_ms: u64,
+) -> ApiResult<Preview> {
     let started = Instant::now();
     if filters_on_an_attribute(group) {
         return Ok(answer(None, false, started));
     }
-    match count(pool, workspace_id, group).await {
+    match count(pool, workspace_id, group, timeout_ms).await {
         Ok(n) => Ok(answer(Some(n), true, started)),
         Err(e) if timed_out(&e) => {
-            let estimate = estimate(pool, workspace_id, group).await?;
+            let estimate = estimate(pool, workspace_id, group, timeout_ms).await?;
             Ok(answer(Some(estimate), false, started))
         }
         Err(e) => Err(e.into()),
@@ -93,9 +105,16 @@ fn filters_on_an_attribute(group: &Group) -> bool {
 
 /// The exact count, under the timeout. The transaction is what makes `SET LOCAL` mean anything;
 /// it is rolled back either way, because nothing here writes.
-async fn count(pool: &PgPool, workspace_id: Uuid, group: &Group) -> sqlx::Result<i64> {
+async fn count(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    group: &Group,
+    timeout_ms: u64,
+) -> sqlx::Result<i64> {
     let mut tx = pool.begin().await?;
-    sqlx::query(COUNT_TIMEOUT).execute(&mut *tx).await?;
+    sqlx::query(timeout_statement(timeout_ms))
+        .execute(&mut *tx)
+        .await?;
     let mut q =
         QueryBuilder::<Postgres>::new("select count(*) from contacts where workspace_id = ");
     q.push_bind(workspace_id).push(" and ");
@@ -106,11 +125,18 @@ async fn count(pool: &PgPool, workspace_id: Uuid, group: &Group) -> sqlx::Result
 }
 
 /// The planner's estimate, in a **fresh** transaction: the one the count timed out in is aborted.
-async fn estimate(pool: &PgPool, workspace_id: Uuid, group: &Group) -> ApiResult<i64> {
+async fn estimate(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    group: &Group,
+    timeout_ms: u64,
+) -> ApiResult<i64> {
     let mut tx = pool.begin().await?;
     // Planning is not what was slow, but an unbounded statement on a pooled connection is the
     // thing this endpoint exists to avoid, so the fallback is capped too.
-    sqlx::query(COUNT_TIMEOUT).execute(&mut *tx).await?;
+    sqlx::query(timeout_statement(timeout_ms))
+        .execute(&mut *tx)
+        .await?;
     let mut q = QueryBuilder::<Postgres>::new(
         // `select 1`, not `count(*)`: an aggregate's plan estimates one row at every node.
         "explain (format json) select 1 from contacts where workspace_id = ",

@@ -27,6 +27,7 @@ pub fn test_config(database_url: &str) -> Config {
         trust_proxy_headers: false,
         metrics_listen: None,
         log_format: LogFormat::Pretty,
+        preview_timeout_ms: 1500,
     }
 }
 

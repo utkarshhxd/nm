@@ -45,6 +45,10 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub metrics_listen: Option<SocketAddr>,
     pub log_format: LogFormat,
+    /// How long `POST /segments/preview` may spend on an exact count before it falls back to the
+    /// planner's estimate (spec M1b section 5 budgets 1500 ms). Tests drive it down so an
+    /// expensive document is decisively over the budget instead of merely over it.
+    pub preview_timeout_ms: u64,
 }
 
 /// Hand-written so the database URL (it carries the password) never reaches logs.
@@ -60,6 +64,7 @@ impl fmt::Debug for Config {
             trust_proxy_headers,
             metrics_listen,
             log_format,
+            preview_timeout_ms,
         } = self;
         f.debug_struct("Config")
             .field("database_url", &"***")
@@ -70,6 +75,7 @@ impl fmt::Debug for Config {
             .field("trust_proxy_headers", trust_proxy_headers)
             .field("metrics_listen", metrics_listen)
             .field("log_format", log_format)
+            .field("preview_timeout_ms", preview_timeout_ms)
             .finish()
     }
 }
@@ -115,6 +121,8 @@ struct Raw {
     metrics_listen: Option<SocketAddr>,
     #[serde(default = "default_log_format")]
     log_format: LogFormat,
+    #[serde(default = "default_preview_timeout_ms")]
+    preview_timeout_ms: u64,
 }
 
 fn default_listen() -> SocketAddr {
@@ -131,6 +139,11 @@ fn default_true() -> bool {
 
 fn default_log_format() -> LogFormat {
     LogFormat::Json
+}
+
+/// Spec M1b section 5.
+fn default_preview_timeout_ms() -> u64 {
+    1500
 }
 
 /// TOML layer for an explicitly requested config file; a missing or unreadable
@@ -170,6 +183,7 @@ impl Config {
             trust_proxy_headers: raw.trust_proxy_headers,
             metrics_listen: raw.metrics_listen,
             log_format: raw.log_format,
+            preview_timeout_ms: raw.preview_timeout_ms,
         })
     }
 }
@@ -229,6 +243,7 @@ mod tests {
         assert_eq!(c.public_url.as_str(), "http://localhost:8080/");
         assert!(c.auto_migrate && !c.trust_proxy_headers && c.metrics_listen.is_none());
         assert_eq!(c.log_format, LogFormat::Json);
+        assert_eq!(c.preview_timeout_ms, 1500, "spec M1b section 5's budget");
         assert_eq!(c.secret_key, SecretKey([1; 32]));
     }
 

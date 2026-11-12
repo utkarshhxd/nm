@@ -11,19 +11,32 @@ use std::{future::IntoFuture, time::Duration};
 use axum::http::StatusCode;
 use common::{PW, TestApp, add_member, create_user, create_workspace};
 use nm::{
+    config::Config,
     error::ApiError,
     http::rate_limit::PREVIEW_PER_MINUTE,
-    segments::{load_rules, parse_new_rules},
+    segments::{compile::push_rules, load_rules, parse_new_rules},
     workspaces::roles::Role,
 };
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 async fn client(pool: &PgPool, email: &str, ws: Uuid, role: Role) -> TestApp {
+    client_with(pool, email, ws, role, |_| {}).await
+}
+
+/// `client`, with the instance's configuration adjusted. The app carries its own `AppState`, so
+/// two clients built here do not share a rate-limit window; tests about the limiter use one.
+async fn client_with(
+    pool: &PgPool,
+    email: &str,
+    ws: Uuid,
+    role: Role,
+    f: impl FnOnce(&mut Config),
+) -> TestApp {
     let id = create_user(pool, email, PW, false).await;
     add_member(pool, ws, id, role).await;
-    let mut app = TestApp::new(pool.clone()).await;
+    let mut app = TestApp::with_config(pool.clone(), f).await;
     app.login(email, PW).await;
     app
 }
@@ -31,9 +44,20 @@ async fn client(pool: &PgPool, email: &str, ws: Uuid, role: Role) -> TestApp {
 /// A workspace and a signed-in admin of it. An admin may do everything an editor may, and may
 /// also define and purge custom fields, which several tests here need.
 async fn workspace(pool: &PgPool, slug: &str) -> (Uuid, TestApp) {
+    workspace_with(pool, slug, |_| {}).await
+}
+
+async fn workspace_with(pool: &PgPool, slug: &str, f: impl FnOnce(&mut Config)) -> (Uuid, TestApp) {
     let owner = create_user(pool, &format!("owner-{slug}@example.com"), PW, false).await;
     let ws = create_workspace(pool, owner, slug).await;
-    let admin = client(pool, &format!("admin-{slug}@example.com"), ws, Role::Admin).await;
+    let admin = client_with(
+        pool,
+        &format!("admin-{slug}@example.com"),
+        ws,
+        Role::Admin,
+        f,
+    )
+    .await;
     (ws, admin)
 }
 
@@ -992,13 +1016,18 @@ async fn insert_contact(pool: &PgPool, ws: Uuid, email: &str, first_name: &str, 
     .expect("insert contact");
 }
 
-/// A document the count cannot finish inside its 1500 ms budget, built only out of what the rule
-/// language allows: 50 `not_contains` rules (the parser's maximum, in groups of at most 20)
-/// against 10 000 contacts whose `first_name` is 400 `a`s. Each rule asks for 200 `a`s followed
-/// by a letter that is not there, so `ilike` restarts at every position of every row; every rule
-/// is true of every row, so `all` cannot short-circuit and every one of them is evaluated.
-/// **Measured on the dev container: 18.3 s uncapped**, against a 1500 ms timeout — so a preview
-/// that comes back in a couple of seconds was cut off, not merely slow.
+/// The budget the previews below are given, far under the 1500 ms the spec budgets in production
+/// (`Config::preview_timeout_ms`'s default, pinned in `config`'s own tests). The expensive
+/// document is then about 180x over the budget instead of 12x, so the timeout assertions do not
+/// depend on how fast the machine is.
+const TEST_TIMEOUT_MS: u64 = 100;
+
+/// A document the count cannot finish inside its budget, built only out of what the rule language
+/// allows: 50 `not_contains` rules (the parser's maximum, in groups of at most 20) against 10 000
+/// contacts whose `first_name` is 400 `a`s. Each rule asks for 200 `a`s followed by a letter that
+/// is not there, so `ilike` restarts at every position of every row; every rule is true of every
+/// row, so `all` cannot short-circuit and every one of them is evaluated. **Measured on the dev
+/// container: 18.3 s uncapped.**
 ///
 /// Every contact matches, so the true count is the whole fixture: the planner's estimate can be
 /// held against a number that is known, which is what catches an `EXPLAIN` of the `count(*)`
@@ -1019,22 +1048,54 @@ fn expensive_rules() -> Value {
     json!({"match": "all", "rules": [group(0, 20), group(20, 40), group(40, 50)]})
 }
 
-async fn fill_for_expensive_preview(pool: &PgPool, ws: Uuid) {
-    sqlx::query(
-        "insert into contacts (id, workspace_id, email, first_name) \
-         select gen_random_uuid(), $1, 'c' || g || '@acme.com', repeat('a', 400) \
-         from generate_series(1, 10000) g",
-    )
-    .bind(ws)
-    .execute(pool)
-    .await
-    .expect("fill contacts");
+/// The workspace under test, its signed-in admin (previewing with `TEST_TIMEOUT_MS`), 10 000
+/// contacts in it — and **a second workspace with 10 000 contacts of its own**. The second one is
+/// what holds the fallback honest: both queries on that path have to say which workspace they are
+/// counting, and an `EXPLAIN` that forgets reports about 20 000 rows, which the bound in the
+/// tests below rejects.
+async fn expensive_fixture(pool: &PgPool) -> (Uuid, TestApp) {
+    let (ws, app) = workspace_with(pool, "acme", |c| c.preview_timeout_ms = TEST_TIMEOUT_MS).await;
+    let (other, _) = workspace(pool, "globex").await;
+    for workspace_id in [ws, other] {
+        sqlx::query(
+            "insert into contacts (id, workspace_id, email, first_name) \
+             select gen_random_uuid(), $1, 'c' || g || '@' || $1 || '.example', \
+                    repeat('a', 400) \
+             from generate_series(1, 10000) g",
+        )
+        .bind(workspace_id)
+        .execute(pool)
+        .await
+        .expect("fill contacts");
+    }
     // So the fallback's estimate is a real one. Without statistics the planner answers from its
-    // defaults, and this test could not tell a row estimate from a made-up one.
+    // defaults, and these tests could not tell a row estimate from a made-up one.
     sqlx::query("analyze contacts")
         .execute(pool)
         .await
         .expect("analyze");
+    (ws, app)
+}
+
+/// A pool whose connections plan in parallel. On this fixture Postgres 16 then puts a `Gather` on
+/// top, whose `Plan Rows` is the whole estimate, over a `Parallel Seq Scan` whose figure is **per
+/// worker** — the under-report the fallback must not read.
+async fn parallel_pool(pool: &PgPool) -> PgPool {
+    PgPoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::raw_sql(
+                    "set parallel_setup_cost = 0; set parallel_tuple_cost = 0; \
+                     set min_parallel_table_scan_size = 0",
+                )
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a pool that plans in parallel")
 }
 
 /// A cheap document is counted exactly, by a viewer, and only within the workspace asked about:
@@ -1075,8 +1136,7 @@ async fn a_cheap_preview_is_exact_and_counts_only_this_workspaces_contacts(pool:
 /// would do.
 #[sqlx::test]
 async fn an_expensive_preview_times_out_and_falls_back_to_an_estimate(pool: PgPool) {
-    let (ws, app) = workspace(&pool, "acme").await;
-    fill_for_expensive_preview(&pool, ws).await;
+    let (ws, app) = expensive_fixture(&pool).await;
 
     let r = preview(&app, ws, &expensive_rules()).await;
     r.assert_status_ok();
@@ -1085,15 +1145,17 @@ async fn an_expensive_preview_times_out_and_falls_back_to_an_estimate(pool: PgPo
     assert!(
         body["count"]
             .as_i64()
-            .is_some_and(|n| (5_000..=20_000).contains(&n)),
-        "the fallback reports the planner's row estimate, near the 10 000 contacts that match, \
-         and not the one row an `EXPLAIN` of the `count(*)` would report: {body}"
+            .is_some_and(|n| (5_000..=15_000).contains(&n)),
+        "the fallback reports the planner's row estimate for THIS workspace, near its 10 000 \
+         contacts: not the one row an `EXPLAIN` of the `count(*)` reports, and not the 20 000 of \
+         a query that forgot its workspace: {body}"
     );
     let took = body["took_ms"].as_u64().expect("took_ms");
     assert!(
-        (1500..5_000).contains(&took),
-        "the preview must have run until the 1500 ms timeout cut it off: not finished early, and \
-         not run to completion (18.3 s uncapped). took_ms = {took}"
+        (TEST_TIMEOUT_MS..TEST_TIMEOUT_MS + 2_000).contains(&took),
+        "the preview must have run until the {TEST_TIMEOUT_MS} ms timeout cut it off: not \
+         finished early, not run to completion (18.3 s uncapped), and not under a timeout other \
+         than the configured one. took_ms = {took}"
     );
 }
 
@@ -1101,8 +1163,7 @@ async fn an_expensive_preview_times_out_and_falls_back_to_an_estimate(pool: PgPo
 /// aborted. The connection goes back to the pool with the server's own setting.
 #[sqlx::test]
 async fn a_timed_out_preview_leaves_no_timeout_behind_on_the_pool(pool: PgPool) {
-    let (ws, app) = workspace(&pool, "acme").await;
-    fill_for_expensive_preview(&pool, ws).await;
+    let (ws, app) = expensive_fixture(&pool).await;
     let r = preview(&app, ws, &expensive_rules()).await;
     r.assert_status_ok();
     assert_eq!(r.json::<Value>()["exact"], false, "the preview timed out");
@@ -1223,4 +1284,83 @@ async fn preview_is_rate_limited_per_workspace_and_reports_its_headers(pool: PgP
     preview(&app, other, &first_name_is("Ann"))
         .await
         .assert_status_ok();
+}
+
+/// The fallback reads the **top** node. Under a parallel plan a scan node's `Plan Rows` is per
+/// worker, so a leaf read under-reports by the worker count — here about 4 100 against 10 000.
+/// The pool, not the fixture, is what makes the plan parallel.
+#[sqlx::test]
+async fn the_fallbacks_estimate_is_the_top_nodes_row_count(pool: PgPool) {
+    let (ws, _app) = expensive_fixture(&pool).await;
+    let parallel = parallel_pool(&pool).await;
+    let mut app =
+        TestApp::with_config(parallel.clone(), |c| c.preview_timeout_ms = TEST_TIMEOUT_MS).await;
+    app.login("admin-acme@example.com", PW).await;
+
+    // The precondition this test rests on: the plan really is parallel, and its leaf really does
+    // report a different, smaller number than the top. Without this the bound below would pass
+    // whichever node the code read.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let group = parse_new_rules(&mut conn, ws, &expensive_rules())
+        .await
+        .expect("the document parses");
+    let mut q = QueryBuilder::<Postgres>::new(
+        "explain (format json) select 1 from contacts where workspace_id = ",
+    );
+    q.push_bind(ws).push(" and ");
+    push_rules(&mut q, &group);
+    let plan: Value = q
+        .build_query_scalar()
+        .fetch_one(&parallel)
+        .await
+        .expect("explain");
+    let top = &plan[0]["Plan"];
+    assert_eq!(top["Node Type"], "Gather", "not a parallel plan: {top}");
+    let top_rows = top["Plan Rows"].as_i64().expect("the top estimate");
+    let leaf = top["Plans"][0]["Plan Rows"]
+        .as_i64()
+        .expect("a leaf estimate");
+    assert!(
+        leaf < 5_000 && (5_000..=15_000).contains(&top_rows),
+        "the leaf must be outside the bound this test asserts, or it proves nothing: \
+         leaf {leaf}, top {top_rows}"
+    );
+
+    let r = preview(&app, ws, &expensive_rules()).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body["exact"], false, "{body}");
+    assert_eq!(
+        body["count"], top_rows,
+        "the estimate is the top node's, not the per-worker leaf's ({leaf}): {body}"
+    );
+    parallel.close().await;
+}
+
+/// The limit is checked **after** `authorize`, so someone who is not in the workspace cannot
+/// spend its quota and deny previews to the people who are. One app, two sessions: the window
+/// lives in the app's state, so this only means anything on a single app.
+#[sqlx::test]
+async fn a_non_member_is_refused_and_spends_none_of_the_workspaces_quota(pool: PgPool) {
+    let (ws, mut app) = workspace(&pool, "acme").await;
+    create_user(&pool, "outsider@example.com", PW, false).await;
+    app.login("outsider@example.com", PW).await;
+
+    for i in 0..=PREVIEW_PER_MINUTE {
+        let r = preview(&app, ws, &first_name_is("Ann")).await;
+        r.assert_status(StatusCode::NOT_FOUND);
+        assert!(
+            r.maybe_header("ratelimit-limit").is_none(),
+            "request {i} told a non-member about the workspace's quota"
+        );
+    }
+
+    app.login("admin-acme@example.com", PW).await;
+    let r = preview(&app, ws, &first_name_is("Ann")).await;
+    r.assert_status_ok();
+    assert_eq!(
+        r.header("ratelimit-remaining").to_str().unwrap(),
+        (PREVIEW_PER_MINUTE - 1).to_string(),
+        "the member's first preview must be the window's first"
+    );
 }
