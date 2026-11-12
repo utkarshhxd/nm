@@ -172,6 +172,19 @@ impl Field {
         })
     }
 
+    /// `NOT NULL` on `contacts` (and, for `email`, validated non-empty), so `is_set` would be true
+    /// for every contact in the workspace and `is_not_set` true for none. Both are refused as
+    /// `invalid-operator`: section 4.1's "matches everything" shape has to be unrepresentable, not
+    /// merely unlikely, and `created_at is_set` is one misclick away in a rule builder. `timezone`
+    /// is genuinely nullable, and `first_name` / `last_name` are meaningful because the compiler
+    /// treats `''` as unset, so none of those three is listed.
+    fn never_unset(&self) -> bool {
+        matches!(
+            self,
+            Field::Email | Field::EmailDomain | Field::CreatedAt | Field::UpdatedAt
+        )
+    }
+
     fn operand(&self) -> Operand {
         match self {
             Field::Email
@@ -428,7 +441,9 @@ impl Walk<'_> {
         let op: Op =
             serde_json::from_value(Value::String(raw.op.clone())).map_err(|_| invalid_op())?;
         let operand = field.operand();
-        if !operand.ops().contains(&op) {
+        if !operand.ops().contains(&op)
+            || (matches!(op, Op::IsSet | Op::IsNotSet) && field.never_unset())
+        {
             return Err(invalid_op());
         }
         let bad = |why| RuleError::InvalidValue {
@@ -712,6 +727,38 @@ mod tests {
     }
 
     #[test]
+    fn is_set_is_refused_on_the_fields_that_can_never_be_unset() {
+        // All four are `NOT NULL` on `contacts`, so `is_set` would compile to a predicate matching
+        // every contact in the workspace. Refused here, so no stored segment can hold one.
+        for field in ["email", "email_domain", "created_at", "updated_at"] {
+            for op in ["is_set", "is_not_set"] {
+                let err =
+                    parse(all(vec![json!({"field": field, "op": op})])).expect_err("must refuse");
+                assert_eq!(err.code(), "invalid-operator", "{field} {op}");
+            }
+        }
+        // The nullable and empty-string-bearing columns keep both operators, and so does every
+        // attribute: an attribute key is absent until something writes it.
+        for field in [
+            "timezone",
+            "first_name",
+            "last_name",
+            "attr:plan",
+            "attr:seats",
+        ] {
+            for op in ["is_set", "is_not_set"] {
+                assert!(
+                    parse(all(vec![json!({"field": field, "op": op})])).is_ok(),
+                    "{field} {op}"
+                );
+            }
+        }
+        // The other operators on those four fields are untouched.
+        let ok = json!({"field": "created_at", "op": "in_last_days", "value": 30});
+        assert!(parse(all(vec![ok])).is_ok());
+    }
+
+    #[test]
     fn reserved_engagement_fields_parse_then_return_not_yet_available() {
         for f in ["opened", "clicked", "bounced", "sent"] {
             // Any operator: the field is refused before the operator is looked at.
@@ -746,7 +793,8 @@ mod tests {
             ("created_at", "in_last_days", json!(1.5)),
             ("tag", "has", json!("not-a-uuid")),
             ("list", "member_of", json!(7)),
-            ("email", "is_set", json!("x")),
+            // `timezone`, not `email`: `is_set` on a `NOT NULL` column is refused a step earlier.
+            ("timezone", "is_set", json!("x")),
         ] {
             let err = parse(all(vec![json!({"field": field, "op": op, "value": value})]))
                 .expect_err(field);
@@ -847,13 +895,15 @@ mod tests {
     fn an_explicit_null_is_refused_so_a_document_round_trips_exactly() {
         // Absent and null are different documents; folding one into the other would let the rule
         // builder corrupt a segment by loading and saving it.
-        let null_value = json!({"field": "email", "op": "is_set", "value": null});
+        // `timezone`, not `email`: `email` is `NOT NULL`, so `is_set` on it is refused a step
+        // earlier, as `invalid-operator`, and would not reach the value check at all.
+        let null_value = json!({"field": "timezone", "op": "is_set", "value": null});
         assert_eq!(code(all(vec![null_value])), "invalid-value");
         let null_value = json!({"field": "email", "op": "eq", "value": null});
         assert_eq!(code(all(vec![null_value])), "invalid-value");
         let null_status = json!({"field": "list", "op": "member_of", "value": ID, "status": null});
         assert_eq!(code(all(vec![null_status])), "malformed-rules");
-        let absent = all(vec![json!({"field": "email", "op": "is_set"})]);
+        let absent = all(vec![json!({"field": "timezone", "op": "is_set"})]);
         let parsed = parse(absent.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), absent);
     }

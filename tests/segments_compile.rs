@@ -28,6 +28,7 @@ const ALL: [&str; 3] = ["a@acme.com", "b@acme.com", "c@globex.com"];
 
 struct Fx {
     ws: Uuid,
+    other_ws: Uuid,
     list: Uuid,
     other_list: Uuid,
     tag: Uuid,
@@ -110,9 +111,36 @@ async fn insert_tag(pool: &PgPool, ws: Uuid, name: &str) -> Uuid {
     id
 }
 
+/// A live suppression row. `ws` is `None` for an instance-wide block. An address row needs a hash
+/// (it is what lets an erasure tombstone outlive its plaintext); the value is irrelevant to this
+/// set path, which matches on plaintext like `mailable_list_members`, but it must differ per
+/// address or the `suppressions_live` unique index rejects the second row in a workspace.
+async fn suppress(pool: &PgPool, ws: Option<Uuid>, scope: &str, value: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    let address = scope == "address";
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, domain, email_hmac, reason) \
+         values ($1, $2, $3, $4, $5, $6, 'bounced')",
+    )
+    .bind(id)
+    .bind(ws)
+    .bind(scope)
+    .bind(address.then_some(value))
+    .bind((!address).then_some(value))
+    .bind(address.then(|| value.as_bytes().to_vec()))
+    .execute(pool)
+    .await
+    .expect("insert suppression");
+    id
+}
+
 /// `a` has every attribute and matches the positive rules; `c` has every attribute with the other
 /// value; `b` has **none** of them, no tag, no list row and a NULL timezone — it is the contact
 /// every negative operator must match and a negated join would lose.
+///
+/// The other workspace is not a decoy that merely exists: its list and tag have a real member, and
+/// it holds a suppression on `a@acme.com` and on the whole of `acme.com`. Without those rows a
+/// tenancy test proves only "an id with no rows matches nothing", which is not tenancy.
 async fn seed(pool: &PgPool) -> Fx {
     let owner = create_user(pool, "owner@example.com", PW, false).await;
     let ws = create_workspace(pool, owner, "acme").await;
@@ -143,8 +171,8 @@ async fn seed(pool: &PgPool) -> Fx {
         400,
     )
     .await;
-    // The decoy: same address shape, in another workspace, matching everything.
-    insert_contact(
+    // The other tenant: the same address, in another workspace, matching everything.
+    let other_a = insert_contact(
         pool,
         other_ws,
         "a@acme.com",
@@ -171,29 +199,45 @@ async fn seed(pool: &PgPool) -> Fx {
         .expect("insert membership");
     }
 
+    // The other workspace's list has a member of its own, so a rule naming it is asking about a
+    // populated list belonging to someone else, not about an empty one.
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status) \
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(other_ws)
+    .bind(other_a)
+    .bind(other_list)
+    .execute(pool)
+    .await
+    .expect("insert other membership");
+
     let tag = insert_tag(pool, ws, "vip").await;
     let other_tag = insert_tag(pool, other_ws, "vip").await;
-    sqlx::query("insert into contact_tags (workspace_id, contact_id, tag_id) values ($1, $2, $3)")
-        .bind(ws)
-        .bind(a)
-        .bind(tag)
+    for (w, contact, t) in [(ws, a, tag), (other_ws, other_a, other_tag)] {
+        sqlx::query(
+            "insert into contact_tags (workspace_id, contact_id, tag_id) values ($1, $2, $3)",
+        )
+        .bind(w)
+        .bind(contact)
+        .bind(t)
         .execute(pool)
         .await
         .expect("insert contact_tag");
+    }
 
-    // `c` alone is suppressed, by address, in this workspace.
-    sqlx::query(
-        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
-         values ($1, $2, 'address', 'c@globex.com', '\\x00'::bytea, 'bounced')",
-    )
-    .bind(Uuid::now_v7())
-    .bind(ws)
-    .execute(pool)
-    .await
-    .expect("insert suppression");
+    // `c` alone is suppressed in this workspace, by address.
+    suppress(pool, Some(ws), "address", "c@globex.com").await;
+    // The other tenant suppresses `a@acme.com`, and the whole of `acme.com`. Neither may make any
+    // contact of *this* workspace look suppressed: the suppression arms correlate on an address,
+    // not on a contact id, and the same address legitimately exists in both workspaces, so
+    // `s.workspace_id = contacts.workspace_id` is the only thing separating the two tenants.
+    suppress(pool, Some(other_ws), "address", "a@acme.com").await;
+    suppress(pool, Some(other_ws), "domain", "acme.com").await;
 
     Fx {
         ws,
+        other_ws,
         list,
         other_list,
         tag,
@@ -392,8 +436,16 @@ async fn every_operator_compiles_and_restricts_beyond_workspace_id(pool: PgPool)
             vec!["a@acme.com"],
         ),
         (
+            json!({"field": "attr:vip", "op": "is_false"}),
+            vec!["c@globex.com"],
+        ),
+        (
             json!({"field": "attr:vip", "op": "is_set"}),
             vec!["a@acme.com", "c@globex.com"],
+        ),
+        (
+            json!({"field": "attr:vip", "op": "is_not_set"}),
+            vec!["b@acme.com"],
         ),
         // list, tag, suppressed
         (
@@ -459,10 +511,9 @@ async fn every_negative_operator_matches_a_missing_row_and_a_null_value(pool: Pg
             json!({"field": "attr:tier", "op": "neq", "value": "gold"}),
             vec!["b@acme.com", "c@globex.com"],
         ),
-        (
-            json!({"field": "attr:vip", "op": "is_false"}),
-            vec!["b@acme.com", "c@globex.com"],
-        ),
+        // `attr:vip is_false` is deliberately NOT here: section 4.5 scopes this rule to negations
+        // of positive operators, and `is_false` is one arm of a partition. See
+        // `a_boolean_attribute_is_a_four_way_partition`.
         (
             json!({"field": "attr:interests", "op": "has_none", "value": ["rust"]}),
             vec!["b@acme.com", "c@globex.com"],
@@ -599,12 +650,88 @@ async fn multi_select_compiles_through_jsonb_exists_any(pool: PgPool) {
     }
 }
 
-/// A list or tag of another workspace matches nothing: the `exists` clauses are correlated on
-/// `workspace_id` as well as the contact.
+/// Spec section 4.5: on a boolean attribute, `is_true` / `is_false` / `is_not_set` partition the
+/// workspace — each contact is in exactly one — and `is_false` means *stored* false, so a contact
+/// that has never been given the field does not match it. "False, or never set" stays expressible
+/// as a group; folding absence into `is_false` would instead make "stored false" unaskable.
+#[sqlx::test]
+async fn a_boolean_attribute_is_a_four_way_partition(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let rule = |op: &str| json!({"field": "attr:vip", "op": op});
+    let is_true = matching(&pool, fx.ws, &all(vec![rule("is_true")])).await;
+    let is_false = matching(&pool, fx.ws, &all(vec![rule("is_false")])).await;
+    let is_not_set = matching(&pool, fx.ws, &all(vec![rule("is_not_set")])).await;
+    assert_eq!(is_true, ["a@acme.com"]);
+    assert_eq!(is_false, ["c@globex.com"], "`is_false` means stored false");
+    assert_eq!(is_not_set, ["b@acme.com"]);
+
+    // Exactly one arm each, and together they are the whole workspace.
+    let mut union: Vec<String> = [is_true, is_false, is_not_set].concat();
+    union.sort();
+    let distinct = union.iter().collect::<std::collections::HashSet<_>>().len();
+    assert_eq!(distinct, union.len(), "the arms overlap: {union:?}");
+    assert_eq!(union, ALL);
+
+    // And the reverse reading is still writable, as a group.
+    let either = all(vec![json!({"group": {"match": "any", "rules": [
+        rule("is_false"), rule("is_not_set"),
+    ]}})]);
+    assert_eq!(
+        matching(&pool, fx.ws, &either).await,
+        ["b@acme.com", "c@globex.com"]
+    );
+}
+
+/// A **populated** list or tag of another workspace matches nothing. The fixture gives both a real
+/// member, so this is not the weaker claim that an id with no rows anywhere matches nothing.
+///
+/// What actually makes list and tag safe is `m.contact_id = contacts.id`, because a contact id is
+/// workspace-unique; `m.workspace_id = contacts.workspace_id` is defence in depth and index
+/// selectivity on top of that. The tenancy guarantee itself is in the schema, not in a predicate,
+/// so the last assertion here is that the database refuses the crossing row at all — which is the
+/// only form of this claim that can be falsified. (The suppression arms are the opposite case:
+/// there the correlation is load-bearing, and
+/// `suppressed_sees_every_arm_and_only_this_workspaces` holds it.)
 #[sqlx::test]
 async fn a_list_or_tag_of_another_workspace_matches_nothing(pool: PgPool) {
     let fx = seed(&pool).await;
     let id = |u: Uuid| json!(u.to_string());
+    let a: Uuid =
+        sqlx::query_scalar("select id from contacts where workspace_id = $1 and email = $2")
+            .bind(fx.ws)
+            .bind("a@acme.com")
+            .fetch_one(&pool)
+            .await
+            .expect("contact a");
+    // A membership or tag row joining this workspace's contact to the other workspace's list or
+    // tag cannot be written: both foreign keys are composite and carry `workspace_id`, so whatever
+    // `workspace_id` such a row claimed would fail one of them.
+    for (sql, other) in [
+        (
+            "insert into list_memberships (workspace_id, contact_id, list_id, status) \
+             values ($1, $2, $3, 'subscribed')",
+            fx.other_list,
+        ),
+        (
+            "insert into contact_tags (workspace_id, contact_id, tag_id) values ($1, $2, $3)",
+            fx.other_tag,
+        ),
+    ] {
+        for claimed in [fx.ws, fx.other_ws] {
+            let err = sqlx::query(sql)
+                .bind(claimed)
+                .bind(a)
+                .bind(other)
+                .execute(&pool)
+                .await
+                .expect_err("a row crossing a workspace boundary must be refused");
+            assert!(
+                err.as_database_error()
+                    .is_some_and(|e| e.code().as_deref() == Some("23503")),
+                "expected a foreign key violation, got {err}"
+            );
+        }
+    }
     for rule in [
         json!({"field": "list", "op": "member_of", "value": id(fx.other_list)}),
         json!({"field": "tag", "op": "has", "value": id(fx.other_tag)}),
@@ -624,6 +751,77 @@ async fn a_list_or_tag_of_another_workspace_matches_nothing(pool: PgPool) {
         let doc = all(vec![rule.clone()]);
         assert_eq!(matching(&pool, fx.ws, &doc).await, ALL, "{rule}");
     }
+}
+
+/// All four suppression arms, one at a time, and the workspace correlation that is the only thing
+/// separating tenants on this field.
+///
+/// Unlike list and tag, these arms match on `contacts.email` and `contacts.email_domain`, and the
+/// same address legitimately exists in many workspaces — so there is no composite foreign key
+/// standing behind the predicate, and dropping `s.workspace_id = contacts.workspace_id` is a live
+/// tenancy leak. The fixture already holds the other tenant's block on `a@acme.com` and on
+/// `acme.com`; step 1 is what makes it bite.
+#[sqlx::test]
+async fn suppressed_sees_every_arm_and_only_this_workspaces(pool: PgPool) {
+    async fn suppressed(pool: &PgPool, ws: Uuid) -> Vec<String> {
+        matching(
+            pool,
+            ws,
+            &all(vec![json!({"field": "suppressed", "op": "is_true"})]),
+        )
+        .await
+    }
+    async fn mailable(pool: &PgPool, ws: Uuid) -> Vec<String> {
+        matching(
+            pool,
+            ws,
+            &all(vec![json!({"field": "suppressed", "op": "is_false"})]),
+        )
+        .await
+    }
+
+    let fx = seed(&pool).await;
+
+    // 1. Arms 1 and 3, workspace-scoped. The other tenant blocks `a@acme.com` by address and
+    //    `acme.com` by domain; neither may reach this workspace, in either direction.
+    assert_eq!(suppressed(&pool, fx.ws).await, ["c@globex.com"]);
+    assert_eq!(mailable(&pool, fx.ws).await, ["a@acme.com", "b@acme.com"]);
+    // ... and from the other side, `c@globex.com`'s block here must not reach the other tenant,
+    //     whose own contact *is* blocked there.
+    assert_eq!(suppressed(&pool, fx.other_ws).await, ["a@acme.com"]);
+    assert_eq!(mailable(&pool, fx.other_ws).await, Vec::<String>::new());
+
+    // 2. Arm 2: an instance-wide address block, which belongs to no workspace and reaches all.
+    suppress(&pool, None, "address", "b@acme.com").await;
+    assert_eq!(
+        suppressed(&pool, fx.ws).await,
+        ["b@acme.com", "c@globex.com"]
+    );
+    assert_eq!(mailable(&pool, fx.ws).await, ["a@acme.com"]);
+
+    // 3. Arm 4: an instance-wide domain block. Now every contact is suppressed, which is the one
+    //    honest way `suppressed is_false` may match nobody.
+    let lifted = suppress(&pool, None, "domain", "globex.com").await;
+    suppress(&pool, None, "domain", "acme.com").await;
+    assert_eq!(suppressed(&pool, fx.ws).await, ALL);
+    assert_eq!(mailable(&pool, fx.ws).await, Vec::<String>::new());
+
+    // 4. `lifted_at is null` in every arm: lifting a block releases the contact it covered.
+    //    `c@globex.com` stays suppressed by its own workspace-scoped address row.
+    sqlx::query("update suppressions set lifted_at = now() where id = $1")
+        .bind(lifted)
+        .execute(&pool)
+        .await
+        .expect("lift");
+    assert_eq!(suppressed(&pool, fx.ws).await, ALL);
+    sqlx::query("update suppressions set lifted_at = now() where scope = 'domain'")
+        .execute(&pool)
+        .await
+        .expect("lift the rest");
+    assert_eq!(
+        suppressed(&pool, fx.ws).await,
+        ["b@acme.com", "c@globex.com"]
+    );
 }
 
 /// `match` and nesting compile to the right boolean shape, and a nested group is parenthesised:
@@ -726,6 +924,10 @@ fn no_caller_supplied_text_reaches_the_sql() {
         "pro' or '1'='1",
         "7b0f2c3e-0000-4000-8000-000000000001",
         "rust",
+        // The one caller-supplied *enum*. `Group::parse` narrows it to three values, so it cannot
+        // carry an injection, but it is the input most likely to be waved through a status check
+        // as "already safe" and then written rather than bound.
+        "subscribed",
     ];
     let doc = json!({"match": "any", "rules": [
         {"field": format!("attr:{INJECTION}"), "op": "eq", "value": "pro' or '1'='1"},
@@ -733,6 +935,8 @@ fn no_caller_supplied_text_reaches_the_sql() {
         {"field": "attr:note", "op": "not_contains", "value": "50%"},
         {"field": "attr:interests", "op": "has_any", "value": ["rust"]},
         {"field": "attr:interests", "op": "has_none", "value": ["rust"]},
+        {"field": "attr:vip", "op": "is_true"},
+        {"field": "attr:vip", "op": "is_false"},
         {"field": "tag", "op": "not_has", "value": "7b0f2c3e-0000-4000-8000-000000000001"},
         {"field": "list", "op": "member_of", "value": "7b0f2c3e-0000-4000-8000-000000000001",
          "status": "subscribed"},
@@ -749,8 +953,24 @@ fn no_caller_supplied_text_reaches_the_sql() {
             "caller-supplied text reached the SQL: {text}\n{sql}"
         );
     }
-    // And the predicate is more than the workspace restriction the caller wrote.
+    // And the predicate is more than the workspace restriction the caller wrote. Every condition
+    // the compiler emits names a `contacts` column or a bound parameter, so a SQL constant in the
+    // fragment can only be a tautology spliced in beside the rules — the `(true or …)` shape that
+    // turns a document into "every contact in the workspace". The only `true` / `false` a
+    // compiled predicate may legitimately contain is the tail of an `is true` / `is false` test on
+    // a boolean attribute, and the document above has both, so this is not a vacuous strip.
     let (_, rules) = sql.split_once("workspace_id = $0 and ").expect("prefix");
     assert!(rules.starts_with('(') && rules.len() > 2, "{sql}");
     assert!(rules.contains("$1"), "nothing was bound: {sql}");
+    assert!(
+        rules.contains(" is true") && rules.contains(" is false"),
+        "{sql}"
+    );
+    let stripped = rules.replace(" is true", "").replace(" is false", "");
+    for constant in ["true", "false", "1=1", "1 = 1"] {
+        assert!(
+            !stripped.contains(constant),
+            "the predicate carries the constant `{constant}`, which no rule can compile to: {sql}"
+        );
+    }
 }

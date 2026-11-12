@@ -14,14 +14,26 @@
 //!    array-index overload, which would make the rule mean something else.
 //! 2. **Negation is `NOT EXISTS`, never a negated join, and survives NULL.** A contact with no
 //!    related rows matches `not_has` / `not_member_of`; a contact whose column or attribute is
-//!    NULL or absent matches every negative operator, because `col not ilike …` is NULL — and so
-//!    not true — for a NULL column.
+//!    NULL or absent matches every *negated positive* operator — `not_has`, `not_member_of`,
+//!    `not_contains`, `neq` — because `col not ilike …` is NULL, and so not true, for a NULL
+//!    column. Section 4.5 scopes that rule to those four: `is_false` is one arm of the four-way
+//!    partition `is_true` / `is_false` / `is_set` / `is_not_set`, so on a boolean attribute it
+//!    means *stored false* and an absent key does not match it.
 //! 3. **LIKE metacharacters are escaped**, with an explicit `ESCAPE` clause. Unescaped, a value of
 //!    `50%` matches every row: the "matches everything" shape of section 4.1, arriving through a
 //!    value instead of a document.
 //! 4. **Casts follow the definition's kind, not the value's shape.** `(attributes ->> $n)::numeric`
 //!    for a number field. That is safe only because `validate_attributes` enforces the type on
 //!    write; the coupling is load-bearing and is recorded in spec section 4.3.
+//!
+//! One shape this file cannot defend against on its own: a rule whose predicate is vacuously true.
+//! `email`, `email_domain`, `created_at` and `updated_at` are `NOT NULL` on `contacts`, so
+//! `is_set` on any of them would match every contact in the workspace and `is_not_set` none — the
+//! "matches everything" shape of section 4.1, arriving one misclick away in a rule builder. It is
+//! closed at the parser (`rules::Field::never_unset`) rather than documented here, because a
+//! vacuous path that is merely written down stays reachable. `timezone` is genuinely nullable and
+//! `first_name` / `last_name` are meaningful under the `''`-is-unset convention below, so all
+//! three keep both operators.
 
 use serde_json::Value;
 use sqlx::{Postgres, QueryBuilder};
@@ -38,6 +50,23 @@ use crate::{
 /// separate clauses, not two with `or` inside — migration 0015 measured that an OR-qualified
 /// anti-join cannot use the partial indexes and degrades to a sequential scan. Every token here is
 /// fixed: nothing caller-supplied reaches this list.
+///
+/// **Which definition this mirrors, and why the two cannot disagree.** Section 4.2 names
+/// `blocking()` for the `suppressed` field, but `blocking()` is the *single-address* path: it
+/// matches on `email_hmac`, because it alone must see a GDPR erasure tombstone, whose plaintext
+/// has been destroyed. This is a set path, so it mirrors the other definition of the same
+/// concept — `migrations/0015_mailable_view.sql`, which matches on plaintext `email` and
+/// `email_domain`, arm for arm. The two can differ on exactly one row shape: a tombstone, which
+/// has `email is null` and so matches no arm here. That is inert for 0015's recorded reason — an
+/// erased contact has no `contacts` row left to select — so the set path and the address path
+/// cannot return different answers about any contact that exists. `tests/segments_compile.rs`'s
+/// `suppressed_sees_every_arm_and_only_this_workspaces` holds each arm against real rows; if a
+/// fifth scope is ever added, 0015, `blocking()` and this array all change together.
+///
+/// `s.workspace_id = contacts.workspace_id` in arms 1 and 3 is **not** defence in depth, unlike
+/// the same clause in the list and tag fragments: those correlate on `contacts.id`, which is
+/// workspace-unique, while these correlate on an address, and the same address legitimately
+/// exists in many workspaces. Here the correlation is the only thing separating tenants.
 const SUPPRESSION_ARMS: [&str; 4] = [
     "(select 1 from suppressions s where s.lifted_at is null \
       and s.workspace_id = contacts.workspace_id \
@@ -224,16 +253,20 @@ fn scalar_rule(q: &mut QueryBuilder<Postgres>, lhs: Lhs<'_>, kind: FieldKind, r:
                 (false, _) => " is null",
             });
         }
-        // `is true` / `is not true`, not `= true` / `= false`: a boolean expression over an absent
-        // key is NULL, and `is not true` is where section 4.5's reviewer check lands for a
-        // boolean — a contact with no value matches `is_false`. `is_set` is how you ask the other
-        // question.
+        // `is true` / `is false`, not `= true` / `is not true`: a boolean expression over an
+        // absent key is NULL, and `is false` is false for NULL — which is what section 4.5 wants.
+        // These two are arms of a four-way partition with `is_set` / `is_not_set`, so `is_false`
+        // means *stored* false; a contact that has never been given the field is `is_not_set`, and
+        // "false, or never set" is written as a group of `any[is_false, is_not_set]`. Folding
+        // absence in here would make "stored false" unaskable, and the reverse stays expressible.
+        // `suppressed is_false` is a different function (`suppressed_rule`) and keeps meaning "no
+        // blocking suppression": `suppressed` is computed and cannot be unset.
         Op::IsTrue | Op::IsFalse => {
             lhs.push_as(q, kind);
             q.push(if r.op == Op::IsTrue {
                 " is true"
             } else {
-                " is not true"
+                " is false"
             });
         }
         op => {
