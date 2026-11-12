@@ -549,7 +549,10 @@ test("axe_reports_no_violations_with_each_destructive_dialog_open", async () => 
   const scan = async (name: string) => {
     const dialog = page.getByRole("dialog", { name, exact: true });
     await expect(dialog).toBeVisible();
-    const { violations } = await new AxeBuilder({ page }).analyze();
+    const { violations, passes } = await new AxeBuilder({ page }).analyze();
+    // A scan that checked nothing would pass every dialog, which is how this milestone's
+    // vacuous assertions got in. `contacts-crud.spec.ts` has guarded its copy from the start.
+    expect(passes.length, `${name}: axe ran no rules`).toBeGreaterThan(0);
     expect(violations, name).toEqual([]);
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
