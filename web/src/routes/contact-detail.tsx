@@ -363,6 +363,8 @@ function Lists({
 
   // Every list in the workspace, for the picker. Only an editor sees one, so only they fetch it.
   const all = useQuery({
+    // The same key and the same request as the contacts grid's filter, deliberately; the lists
+    // screen's own paged query is ["lists", ws, "all"] so that it is not a third shape here.
     queryKey: ["lists", ws],
     enabled: canEdit,
     queryFn: async () => {

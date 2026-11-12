@@ -93,6 +93,14 @@ function layoutProblems(): string[] {
     if (box.width === 0 && box.height === 0) continue;
     const text = (el.textContent ?? "").trim();
 
+    // A modal is not a scroller. <dialog> carries a UA `overflow: auto`, so content that runs
+    // out of one is a horizontal scrollbar *inside* the modal — which every check below reads
+    // as "a scroller can reach it" and lets through. A table that must scroll goes in a
+    // TableScroller, which is labelled and reachable; a label that must wrap wraps.
+    if (el.tagName === "DIALOG" && el.scrollWidth > el.clientWidth + 1) {
+      out.push(`the dialog scrolls sideways: ${el.scrollWidth} in ${el.clientWidth}`);
+    }
+
     if ((box.right > width + 1 || box.left < -1) && !clippedBy(el)) {
       // Only the outermost box: its children are off the screen because it is.
       if (inside(el)) continue;
@@ -133,8 +141,26 @@ async function sound(where: string): Promise<string[]> {
   return found;
 }
 
-type Screen = { name: string; path: () => string; ready: (p: Page) => Locator };
+type Screen = {
+  name: string;
+  path: () => string;
+  ready: (p: Page) => Locator;
+  /** Run once the page is ready, to put the screen in the state being measured: open a dialog. */
+  open?: (p: Page) => Promise<void>;
+};
 const heading = (name: string | RegExp) => (p: Page) => p.getByRole("heading", { name });
+
+/**
+ * A dialog is a screen too, and the one place a workspace's own words — a 100-character field
+ * label, a 254-character address — reach a 32rem box. Opening it here is what puts it through
+ * `layoutProblems` and axe in both themes at all three sizes.
+ */
+const opens = (button: string, title: string) => async (p: Page) => {
+  await p.getByRole("button", { name: button, exact: true }).click();
+  await expect(p.getByRole("dialog", { name: title, exact: true })).toBeVisible();
+  // A dialog has queries of its own (the custom field definitions): measure the form, not a skeleton.
+  await expect(p.locator('[role="status"][aria-busy="true"]')).toHaveCount(0);
+};
 const SCREENS: Screen[] = [
   { name: "home", path: () => "/", ready: heading("NM") },
   { name: "new workspace", path: () => "/workspaces/new", ready: heading("Create workspace") },
@@ -153,6 +179,51 @@ const SCREENS: Screen[] = [
   { name: "api keys", path: () => `/w/${SLUG}/api-keys`, ready: heading("API keys") },
   { name: "audit log", path: () => `/w/${SLUG}/audit-log`, ready: heading("Audit log") },
   { name: "account security", path: () => "/account/security", ready: heading("Security") },
+  // The dialogs. Spec §14 asks the break harness over every new component, and until these
+  // lines existed it had never seen one: the defect it found first was a 100-character custom
+  // field label scrolling the New contact dialog sideways, on desktop.
+  {
+    name: "new contact dialog",
+    path: () => `/w/${SLUG}/contacts`,
+    ready: (p) => p.getByRole("grid", { name: "Contacts" }),
+    open: opens("New contact", "New contact"),
+  },
+  {
+    name: "edit contact dialog",
+    path: () => `/w/${SLUG}/contacts/${ids.sink}`,
+    ready: heading(LONG_EMAIL),
+    open: opens("Edit contact", "Edit contact"),
+  },
+  {
+    name: "delete contact dialog",
+    path: () => `/w/${SLUG}/contacts/${ids.sink}`,
+    ready: heading(LONG_EMAIL),
+    open: opens("Delete contact", "Delete this contact"),
+  },
+  {
+    name: "erase contact dialog",
+    path: () => `/w/${SLUG}/contacts/${ids.sink}`,
+    ready: heading(LONG_EMAIL),
+    open: opens("Erase contact", "Erase this contact"),
+  },
+  {
+    name: "new list dialog",
+    path: () => `/w/${SLUG}/lists`,
+    ready: heading("Lists"),
+    open: opens("New list", "New list"),
+  },
+  {
+    name: "edit list dialog",
+    path: () => `/w/${SLUG}/lists/${ids.list}`,
+    ready: heading(LONG_NAME),
+    open: opens("Edit list", "Edit list"),
+  },
+  {
+    name: "delete list dialog",
+    path: () => `/w/${SLUG}/lists/${ids.list}`,
+    ready: heading(LONG_NAME),
+    open: opens("Delete list", "Delete this list"),
+  },
 ];
 
 async function everyScreen(screens: Screen[], suffix = ""): Promise<string[]> {
@@ -160,6 +231,7 @@ async function everyScreen(screens: Screen[], suffix = ""): Promise<string[]> {
   for (const theme of THEMES) {
     for (const s of screens) {
       await visit(s.path(), theme, s.ready);
+      await s.open?.(page);
       found.push(...(await sound(`${s.name} (${theme}${suffix})`)));
     }
   }
@@ -249,6 +321,10 @@ test("seed_the_worst_case_data", async () => {
     kind: "multi_select",
     options: OPTIONS,
   });
+  // One per control shape the contact form has, each with a label at the server's limit: the
+  // `Field` path (an input), and the `Labelled` path (a select).
+  await post("/custom-fields", { key: "long_text", label: LONG_NAME, kind: "text" });
+  await post("/custom-fields", { key: "long_select", label: LONG_NAME, kind: "select", options: OPTIONS });
   ids.list = (await post("/lists", { name: LONG_NAME, double_optin: false })).id;
   await post("/lists", { name: "Announcements", double_optin: true });
   ids.tag = (await post("/tags", { name: LONG_NAME })).id;

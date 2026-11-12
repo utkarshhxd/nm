@@ -193,8 +193,12 @@ export function ContactForm({
       {existing ? (
         <p className="mt-3">
           <span className="font-medium">Email</span>{" "}
-          <span className="wrap-anywhere">{existing.email}</span>. It cannot be changed: delete
-          this contact and add the new address, or erase it if the person asked to be forgotten.
+          <span className="wrap-anywhere">{existing.email}</span>. It cannot be changed. Every
+          list membership here is consent this address gave, and the suppressions that block it
+          are held against it too; moving the contact to another address would hand one person&rsquo;s
+          consent to another, and take them out from under their own blocks. Delete this contact
+          and add the new address, so that address gives its own consent — or erase this one if
+          the person asked to be forgotten.
         </p>
       ) : (
         <Field
@@ -280,7 +284,7 @@ function Labelled({
 }) {
   return (
     <div className="mt-4">
-      <label className="block font-medium" htmlFor={id}>
+      <label className="block font-medium wrap-anywhere" htmlFor={id}>
         {label}
       </label>
       {children}

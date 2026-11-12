@@ -159,6 +159,13 @@ unsalted means one sweep covers every user at once.
   `~/.wslconfig` would remove both constraints.
 - A full-suite run occasionally dies with `error reading contents of migration directory` — the
   Windows bind mount under concurrent compilation. Re-run once before investigating.
+- **The e2e suite runs the UI that is compiled into the binary, not the one in `web/dist`.**
+  `src/http/web_ui.rs` embeds `web/dist` with `rust-embed`, so a UI change needs
+  `pnpm -C web build` **and then** `cargo build --release --bin nm` before `pnpm -C web e2e`.
+  Rebuild only the web and the e2e silently tests the previous UI: a fix looks like it did not
+  work, and a defect you just introduced looks fine. It cost the Task 16 reviewer one false
+  negative and one false positive in a single session. If an e2e result makes no sense, check the
+  binary's timestamp before anything else.
 
 ---
 

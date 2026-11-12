@@ -129,6 +129,8 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   };
 
   const lists = useQuery({
+    // The pickers' key, shared on purpose with the contact page's: same request, same shape, one
+    // cache entry. The lists screen's own paged query is ["lists", ws, "all"] for that reason.
     queryKey: ["lists", id],
     queryFn: async () => {
       const { data } = await api.GET("/api/v1/workspaces/{workspace_id}/lists", {

@@ -32,7 +32,7 @@ let editorPage: Page;
 let viewerPage: Page;
 let workspaceId = "";
 let csrf = "";
-const ids = { created: "", deleteMe: "", eraseMe: "", long: "", vip: "" };
+const ids = { created: "", deleteMe: "", eraseMe: "", long: "", vip: "", list: "" };
 
 const base = () => `/api/v1/workspaces/${workspaceId}`;
 
@@ -201,6 +201,38 @@ test("edit_a_contact_and_see_the_change", async () => {
   expect(contact.attributes["seats"]).toBe(1250);
 });
 
+test("an_edit_sends_only_the_fields_that_changed", async () => {
+  // The other half of RFC 7386. `update_contact` writes the list of field names a PATCH sent
+  // into the audit log, deliberately without their values, and that log outlives an erasure: a
+  // form that resends everything makes every edit look like it touched every field, and the
+  // record of what a person actually did is then wrong.
+  await page.goto(contactPath(ids.created));
+
+  async function save(change: (form: ReturnType<typeof dialog>) => Promise<void>) {
+    await page.getByRole("button", { name: "Edit contact", exact: true }).click();
+    const form = dialog(page, "Edit contact");
+    await change(form);
+    const sent = page.waitForRequest(
+      (r) => r.method() === "PATCH" && r.url().includes(`/contacts/${ids.created}`),
+    );
+    await form.getByRole("button", { name: "Save contact", exact: true }).click();
+    const body = JSON.parse((await sent).postData() ?? "{}") as Record<string, unknown>;
+    await expect(form).toBeHidden();
+    return body;
+  }
+
+  const name = await save((form) => form.getByLabel("First name", { exact: true }).fill("Ada"));
+  expect(Object.keys(name)).toEqual(["first_name"]);
+  expect(name["first_name"]).toBe("Ada");
+
+  // One custom field, and only that key inside `attributes`: the merge patch is per key.
+  const seats = await save((form) => form.getByLabel("Seats", { exact: true }).fill("7"));
+  expect(Object.keys(seats)).toEqual(["attributes"]);
+  expect(seats["attributes"]).toEqual({ seats: 7 });
+
+  expect((await apiContact(ids.created)).attributes["seats"]).toBe(7);
+});
+
 test("delete_a_contact_and_it_leaves_the_grid", async () => {
   await page.goto(contactPath(ids.deleteMe));
   await page.getByRole("button", { name: "Delete contact", exact: true }).click();
@@ -293,9 +325,10 @@ test("create_a_list_then_add_a_contact_to_it", async () => {
   await lists.getByLabel("List to add", { exact: true }).selectOption({ label: "Product news" });
   await lists.getByRole("button", { name: "Add to list", exact: true }).click();
   await expect(row(page, "Product news")).toContainText("Subscribed");
-  expect(await memberships(ids.created)).toMatchObject([
-    { name: "Product news", status: "subscribed" },
-  ]);
+  const joined = await memberships(ids.created);
+  expect(joined).toMatchObject([{ name: "Product news", status: "subscribed" }]);
+  ids.list = joined[0]?.list_id ?? "";
+  expect(ids.list).not.toBe("");
 });
 
 test("remove_a_membership_leaves_it_unsubscribed_not_deleted", async () => {
@@ -371,6 +404,12 @@ test("axe_reports_no_violations_with_each_dialog_open", async () => {
   await page.goto(listsPath);
   await page.getByRole("button", { name: "New list", exact: true }).click();
   await scan("New list");
+
+  await page.goto(`${listsPath}/${ids.list}`);
+  await page.getByRole("button", { name: "Edit list", exact: true }).click();
+  await scan("Edit list");
+  await page.getByRole("button", { name: "Delete list", exact: true }).click();
+  await scan("Delete this list");
 });
 
 test("the_dialogs_hold_up_at_320px_with_a_254_character_address", async () => {
@@ -402,4 +441,33 @@ test("the_dialogs_hold_up_at_320px_with_a_254_character_address", async () => {
   } finally {
     await page.setViewportSize({ width: 1280, height: 720 });
   }
+});
+
+// Last, because it destroys the list the tests above built on.
+test("rename_a_list_then_delete_it_and_say_what_goes_with_it", async () => {
+  await page.goto(`${listsPath}/${ids.list}`);
+  await page.getByRole("button", { name: "Edit list", exact: true }).click();
+  const form = dialog(page, "Edit list");
+  await form.getByLabel("Name", { exact: true }).fill("Product updates");
+  await form.getByRole("button", { name: "Save list", exact: true }).click();
+  await expect(form).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Product updates", exact: true })).toBeVisible();
+
+  // The unsubscribed membership from the earlier test is still here, before the delete.
+  expect(await memberships(ids.created)).toMatchObject([{ status: "unsubscribed" }]);
+
+  await page.getByRole("button", { name: "Delete list", exact: true }).click();
+  const confirm = dialog(page, "Delete this list");
+  await expect(confirm).toContainText("Product updates");
+  await expect(confirm).toContainText("every membership");
+  // What it really costs: the opt-out recorded against this list goes with the list.
+  await expect(confirm).toContainText("unsubscribed");
+  await expect(confirm).toContainText("No contact is deleted");
+  await confirm.getByRole("button", { name: "Delete list", exact: true }).click();
+
+  await expect(page).toHaveURL(new RegExp(`${listsPath}$`));
+  await expect(row(page, "Product updates")).toHaveCount(0);
+  expect(await memberships(ids.created)).toEqual([]);
+  // The contact itself survived.
+  expect((await apiContact(ids.created)).id).toBe(ids.created);
 });

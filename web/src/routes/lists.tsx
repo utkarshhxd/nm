@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
 import { api, problemMessage, problemText } from "../api/client";
 import type { components } from "../api/schema";
 import { Button } from "../components/button";
 import { Checkbox } from "../components/checkbox";
+import { ConfirmDialog } from "../components/confirm-dialog";
 import { Dialog } from "../components/dialog";
 import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
@@ -45,10 +46,12 @@ export default function Lists() {
 }
 
 function AllLists({ ws, slug, canEdit }: { ws: string; slug: string; canEdit: boolean }) {
-  const qc = useQueryClient();
   const [creating, setCreating] = useState(false);
   const lists = useQuery({
-    queryKey: ["lists", ws],
+    // Under the pickers' key as a prefix, never equal to it: the pickers on the contacts grid
+    // and the contact page read ["lists", ws] with a queryFn of their own, and one cache entry
+    // serving several queryFns means whichever mounted last decides what a failure does.
+    queryKey: ["lists", ws, "all"],
     queryFn: async () => {
       const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/lists", {
         params: { path: { workspace_id: ws }, query: { limit: 200 } },
@@ -118,52 +121,67 @@ function AllLists({ ws, slug, canEdit }: { ws: string; slug: string; canEdit: bo
       </div>
 
       <Dialog open={creating} onClose={() => setCreating(false)} title="New list">
-        <NewList
-          ws={ws}
-          onCancel={() => setCreating(false)}
-          onDone={async () => {
-            setCreating(false);
-            await qc.invalidateQueries({ queryKey: ["lists", ws] });
-          }}
-        />
+        <ListForm ws={ws} onCancel={() => setCreating(false)} onDone={() => setCreating(false)} />
       </Dialog>
     </section>
   );
 }
 
 /**
- * Create a list. Double opt-in is on by default, as it is on the server: a new member is then
- * `pending` and not mailable until they confirm, and nothing in this milestone sends the
- * confirmation — so the checkbox says it rather than leaving someone to find out.
+ * Create a list, or edit one. Double opt-in is on by default, as it is on the server: a new
+ * member is then `pending` and not mailable until they confirm, and nothing in this milestone
+ * sends the confirmation — so the checkbox says it rather than leaving someone to find out.
  *
  * Visibility is not offered: it does nothing until the preference center exists.
  */
-function NewList({
+function ListForm({
   ws,
+  existing,
   onCancel,
   onDone,
 }: {
   ws: string;
+  existing?: List;
   onCancel: () => void;
-  onDone: () => Promise<void>;
+  onDone: () => void;
 }) {
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [doubleOptin, setDoubleOptin] = useState(true);
+  const qc = useQueryClient();
+  const [name, setName] = useState(existing?.name ?? "");
+  const [description, setDescription] = useState(existing?.description ?? "");
+  const [doubleOptin, setDoubleOptin] = useState(existing?.double_optin ?? true);
 
   const create = useMutation({
     mutationFn: async () => {
-      const { data, error } = await api.POST("/api/v1/workspaces/{workspace_id}/lists", {
-        params: { path: { workspace_id: ws } },
-        body: {
-          name: name.trim(),
-          description: description.trim(),
-          double_optin: doubleOptin,
-        },
-      });
-      if (!data) throw new Error(problemText(error, KNOWN, "The list could not be created."));
+      // A merge patch: only what changed goes, so the audit log records the fields that were
+      // really edited. See `update_list`, which stores exactly the names it was sent.
+      const { data, error } = existing
+        ? await api.PATCH("/api/v1/workspaces/{workspace_id}/lists/{id}", {
+            params: { path: { workspace_id: ws, id: existing.id } },
+            body: {
+              ...(name.trim() === existing.name ? {} : { name: name.trim() }),
+              ...(description.trim() === existing.description
+                ? {}
+                : { description: description.trim() }),
+              ...(doubleOptin === existing.double_optin ? {} : { double_optin: doubleOptin }),
+            },
+          })
+        : await api.POST("/api/v1/workspaces/{workspace_id}/lists", {
+            params: { path: { workspace_id: ws } },
+            body: {
+              name: name.trim(),
+              description: description.trim(),
+              double_optin: doubleOptin,
+            },
+          });
+      if (!data) throw new Error(problemText(error, KNOWN, "The list could not be saved."));
     },
-    onSuccess: onDone,
+    onSuccess: async () => {
+      onDone();
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["lists", ws] }),
+        existing ? qc.invalidateQueries({ queryKey: ["list", ws, existing.id] }) : null,
+      ]);
+    },
   });
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -207,13 +225,16 @@ function NewList({
           A new member stays pending, and cannot be mailed, until they confirm. Nothing sends that
           confirmation yet, so they stay pending. Turn it off and a new member is subscribed at
           once.
+          {existing
+            ? " Changing it decides the status of members added from now on; anyone already pending stays pending."
+            : ""}
         </span>
       </div>
       {create.error ? <Alert>{create.error.message}</Alert> : null}
       <div className="mt-6 flex flex-wrap justify-end gap-3">
         <Button onClick={onCancel}>Cancel</Button>
         <Button type="submit" variant="solid" busy={create.isPending}>
-          Create list
+          {existing ? "Save list" : "Create list"}
         </Button>
       </div>
     </form>
@@ -224,10 +245,27 @@ export function ListDetail() {
   const { workspace } = useWorkspace();
   const { listId } = useParams({ from: "/w/$slug/lists/$listId" });
   if (!workspace) return null;
-  return <Detail ws={workspace.id} slug={workspace.slug} listId={listId} />;
+  return (
+    <Detail
+      ws={workspace.id}
+      slug={workspace.slug}
+      listId={listId}
+      canEdit={atLeast(workspace.role, "editor")}
+    />
+  );
 }
 
-function Detail({ ws, slug, listId }: { ws: string; slug: string; listId: string }) {
+function Detail({
+  ws,
+  slug,
+  listId,
+  canEdit,
+}: {
+  ws: string;
+  slug: string;
+  listId: string;
+  canEdit: boolean;
+}) {
   const list = useQuery({
     queryKey: ["list", ws, listId],
     queryFn: async () => {
@@ -262,6 +300,7 @@ function Detail({ ws, slug, listId }: { ws: string; slug: string; listId: string
       ) : (
         <>
           <h2 className="mt-4 text-xl font-semibold wrap-anywhere">{list.data.name}</h2>
+          {canEdit ? <ListActions ws={ws} slug={slug} list={list.data} /> : null}
           <Settings list={list.data} />
           {/* Its own component and query: the count is slow on a big list and blocks nothing. */}
           <MailableCount ws={ws} listId={listId} />
@@ -269,6 +308,79 @@ function Detail({ ws, slug, listId }: { ws: string; slug: string; listId: string
         </>
       )}
     </section>
+  );
+}
+
+/**
+ * Edit and delete one list. Deleting takes every membership with it, by `on delete cascade`
+ * (`migrations/0012_lists.sql`), so the dialog says what that costs: an unsubscribe recorded
+ * against this list is part of what is deleted.
+ */
+function ListActions({ ws, slug, list }: { ws: string; slug: string; list: List }) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const remove = useMutation({
+    mutationFn: async () => {
+      const { response, error } = await api.DELETE(
+        "/api/v1/workspaces/{workspace_id}/lists/{id}",
+        { params: { path: { workspace_id: ws, id: list.id } } },
+      );
+      if (!response.ok) throw new Error(problemText(error, KNOWN, "The list could not be deleted."));
+    },
+    onSuccess: async () => {
+      // Every screen that counts or names a list: the grid's filter, a contact's memberships.
+      await Promise.all(
+        ["lists", "contact-lists", "mailable-count", "list-members", "contacts"].map((k) =>
+          qc.invalidateQueries({ queryKey: [k] }),
+        ),
+      );
+      await navigate({ to: "/w/$slug/lists", params: { slug } });
+    },
+  });
+
+  return (
+    <div className="mt-4 flex flex-wrap gap-2">
+      <Button onClick={() => setEditing(true)}>Edit list</Button>
+      <Button variant="danger-ghost" onClick={() => setDeleting(true)}>
+        Delete list
+      </Button>
+
+      <Dialog open={editing} onClose={() => setEditing(false)} title="Edit list">
+        <ListForm
+          ws={ws}
+          existing={list}
+          onCancel={() => setEditing(false)}
+          onDone={() => setEditing(false)}
+        />
+      </Dialog>
+
+      <ConfirmDialog
+        open={deleting}
+        onClose={() => {
+          setDeleting(false);
+          remove.reset();
+        }}
+        title="Delete this list"
+        confirmLabel="Delete list"
+        busy={remove.isPending}
+        error={remove.error?.message}
+        onConfirm={() => remove.mutate()}
+      >
+        <p>
+          <strong className="wrap-anywhere">{list.name}</strong> is deleted, with every membership
+          of it. No contact is deleted and nothing else they are on changes.
+        </p>
+        <p>
+          That includes the <strong>unsubscribed</strong> memberships: the record that someone
+          opted out of this list goes with the list, so it cannot say later that they did. An
+          opt-out from the whole workspace is a suppression, not a membership, and is not touched.
+        </p>
+        <p>This cannot be undone. To stop mailing a list without losing any of that, leave it in place and do not send to it.</p>
+      </ConfirmDialog>
+    </div>
   );
 }
 

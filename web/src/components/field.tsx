@@ -22,7 +22,9 @@ export function Field({ id, label, error, hint, ...input }: FieldProps) {
   const described = [hint ? `${id}-hint` : "", error ? `${id}-error` : ""].filter(Boolean).join(" ");
   return (
     <div className="mt-4">
-      <label className="block font-medium" htmlFor={id}>
+      {/* A label is not always ours: a custom field's is up to 100 characters of whatever its
+          workspace typed, and one unbroken word would otherwise scroll the dialog sideways. */}
+      <label className="block font-medium wrap-anywhere" htmlFor={id}>
         {label}
       </label>
       <Input
