@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
 
 import { api, problemText } from "../api/client";
 import type { components } from "../api/schema";
@@ -9,9 +9,9 @@ import { Button } from "./button";
 import { Checkbox } from "./checkbox";
 import { Input } from "./input";
 import { Select } from "./select";
+import { Skeleton } from "./skeleton";
 
 type Definition = components["schemas"]["Definition"];
-type Preview = components["schemas"]["Preview"];
 
 /**
  * The rule document the server parses (spec M1b section 4.1): a group of leaves and nested
@@ -157,6 +157,27 @@ const needsValue = (op: string) => !VALUELESS.has(op);
 const filled = (value: unknown): boolean =>
   Array.isArray(value) ? value.length > 0 : value !== undefined && value !== null && value !== "";
 
+/** The two operators the server takes an empty string for, where it means "the value is empty". */
+const EMPTY_IS_A_VALUE = new Set(["eq", "neq"]);
+
+/**
+ * Whether a leaf carries a value **the server would accept** — not merely one this builder likes.
+ *
+ * The difference is not academic. `eq ""` on a text or select field is a document `check_value`
+ * accepts, and calling it unfinished stranded a segment that had one stored: the editor refused
+ * to save back what it had just loaded. Everywhere else an empty string is refused by the server
+ * too (a pattern must not be empty, a list value must be a uuid, a date must parse), so this
+ * agrees with it there as well.
+ */
+function ready(leaf: Leaf, fields: FieldOption[]): boolean {
+  if (!needsValue(leaf.op)) return true;
+  if (leaf.value === undefined || leaf.value === null) return false;
+  if (Array.isArray(leaf.value)) return leaf.value.length > 0;
+  if (leaf.value !== "") return true;
+  const kind = fields.find((f) => f.name === leaf.field)?.kind;
+  return EMPTY_IS_A_VALUE.has(leaf.op) && (kind === "text" || kind === "select");
+}
+
 /**
  * Whether the document is worth sending. An unfinished rule is a `422` the person has not caused
  * yet, and preview is 30/minute/workspace: neither the count nor the quota is spent on one.
@@ -164,11 +185,11 @@ const filled = (value: unknown): boolean =>
  * An empty `rules` is incomplete at every level, which is also why the top group — the one
  * `RuleBuilder` cannot remove — never reaches the server empty.
  */
-export function complete(doc: Doc): boolean {
+export function complete(doc: Doc, fields: FieldOption[]): boolean {
   return (
     doc.rules.length > 0 &&
     doc.rules.every((node) =>
-      isGroup(node) ? complete(node.group) : !needsValue(node.op) || filled(node.value),
+      isGroup(node) ? complete(node.group, fields) : ready(node, fields),
     )
   );
 }
@@ -229,27 +250,40 @@ function GroupEditor({
 }) {
   const name = path === "" ? "Rules" : `Group ${path}`;
   const suffix = path === "" ? "" : ` to group ${path}`;
+  // The ref is on the row of buttons rather than on the button, because `Button` is a function
+  // component and a ref reaching it through a spread is not something to rest a focus fix on.
+  const actions = useRef<HTMLDivElement>(null);
 
-  /**
-   * **A group that loses its last rule is removed with it** (section 4.1, section 14). An empty
-   * `rules` is `422 empty-rules` at every level, and under `match: "all"` it is vacuously true —
-   * it compiles to every contact in the workspace. Removal cascades, because a parent left empty
-   * by this call takes the same path. The top group has no `onRemove`: it is allowed to empty on
-   * screen, and `complete` stops it reaching the server.
-   */
-  const setRules = (rules: Node[]) => {
-    if (rules.length === 0 && onRemove) onRemove();
-    else onChange({ ...group, rules });
-  };
+  const setRules = (rules: Node[]) => onChange({ ...group, rules });
   const replace = (index: number, node: Node) => {
     const next = group.rules.slice();
     next[index] = node;
     setRules(next);
   };
+
+  /**
+   * **A group that loses its last rule is removed with it** (section 4.1, section 14). An empty
+   * `rules` is `422 empty-rules` at every level, and under `match: "all"` it is vacuously true —
+   * it compiles to every contact in the workspace.
+   *
+   * Removal cascades to **any** depth: a group's `onRemove` is its parent's `remove`, so a group
+   * emptied by the group it contained is removed by exactly this code one level up, and again
+   * above that. The top group has no `onRemove`, so it is allowed to empty on screen, and
+   * `complete` is what stops it reaching the server.
+   */
   const remove = (index: number) => {
     const next = group.rules.slice();
     next.splice(index, 1);
+    if (next.length === 0 && onRemove) {
+      // This group goes with it. Whichever group survives the cascade takes the focus, below.
+      onRemove();
+      return;
+    }
     setRules(next);
+    // Where the person carries on from: this group's "Add rule". Without it, focus is left on a
+    // Remove button whose row has been rewritten underneath it — the rows are keyed by position,
+    // so the next rule's Remove is now under the pointer and one keystroke from firing.
+    actions.current?.querySelector("button")?.focus();
   };
 
   return (
@@ -295,7 +329,7 @@ function GroupEditor({
         );
       })}
 
-      <div className="mt-3 flex flex-wrap gap-2">
+      <div ref={actions} className="mt-3 flex flex-wrap gap-2">
         <Button onClick={() => setRules([...group.rules, newRule()])}>{`Add rule${suffix}`}</Button>
         {/* Deeper than three is `422 rules-too-deep`, so the button is not offered there. */}
         {depth < MAX_DEPTH ? (
@@ -581,23 +615,36 @@ const PREVIEW_PROBLEMS = {
 };
 
 /**
+ * What a count area has to show. One type for the builder and for a row of the list, so the
+ * wording and the three shapes of section 5 are written once.
+ */
+export type CountState =
+  | { kind: "unfinished" }
+  | { kind: "counting" }
+  | { kind: "failed"; message: string; retry: () => void }
+  | { kind: "counted"; count: number | null | undefined; exact: boolean };
+
+/**
  * The count for `doc`, refreshed on a debounce and **only when the document really changed**:
  * the query is keyed by the document itself, so a character typed and taken back is answered
  * from the cache and costs no request.
  *
+ * **A number is only ever shown for the document that produced it.** While the debounce or the
+ * request is outstanding the answer is `counting`, never the previous document's figure: a stale
+ * number presented as this document's answer is a lie of exactly the kind section 5 is about.
+ *
  * Nothing here is on the typing path. The controls are driven by `doc`, which this only reads.
  */
-export function usePreview(ws: string, doc: Doc, enabled = true) {
+export function usePreview(ws: string, doc: Doc, fields: FieldOption[]): CountState {
   const json = JSON.stringify(doc);
-  // Seeded with the first document, so a count that never changes (a saved segment in the list)
-  // is fetched at once and only an edit waits.
   const [settled, setSettled] = useState(json);
   useEffect(() => {
     const timer = window.setTimeout(() => setSettled(json), DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
   }, [json]);
 
-  return useQuery({
+  const finished = complete(doc, fields);
+  const query = useQuery({
     queryKey: ["segment-preview", ws, settled],
     queryFn: async () => {
       const { data, error } = await api.POST(
@@ -610,14 +657,47 @@ export function usePreview(ws: string, doc: Doc, enabled = true) {
       if (!data) throw new Error(problemText(error, PREVIEW_PROBLEMS, "The count could not be loaded."));
       return data;
     },
-    enabled: enabled && json === settled && complete(doc),
+    enabled: finished && json === settled,
     retry: false,
     refetchOnWindowFocus: false,
     // A count is only ever a number about this moment, and the window it is drawn from is a
     // minute wide: re-asking the same question inside that is the request the limit is for.
     staleTime: 60_000,
-    placeholderData: keepPreviousData,
   });
+
+  if (!finished) return { kind: "unfinished" };
+  if (json !== settled) return { kind: "counting" };
+  if (query.isError) {
+    return { kind: "failed", message: query.error.message, retry: () => void query.refetch() };
+  }
+  return query.data
+    ? { kind: "counted", count: query.data.count, exact: query.data.exact }
+    : { kind: "counting" };
+}
+
+/** A count area: the pending, failed and unfinished states around [`CountText`]. */
+export function Count({ state, testId }: { state: CountState; testId: string }) {
+  if (state.kind === "unfinished") {
+    return <span>no count yet — every rule needs a value.</span>;
+  }
+  if (state.kind === "failed") {
+    return (
+      <span role="alert">
+        {state.message}{" "}
+        <Button variant="ghost" onClick={state.retry}>
+          Retry
+        </Button>
+      </span>
+    );
+  }
+  if (state.kind === "counting") {
+    return (
+      <div className="w-24">
+        <Skeleton label="Counting contacts" />
+      </div>
+    );
+  }
+  return <CountText count={state.count} exact={state.exact} testId={testId} />;
 }
 
 /**
@@ -628,17 +708,25 @@ export function usePreview(ws: string, doc: Doc, enabled = true) {
  * "estimate" is text, never colour: a count whose honesty is carried by a shade is a count a
  * colour-blind reader acts on as exact (WCAG 1.4.1).
  */
-export function CountText({ preview, testId }: { preview: Preview; testId: string }) {
-  if (preview.count === null || preview.count === undefined) {
+export function CountText({
+  count,
+  exact,
+  testId,
+}: {
+  count: number | null | undefined;
+  exact: boolean;
+  testId: string;
+}) {
+  if (count === null || count === undefined) {
     return <span data-testid={testId}>too many to count exactly</span>;
   }
-  const number = preview.count.toLocaleString();
+  const number = count.toLocaleString();
   return (
     <>
       <span data-testid={testId} className="tabular-nums">
-        {preview.exact ? number : `~${number}`}
+        {exact ? number : `~${number}`}
       </span>
-      {preview.exact ? null : <span className="ms-2 text-fg-muted">estimate</span>}
+      {exact ? null : <span className="ms-2 text-fg-muted">estimate</span>}
     </>
   );
 }

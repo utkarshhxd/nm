@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select s.id, s.rules,\n                  coalesce((select jsonb_object_agg(f.key, f.kind) from custom_fields f\n                            where f.workspace_id = $1), '{}'::jsonb)\n                      as \"kinds!: Json<HashMap<String, FieldKind>>\"\n           from segments s where s.workspace_id = $1 and s.id = any($2)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "segments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "rules",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "segments",
+            "name": "rules"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kinds!: Json<HashMap<String, FieldKind>>",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "1b44f65c54625f32f66d029136c980e9d0d23c43119bc60141b13013ef45d9a7"
+}

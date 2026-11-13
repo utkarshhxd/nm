@@ -24,8 +24,22 @@ const SLUG = "segmentsco";
 const VIEWER = "viewer-segments@example.com";
 const VIEWER_PASSWORD = "viewer-segments-password";
 
-/** The preview route, which several tests intercept. */
+/** The two count routes, which several tests intercept. */
 const PREVIEW = "**/segments/preview";
+const COUNTS = "**/segments/counts*";
+const CUSTOM_FIELDS = "**/custom-fields*";
+
+/** A 500 that is a real problem document, so the client reads it the way it reads the server's. */
+const BROKEN = {
+  status: 500,
+  contentType: "application/problem+json",
+  body: JSON.stringify({
+    type: "urn:nm:problem:internal",
+    title: "Internal Server Error",
+    status: 500,
+    detail: "internal error",
+  }),
+};
 
 let admin: BrowserContext;
 let viewer: BrowserContext;
@@ -222,6 +236,57 @@ test("deleting_the_last_rule_in_a_group_removes_the_group", async () => {
   });
 });
 
+test("a_group_nested_in_a_group_is_removed_when_its_last_rule_goes", async () => {
+  await openSegments();
+  await openBuilder("Nested");
+  await fieldOf("1").selectOption("email");
+  await opOf("1").selectOption("contains");
+  await valueOf("1").fill("@acme.test");
+
+  await page.getByRole("button", { name: "Add group", exact: true }).click();
+  await page.getByRole("button", { name: "Add group to group 2", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Group 2.2", exact: true })).toBeVisible();
+  await expect(rule("2.2.1")).toBeVisible();
+
+  // Two levels down, so the removal has to recurse rather than reach the top group directly.
+  await page.getByRole("button", { name: "Remove rule 2.2.1", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Group 2.2", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("group", { name: "Group 2", exact: true })).toBeVisible();
+  await expect(rule("2.1")).toBeVisible();
+
+  // And again: group 2 is down to one rule, so removing that takes group 2 with it.
+  await page.getByRole("button", { name: "Remove rule 2.1", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Group 2", exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Save segment", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "New segment", exact: true })).toBeHidden();
+  expect((await apiSegment("Nested")).rules).toEqual({
+    match: "all",
+    rules: [{ field: "email", op: "contains", value: "@acme.test" }],
+  });
+});
+
+test("focus_lands_somewhere_deliberate_after_a_rule_is_removed", async () => {
+  await openSegments();
+  await openBuilder("Focus");
+  await page.getByRole("button", { name: "Add group", exact: true }).click();
+  await page.getByRole("button", { name: "Add rule to group 2", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Rule 2.2", exact: true })).toBeVisible();
+
+  // The group survives this one, so its own "Add rule" takes the focus. Rows are keyed by
+  // position, so without it focus is left on a Remove button that now belongs to another rule.
+  await page.getByRole("button", { name: "Remove rule 2.1", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Add rule to group 2", exact: true }),
+  ).toBeFocused();
+
+  // This one takes the group with it, so the group that survives the cascade takes the focus.
+  await page.getByRole("button", { name: "Remove rule 2.1", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Group 2", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Add rule", exact: true })).toBeFocused();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+});
+
 test("the_count_is_debounced_and_asks_again_only_when_the_document_changed", async () => {
   await openSegments();
   await openBuilder("Debounced");
@@ -250,6 +315,26 @@ test("the_count_is_debounced_and_asks_again_only_when_the_document_changed", asy
   await page.waitForTimeout(1500);
   await expect(count()).toHaveText("1");
   expect(sent.length, `previews after a no-op edit: ${sent.length}`).toBe(1);
+});
+
+test("a_count_from_the_previous_document_is_never_shown_as_this_ones", async () => {
+  await openSegments();
+  await openBuilder("Stale");
+  await fieldOf("1").selectOption("email");
+  await opOf("1").selectOption("contains");
+  await valueOf("1").fill("@acme.test");
+  await expect(count()).toHaveText("2");
+
+  // Hold the next count open. "2" is the answer to a question nobody is asking any more, and a
+  // number presented as this document's answer when it is the last one's is the defect.
+  await page.route(PREVIEW, async (route) => {
+    await new Promise((done) => setTimeout(done, 2500));
+    await route.continue().catch(() => undefined);
+  });
+  await valueOf("1").fill("one@acme");
+  await expect(count()).toHaveCount(0);
+  await expect(drawer().getByText("Counting contacts")).toBeAttached();
+  await page.unroute(PREVIEW);
 });
 
 test("an_attribute_rule_says_too_many_to_count_exactly", async () => {
@@ -304,7 +389,9 @@ test("a_rate_limited_count_says_to_slow_down", async () => {
   await opOf("1").selectOption("contains");
   await valueOf("1").fill("@acme.test");
   await expect(drawer().getByText(/slow down/i)).toBeVisible();
-  await expect(page.getByText(/something went wrong/i)).toHaveCount(0);
+  // The generic fallback is a string `problemText` really can emit, so this fails if the
+  // refusal is swallowed into it rather than read.
+  await expect(drawer().getByText("The count could not be loaded.")).toHaveCount(0);
   await page.unroute(PREVIEW);
 });
 
@@ -373,8 +460,8 @@ test("a_segment_deleted_underneath_the_editor_is_a_404_it_names", async () => {
 });
 
 test("the_list_shows_its_rows_before_the_counts_arrive", async () => {
-  // Every count held for two seconds: the rows must be on screen well before that.
-  await page.route(PREVIEW, async (route) => {
+  // The counts held for two seconds: the rows must be on screen well before that.
+  await page.route(COUNTS, async (route) => {
     await new Promise((done) => setTimeout(done, 2000));
     // The page has moved on by the time this wakes, so the route may already be gone.
     await route.continue().catch(() => undefined);
@@ -387,12 +474,82 @@ test("the_list_shows_its_rows_before_the_counts_arrive", async () => {
   expect(Date.now() - opened, "the list waited for the counts").toBeLessThan(2000);
   // Still counting while the rows are already readable.
   await expect(page.getByText("Counting contacts").first()).toBeAttached();
-  await page.unroute(PREVIEW);
+  await page.unroute(COUNTS);
 
   // And the count lands: "No empty group" matches the two @acme.test contacts.
   await openSegments();
   const row = page.getByRole("row", { name: /No empty group/ });
   await expect(row.getByTestId("segment-count")).toHaveText("2");
+});
+
+test("the_page_is_counted_in_one_request_and_an_archived_field_still_counts", async () => {
+  const legacy = await post("/custom-fields", { key: "legacy", label: "Legacy", kind: "text" });
+  await post("/segments", {
+    name: "On a field since put away",
+    description: "",
+    rules: { match: "all", rules: [{ field: "attr:legacy", op: "eq", value: "x" }] },
+  });
+  const archived = await admin.request.delete(`${base()}/custom-fields/${legacy.id}`, {
+    headers: { "X-CSRF-Token": csrf },
+  });
+  expect(archived.ok(), `archive -> ${archived.status()}`).toBe(true);
+
+  const asked: string[] = [];
+  page.on("request", (r) => {
+    if (r.url().includes("/segments/counts")) asked.push("counts");
+    if (r.url().includes("/segments/preview")) asked.push("preview");
+  });
+  await openSegments();
+
+  // A stored document resolves archived definitions (section 4.2), so this counts rather than
+  // being refused as a new rule naming a field that no longer takes data. An `attr:` rule gets
+  // no number for section 5's reason, which is a count, not a failure.
+  await expect(
+    page.getByRole("row", { name: /On a field since put away/ }).getByTestId("segment-count"),
+  ).toHaveText("too many to count exactly");
+  await expect(page.getByText(/unknown field/i)).toHaveCount(0);
+
+  // One request for the whole page, however many rows it has.
+  expect((await apiSegments()).length, "fewer than two rows proves nothing").toBeGreaterThan(1);
+  expect(asked, `count requests for one page: ${asked.join(", ")}`).toEqual(["counts"]);
+});
+
+test("a_rule_the_server_accepts_does_not_strand_the_editor", async () => {
+  // `eq ""` is a document `check_value` accepts: "the value is empty", not "nothing chosen yet".
+  const stored = { match: "all", rules: [{ field: "first_name", op: "eq", value: "" }] };
+  await post("/segments", { name: "Empty value", description: "", rules: stored });
+  await openSegments();
+  const row = page.getByRole("row", { name: /Empty value/ });
+  // Every contact here was created without a first name, and the column is `not null default ''`.
+  await expect(row.getByTestId("segment-count")).toHaveText("3");
+
+  await page.getByRole("button", { name: "Edit Empty value", exact: true }).click();
+  await page.getByRole("button", { name: "Save segment", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Edit segment", exact: true })).toBeHidden();
+  expect((await apiSegment("Empty value")).rules).toEqual(stored);
+});
+
+test("a_catalog_that_failed_to_load_is_never_read_as_archived", async () => {
+  await post("/segments", {
+    name: "On a live field",
+    description: "",
+    rules: { match: "all", rules: [{ field: "attr:company", op: "eq", value: "Acme" }] },
+  });
+  // Installed before the page loads, because the pickers are fetched when the screen mounts.
+  await page.route(CUSTOM_FIELDS, (route) => route.fulfill(BROKEN));
+  await openSegments();
+  await page.getByRole("button", { name: "Edit On a live field", exact: true }).click();
+
+  // `company` is live. Saying it was archived — and offering removal as the only way on — is a
+  // false statement with a destructive fix attached.
+  await expect(drawer().getByText(/could not be loaded/i)).toBeVisible();
+  await expect(drawer().getByText(/archived/i)).toHaveCount(0);
+  await expect(drawer().getByRole("button", { name: "Remove", exact: true })).toHaveCount(0);
+
+  await page.unroute(CUSTOM_FIELDS);
+  await drawer().getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(fieldOf("1")).toHaveValue("attr:company");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
 });
 
 test("a_viewer_reads_segments_and_is_offered_no_way_to_change_one", async () => {

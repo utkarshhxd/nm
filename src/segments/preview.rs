@@ -23,7 +23,7 @@
 //! The compiler emits no `workspace_id` restriction of its own (see `compile::push_rules`), so
 //! both queries below write one. Without it a preview would count every tenant's contacts.
 
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -85,6 +85,92 @@ pub async fn preview(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// One segment's count in a batch. `Preview`'s `took_ms` has no meaning per row: the batch is one
+/// statement and every row in it took the same time.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SegmentCount {
+    pub id: Uuid,
+    /// `null` where section 5 allows no honest number: the document filters on a custom attribute,
+    /// or the batch ran out of time. The list shows "too many to count exactly" for both.
+    pub count: Option<i64>,
+    /// Always `true` alongside a number here: a batch is counted exactly or not at all.
+    pub exact: bool,
+}
+
+/// How many contacts each of `segments` matches, in **one** statement on **one** connection.
+///
+/// The list view counts every segment on the page. A preview request per row spends a workspace's
+/// whole quota on a single page load — 30 a minute against 25 rows — which is what makes section
+/// 19's lateral-join note urgent ahead of its latency argument.
+///
+/// Section 5 still decides what a count may say, and this path is strictly more conservative than
+/// `preview`: a document filtering on a custom attribute gets no number without touching the
+/// database, and a batch that times out gets no numbers at all. The planner estimate `preview`
+/// falls back to needs an `EXPLAIN` per segment, which is the round trip per row this exists to
+/// avoid, and section 5's own measurement says a figure nobody should act on is worse than none.
+pub async fn counts(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    segments: &[(Uuid, Group)],
+    timeout_ms: u64,
+) -> ApiResult<Vec<SegmentCount>> {
+    let countable: Vec<&(Uuid, Group)> = segments
+        .iter()
+        .filter(|(_, group)| !filters_on_an_attribute(group))
+        .collect();
+    let mut counted: HashMap<Uuid, i64> = HashMap::new();
+    if !countable.is_empty() {
+        match count_many(pool, workspace_id, &countable, timeout_ms).await {
+            Ok(rows) => counted = rows.into_iter().collect(),
+            // Every row in the batch loses its number together: they were one statement.
+            Err(e) if timed_out(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(segments
+        .iter()
+        .map(|(id, _)| SegmentCount {
+            id: *id,
+            count: counted.get(id).copied(),
+            exact: counted.contains_key(id),
+        })
+        .collect())
+}
+
+/// Every countable segment's count as one `union all`, under the same timeout a preview gets.
+async fn count_many(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    countable: &[&(Uuid, Group)],
+    timeout_ms: u64,
+) -> sqlx::Result<Vec<(Uuid, i64)>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(timeout_statement(timeout_ms))
+        .execute(&mut *tx)
+        .await?;
+    let mut q = QueryBuilder::<Postgres>::new("");
+    for (i, (id, group)) in countable.iter().enumerate() {
+        if i > 0 {
+            q.push(" union all ");
+        }
+        // The cast names the column's type for the union; the id itself is bound, like every
+        // other value the compiler emits.
+        q.push("select ");
+        q.push_bind(*id);
+        q.push("::uuid, (select count(*) from contacts where workspace_id = ");
+        q.push_bind(workspace_id);
+        q.push(" and ");
+        push_rules(&mut q, group);
+        q.push(")");
+    }
+    let rows = q
+        .build_query_as::<(Uuid, i64)>()
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.rollback().await?;
+    Ok(rows)
 }
 
 fn answer(count: Option<i64>, exact: bool, started: Instant) -> Preview {

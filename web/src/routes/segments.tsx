@@ -14,8 +14,9 @@ import { Alert, Field } from "../components/field";
 import { CONTROL } from "../components/input";
 import {
   type Catalog,
+  type CountState,
   type Doc,
-  CountText,
+  Count,
   RuleBuilder,
   asDoc,
   asRules,
@@ -35,13 +36,26 @@ const day = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 const th = "py-2 pe-3 text-start font-medium";
 
 /**
- * One page of segments. Each row counts itself, and preview is 30 per minute per workspace
- * (`PREVIEW_PER_MINUTE`), so the page size is what a workspace can afford to count in one visit.
+ * One page of segments, and the server's `MAX_COUNT_IDS`: the page is counted in one request,
+ * and that request is bounded by what a page shows.
  *
- * shortcut: no "Load more". Add one — and count only the rows on screen — the day a workspace
+ * shortcut: no "Load more". Add one — asking for the new page's counts — the day a workspace
  * keeps more segments than this.
  */
 const PAGE = 25;
+
+/**
+ * How many custom fields, lists and tags the pickers offer.
+ *
+ * shortcut: the first 200 of each, with no cursor. The builder says so when a list is at the cap,
+ * because a field that is simply missing from a picker is indistinguishable from one that was
+ * never defined. Page them the day a workspace has more.
+ */
+const CATALOG_LIMIT = 200;
+
+const COUNT_PROBLEMS = {
+  "rate-limited": "Counting is busy — the counts will catch up in a moment.",
+};
 
 const SAVE_PROBLEMS = {
   "segment-name-taken": "A segment with that name already exists in this workspace.",
@@ -75,6 +89,41 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
   });
 
   const catalog = useCatalog(ws);
+  const rows = segments.data?.data ?? [];
+  const ids = rows.map((s) => s.id).join(",");
+
+  /**
+   * Every row's count in **one** request, from a route that counts stored segments by id.
+   *
+   * It is its own query, so the rows are on screen before any count lands — a count may hold a
+   * connection for 1.5 seconds. It is one request rather than one per row because preview is 30
+   * a minute for a workspace and a full page is 25 rows; and it resolves a stored document, so a
+   * segment naming a custom field archived since it was saved still counts, where `preview`
+   * would refuse it as a new rule.
+   */
+  const counts = useQuery({
+    queryKey: ["segment-counts", ws, ids],
+    queryFn: async () => {
+      const { data, error } = await api.GET(
+        "/api/v1/workspaces/{workspace_id}/segments/counts",
+        { params: { path: { workspace_id: ws }, query: { ids } } },
+      );
+      if (!data) throw new Error(problemText(error, COUNT_PROBLEMS, "The counts could not be loaded."));
+      return new Map(data.map((c) => [c.id, c]));
+    },
+    enabled: ids !== "",
+    retry: false,
+    refetchOnWindowFocus: false,
+    staleTime: 60_000,
+  });
+  const countOf = (id: string): CountState => {
+    if (counts.isError) {
+      return { kind: "failed", message: counts.error.message, retry: () => void counts.refetch() };
+    }
+    const found = counts.data?.get(id);
+    return found ? { kind: "counted", count: found.count, exact: found.exact } : { kind: "counting" };
+  };
+
   // Its own key rather than the members screen's: one cache entry served by two queryFns is one
   // whose failure behaviour depends on which screen mounted last.
   const people = useQuery({
@@ -105,8 +154,6 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
       await qc.invalidateQueries({ queryKey: ["segments", ws] });
     },
   });
-
-  const rows = segments.data?.data ?? [];
 
   return (
     <section className="mt-8">
@@ -180,7 +227,7 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                       <td className="py-2 pe-3 font-medium wrap-anywhere">{s.name}</td>
                       <td className="py-2 pe-3 wrap-anywhere">{s.description || "—"}</td>
                       <td className="py-2 pe-3">
-                        <RowCount ws={ws} segment={s} />
+                        <Count state={countOf(s.id)} testId="segment-count" />
                       </td>
                       <td className="py-2 pe-3 wrap-anywhere">{author(s.created_by)}</td>
                       <td className="py-2 pe-3 tabular-nums text-fg-muted">
@@ -220,11 +267,30 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
         variant="drawer"
         title={form === "new" ? "New segment" : "Edit segment"}
       >
-        {form === null ? null : (
+        {/* The builder is not rendered until the fields, lists and tags are really loaded. It
+            reads "not in the catalog" as "archived", which is true only of a catalog that
+            arrived: against a failed request it would tell someone a live field was archived and
+            offer to delete their rule. */}
+        {form === null ? null : catalog.isError ? (
+          <>
+            <ErrorState
+              title="The fields, lists and tags could not be loaded."
+              onRetry={catalog.retry}
+            >
+              Without them this segment cannot be shown correctly, so it is not shown at all.
+            </ErrorState>
+            <div className="mt-6 flex justify-end">
+              <Button onClick={() => setForm(null)}>Cancel</Button>
+            </div>
+          </>
+        ) : catalog.isPending ? (
+          <Skeleton label="Loading the fields, lists and tags" rows={3} />
+        ) : (
           <SegmentForm
             ws={ws}
             existing={form === "new" ? undefined : form}
-            catalog={catalog}
+            catalog={catalog.catalog}
+            truncated={catalog.truncated}
             onCancel={() => setForm(null)}
             onDone={async () => {
               setForm(null);
@@ -256,81 +322,81 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
   );
 }
 
-/** The live field, list and tag options the pickers are built from. */
-function useCatalog(ws: string): Catalog {
+/**
+ * The live field, list and tag options the pickers are built from.
+ *
+ * **Loaded, failed and loaded-but-empty are three different states and the caller is told which.**
+ * Collapsing a failure into an empty catalog is how the builder came to say a live field had been
+ * archived; a fetch that did not happen is not evidence about anything.
+ */
+function useCatalog(ws: string): {
+  catalog: Catalog;
+  isPending: boolean;
+  isError: boolean;
+  truncated: boolean;
+  retry: () => void;
+} {
   const definitions = useQuery({
     queryKey: ["custom-fields", ws, "segments"],
     queryFn: async () => {
-      const { data } = await api.GET("/api/v1/workspaces/{workspace_id}/custom-fields", {
-        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+      const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/custom-fields", {
+        params: { path: { workspace_id: ws }, query: { limit: CATALOG_LIMIT } },
       });
-      return data?.data ?? [];
+      if (!data) throw new Error(problemMessage(error, "The custom fields could not be loaded."));
+      return data.data;
     },
     retry: false,
   });
   const lists = useQuery({
-    queryKey: ["lists", ws],
+    queryKey: ["lists", ws, "segments"],
     queryFn: async () => {
-      const { data } = await api.GET("/api/v1/workspaces/{workspace_id}/lists", {
-        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+      const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/lists", {
+        params: { path: { workspace_id: ws }, query: { limit: CATALOG_LIMIT } },
       });
-      return data?.data ?? [];
+      if (!data) throw new Error(problemMessage(error, "The lists could not be loaded."));
+      return data.data;
     },
     retry: false,
   });
   const tags = useQuery({
-    queryKey: ["tags", ws],
+    queryKey: ["tags", ws, "segments"],
     queryFn: async () => {
-      const { data } = await api.GET("/api/v1/workspaces/{workspace_id}/tags", {
-        params: { path: { workspace_id: ws }, query: { limit: 200 } },
+      const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/tags", {
+        params: { path: { workspace_id: ws }, query: { limit: CATALOG_LIMIT } },
       });
-      return data?.data ?? [];
+      if (!data) throw new Error(problemMessage(error, "The tags could not be loaded."));
+      return data.data;
     },
     retry: false,
   });
+  const all = [definitions, lists, tags];
   return {
-    fields: fieldOptions(definitions.data ?? []),
-    lists: lists.data ?? [],
-    tags: tags.data ?? [],
+    catalog: {
+      fields: fieldOptions(definitions.data ?? []),
+      lists: lists.data ?? [],
+      tags: tags.data ?? [],
+    },
+    isPending: all.some((q) => q.isPending),
+    isError: all.some((q) => q.isError),
+    truncated: all.some((q) => (q.data?.length ?? 0) >= CATALOG_LIMIT),
+    retry: () => {
+      for (const q of all) void q.refetch();
+    },
   };
-}
-
-/**
- * One row's count: its own query, so the list is readable before any of them land. A count can
- * hold a connection for 1.5 seconds and there is one per row, so nothing waits for them.
- */
-function RowCount({ ws, segment }: { ws: string; segment: Segment }) {
-  const preview = usePreview(ws, asDoc(segment.rules));
-  if (preview.isError) {
-    return (
-      <span role="alert">
-        {preview.error.message}{" "}
-        <Button variant="ghost" aria-label={`Count ${segment.name} again`} onClick={() => void preview.refetch()}>
-          Retry
-        </Button>
-      </span>
-    );
-  }
-  if (!preview.data) {
-    return (
-      <div className="w-24">
-        <Skeleton label="Counting contacts" />
-      </div>
-    );
-  }
-  return <CountText preview={preview.data} testId="segment-count" />;
 }
 
 function SegmentForm({
   ws,
   existing,
   catalog,
+  truncated,
   onCancel,
   onDone,
 }: {
   ws: string;
   existing?: Segment;
   catalog: Catalog;
+  truncated: boolean;
   onCancel: () => void;
   onDone: () => void;
 }) {
@@ -339,7 +405,7 @@ function SegmentForm({
   const [doc, setDoc] = useState<Doc>(existing ? asDoc(existing.rules) : emptyDoc());
   const [unfinished, setUnfinished] = useState("");
 
-  const preview = usePreview(ws, doc);
+  const count = usePreview(ws, doc, catalog.fields);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -365,7 +431,7 @@ function SegmentForm({
       setUnfinished("A segment needs at least one rule: an empty one would match every contact.");
       return;
     }
-    if (!complete(doc)) {
+    if (!complete(doc, catalog.fields)) {
       setUnfinished("Finish every rule first — each one still needs a value.");
       return;
     }
@@ -401,21 +467,17 @@ function SegmentForm({
       <div className="mt-6">
         <h3 className="font-medium">Rules</h3>
         <RuleBuilder doc={doc} onChange={setDoc} catalog={catalog} />
+        {truncated ? (
+          <p className="mt-3 text-fg-muted">
+            The pickers offer the first {CATALOG_LIMIT} custom fields, lists and tags. A workspace
+            with more than that has some that cannot be chosen here yet.
+          </p>
+        ) : null}
       </div>
 
       <div className="mt-4 rounded-md border border-border p-3">
         <span className="text-fg-muted">Matching contacts: </span>
-        {!complete(doc) ? (
-          <span>no count yet — every rule needs a value.</span>
-        ) : preview.isError ? (
-          <Alert>{preview.error.message}</Alert>
-        ) : preview.data ? (
-          <CountText preview={preview.data} testId="preview-count" />
-        ) : (
-          <div className="w-24">
-            <Skeleton label="Counting contacts" />
-          </div>
-        )}
+        <Count state={count} testId="preview-count" />
       </div>
 
       {unfinished ? <Alert>{unfinished}</Alert> : null}

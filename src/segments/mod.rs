@@ -113,18 +113,47 @@ pub async fn parse_unchanged_rules(
 /// between two statements cannot make a stored segment fail to load. Every definition is read,
 /// archived ones included.
 pub async fn load_rules(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResult<Group> {
-    let row = sqlx::query!(
-        r#"select s.rules,
+    let (_, group) = load_many_rules(db, workspace_id, &[id])
+        .await?
+        .pop()
+        .ok_or(ApiError::NotFound)?;
+    Ok(group)
+}
+
+/// [`load_rules`] for several ids at once, in the order asked for, in **one** statement.
+///
+/// The list view counts every segment on the page, and one request per row spends a workspace's
+/// whole preview quota on a single page load. Counting them together needs their rules together.
+///
+/// Every id must resolve: a missing one is the same `404` as on every other path that accepts a
+/// `segment_id`, never a silently shorter answer. Duplicates are the caller's to remove.
+pub async fn load_many_rules(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    ids: &[Uuid],
+) -> ApiResult<Vec<(Uuid, Group)>> {
+    let rows = sqlx::query!(
+        r#"select s.id, s.rules,
                   coalesce((select jsonb_object_agg(f.key, f.kind) from custom_fields f
                             where f.workspace_id = $1), '{}'::jsonb)
                       as "kinds!: Json<HashMap<String, FieldKind>>"
-           from segments s where s.workspace_id = $1 and s.id = $2"#,
+           from segments s where s.workspace_id = $1 and s.id = any($2)"#,
         workspace_id,
-        id,
+        ids,
     )
-    .fetch_optional(&mut *db)
-    .await?
-    .ok_or(ApiError::NotFound)?;
-    // A stored document that no longer parses answers with the parser's own problem code.
-    Ok(Group::parse(&row.rules, &row.kinds.0)?)
+    .fetch_all(&mut *db)
+    .await?;
+    let mut parsed = HashMap::with_capacity(rows.len());
+    for row in rows {
+        // A stored document that no longer parses answers with the parser's own problem code.
+        parsed.insert(row.id, Group::parse(&row.rules, &row.kinds.0)?);
+    }
+    ids.iter()
+        .map(|id| {
+            parsed
+                .remove(id)
+                .map(|group| (*id, group))
+                .ok_or(ApiError::NotFound)
+        })
+        .collect()
 }

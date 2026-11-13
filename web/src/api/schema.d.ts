@@ -909,6 +909,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/segments/counts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Counts the contacts each named **stored** segment matches. A read: `viewer` (section 13).
+         * @description The list view's counts, in one request. It resolves through `load_many_rules`, which reads a
+         *     stored document — archived definitions included — so a segment naming a field that was
+         *     archived after it was saved counts here, where `preview` would refuse it as a new rule. It
+         *     costs one unit of the preview quota however many segments it names, which is the whole point:
+         *     a page of 25 rows used to cost 25 of the 30 a workspace has in a minute.
+         */
+        get: operations["count_segments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/segments/preview": {
         parameters: {
             query?: never;
@@ -1848,6 +1872,22 @@ export interface components {
              * @description Starts at 1 and moves only when an edit changes `rules`: a rename leaves it alone.
              */
             version: number;
+        };
+        /**
+         * @description One segment's count in a batch. `Preview`'s `took_ms` has no meaning per row: the batch is one
+         *     statement and every row in it took the same time.
+         */
+        SegmentCount: {
+            /**
+             * Format: int64
+             * @description `null` where section 5 allows no honest number: the document filters on a custom attribute,
+             *     or the batch ran out of time. The list shows "too many to count exactly" for both.
+             */
+            count?: number | null;
+            /** @description Always `true` alongside a number here: a batch is counted exactly or not at all. */
+            exact: boolean;
+            /** Format: uuid */
+            id: string;
         };
         /** @description A materialised selection: the snapshot that was written, and the token for it. */
         SelectionToken: {
@@ -4945,6 +4985,53 @@ export interface operations {
             };
             /** @description invalid name or description, or a refused rule document (malformed-rules, empty-rules, unknown-field, ...) */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    count_segments: {
+        parameters: {
+            query: {
+                /** @description Comma-separated segment ids, at most 25. */
+                ids: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One entry per id, in the order asked for. `count` is null where section 5 allows no honest number */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SegmentCount"][];
+                };
+            };
+            /** @description not a member, or an id that is not a segment of this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description ids that are not a list of at most 25 uuids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many counts for this workspace */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

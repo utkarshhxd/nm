@@ -1374,3 +1374,91 @@ async fn a_non_member_is_refused_and_spends_none_of_the_workspaces_quota(pool: P
         "the member's first preview must be the window's first"
     );
 }
+
+// `GET /segments/counts` (spec M1b sections 5, 12, 13 and 19).
+
+fn counts_path(ws: Uuid, ids: &[Uuid]) -> String {
+    let joined = ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}/counts?ids={joined}", segments(ws))
+}
+
+/// The list view's counts, in one request for a page of segments.
+///
+/// It resolves a **stored** document, archived definitions included, where `preview` parses a new
+/// one and refuses a rule naming a field that has since been archived. That difference is the
+/// reason this route exists alongside `preview`, so the same document is asked of both here.
+#[sqlx::test]
+async fn counts_answer_a_page_at_once_and_resolve_an_archived_field(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let field = create_field(&app, ws, "plan").await;
+    insert_contact(&pool, ws, "a@acme.com", "Ann", json!({"plan": "pro"})).await;
+    insert_contact(&pool, ws, "b@acme.com", "Ann", json!({})).await;
+    insert_contact(&pool, ws, "c@acme.com", "Bob", json!({})).await;
+    let by_name = create(&app, ws, "anns", first_name_is("Ann")).await;
+    let by_attr = create(&app, ws, "pros", plan_is("pro")).await;
+    app.delete(&format!("{}/{field}", fields(ws)))
+        .await
+        .assert_status_ok();
+
+    // A viewer may count (section 13), and the answer is in the order asked for.
+    let viewer = client(&pool, "viewer@acme.com", ws, Role::Viewer).await;
+    let r = viewer.get(&counts_path(ws, &[by_name, by_attr])).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body[0]["id"], by_name.to_string(), "{body}");
+    assert_eq!(body[0]["count"], 2, "{body}");
+    assert_eq!(body[0]["exact"], true, "{body}");
+    // Section 5: a document filtering on a custom attribute gets no number, ever.
+    assert_eq!(body[1]["id"], by_attr.to_string(), "{body}");
+    assert_eq!(body[1]["count"], Value::Null, "{body}");
+    assert_eq!(body[1]["exact"], false, "{body}");
+    assert_eq!(
+        r.header("ratelimit-limit").to_str().unwrap(),
+        PREVIEW_PER_MINUTE.to_string(),
+        "a page of counts costs one unit of the preview quota, with the headers to say so"
+    );
+
+    // The same document through `preview`, which parses it as new: now a 422, which is exactly
+    // what the list used to show instead of a count.
+    let refused = preview(&app, ws, &plan_is("pro")).await;
+    refused.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&refused), "urn:nm:problem:unknown-field");
+}
+
+/// An id that is not a segment of this workspace is a `404` on this path too (section 4.2), and a
+/// list that is not uuids, or longer than a page, is a malformed request rather than a missing one.
+#[sqlx::test]
+async fn counts_refuse_an_unknown_id_a_bad_id_and_more_than_a_page(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (other, elsewhere) = workspace(&pool, "globex").await;
+    let mine = create(&app, ws, "anns", first_name_is("Ann")).await;
+    let theirs = create(&elsewhere, other, "theirs", first_name_is("Ann")).await;
+
+    app.get(&counts_path(ws, &[mine, Uuid::now_v7()]))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    // Another workspace's segment is missing here, not forbidden: 404 before 403.
+    app.get(&counts_path(ws, &[theirs]))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    for ids in ["", "nope", "not-a-uuid,also-not"] {
+        let r = app.get(&format!("{}/counts?ids={ids}", segments(ws))).await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem_type(&r), "urn:nm:problem:invalid-segment-ids");
+    }
+
+    let page_and_one: Vec<Uuid> = (0..26).map(Uuid::from_u128).collect();
+    let r = app.get(&counts_path(ws, &page_and_one)).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&r), "urn:nm:problem:invalid-segment-ids");
+
+    // A repeated id is the caller's slip, not a refusal: it is counted once.
+    let r = app.get(&counts_path(ws, &[mine, mine])).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>().as_array().unwrap().len(), 1);
+}

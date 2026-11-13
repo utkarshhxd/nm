@@ -3348,6 +3348,61 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/segments/counts": {
+      "get": {
+        "tags": [
+          "crate::segments::routes"
+        ],
+        "summary": "Counts the contacts each named **stored** segment matches. A read: `viewer` (section 13).",
+        "description": "The list view's counts, in one request. It resolves through `load_many_rules`, which reads a\nstored document — archived definitions included — so a segment naming a field that was\narchived after it was saved counts here, where `preview` would refuse it as a new rule. It\ncosts one unit of the preview quota however many segments it names, which is the whole point:\na page of 25 rows used to cost 25 of the 30 a workspace has in a minute.",
+        "operationId": "count_segments",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "ids",
+            "in": "query",
+            "description": "Comma-separated segment ids, at most 25.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One entry per id, in the order asked for. `count` is null where section 5 allows no honest number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SegmentCount"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or an id that is not a segment of this workspace"
+          },
+          "422": {
+            "description": "ids that are not a list of at most 25 uuids"
+          },
+          "429": {
+            "description": "rate-limited: too many counts for this workspace"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/segments/preview": {
       "post": {
         "tags": [
@@ -6309,6 +6364,32 @@
             "type": "integer",
             "format": "int32",
             "description": "Starts at 1 and moves only when an edit changes `rules`: a rename leaves it alone."
+          }
+        }
+      },
+      "SegmentCount": {
+        "type": "object",
+        "description": "One segment's count in a batch. `Preview`'s `took_ms` has no meaning per row: the batch is one\nstatement and every row in it took the same time.",
+        "required": [
+          "id",
+          "exact"
+        ],
+        "properties": {
+          "count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`null` where section 5 allows no honest number: the document filters on a custom attribute,\nor the batch ran out of time. The list shows \"too many to count exactly\" for both."
+          },
+          "exact": {
+            "type": "boolean",
+            "description": "Always `true` alongside a number here: a batch is counted exactly or not at all."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },

@@ -8,10 +8,13 @@ use axum::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use super::{Segment, parse_new_rules, parse_unchanged_rules, preview::Preview};
+use super::{
+    Segment, load_many_rules, parse_new_rules, parse_unchanged_rules,
+    preview::{Preview, SegmentCount},
+};
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
@@ -32,6 +35,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/workspaces/{workspace_id}/segments/preview",
             axum::routing::post(preview_segment),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/segments/counts",
+            axum::routing::get(count_segments),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/segments/{id}",
@@ -486,6 +493,107 @@ async fn counted(state: &AppState, workspace_id: Uuid, rules: &Value) -> ApiResu
         &state.pool,
         workspace_id,
         &group,
+        state.config.preview_timeout_ms,
+    )
+    .await
+}
+
+/// At most one page of the list view. The endpoint exists to spend one request where a page used
+/// to spend one per row, so the batch is bounded by what a page shows rather than by what a
+/// caller asks for.
+const MAX_COUNT_IDS: usize = 25;
+
+/// `?ids=` for `count_segments`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct CountParams {
+    /// Comma-separated segment ids, at most 25.
+    pub ids: String,
+}
+
+/// The ids in the order asked for, without repeats. Anything that is not a list of uuids within
+/// the cap is a `422`: an unparseable id is a malformed request, not a missing segment.
+fn parse_ids(raw: &str) -> ApiResult<Vec<Uuid>> {
+    let bad = |detail: String| ApiError::UnprocessableDetail {
+        code: "invalid-segment-ids",
+        detail,
+    };
+    let mut ids = Vec::new();
+    for part in raw.split(',') {
+        let id = Uuid::parse_str(part.trim())
+            .map_err(|_| bad(format!("`{}` is not a segment id", part.trim())))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(bad("name at least one segment".to_owned()));
+    }
+    if ids.len() > MAX_COUNT_IDS {
+        return Err(bad(format!("at most {MAX_COUNT_IDS} segments at a time")));
+    }
+    Ok(ids)
+}
+
+/// Counts the contacts each named **stored** segment matches. A read: `viewer` (section 13).
+///
+/// The list view's counts, in one request. It resolves through `load_many_rules`, which reads a
+/// stored document — archived definitions included — so a segment naming a field that was
+/// archived after it was saved counts here, where `preview` would refuse it as a new rule. It
+/// costs one unit of the preview quota however many segments it names, which is the whole point:
+/// a page of 25 rows used to cost 25 of the 30 a workspace has in a minute.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/segments/counts",
+    operation_id = "count_segments",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id"), CountParams),
+    responses(
+        (status = 200, description = "One entry per id, in the order asked for. `count` is null \
+            where section 5 allows no honest number", body = Vec<SegmentCount>),
+        (status = 404, description = "not a member, or an id that is not a segment of this \
+            workspace"),
+        (status = 422, description = "ids that are not a list of at most 25 uuids"),
+        (status = 429, description = "rate-limited: too many counts for this workspace"),
+    ),
+)]
+pub async fn count_segments(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiQuery(params): ApiQuery<CountParams>,
+) -> ApiResult<Response> {
+    authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
+    let ids = parse_ids(&params.ids)?;
+    // The same limiter as `preview`, and one unit for the whole batch: what it protects is the
+    // pool, and this holds one connection for one statement however many segments it counts.
+    let quota = state.preview_limit.check(workspace_id);
+    if let Some(retry_after_secs) = quota.over {
+        return Ok((
+            quota.headers,
+            ApiError::TooManyRequests { retry_after_secs },
+        )
+            .into_response());
+    }
+    Ok(match counted_by_id(&state, workspace_id, &ids).await {
+        Ok(counts) => (quota.headers, Json(counts)).into_response(),
+        Err(e) => (quota.headers, e).into_response(),
+    })
+}
+
+/// `count_segments` past the role check and the quota: load the stored documents, then count them.
+async fn counted_by_id(
+    state: &AppState,
+    workspace_id: Uuid,
+    ids: &[Uuid],
+) -> ApiResult<Vec<SegmentCount>> {
+    let mut conn = state.pool.acquire().await?;
+    let segments = load_many_rules(&mut conn, workspace_id, ids).await?;
+    drop(conn);
+    super::preview::counts(
+        &state.pool,
+        workspace_id,
+        &segments,
         state.config.preview_timeout_ms,
     )
     .await
