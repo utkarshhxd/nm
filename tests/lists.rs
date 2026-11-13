@@ -961,7 +961,7 @@ async fn a_membership_records_how_it_was_created(pool: PgPool) {
         .assert_status(StatusCode::NO_CONTENT);
     keyed
         .post(&members_path(ws, news))
-        .add_header("authorization", key)
+        .add_header("authorization", key.clone())
         .json(&json!({"contact_id": people[0]}))
         .await
         .assert_status_ok();
@@ -974,6 +974,23 @@ async fn a_membership_records_how_it_was_created(pool: PgPool) {
     assert_eq!(
         source_of(&pool, news, people[0]).await.as_deref(),
         Some("api")
+    );
+
+    // The same for a `pending` member: re-adding one on a double-opt-in list keeps both the status
+    // and how they first came in. It rides the same `where status = 'unsubscribed'` clause, but
+    // `source` is asserted here by name rather than inferred from the status tests.
+    let double = create_list(&ui, ws, "double", true).await;
+    assert_eq!(add(&ui, ws, double, people[1]).await, "pending");
+    keyed
+        .post(&members_path(ws, double))
+        .add_header("authorization", key)
+        .json(&json!({"contact_id": people[1]}))
+        .await
+        .assert_status_ok();
+    assert_eq!(row(&pool, double, people[1]).await.0, "pending");
+    assert_eq!(
+        source_of(&pool, double, people[1]).await.as_deref(),
+        Some("ui")
     );
 }
 

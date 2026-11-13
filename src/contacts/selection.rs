@@ -33,7 +33,7 @@ use crate::{
     audit::Actor,
     crypto::{secrets::Secrets, tokens},
     error::{ApiError, ApiResult, FieldError},
-    lists::MembershipStatus,
+    lists::{MembershipSource, MembershipStatus},
     segments::{compile::push_rules, rules::Group},
 };
 
@@ -680,7 +680,9 @@ pub async fn subscribe(
             .push_bind(status)
             .push(", case when ")
             .push_bind(status)
-            .push(" = 'subscribed' then now() end, 'bulk' from sel on conflict (contact_id, list_id) do nothing");
+            .push(" = 'subscribed' then now() end, ")
+            .push_bind(MembershipSource::Bulk)
+            .push(" from sel on conflict (contact_id, list_id) do nothing");
     })
     .await
 }
