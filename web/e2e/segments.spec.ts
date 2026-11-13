@@ -726,6 +726,90 @@ test("selecting_a_segments_contacts_shows_the_frozen_set_on_the_contacts_grid", 
   await page.unroute("**/contacts/selection");
 });
 
+test("a_handover_abandoned_before_the_grid_mounts_is_not_adopted_by_another_workspace", async () => {
+  // The handover is module state, so it outlives a navigation that never completes: the lazy
+  // contacts chunk is still in flight and the person goes somewhere else. Without the workspace
+  // id on it, the next contacts grid in *any* workspace adopts it and shows a bar claiming a
+  // selection over a snapshot that workspace does not have.
+  //
+  // The precondition is forced by holding the chunk's real network response — a delayed asset,
+  // not a stubbed one, with the router's own loading code running unmodified.
+  const other = (await (
+    await admin.request.post("/api/v1/workspaces", {
+      data: { name: "Other Co", slug: "othersegco" },
+      headers: { "X-CSRF-Token": csrf },
+    })
+  ).json()) as { id: string };
+  const contact = await admin.request.post(`/api/v1/workspaces/${other.id}/contacts`, {
+    data: { email: "only@other.test" },
+    headers: { "X-CSRF-Token": csrf },
+  });
+  expect(contact.ok(), `seed the other workspace -> ${contact.status()}`).toBe(true);
+
+  // Its own context, so the contacts chunk has never been fetched: `/assets/` is served
+  // `immutable`, and a cached one would never reach the route below.
+  const fresh = await admin.browser()!.newContext();
+  const p = await fresh.newPage();
+  try {
+    await signIn(p, ADMIN_EMAIL, ADMIN_PASSWORD);
+    const CHUNK = /\/assets\/contacts-[^/]*\.js$/;
+    let releaseChunk = () => {};
+    const chunkHeld = new Promise<void>((done) => {
+      releaseChunk = done;
+    });
+    await p.route(CHUNK, async (route) => {
+      await chunkHeld;
+      await route.continue().catch(() => undefined);
+    });
+
+    // Select from the segments list. The POST lands and the handover is set; the navigation to
+    // the contacts route stalls on the chunk, so the grid never mounts to take it.
+    await p.goto(`/w/${SLUG}/segments`);
+    await expect(p.getByRole("heading", { name: "Segments", exact: true })).toBeVisible();
+    const selected = p.waitForResponse(
+      (r) => r.request().method() === "POST" && r.url().includes("/contacts/selection"),
+    );
+    await p.getByRole("button", { name: "Select contacts in Pickable", exact: true }).click();
+    expect((await selected).status(), "the selection itself must have succeeded").toBe(200);
+
+    // Abandon it for a different route, then let the chunk through.
+    await p.getByRole("link", { name: "Lists", exact: true }).click();
+    await expect(p).toHaveURL(new RegExp(`/w/${SLUG}/lists$`));
+    releaseChunk();
+    await p.unroute(CHUNK);
+    await expect(p).toHaveURL(new RegExp(`/w/${SLUG}/lists$`));
+
+    // Every snapshot-bearing read of the *other* workspace's contacts. There must be none: the
+    // token is this workspace's and that grid has no business asking with it.
+    //
+    // The request is what this test watches, rather than the bulk bar it would produce. A bar
+    // from an adopted handover exists only between that grid's first render and the moment the
+    // read comes back `selection-expired` and the read path clears it — a window with no
+    // Playwright anchor inside it, since the heading does not settle until the read does. The
+    // request is the same event, and it is observable without timing anything.
+    const foreignSnapshotReads: string[] = [];
+    const theirContacts = `/api/v1/workspaces/${other.id}/contacts`;
+    p.on("request", (r) => {
+      const url = new URL(r.url());
+      if (r.method() === "GET" && url.pathname === theirContacts && url.searchParams.get("snapshot_id")) {
+        foreignSnapshotReads.push(r.url());
+      }
+    });
+
+    // In-SPA, so module state survives the move.
+    await p.locator("#workspace").selectOption("othersegco");
+    await p.getByRole("link", { name: "Contacts", exact: true }).click();
+
+    // The other workspace's own single contact, which it can only show by having asked without a
+    // snapshot — and which is also what waits for that grid to have asked at all.
+    await expect(p.locator("tbody tr[aria-rowindex]")).toHaveCount(1);
+    await expect(p.getByText(/^Here is what you selected/)).toHaveCount(0);
+    expect(foreignSnapshotReads, "a snapshot from another workspace was read").toEqual([]);
+  } finally {
+    await fresh.close();
+  }
+});
+
 test("a_snapshot_that_is_gone_drops_the_selection_rather_than_offering_a_retry", async () => {
   // `GET /contacts?snapshot_id=` is `422 selection-expired` — not an empty page — when the
   // snapshot has expired, been swept or been superseded. Retrying it refuses for as long as the

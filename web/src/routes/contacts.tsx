@@ -126,6 +126,9 @@ type Confirming = {
   promised: number;
 };
 
+/** The sentence the locked tick boxes point at, so it reaches a screen reader and not only a screen. */
+const WHY_LOCKED = "frozen-page-loading";
+
 /** The title and the button of each confirmation, so the dialog is not three nested ternaries. */
 const CONFIRM: Record<Confirming["kind"], { title: string; label: (n: number) => string }> = {
   tag: { title: "Tag these contacts", label: (n) => `Tag ${count(n, "contact")}` },
@@ -324,7 +327,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       canEdit
         ? {
             store,
-            locked,
+            lockedBy: locked ? WHY_LOCKED : undefined,
             label: (c: Contact) => `Select ${c.email}`,
             onToggle: (contactId: string) => {
               if (!store.toggle(contactId)) {
@@ -644,7 +647,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         {/* Why the ticks are off. A disabled control that does not say why is a control nobody
             can act on, which is the pattern `m1a-decisions.md` settled for the bulk bar. */}
         {locked ? (
-          <p className="mb-3 text-fg-muted">
+          <p id={WHY_LOCKED} className="mb-3 text-fg-muted">
             Loading the contacts you selected. These are the rows you were looking at before, so
             they cannot be ticked until it arrives.
           </p>

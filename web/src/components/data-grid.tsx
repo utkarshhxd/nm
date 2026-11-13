@@ -35,10 +35,16 @@ export type Sort = { id: string; dir: "asc" | "desc" };
 export type Selecting<T> = {
   store: SelectionStore;
   /**
-   * Ticking is off: the rows on screen are not the set the selection holds, so a tick here could
-   * not mean what it appears to. The caller says why in its own words beside the grid.
+   * Ticking is off, and this is the `id` of the element that says why: the rows on screen are not
+   * the set the selection holds, so a tick here could not mean what it appears to. Set means
+   * locked, and every tick box points at it with `aria-describedby`.
+   *
+   * One field rather than a flag and an id, because a dimmed control whose explanation reaches
+   * sighted readers only is half a control — and this state is transient, unlike every other
+   * disabled control here, so a reader who arrives late gets no second chance to find the
+   * sentence beside the grid.
    */
-  locked?: boolean;
+  lockedBy?: string;
   /** The checkbox's accessible name, e.g. `Select jo@example.com`. Never a bare "Select". */
   label: (row: T) => string;
   onToggle: (id: string) => void;
@@ -206,7 +212,7 @@ export function DataGrid<T>({
         return go(here - screen);
       case " ":
         // A checkbox inside the row toggles itself; this is the row's own Space.
-        if (event.target === row && selecting && !selecting.locked) {
+        if (event.target === row && selecting && !selecting.lockedBy) {
           event.preventDefault();
           selecting.onToggle(getId(rows[here] as T));
         }
@@ -218,7 +224,7 @@ export function DataGrid<T>({
       case "Escape":
         return selecting?.onClear();
       case "a":
-        if ((event.ctrlKey || event.metaKey) && selecting && !selecting.locked) {
+        if ((event.ctrlKey || event.metaKey) && selecting && !selecting.lockedBy) {
           event.preventDefault();
           selecting.onSelectLoaded();
         }
@@ -369,7 +375,8 @@ const GridRow = memo(function GridRow<T>({
           <Checkbox
             tabIndex={-1}
             checked={selected}
-            disabled={selecting.locked ?? false}
+            disabled={Boolean(selecting.lockedBy)}
+            aria-describedby={selecting.lockedBy}
             onChange={() => selecting.onToggle(id)}
             aria-label={selecting.label(row)}
           />
@@ -406,7 +413,8 @@ function SelectAll<T>({
     <Checkbox
       aria-label="Select all loaded contacts"
       checked={all}
-      disabled={selecting.locked ?? false}
+      disabled={Boolean(selecting.lockedBy)}
+      aria-describedby={selecting.lockedBy}
       indeterminate={state.mode !== "none" && !all}
       onChange={selecting.onToggleAll}
     />

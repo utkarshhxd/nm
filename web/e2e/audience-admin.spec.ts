@@ -691,14 +691,20 @@ test("the_rows_cannot_be_ticked_while_the_frozen_page_is_in_flight", async () =>
   // Off, and it says why: a disabled control that does not explain itself is one nobody can act on.
   await expect(page.getByText("Loading the contacts you selected")).toBeVisible();
   const row = page.getByRole("checkbox", { name: "Select view-a@example.test", exact: true });
+  const header = page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true });
   await expect(row).toBeDisabled();
-  await expect(
-    page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }),
-  ).toBeDisabled();
+  await expect(header).toBeDisabled();
+  // And says it to a screen reader, not only to a screen. This state lasts one round trip, so a
+  // reader who lands on a dimmed box after the sentence has been read has no second chance at it:
+  // the box itself has to carry it.
+  await expect(row).toHaveAccessibleDescription(/cannot be ticked until it arrives/);
+  await expect(header).toHaveAccessibleDescription(/cannot be ticked until it arrives/);
 
   release();
   await page.unroute(gridRequests);
-  // And back on once the rows on screen really are the frozen set.
+  // And back on once the rows on screen really are the frozen set. The description is not
+  // asserted here: the paragraph it points at is unmounted with the lock, so the computed
+  // description is empty whatever the attribute says — a check that could not fail.
   await expect(row).toBeEnabled();
   await expect(page.getByText("Loading the contacts you selected")).toHaveCount(0);
 });
