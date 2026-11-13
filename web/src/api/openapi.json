@@ -1365,7 +1365,8 @@
         "tags": [
           "crate::contacts::routes"
         ],
-        "summary": "One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is\nhow the grid shows what a selection actually holds; a snapshot that has expired, been swept or\nbelongs to another workspace shows no contacts rather than all of them.",
+        "summary": "One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is\nhow the grid shows what a selection actually holds.",
+        "description": "A snapshot that has expired, been swept, been superseded or belongs to another workspace is\n`422 selection-expired`, **not** an empty page: \"zero contacts matched\" is a different fact\nfrom \"this selection is gone\", and the grid cannot tell someone to select again if the server\nwill not say which it was.",
         "operationId": "list_contacts",
         "parameters": [
           {
@@ -1480,7 +1481,7 @@
             "description": "not a member, or no such workspace"
           },
           "422": {
-            "description": "a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id`"
+            "description": "a malformed cursor, an unknown `sort`, a `q` under 3 characters, a `list_status` without a `list_id`, or selection-expired: the `snapshot_id` names no live selection of this workspace"
           }
         }
       },

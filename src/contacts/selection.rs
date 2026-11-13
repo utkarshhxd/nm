@@ -104,6 +104,11 @@ pub enum Selection {
     /// The ticked rows of a grid: these contacts and no others. An explicit id list is already a
     /// frozen set, so it carries no `snapshot_id` and nothing is materialised for it. It is still
     /// scoped by `workspace_id`, so an id from another workspace selects nothing.
+    ///
+    /// An **empty** `ids` is representable here and must stay refused at the door
+    /// (`check_ids`): `id = any('{}')` is false for every row, so it acts on nothing today, but
+    /// it is one careless edit away from meaning "no restriction". Nothing in the product builds
+    /// one — only a route does, from a body `check_ids` has already seen.
     Ids { workspace_id: Uuid, ids: Vec<Uuid> },
 }
 
@@ -491,6 +496,33 @@ pub async fn resolve(db: &mut PgConnection, token: Token) -> ApiResult<Selection
     })
 }
 
+/// `422 selection-expired` unless this workspace has a live snapshot with this id.
+///
+/// For the read path, which has no token to parse: `GET /contacts?snapshot_id=…`. An empty page
+/// would be the wrong answer — "zero contacts matched" is a different fact from "this selection is
+/// gone", and the grid cannot tell someone to select again if the server will not say which. Past
+/// `expires_at`, swept, superseded and belonging to another workspace are one answer, as they are
+/// for a bulk action: the caller is already authorised in this workspace, so the refusal is no
+/// oracle, and a foreign id is indistinguishable from one that never existed.
+pub async fn require_live(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    snapshot_id: Uuid,
+) -> ApiResult<()> {
+    let live = sqlx::query_scalar!(
+        "select exists (select 1 from selection_snapshots \
+         where workspace_id = $1 and id = $2 and expires_at > now())",
+        workspace_id,
+        snapshot_id,
+    )
+    .fetch_one(db)
+    .await?;
+    if live == Some(true) {
+        return Ok(());
+    }
+    Err(ApiError::Unprocessable("selection-expired"))
+}
+
 /// Appends ` and id in (<the frozen set>)` to a query that has already constrained
 /// `contacts.workspace_id`. The grid's `?snapshot_id=` and every bulk action share it, so "the
 /// contacts this snapshot shows" and "the contacts this snapshot acts on" cannot drift apart.
@@ -545,14 +577,18 @@ pub struct Counts {
     pub affected: u64,
 }
 
+/// The whole statement a bulk action runs:
 /// `with sel as (<the selection>), done as (<action> returning 1) select count(sel), count(done)`.
 /// `action` appends the data-changing statement, which reads `sel` for the contact ids.
-async fn run(
-    db: &mut PgConnection,
+///
+/// Built here rather than inside [`run`] so that a test can read it. `run` executes, so the one
+/// thing a test could otherwise never see is the opening — `select id from **contacts**` — which
+/// is the half of section 8.2 that matters: the ids are never taken *out of* the members table.
+fn statement(
     sel: &Selection,
     excluded: &[Uuid],
     action: impl FnOnce(&mut QueryBuilder<Postgres>),
-) -> ApiResult<Counts> {
+) -> QueryBuilder<Postgres> {
     let mut q = QueryBuilder::<Postgres>::new("with sel as (select id from contacts where ");
     push_selected(&mut q, sel, excluded);
     q.push("), done as (");
@@ -561,6 +597,16 @@ async fn run(
         " returning 1) \
          select (select count(*) from sel)::bigint, (select count(*) from done)::bigint",
     );
+    q
+}
+
+async fn run(
+    db: &mut PgConnection,
+    sel: &Selection,
+    excluded: &[Uuid],
+    action: impl FnOnce(&mut QueryBuilder<Postgres>),
+) -> ApiResult<Counts> {
+    let mut q = statement(sel, excluded, action);
     let (selected, affected): (i64, i64) = q.build_query_as().fetch_one(db).await?;
     // Counts are never negative.
     Ok(Counts {
@@ -698,31 +744,36 @@ mod tests {
         assert_eq!(parse(&secrets(), &issue(&secrets(), &t)).unwrap(), t);
     }
 
-    /// The statement a bulk action runs, which only its SQL can witness: nothing reachable from a
-    /// test can make the `expires_at` join fire, because the handler refuses an expired snapshot
-    /// before it gets here, and `tests/bulk.rs` drives the join through this module directly.
+    /// The **whole** statement a bulk action runs, which only its SQL can witness.
     ///
-    /// Two properties. **`contacts` is the driving table** and the members table appears only
-    /// inside `id in (…)`: selecting ids *out of* the members table and inserting them elsewhere
-    /// would hit a foreign-key violation the moment one selected contact had been deleted, which
-    /// kills the whole action rather than one row. And the subquery **joins the parent on
-    /// `expires_at > now()`**, so an unswept expired snapshot narrows to nothing rather than being
-    /// acted on.
+    /// Three properties, in one string. **`contacts` is the driving table**: the `sel` CTE opens
+    /// `select id from contacts`, and the members table appears only inside `id in (…)`. Selecting
+    /// the ids *out of* the members table and inserting them elsewhere would hit a foreign-key
+    /// violation the moment one selected contact had been deleted, which kills the whole action
+    /// rather than one row — and that substitution lives in this statement's opening, not in
+    /// `push_selected`, which is why the assertion covers the opening too. The subquery **joins
+    /// the parent on `expires_at > now()`**, so an unswept expired snapshot narrows to nothing;
+    /// nothing reachable through a handler can witness that, because the handler refuses an
+    /// expired snapshot first, and `tests/bulk.rs` drives it through this module instead. And the
+    /// **exclusions** are applied to `contacts`, not to the members table.
     #[test]
     fn the_action_narrows_contacts_by_a_live_snapshot() {
         let sel = Selection::Snapshot {
             token: token(),
             filter: serde_json::json!({}),
         };
-        let mut q = QueryBuilder::<Postgres>::new("select id from contacts where ");
-        push_selected(&mut q, &sel, &[]);
-        let sql = q.into_sql();
+        let sql = statement(&sel, &[], |q| {
+            q.push("delete from contacts where id in (select id from sel)");
+        })
+        .into_sql();
         assert_eq!(
             sql,
-            "select id from contacts where workspace_id = $1 and id in (select m.contact_id from \
-             selection_snapshot_members m join selection_snapshots s on s.workspace_id = \
-             m.workspace_id and s.id = m.snapshot_id where m.workspace_id = $2 and m.snapshot_id = \
-             $3 and s.expires_at > now()) and id <> all($4)"
+            "with sel as (select id from contacts where workspace_id = $1 and id in (select \
+             m.contact_id from selection_snapshot_members m join selection_snapshots s on \
+             s.workspace_id = m.workspace_id and s.id = m.snapshot_id where m.workspace_id = $2 \
+             and m.snapshot_id = $3 and s.expires_at > now()) and id <> all($4)), done as (delete \
+             from contacts where id in (select id from sel) returning 1) select (select count(*) \
+             from sel)::bigint, (select count(*) from done)::bigint"
         );
     }
 

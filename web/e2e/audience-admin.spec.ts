@@ -497,10 +497,10 @@ test("a_delete_that_lost_a_race_is_measured_against_what_it_promised", async () 
   await expect(result()).toContainText("someone else");
 });
 
-test("a_delete_whose_view_widened_is_refused_and_names_both_numbers", async () => {
-  // A tag filter, so the match can be changed from outside this page. The snapshot bounds
-  // creation time only: every contact here existed before the token was issued, so nothing but
-  // the issue-time count can tell that the view grew.
+test("a_selection_acts_on_the_frozen_set_and_refuses_to_reach_past_the_confirmation", async () => {
+  // The end-to-end shape that matters: a signed token, rows unticked, and the real engine. A tag
+  // filter, so a second editor can change the live view from outside this page while the frozen
+  // set stays what it was.
   await page.goto(contactsPath);
   await page.getByLabel("Filter by tag", { exact: true }).selectOption({ label: "churn" });
   await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
@@ -510,42 +510,64 @@ test("a_delete_whose_view_widened_is_refused_and_names_both_numbers", async () =
     .click();
   await expect(page.getByText("All 2 contacts matching this view are selected.")).toBeVisible();
 
-  // A second editor tags exactly one more. One is the point: the widening has to be no larger
-  // than the number of rows the user unticks, or the bound catches it without the adjustment and
-  // this test proves nothing.
+  // A second editor tags one more into the filter. Under a re-evaluated predicate the actions
+  // below would reach it; it is not in the frozen set, so they must not.
   const found = await get<{ data: { id: string }[] }>("/contacts?q=wide-c@");
-  await put(`/contacts/${found.data[0]?.id}/tags/${ids.churn}`);
+  const wideC = found.data[0]?.id ?? "";
+  await put(`/contacts/${wideC}/tags/${ids.churn}`);
 
-  // Untick one. This is what used to buy room for the widening: the confirmation then reads
-  // "Delete 1 contact" while the server compared a count taken after the exclusions against one
-  // taken without them.
-  await page.getByRole("checkbox", { name: "Select wide-a@example.test", exact: true }).uncheck();
+  // An action over the token: exactly the two that were frozen, and the grid refetches after it,
+  // which is how the newcomer appears as a ticked row the selection never held.
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
+  await page.getByRole("button", { name: "Add tag", exact: true }).click();
+  await expect(result()).toContainText("Tagged 2 contacts with “crowd”");
+  expect(await named(`/contacts/${wideC}/tags`)).toMatchObject([{ name: "churn" }]);
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await expect(page.getByText("All 2 contacts matching this view are selected.")).toBeVisible();
+
+  // Untick the newcomer. The button now says one less than the action would reach, because the
+  // row unticked was never in the frozen set — the divergence a live grid produces.
+  await page.getByRole("checkbox", { name: "Select wide-c@example.test", exact: true }).uncheck();
   await expect(
     page.getByText("1 of 2 contacts matching this view are selected (1 left out)."),
   ).toBeVisible();
-
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
   const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
   await expect(confirm.getByRole("paragraph").first()).toContainText("1 contact");
   await confirm.getByRole("button", { name: "Delete 1 contact", exact: true }).click();
 
-  // Refused, with both numbers, and nothing deleted.
-  const alert = page.getByRole("alert").filter({ hasText: "nothing was deleted" });
+  // Refused, naming both numbers, with nothing deleted — a dialog reading "Delete 1 contact"
+  // must never delete two.
+  const alert = page.getByRole("alert").filter({ hasText: "nothing was done" });
   await expect(alert).toBeVisible();
-  await expect(alert).toContainText("2 contacts when you selected it");
-  await expect(alert).toContainText("matches up to 3 now");
+  await expect(alert).toContainText("acted on 2 contacts");
+  await expect(alert).toContainText("the confirmation said 1");
   const left = await get<{ data: { email: string }[] }>("/contacts?q=wide-");
   expect(left.data).toHaveLength(4);
+  // And the selection it refused is dropped, so the same button cannot repeat the same refusal.
+  await expect(page.getByText("contacts matching this view are selected")).toHaveCount(0);
 
-  // A reversible action over the same widened token proceeds, and says the view grew rather
-  // than reporting four as a plain success.
-  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "churn" });
-  await page.getByRole("button", { name: "Remove tag", exact: true }).click();
-  await expect(result()).toContainText("2 contacts when you selected it");
-  // The reversible kinds compare the same two unlike numbers, so the exclusion is added back
-  // here too: without it this reads as a plain success over three contacts.
-  await expect(result()).toContainText("matches up to 3 now");
-  await expect(result()).toContainText("changed to match it in between");
+  // Select again — three match now — and untick one that *is* in the new frozen set: the
+  // ordinary case proceeds and spares exactly the row that was unticked.
+  await page
+    .getByRole("checkbox", { name: "Select all loaded contacts", exact: true })
+    .check({ force: true });
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("All 3 contacts matching this view are selected.")).toBeVisible();
+  await page.getByRole("checkbox", { name: "Select wide-a@example.test", exact: true }).uncheck();
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Delete these contacts", exact: true })
+    .getByRole("button", { name: "Delete 2 contacts", exact: true })
+    .click();
+  await expect(result()).toContainText("Deleted 2 contacts");
+  const after = await get<{ data: { email: string }[] }>("/contacts?q=wide-");
+  expect(after.data.map((c) => c.email).sort()).toEqual([
+    "wide-a@example.test",
+    "wide-d@example.test",
+  ]);
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {

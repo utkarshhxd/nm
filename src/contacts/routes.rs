@@ -115,8 +115,12 @@ where
 }
 
 /// One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is
-/// how the grid shows what a selection actually holds; a snapshot that has expired, been swept or
-/// belongs to another workspace shows no contacts rather than all of them.
+/// how the grid shows what a selection actually holds.
+///
+/// A snapshot that has expired, been swept, been superseded or belongs to another workspace is
+/// `422 selection-expired`, **not** an empty page: "zero contacts matched" is a different fact
+/// from "this selection is gone", and the grid cannot tell someone to select again if the server
+/// will not say which it was.
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{workspace_id}/contacts",
@@ -125,7 +129,7 @@ where
     responses(
         (status = 200, description = "Newest first unless `sort` says otherwise", body = Page<Contact>),
         (status = 404, description = "not a member, or no such workspace"),
-        (status = 422, description = "a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id`"),
+        (status = 422, description = "a malformed cursor, an unknown `sort`, a `q` under 3 characters, a `list_status` without a `list_id`, or selection-expired: the `snapshot_id` names no live selection of this workspace"),
     ),
 )]
 pub async fn list_contacts(
@@ -148,6 +152,12 @@ pub async fn list_contacts(
         tag_id: params.tag_id,
         ..ContactFilter::with_search(params.q.as_deref())?
     };
+    // Refused here rather than answered with an empty page, and the page is *also* narrowed by the
+    // same `expires_at` join inside `list`: the check is the honest answer, the join is what makes
+    // a missed check harmless.
+    if let Some(snapshot_id) = params.snapshot_id {
+        selection::require_live(&mut conn, workspace_id, snapshot_id).await?;
+    }
     Ok(Json(list(&mut conn, workspace_id, &filter, &params).await?))
 }
 
@@ -766,29 +776,20 @@ async fn begin_bulk(
             if token.workspace_id != workspace_id {
                 return Err(ApiError::NotFound);
             }
-            // Issue `03`: the number the person confirmed finally reaches the server. Required,
-            // not optional — the whole gap was that nothing compared it, and a client that may
-            // omit it is a client that is not checked.
-            let Some(confirmed) = target.confirmed_count else {
+            // Issue `03`: the number the person confirmed must reach the server. Required, not
+            // optional — the whole gap was that nothing compared it, and a client that may omit
+            // it is a client that is not checked. It is compared in `refuse_if_more_than_confirmed`,
+            // after the action has resolved, because the quantity it has to be compared against is
+            // what the action actually reached.
+            if target.confirmed_count.is_none() {
                 return Err(ApiError::Validation(vec![FieldError::new(
                     "confirmed_count",
                     "send the number of contacts the confirmation showed",
                 )]));
-            };
-            let selection = selection::resolve(&mut tx, token).await?;
-            // `resolve` has refused unless `issued` is this snapshot's stored `size`, so this
-            // compares what the person confirmed against `selection_snapshots.size`.
-            if confirmed != selection.issued() {
-                return Err(ApiError::ConflictDetail {
-                    code: "selection-count-mismatch",
-                    detail: format!(
-                        "You confirmed {confirmed} contacts and this selection holds {}, so \
-                         nothing was done. Select again to see what you would be acting on.",
-                        selection.issued(),
-                    ),
-                });
             }
-            selection
+            // `resolve` refuses unless the token's `issued` is this snapshot's stored `size`,
+            // which is a different property worth having: it ties the signature to the row.
+            selection::resolve(&mut tx, token).await?
         }
         (None, Some(ids)) => {
             selection::check_ids(ids)?;
@@ -851,8 +852,52 @@ fn refuse_if_widened(
     })
 }
 
-/// The one audit row for a bulk action: what was asked (the filter and its time bound) and what
-/// it did (the count), never the contacts. Per-contact rows would outgrow the contacts table.
+/// Refuses, inside the transaction, when the action reached **more** contacts than the dialog
+/// said it would. The action has already run; returning an error here rolls it back.
+///
+/// This is issue `03`'s actual close (section 9.2). `confirmed_count` is the number on the button
+/// — the selection's size *less the rows the person unticked* — and `selected` is what the frozen
+/// set resolved to less the exclusions the request carried. Comparing the two is the only check
+/// that can catch a confirmation and a request that disagree: comparing `confirmed_count` with
+/// `selection_snapshots.size` compares it with the token's own signed `issued`, which the server
+/// already knew, so it verifies nothing a replayed token with fewer exclusions could not satisfy.
+///
+/// **One-sided, like `refuse_if_widened`.** Fewer than confirmed is not refused: section 8.2 says
+/// a contact deleted between the selection and the action is simply absent and the `affected` /
+/// `selected` gap reports it, and refusing there would turn somebody else's delete into this
+/// person's error. More than confirmed is refused, because that is the direction in which a
+/// dialog that said "Delete 1 contact" deletes two.
+///
+/// It fires today on an ordinary grid action: the grid shows the live filter, so unticking a row
+/// that is *not* in the frozen set lowers the dialog's number without lowering what the action
+/// reaches. That is a true refusal, not the spurious `409` section 8.9 removed — the dialog really
+/// did understate — and `?snapshot_id=` is what removes the case at source once the grid shows the
+/// frozen set (section 14).
+fn refuse_if_more_than_confirmed(target: &BulkTarget, counts: Counts) -> ApiResult<()> {
+    let Some(confirmed) = target.confirmed_count else {
+        // An explicit id list carries no confirmed count: the ids *are* the number, and the route
+        // refuses one alongside them.
+        return Ok(());
+    };
+    if counts.selected <= confirmed {
+        return Ok(());
+    }
+    Err(ApiError::ConflictDetail {
+        code: "selection-count-mismatch",
+        detail: format!(
+            "This would have acted on {} contacts and the confirmation said {confirmed}, so \
+             nothing was done. Select again to see what you would be acting on.",
+            counts.selected,
+        ),
+    })
+}
+
+/// The one audit row for a bulk action: what was asked (the predicate and its snapshot) and what
+/// it did (the counts), never the contacts. Per-contact rows would outgrow the contacts table.
+///
+/// It is also where `refuse_if_more_than_confirmed` runs, so that every action goes through it:
+/// this is the last thing inside the transaction, every bulk route ends here, and a sixth route
+/// cannot be written that forgets the check and still commits.
 async fn finish_bulk(
     mut tx: Transaction<'static, Postgres>,
     meta: &RequestMeta,
@@ -862,6 +907,8 @@ async fn finish_bulk(
     extra: Value,
     (counts, status): (Counts, Option<MembershipStatus>),
 ) -> ApiResult<Json<BulkResult>> {
+    // Before the audit row, so a refused action leaves no log entry claiming it happened.
+    refuse_if_more_than_confirmed(target, counts)?;
     // The predicate as the snapshot stored it (section 8.7). The token carries none and the
     // snapshot is deleted within the hour, so a log row holding only a snapshot id would read
     // "deleted 417,004 contacts, snapshot 0192…" against a row nobody can ever look up — worse

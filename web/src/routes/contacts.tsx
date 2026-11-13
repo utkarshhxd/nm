@@ -9,7 +9,7 @@ import {
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
-import { api, problemMessage } from "../api/client";
+import { api, problemMessage, problemType } from "../api/client";
 import type { components } from "../api/schema";
 import { Button } from "../components/button";
 import { ConfirmDialog } from "../components/confirm-dialog";
@@ -102,6 +102,17 @@ type Result = { tone: "ok" | "warn"; text: string };
 
 /** The five bulk routes. Only the last two are destructive enough to be confirmed first. */
 type Kind = "tag" | "untag" | "subscribe" | "unsubscribe" | "delete";
+
+/**
+ * Problem codes that mean the selection in hand can never be used again: its hour is up, its
+ * snapshot is gone, or it would reach more contacts than the bar said. Repeating the request
+ * cannot help, so the selection is dropped and the view refetched.
+ */
+const STALE_SELECTION = new Set([
+  "selection-expired",
+  "selection-invalid",
+  "selection-count-mismatch",
+]);
 type Confirming = {
   kind: "unsubscribe" | "delete";
   target: string;
@@ -334,15 +345,16 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       // server takes exactly one of the two, and applies the same rules to both. Each body
       // denies unknown fields, so a route is sent exactly the fields it declares and no more.
       //
-      // `confirmed_count` is the size the selection was made for — the number this bar showed,
-      // before any unticking — and the server refuses the action if it is not the size of the
-      // frozen set. It is what closes "you confirmed 5,000 and we changed 4,980".
-      const excluded = current.mode === "all" ? current.excluded.size : 0;
+      // `confirmed_count` is **the number on the button**: the selection's size less the rows
+      // unticked here, which is what `chosen` renders and what the dialog says. The server
+      // refuses the action if it would reach more than that, which is what closes "you confirmed
+      // 1 and we deleted 2". Sending the selection's whole size instead would send the server a
+      // number it already had signed into the token, and check nothing.
       const body =
         current.mode === "all"
           ? {
               selection_token: current.token,
-              confirmed_count: current.matched,
+              confirmed_count: current.matched - current.excluded.size,
               excluded_ids: [...current.excluded],
             }
           : { ids: [...current.ids] };
@@ -373,6 +385,15 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
                 }));
       if (error || !data) {
         setFailure(problemMessage(error, "The action failed and nothing was changed."));
+        // These three all mean "this selection cannot be used again": it expired, its snapshot is
+        // gone, or what it would reach no longer matches what the bar showed. The server's
+        // sentence says to select again, so clear the stale selection and refetch — otherwise the
+        // same button repeats the same refusal for an hour.
+        if (STALE_SELECTION.has(problemType(error).replace("urn:nm:problem:", ""))) {
+          silentClear.current = true;
+          store.clear();
+          await queryClient.invalidateQueries({ queryKey: ["contacts", id] });
+        }
         return;
       }
       // Deleting empties the selection: the rows it named are gone, and a stale set of ids is
@@ -383,7 +404,11 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         // The bar that held the button is about to unmount; focus goes to the outcome.
         toFocus.current = true;
       }
-      const message = describe(kind, name, data, promised, excluded);
+      // No "the view widened" line any more, and no exclusion count to compute one from: the
+      // server acts on a set that was written down when the selection was made, so nothing can
+      // join it afterwards, and anything it would reach beyond the confirmed number is refused
+      // rather than reported.
+      const message = describeOutcome(kind, name, data, promised);
       setResult(message);
       announce(message.text);
       // The table only changes when rows left it, or when it is filtered by what changed.
@@ -760,37 +785,6 @@ function BulkAction({
 }
 
 /**
- * What a bulk action did, in words that cannot be mistaken for more, plus the one thing the
- * per-kind wording cannot know: whether the view itself grew between the selection and the
- * action.
- */
-function describe(
-  kind: Kind,
-  name: string,
-  result: components["schemas"]["BulkResult"],
-  promised?: number,
-  excluded = 0,
-): Result {
-  const outcome = describeOutcome(kind, name, result, promised);
-  const { selected, issued } = result;
-  // `selected` is the match less the exclusions and `issued` is the whole match at issue time,
-  // so they are not the same quantity: comparing them directly misses any widening smaller than
-  // the number of rows the user unticked. The match now is at most `selected + excluded`, which
-  // is both the right thing to compare and the right number to show.
-  const now = selected + excluded;
-  if (now <= issued) return outcome;
-  // The view matched more when the action ran than when it was made: those contacts existed all
-  // along and someone tagged, subscribed or renamed them into it in between. `bulk/delete` and
-  // `bulk/subscribe` refuse outright (409, shown as the failure), so only tag, untag and
-  // unsubscribe reach this.
-  const extra = now - issued;
-  return {
-    tone: "warn",
-    text: `${outcome.text} This view matched ${count(issued, "contact")} when you selected it and matches up to ${now.toLocaleString()} now: ${extra.toLocaleString()} ${extra === 1 ? "was" : "were"} changed to match it in between.`,
-  };
-}
-
-/**
  * The outcome in that action's own terms. `affected` is how many it changed and `selected` how
  * many it was aimed at; they differ whenever some were already done. A `pending` subscribe wrote
  * rows that are not mailable until confirmed and nothing in this milestone confirms them, so it
@@ -836,13 +830,15 @@ function describeOutcome(
     const want = promised ?? selected;
     const short = want - affected;
     const them = short === 1 ? "it" : "them";
-    // More than was confirmed. The server refuses a widened filter selection before it deletes
-    // anything, so this is a backstop, not the main defence — and it is the direction that
-    // cannot be undone, so it says what happened rather than reading as success.
+    // More than was confirmed. The server now refuses that before it deletes anything — it
+    // compares this very number against what the action would reach — so this is a backstop for
+    // an id-list selection, which carries no confirmed count, and for a server that stopped
+    // checking. It is the direction that cannot be undone, so it says what happened rather than
+    // reading as success.
     if (short < 0) {
       return {
         tone: "warn",
-        text: `Deleted ${affected.toLocaleString()} contacts — more than the ${count(want, "contact")} you confirmed. Contacts that already existed were changed to match this view after you selected it. No address was suppressed.`,
+        text: `Deleted ${affected.toLocaleString()} contacts — more than the ${count(want, "contact")} you confirmed. No address was suppressed.`,
       };
     }
     return short > 0

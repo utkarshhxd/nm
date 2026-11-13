@@ -108,13 +108,25 @@ struct Sel {
 }
 
 impl Sel {
-    /// The target fields of a bulk body for this selection.
+    /// The target fields of a bulk body for this selection: the token and the number the
+    /// confirmation showed, which with nothing unticked is the whole frozen set.
     fn target(&self) -> Value {
         json!({"selection_token": self.token, "confirmed_count": self.selected})
     }
 
+    /// Unticking rows, as the grid does it: the confirmation's number drops by one per unticked
+    /// row, which is right exactly while the rows shown are the rows frozen.
     fn excluding(&self, ids: &[Uuid]) -> Value {
-        body(self.target(), json!({"excluded_ids": ids}))
+        self.excluding_confirming(ids, self.selected - ids.len() as u64)
+    }
+
+    /// Unticking rows while the confirmation showed `confirmed` — the two come apart when the
+    /// grid is showing the live filter and a row that is not in the frozen set is unticked.
+    fn excluding_confirming(&self, ids: &[Uuid], confirmed: u64) -> Value {
+        body(
+            self.target(),
+            json!({"excluded_ids": ids, "confirmed_count": confirmed}),
+        )
     }
 }
 
@@ -652,9 +664,10 @@ async fn refuse_if_widened_never_fires(pool: PgPool) {
     assert_eq!(sel.selected, 2);
 
     // Everything M1a's arithmetic would have refused, at once: a contact tagged into the live
-    // view after the selection, and an exclusion that the frozen set never held.
+    // view after the selection, and exclusions the frozen set never held. The confirmation named
+    // the two that are frozen, which is what a grid showing the frozen set shows.
     apply_tag(&app, ws, churn, &ids[2..3]).await;
-    let outside = sel.excluding(&[ids[2], ids[3], Uuid::now_v7()]);
+    let outside = sel.excluding_confirming(&[ids[2], ids[3], Uuid::now_v7()], 2);
     let r = bulk(
         &app,
         ws,
@@ -670,9 +683,15 @@ async fn refuse_if_widened_never_fires(pool: PgPool) {
         "an exclusion outside the snapshot refused a selection that cannot widen"
     );
 
-    // The same on the irreversible one, and with an exclusion that *is* in the snapshot: it
+    // The same on the irreversible one, with one exclusion in the snapshot and one outside: it
     // narrows, it does not refuse.
-    let r = bulk(&app, ws, "delete", sel.excluding(&[ids[0], ids[3]])).await;
+    let r = bulk(
+        &app,
+        ws,
+        "delete",
+        sel.excluding_confirming(&[ids[0], ids[3]], 1),
+    )
+    .await;
     r.assert_status_ok();
     let v: Value = r.json();
     assert_eq!((&v["issued"], &v["affected"]), (&json!(2), &json!(1)));
@@ -681,33 +700,31 @@ async fn refuse_if_widened_never_fires(pool: PgPool) {
     // Ten thousand ids that are not in the snapshot — `MAX_EXCLUDED` exactly — still do not.
     let sel = select(&app, ws, json!({})).await;
     let many: Vec<Uuid> = (0..MAX_EXCLUDED).map(|_| Uuid::now_v7()).collect();
-    let r = bulk(&app, ws, "delete", sel.excluding(&many)).await;
+    let r = bulk(&app, ws, "delete", sel.excluding_confirming(&many, 3)).await;
     assert_eq!(affected(r).await, 3);
     assert_eq!(count(&pool, "select count(*) from contacts").await, 0);
 }
 
-/// Issue `03`: the number the person confirmed reaches the server, and the action is refused if it
-/// is not the size of the set that was frozen. "You confirmed 5,000 and we deleted 4,980" was open
-/// since M1a because closing it needed this design change.
+/// Issue `03`: the number the person confirmed reaches the server, and an action that would reach
+/// **more** contacts than that number is refused with nothing written. "You confirmed 5,000 and we
+/// deleted 4,980" was open since M1a because closing it needed this design change.
 #[sqlx::test]
-async fn the_confirmed_count_must_be_the_size_of_the_frozen_set(pool: PgPool) {
+async fn an_action_reaching_more_than_the_dialog_said_is_refused(pool: PgPool) {
     let (ws, app) = workspace(&pool, "acme").await;
     contacts(&app, ws, "c", 3).await;
     let sel = select(&app, ws, json!({})).await;
     assert_eq!(sel.selected, 3);
 
-    for wrong in [2u64, 4] {
-        let mut target = sel.target();
-        target["confirmed_count"] = json!(wrong);
-        let r = bulk(&app, ws, "delete", target).await;
-        r.assert_status(StatusCode::CONFLICT);
-        assert_eq!(problem_type(&r), "urn:nm:problem:selection-count-mismatch");
-        let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
-        assert!(
-            detail.contains(&wrong.to_string()) && detail.contains('3'),
-            "the refusal names both numbers: {detail}"
-        );
-    }
+    let mut target = sel.target();
+    target["confirmed_count"] = json!(2);
+    let r = bulk(&app, ws, "delete", target).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:selection-count-mismatch");
+    let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains('2') && detail.contains('3'),
+        "the refusal names both numbers: {detail}"
+    );
 
     // Absent is refused too: a count a client may leave out is a count nothing checks.
     let mut target = sel.target();
@@ -726,13 +743,22 @@ async fn the_confirmed_count_must_be_the_size_of_the_frozen_set(pool: PgPool) {
         0,
         "a refused action wrote an audit row"
     );
-    // The right number goes through, so the refusals above are not simply "every delete fails".
-    assert_eq!(
-        affected(bulk(&app, ws, "delete", sel.target()).await).await,
-        3
-    );
 
-    // It only applies to a token: with `ids` there is no snapshot to compare against, and a
+    // **Fewer** than confirmed is not refused: a contact somebody else deleted in between is
+    // simply absent, and the `issued`/`selected`/`affected` gap is how that is reported
+    // (section 8.2). Refusing here would turn their delete into this person's error.
+    let mut target = sel.target();
+    target["confirmed_count"] = json!(9);
+    let r = bulk(&app, ws, "delete", target).await;
+    r.assert_status_ok();
+    let v: Value = r.json();
+    assert_eq!(
+        (&v["issued"], &v["selected"], &v["affected"]),
+        (&json!(3), &json!(3), &json!(3))
+    );
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 0);
+
+    // It only applies to a token: with `ids` there is no frozen set to compare against, and a
     // number nothing checks must not be accepted.
     let fresh = contacts(&app, ws, "d", 2).await;
     bulk(
@@ -743,6 +769,45 @@ async fn the_confirmed_count_must_be_the_size_of_the_frozen_set(pool: PgPool) {
     )
     .await
     .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 2);
+}
+
+/// The case the check exists for, and the one the grid produces today: the live view has grown
+/// since the selection, the person unticks a row that is **not** in the frozen set, and the
+/// confirmation therefore says one less than the action would reach. Under a comparison against
+/// `selection_snapshots.size` — the token's own signed `issued` — this passed, and a dialog
+/// reading "Delete 1 contact" deleted two.
+#[sqlx::test]
+async fn unticking_a_row_outside_the_frozen_set_is_refused_not_quietly_widened(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let churn = tag(&app, ws, "churn").await;
+    let ids = contacts(&app, ws, "c", 3).await;
+    apply_tag(&app, ws, churn, &ids[..2]).await;
+    let sel = select(&app, ws, json!({"tag_id": churn})).await;
+    assert_eq!(sel.selected, 2, "the frozen set is c0 and c1");
+
+    // A second editor tags c2 into the live view; the grid shows three and the person unticks the
+    // newcomer, so the button reads "Delete 1 contact".
+    apply_tag(&app, ws, churn, &ids[2..]).await;
+    let r = bulk(&app, ws, "delete", sel.excluding(&[ids[2]])).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:selection-count-mismatch");
+    let detail = r.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains('1') && detail.contains('2'), "{detail}");
+
+    assert_eq!(count(&pool, "select count(*) from contacts").await, 3);
+    assert_eq!(
+        count(
+            &pool,
+            "select count(*) from audit_log where action like 'contacts.bulk_%'"
+        )
+        .await,
+        0
+    );
+
+    // Unticking a row that *is* frozen is the ordinary case and proceeds: the numbers agree.
+    let r = bulk(&app, ws, "delete", sel.excluding(&[ids[0]])).await;
+    assert_eq!(affected(r).await, 1);
     assert_eq!(count(&pool, "select count(*) from contacts").await, 2);
 }
 
@@ -1068,12 +1133,14 @@ async fn excluded_ids_are_bounded(pool: PgPool) {
     let sel = select(&app, ws, json!({})).await;
     let ids = |n: usize| (0..n).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
 
-    let r = bulk(&app, ws, "delete", sel.excluding(&ids(MAX_EXCLUDED + 1))).await;
+    let over = sel.excluding_confirming(&ids(MAX_EXCLUDED + 1), 2);
+    let r = bulk(&app, ws, "delete", over).await;
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(count(&pool, "select count(*) from contacts").await, 2);
 
-    // Exactly the cap passes the check and the action runs over the two that are frozen.
-    let target = sel.excluding(&ids(MAX_EXCLUDED));
+    // Exactly the cap passes the check and the action runs over the two that are frozen: none of
+    // those ten thousand ids is in the snapshot, so none of them narrows it.
+    let target = sel.excluding_confirming(&ids(MAX_EXCLUDED), 2);
     let r = bulk(&app, ws, "tag", body(target, json!({"tag_id": vip}))).await;
     assert_eq!(affected(r).await, 2);
 }
@@ -1537,23 +1604,19 @@ async fn the_grid_shows_the_frozen_set(pool: PgPool) {
         sorted(ids[..2].to_vec()),
         "the frozen set"
     );
-    // It narrows and never widens: an id that names no live snapshot of this workspace shows
-    // nothing, where an ignored parameter would show the whole workspace.
-    for unknown in [Uuid::now_v7(), Uuid::nil()] {
-        assert!(
-            page_ids(&app, ws, &format!("snapshot_id={unknown}"))
-                .await
-                .is_empty(),
-            "an unknown snapshot showed contacts"
-        );
-    }
+    // An id that names no live snapshot of this workspace is refused, not answered with an empty
+    // page: "zero contacts matched" is a different fact from "this selection is gone", and the
+    // grid cannot say "select again" if the server will not say which. It is certainly never the
+    // whole workspace, which is what ignoring the parameter would show.
     let theirs = select(&other, other_ws, json!({})).await;
-    assert!(
-        page_ids(&app, ws, &format!("snapshot_id={}", theirs.snapshot_id))
-            .await
-            .is_empty(),
-        "another workspace's snapshot"
-    );
+    for gone in [Uuid::now_v7(), Uuid::nil(), theirs.snapshot_id] {
+        let r = app
+            .get(&format!("{}/contacts?snapshot_id={gone}", base(ws)))
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem_type(&r), "urn:nm:problem:selection-expired");
+        assert!(r.json::<Value>().get("data").is_none(), "{gone}");
+    }
     // A snapshot narrows alongside the ordinary filters rather than replacing them.
     assert_eq!(
         page_ids(
@@ -1565,7 +1628,8 @@ async fn the_grid_shows_the_frozen_set(pool: PgPool) {
         vec![ids[1]]
     );
 
-    // An expired snapshot, still unswept, is empty here too.
+    // An expired snapshot, still unswept, is refused here too, and by its `expires_at` rather
+    // than by the row being gone.
     sqlx::query(
         "update selection_snapshots set expires_at = now() - interval '1 minute' where id = $1",
     )
@@ -1573,11 +1637,15 @@ async fn the_grid_shows_the_frozen_set(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    assert!(
-        page_ids(&app, ws, &format!("snapshot_id={}", sel.snapshot_id))
-            .await
-            .is_empty()
-    );
+    let r = app
+        .get(&format!(
+            "{}/contacts?snapshot_id={}",
+            base(ws),
+            sel.snapshot_id
+        ))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&r), "urn:nm:problem:selection-expired");
 }
 
 /// The ids on one page of `GET /contacts`, sorted.

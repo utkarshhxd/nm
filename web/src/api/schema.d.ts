@@ -451,8 +451,11 @@ export interface paths {
         };
         /**
          * One page of contacts. `?snapshot_id=` narrows it to a selection snapshot's frozen set, which is
-         *     how the grid shows what a selection actually holds; a snapshot that has expired, been swept or
-         *     belongs to another workspace shows no contacts rather than all of them.
+         *     how the grid shows what a selection actually holds.
+         * @description A snapshot that has expired, been swept, been superseded or belongs to another workspace is
+         *     `422 selection-expired`, **not** an empty page: "zero contacts matched" is a different fact
+         *     from "this selection is gone", and the grid cannot tell someone to select again if the server
+         *     will not say which it was.
          */
         get: operations["list_contacts"];
         put?: never;
@@ -3343,7 +3346,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a malformed cursor, an unknown `sort`, a `q` under 3 characters, or a `list_status` without a `list_id` */
+            /** @description a malformed cursor, an unknown `sort`, a `q` under 3 characters, a `list_status` without a `list_id`, or selection-expired: the `snapshot_id` names no live selection of this workspace */
             422: {
                 headers: {
                     [name: string]: unknown;
