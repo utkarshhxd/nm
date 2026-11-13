@@ -147,3 +147,31 @@ pub async fn add_member(pool: &PgPool, ws: Uuid, user: Uuid, role: Role) {
         .await
         .expect("add member");
 }
+
+/// Mints an API key of `role` as the signed-in `owner`.
+pub async fn api_key(owner: &TestApp, ws: Uuid, role: &str) -> String {
+    let r = owner
+        .post(&format!("/api/v1/workspaces/{ws}/api-keys"))
+        .json(&json!({"name": "ci", "role": role}))
+        .await;
+    r.assert_status(axum::http::StatusCode::CREATED);
+    r.json::<Value>()["key"].as_str().unwrap().to_owned()
+}
+
+/// A bearer-authenticated POST straight into the router. There is no HTTP client in between, so a
+/// streamed body reaches the caller as the server produces it, instead of being collected first
+/// the way `axum-test` collects every response.
+pub async fn post_raw(
+    state: &AppState,
+    key: &str,
+    uri: &str,
+    body: &Value,
+) -> axum::response::Response {
+    use tower::ServiceExt;
+    let req = axum::http::Request::post(uri)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    app::router(state.clone()).oneshot(req).await.unwrap()
+}

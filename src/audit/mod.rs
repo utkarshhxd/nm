@@ -40,6 +40,7 @@ pub mod actions {
     pub const CONTACTS_BULK_SUBSCRIBED: &str = "contacts.bulk_subscribed";
     pub const CONTACTS_BULK_UNSUBSCRIBED: &str = "contacts.bulk_unsubscribed";
     pub const CONTACTS_BULK_DELETED: &str = "contacts.bulk_deleted";
+    pub const CONTACTS_EXPORTED: &str = "contacts.exported";
     pub const LIST_CREATED: &str = "list.created";
     pub const LIST_UPDATED: &str = "list.updated";
     pub const LIST_DELETED: &str = "list.deleted";

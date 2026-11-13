@@ -13,7 +13,9 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    Contact, ContactFilter, NewContact, create, get, list,
+    Contact, ContactFilter, NewContact, create,
+    export::{self, Audit},
+    get, list,
     selection::{self, Counts, Selection},
     validate_attributes_patch, validate_name,
 };
@@ -75,6 +77,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts/bulk/delete",
             axum::routing::post(bulk_delete_contacts),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/contacts/export",
+            axum::routing::post(export_contacts),
         )
 }
 
@@ -536,6 +542,24 @@ pub struct NewSelection {
     pub segment_id: Option<Uuid>,
 }
 
+impl NewSelection {
+    /// The grid's filter for this body; `422` for a short `q` or a `list_status` with no list.
+    fn filter(&self) -> ApiResult<ContactFilter> {
+        if self.list_status.is_some() && self.list_id.is_none() {
+            return Err(ApiError::Validation(vec![FieldError::new(
+                "list_status",
+                "needs a list_id to narrow",
+            )]));
+        }
+        Ok(ContactFilter {
+            list_id: self.list_id,
+            list_status: self.list_status,
+            tag_id: self.tag_id,
+            ..ContactFilter::with_search(self.q.as_deref())?
+        })
+    }
+}
+
 /// What a bulk route acts on: exactly one of a filter selection or an explicit list of contacts.
 ///
 /// The three bulk bodies spell their fields out and deny unknown ones, on purpose: `excluded_ids`
@@ -700,18 +724,7 @@ async fn freeze(
     input: NewSelection,
     mut conn: sqlx::pool::PoolConnection<Postgres>,
 ) -> ApiResult<SelectionToken> {
-    if input.list_status.is_some() && input.list_id.is_none() {
-        return Err(ApiError::Validation(vec![FieldError::new(
-            "list_status",
-            "needs a list_id to narrow",
-        )]));
-    }
-    let filter = ContactFilter {
-        list_id: input.list_id,
-        list_status: input.list_status,
-        tag_id: input.tag_id,
-        ..ContactFilter::with_search(input.q.as_deref())?
-    };
+    let filter = input.filter()?;
     // A stored segment resolves with archived definitions **included**. Archiving a custom field
     // keeps every contact's value, so it must not break a saved segment that names the field;
     // preview and a save use the other resolver, because a *new* rule may not name an archived
@@ -929,9 +942,7 @@ async fn finish_bulk(
     // that a search was part of the selection, never what it said. Not a hash either: a hash of
     // an address falls to a dictionary. The snapshot keeps it unredacted while it lives, because
     // it is deleted within the hour and the person reading it is the one who typed it.
-    if !filter["q"].is_null() {
-        filter["q"] = json!("<redacted>");
-    }
+    redact_q(&mut filter);
     audit::record(
         &mut *tx,
         meta,
@@ -1186,4 +1197,83 @@ pub async fn bulk_delete_contacts(
         (n, None),
     )
     .await
+}
+
+/// The search text can be an address or a name, and the audit log outlives an erasure: record
+/// that a search was part of the filter, never what it said. The filter is the flat document
+/// `serde_json::to_value(NewSelection)` gives, so `q` is a top-level key.
+fn redact_q(filter: &mut Value) {
+    if !filter["q"].is_null() {
+        filter["q"] = json!("<redacted>");
+    }
+}
+
+/// Streams every contact the filter matches as CSV: the grid's filter, `segment_id` included.
+///
+/// Never buffered (`export` explains how), formula cells are prefixed with `'`, and the audit row
+/// records the actor, the filter with `q` redacted, and the row count. Admin only. That does not
+/// stop exfiltration, since an editor can already page the book out 100 rows at a time; it raises
+/// the cost and makes one place where there was none.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/export",
+    operation_id = "export_contacts",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id")),
+    request_body = NewSelection,
+    responses(
+        (status = 200, description = "text/csv, streamed", content_type = "text/csv", body = String),
+        (status = 403, description = "insufficient-role: export takes admin"),
+        (status = 404, description = "not a member, no such workspace, or no such segment"),
+        (status = 422, description = "a `q` under 3 characters, or a `list_status` without a `list_id`"),
+    ),
+)]
+pub async fn export_contacts(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiJson(input): ApiJson<NewSelection>,
+) -> ApiResult<Response> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Admin).await?;
+    let filter = input.filter()?;
+    // `404` for a segment that is not this workspace's, decided in `load_rules`: read as "no
+    // rules" it would export the whole workspace. Nothing here builds a `Group` by hand.
+    let rules = match input.segment_id {
+        Some(id) => Some(load_rules(&mut conn, workspace_id, id).await?),
+        None => None,
+    };
+    let live = definitions_for(&mut *conn, workspace_id)
+        .await?
+        .into_iter()
+        .filter(|d| d.archived_at.is_none())
+        .collect();
+    let mut doc = serde_json::to_value(&input).map_err(|e| ApiError::Internal(e.into()))?;
+    redact_q(&mut doc);
+    let audit = Audit {
+        meta,
+        actor: principal.actor(),
+        filter: doc,
+    };
+    let body = export::start(
+        state.pool.clone(),
+        conn,
+        workspace_id,
+        filter,
+        rules,
+        live,
+        audit,
+    );
+    Ok((
+        [
+            ("content-type", "text/csv; charset=utf-8"),
+            (
+                "content-disposition",
+                "attachment; filename=\"contacts.csv\"",
+            ),
+            ("cache-control", "no-store"),
+        ],
+        body,
+    )
+        .into_response())
 }

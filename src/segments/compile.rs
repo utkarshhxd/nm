@@ -67,7 +67,7 @@ use crate::{
 /// the same clause in the list and tag fragments: those correlate on `contacts.id`, which is
 /// workspace-unique, while these correlate on an address, and the same address legitimately
 /// exists in many workspaces. Here the correlation is the only thing separating tenants.
-const SUPPRESSION_ARMS: [&str; 4] = [
+pub(crate) const SUPPRESSION_ARMS: [&str; 4] = [
     "(select 1 from suppressions s where s.lifted_at is null \
       and s.workspace_id = contacts.workspace_id \
       and s.scope = 'address' and s.email = contacts.email)",

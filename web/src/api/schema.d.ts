@@ -566,6 +566,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Streams every contact the filter matches as CSV: the grid's filter, `segment_id` included.
+         * @description Never buffered (`export` explains how), formula cells are prefixed with `'`, and the audit row
+         *     records the actor, the filter with `q` redacted, and the row count. Admin only. That does not
+         *     stop exfiltration, since an editor can already page the book out 100 rows at a time; it raises
+         *     the cost and makes one place where there was none.
+         */
+        post: operations["export_contacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts/selection": {
         parameters: {
             query?: never;
@@ -3683,6 +3706,54 @@ export interface operations {
                 content?: never;
             };
             /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    export_contacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSelection"];
+            };
+        };
+        responses: {
+            /** @description text/csv, streamed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/csv": string;
+                };
+            };
+            /** @description insufficient-role: export takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such workspace, or no such segment */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a `q` under 3 characters, or a `list_status` without a `list_id` */
             422: {
                 headers: {
                     [name: string]: unknown;

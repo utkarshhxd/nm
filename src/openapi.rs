@@ -60,6 +60,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::contacts::routes::bulk_subscribe_contacts,
         crate::contacts::routes::bulk_unsubscribe_contacts,
         crate::contacts::routes::bulk_delete_contacts,
+        crate::contacts::routes::export_contacts,
         crate::lists::routes::list_lists,
         crate::lists::routes::get_list,
         crate::lists::routes::create_list,

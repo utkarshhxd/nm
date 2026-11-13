@@ -1813,6 +1813,59 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/contacts/export": {
+      "post": {
+        "tags": [
+          "crate::contacts::routes"
+        ],
+        "summary": "Streams every contact the filter matches as CSV: the grid's filter, `segment_id` included.",
+        "description": "Never buffered (`export` explains how), formula cells are prefixed with `'`, and the audit row\nrecords the actor, the filter with `q` redacted, and the row count. Admin only. That does not\nstop exfiltration, since an editor can already page the book out 100 rows at a time; it raises\nthe cost and makes one place where there was none.",
+        "operationId": "export_contacts",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSelection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "text/csv, streamed",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: export takes admin"
+          },
+          "404": {
+            "description": "not a member, no such workspace, or no such segment"
+          },
+          "422": {
+            "description": "a `q` under 3 characters, or a `list_status` without a `list_id`"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts/selection": {
       "post": {
         "tags": [
