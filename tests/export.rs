@@ -61,6 +61,31 @@ async fn insert(pool: &PgPool, ws: Uuid, email: &str, first: &str) -> Uuid {
     id
 }
 
+/// Splits at every `sep` that no backslash escapes, leaving the escapes in place.
+fn split_unescaped(s: &str, sep: char) -> Vec<String> {
+    let (mut parts, mut cur, mut chars) = (vec![], String::new(), s.chars());
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                cur.push(c);
+                cur.extend(chars.next());
+            }
+            c if c == sep => parts.push(std::mem::take(&mut cur)),
+            c => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
+fn unescape(s: &str) -> String {
+    let (mut out, mut chars) = (String::new(), s.chars());
+    while let Some(c) = chars.next() {
+        out.push(if c == '\\' { chars.next().unwrap() } else { c });
+    }
+    out
+}
+
 /// RFC 4180, enough of it to read our own output back: quoted cells, doubled quotes. **A bare CR or
 /// LF outside quotes ends a record too**, as it does for the many readers that split lines first:
 /// a cell holding a line break that was not quoted would show up here as an extra record.
@@ -704,6 +729,96 @@ async fn exports_are_rate_limited_per_workspace(pool: PgPool) {
         nm::http::rate_limit::EXPORT_PER_MINUTE as usize,
         "a refused export is not an export"
     );
+}
+
+/// `lists` and `tags` read back to exactly the names that went in, whatever those names hold. A
+/// list named `A;B` must not come back as two lists, nor `C:D` as a list `C` with the status `D:...`.
+#[sqlx::test]
+async fn list_and_tag_names_with_separators_round_trip(pool: PgPool) {
+    let (ws, _owner, admin) = workspace(&pool, "acme").await;
+    let contact = insert(&pool, ws, "a@example.com", "A").await;
+    let lists = [
+        ("A;B", "subscribed"),
+        ("C:D", "unsubscribed"),
+        (r"E\F", "pending"),
+        (r"G\;H:I", "subscribed"),
+    ];
+    for (name, status) in lists {
+        let l = admin
+            .post(&format!("{}/lists", base(ws)))
+            .json(&json!({"name": name}))
+            .await;
+        l.assert_status(StatusCode::CREATED);
+        sqlx::query(
+            "insert into list_memberships (workspace_id, contact_id, list_id, status) \
+             values ($1, $2, $3, $4)",
+        )
+        .bind(ws)
+        .bind(contact)
+        .bind(
+            l.json::<Value>()["id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        )
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let tags = ["T;1", "T:2", r"T\3"];
+    for name in tags {
+        let t = admin
+            .post(&format!("{}/tags", base(ws)))
+            .json(&json!({"name": name}))
+            .await;
+        t.assert_status(StatusCode::CREATED);
+        sqlx::query(
+            "insert into contact_tags (workspace_id, contact_id, tag_id) values ($1, $2, $3)",
+        )
+        .bind(ws)
+        .bind(contact)
+        .bind(
+            t.json::<Value>()["id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (head, rows) = export(&admin, ws, json!({})).await;
+    let row = &rows[0];
+    let mut got: Vec<(String, String)> = split_unescaped(&row[col(&head, "lists")], ';')
+        .iter()
+        .map(|entry| {
+            // Exactly one `:` is unescaped, the one between name and status: a name's own colon
+            // must not be a second.
+            let parts = split_unescaped(entry, ':');
+            assert_eq!(parts.len(), 2, "entry {entry:?}");
+            (unescape(&parts[0]), parts[1].clone())
+        })
+        .collect();
+    got.sort();
+    let mut want: Vec<(String, String)> = lists
+        .iter()
+        .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
+        .collect();
+    want.sort();
+    assert_eq!(got, want, "raw cell {:?}", row[col(&head, "lists")]);
+
+    let mut got_tags: Vec<String> = split_unescaped(&row[col(&head, "tags")], ';')
+        .iter()
+        .map(|t| unescape(t))
+        .collect();
+    got_tags.sort();
+    let mut want_tags: Vec<String> = tags.iter().map(|t| (*t).to_owned()).collect();
+    want_tags.sort();
+    assert_eq!(got_tags, want_tags);
 }
 
 /// A number is not a formula, so `-5` comes back as `-5`; nothing that merely starts like one does.

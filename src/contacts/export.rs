@@ -70,6 +70,11 @@ pub struct Audit {
 /// prefixed (plus-addressing makes `+x@y.com` real); the importer strips a leading apostrophe on
 /// read, which is lossless, where an exception per column would mean reasoning about a
 /// spreadsheet's parser per column.
+///
+/// **What M1c's importer must undo when it reads this file back, both of them lossless:** (1) a
+/// leading `'` on a cell, and (2) the backslash escapes in the `lists` and `tags` columns: split
+/// on a `;` that no backslash precedes, split a list entry at its one unescaped `:` into name and
+/// status, then turn `\\`, `\;` and `\:` back into `\`, `;` and `:`.
 fn push_cell(out: &mut String, cell: &str) {
     let formula = matches!(
         cell.chars().next(),
@@ -116,29 +121,39 @@ fn attr_text(value: Option<&Value>) -> String {
 /// The export query. **The workspace clause is written here**: neither `push_filter` nor
 /// `push_rules` emits one, and a missing one exports every tenant's contacts.
 ///
+/// A name as the `lists` and `tags` columns carry it: `\`, `;` and `:` each get a backslash, `\`
+/// first. `;` joins the names and `:` separates a list's name from its status, so without this a
+/// list named `A;B` reads back as two lists and one named `C:D` as a list `C` with the status `D...`.
+/// Almost no name holds any of them, so the column stays readable in a spreadsheet, and it is
+/// lossless for the importer.
+fn escaped(column: &str) -> String {
+    format!("replace(replace(replace({column}, '\\', '\\\\'), ';', '\\;'), ':', '\\:')")
+}
+
 /// `lists` is `name:status` for every membership, whatever its status: an export that cannot tell
-/// `unsubscribed` from `subscribed` is a re-subscription waiting for the importer. `tags` are bare
-/// names, having no status. `contacts` is not aliased: the fragments the filter appends refer to
-/// it by name.
+/// `unsubscribed` from `subscribed` is a re-subscription waiting for the importer. `tags` are
+/// names with no status, escaped the same way. `contacts` is not aliased: the fragments the filter
+/// appends refer to it by name.
 fn query(
     workspace_id: Uuid,
     filter: &ContactFilter,
     rules: Option<&Group>,
 ) -> QueryBuilder<Postgres> {
-    let mut q = QueryBuilder::<Postgres>::new(
+    let (list, tag) = (escaped("l.name"), escaped("t.name"));
+    let mut q = QueryBuilder::<Postgres>::new(format!(
         "select contacts.id, contacts.email, contacts.first_name, contacts.last_name, \
          contacts.timezone, contacts.created_at, contacts.updated_at, contacts.attributes, \
-         coalesce((select string_agg(l.name || ':' || m.status, ';' order by l.name) \
+         coalesce((select string_agg({list} || ':' || m.status, ';' order by l.name) \
             from list_memberships m join lists l \
               on l.workspace_id = m.workspace_id and l.id = m.list_id \
             where m.workspace_id = contacts.workspace_id and m.contact_id = contacts.id), '') \
             as lists, \
-         coalesce((select string_agg(t.name, ';' order by t.name) \
+         coalesce((select string_agg({tag}, ';' order by t.name) \
             from contact_tags ct join tags t \
               on t.workspace_id = ct.workspace_id and t.id = ct.tag_id \
             where ct.workspace_id = contacts.workspace_id and ct.contact_id = contacts.id), '') \
-            as tags, (",
-    );
+            as tags, ("
+    ));
     for (i, arm) in SUPPRESSION_ARMS.iter().enumerate() {
         if i > 0 {
             q.push(" or ");
