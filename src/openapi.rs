@@ -163,6 +163,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::segments::routes::PreviewRequest,
         crate::segments::preview::Preview,
         crate::segments::preview::SegmentCount,
+        crate::segments::preview::CountState,
         crate::tags::Tag,
         crate::tags::routes::NewTag,
         crate::tags::routes::UpdateTag,

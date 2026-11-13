@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::{
     compile::push_rules,
-    rules::{Field, Group, RuleNode},
+    rules::{Field, Group, RuleError, RuleNode},
 };
 use crate::error::{ApiError, ApiResult};
 
@@ -87,16 +87,42 @@ pub async fn preview(
     }
 }
 
+/// What one row of a batch count is, and why.
+///
+/// A nullable number stood for three different facts here — no estimate is honest, the batch ran
+/// out of time, the stored document no longer parses — and the list told all three of them with
+/// section 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CountState {
+    /// Counted. `count` is the number of contacts that match.
+    Exact,
+    /// The planner's row estimate, after the count ran out of its budget. `count` is that figure.
+    Estimated,
+    /// No honest number: the document filters on a custom attribute, where section 6 ships no
+    /// index and the planner's default selectivity measured 66x low. `count` is null, and this is
+    /// the only state the list says "too many to count exactly" for.
+    NoEstimate,
+    /// The stored document no longer parses, so it cannot be compiled or counted. `count` is null
+    /// and the segment needs re-saving. One such row no longer costs the other 24 their counts.
+    Unreadable,
+}
+
 /// One segment's count in a batch. `Preview`'s `took_ms` has no meaning per row: the batch is one
 /// statement and every row in it took the same time.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SegmentCount {
     pub id: Uuid,
-    /// `null` where section 5 allows no honest number: the document filters on a custom attribute,
-    /// or the batch ran out of time. The list shows "too many to count exactly" for both.
+    pub state: CountState,
+    /// The number, for `exact` and `estimated`. Null for the other two states, which is what
+    /// `state` is there to explain.
     pub count: Option<i64>,
-    /// Always `true` alongside a number here: a batch is counted exactly or not at all.
-    pub exact: bool,
+}
+
+impl SegmentCount {
+    fn new(id: Uuid, state: CountState, count: Option<i64>) -> SegmentCount {
+        SegmentCount { id, state, count }
+    }
 }
 
 /// How many contacts each of `segments` matches, in **one** statement on **one** connection.
@@ -105,37 +131,57 @@ pub struct SegmentCount {
 /// whole quota on a single page load — 30 a minute against 25 rows — which is what makes section
 /// 19's lateral-join note urgent ahead of its latency argument.
 ///
-/// Section 5 still decides what a count may say, and this path is strictly more conservative than
-/// `preview`: a document filtering on a custom attribute gets no number without touching the
-/// database, and a batch that times out gets no numbers at all. The planner estimate `preview`
-/// falls back to needs an `EXPLAIN` per segment, which is the round trip per row this exists to
-/// avoid, and section 5's own measurement says a figure nobody should act on is worse than none.
+/// Section 5 decides what a count may say, per row:
+///
+/// - A document filtering on a custom attribute is `no_estimate` without touching the database.
+/// - A stored document that no longer parses is `unreadable`, and only that row.
+/// - The rest are counted together. **If that statement runs out of time, each of them falls back
+///   to the planner's estimate in a fresh transaction**, the way `preview` does — the timed-out
+///   transaction is aborted and unusable. `EXPLAIN` is plan-only, so the round trip per row this
+///   route exists to avoid is paid only on a page that was already too slow to count.
 pub async fn counts(
     pool: &PgPool,
     workspace_id: Uuid,
-    segments: &[(Uuid, Group)],
+    segments: &[(Uuid, Result<Group, RuleError>)],
     timeout_ms: u64,
 ) -> ApiResult<Vec<SegmentCount>> {
-    let countable: Vec<&(Uuid, Group)> = segments
-        .iter()
-        .filter(|(_, group)| !filters_on_an_attribute(group))
-        .collect();
-    let mut counted: HashMap<Uuid, i64> = HashMap::new();
+    let mut rows: HashMap<Uuid, SegmentCount> = HashMap::new();
+    let mut countable: Vec<(Uuid, &Group)> = Vec::new();
+    for (id, parsed) in segments {
+        match parsed {
+            Err(_) => {
+                rows.insert(*id, SegmentCount::new(*id, CountState::Unreadable, None));
+            }
+            Ok(group) if filters_on_an_attribute(group) => {
+                rows.insert(*id, SegmentCount::new(*id, CountState::NoEstimate, None));
+            }
+            Ok(group) => countable.push((*id, group)),
+        }
+    }
+
     if !countable.is_empty() {
         match count_many(pool, workspace_id, &countable, timeout_ms).await {
-            Ok(rows) => counted = rows.into_iter().collect(),
-            // Every row in the batch loses its number together: they were one statement.
-            Err(e) if timed_out(&e) => {}
+            Ok(counted) => {
+                for (id, n) in counted {
+                    rows.insert(id, SegmentCount::new(id, CountState::Exact, Some(n)));
+                }
+            }
+            // One statement, so every countable row ran out of time together — and every one of
+            // them gets its own estimate rather than the whole page losing its numbers.
+            Err(e) if timed_out(&e) => {
+                for (id, group) in &countable {
+                    let n = estimate(pool, workspace_id, group, timeout_ms).await?;
+                    rows.insert(*id, SegmentCount::new(*id, CountState::Estimated, Some(n)));
+                }
+            }
             Err(e) => return Err(e.into()),
         }
     }
+
+    // In the order asked for. Every id has a row: the three arms above are exhaustive.
     Ok(segments
         .iter()
-        .map(|(id, _)| SegmentCount {
-            id: *id,
-            count: counted.get(id).copied(),
-            exact: counted.contains_key(id),
-        })
+        .filter_map(|(id, _)| rows.remove(id))
         .collect())
 }
 
@@ -143,7 +189,7 @@ pub async fn counts(
 async fn count_many(
     pool: &PgPool,
     workspace_id: Uuid,
-    countable: &[&(Uuid, Group)],
+    countable: &[(Uuid, &Group)],
     timeout_ms: u64,
 ) -> sqlx::Result<Vec<(Uuid, i64)>> {
     let mut tx = pool.begin().await?;

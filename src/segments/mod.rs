@@ -22,7 +22,7 @@ use crate::{
     custom_fields::{FieldKind, definitions_for},
     error::{ApiError, ApiResult},
 };
-use rules::Group;
+use rules::{Group, RuleError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Segment {
@@ -113,11 +113,12 @@ pub async fn parse_unchanged_rules(
 /// between two statements cannot make a stored segment fail to load. Every definition is read,
 /// archived ones included.
 pub async fn load_rules(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResult<Group> {
-    let (_, group) = load_many_rules(db, workspace_id, &[id])
+    let (_, parsed) = load_many_rules(db, workspace_id, &[id])
         .await?
         .pop()
         .ok_or(ApiError::NotFound)?;
-    Ok(group)
+    // One document, so a document that no longer parses is this caller's whole answer.
+    Ok(parsed?)
 }
 
 /// [`load_rules`] for several ids at once, in the order asked for, in **one** statement.
@@ -127,11 +128,15 @@ pub async fn load_rules(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> 
 ///
 /// Every id must resolve: a missing one is the same `404` as on every other path that accepts a
 /// `segment_id`, never a silently shorter answer. Duplicates are the caller's to remove.
+///
+/// **A document that no longer parses is returned as that row's `Err`, not as the batch's.** One
+/// unreadable segment on a page used to cost the other twenty-four their counts; the caller
+/// decides what to do per row, and `load_rules` — one id — simply propagates it.
 pub async fn load_many_rules(
     db: &mut PgConnection,
     workspace_id: Uuid,
     ids: &[Uuid],
-) -> ApiResult<Vec<(Uuid, Group)>> {
+) -> ApiResult<Vec<(Uuid, Result<Group, RuleError>)>> {
     let rows = sqlx::query!(
         r#"select s.id, s.rules,
                   coalesce((select jsonb_object_agg(f.key, f.kind) from custom_fields f
@@ -145,8 +150,7 @@ pub async fn load_many_rules(
     .await?;
     let mut parsed = HashMap::with_capacity(rows.len());
     for row in rows {
-        // A stored document that no longer parses answers with the parser's own problem code.
-        parsed.insert(row.id, Group::parse(&row.rules, &row.kinds.0)?);
+        parsed.insert(row.id, Group::parse(&row.rules, &row.kinds.0));
     }
     ids.iter()
         .map(|id| {

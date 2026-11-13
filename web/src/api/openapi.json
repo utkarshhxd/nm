@@ -3379,7 +3379,7 @@
         ],
         "responses": {
           "200": {
-            "description": "One entry per id, in the order asked for. `count` is null where section 5 allows no honest number",
+            "description": "One entry per id, in the order asked for, each carrying its own `state`: counted, estimated, or one of the two reasons there is no number",
             "content": {
               "application/json": {
                 "schema": {
@@ -4544,6 +4544,16 @@
         "enum": [
           "created",
           "email"
+        ]
+      },
+      "CountState": {
+        "type": "string",
+        "description": "What one row of a batch count is, and why.\n\nA nullable number stood for three different facts here — no estimate is honest, the batch ran\nout of time, the stored document no longer parses — and the list told all three of them with\nsection 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.",
+        "enum": [
+          "exact",
+          "estimated",
+          "no_estimate",
+          "unreadable"
         ]
       },
       "CreatedApiKey": {
@@ -6372,7 +6382,7 @@
         "description": "One segment's count in a batch. `Preview`'s `took_ms` has no meaning per row: the batch is one\nstatement and every row in it took the same time.",
         "required": [
           "id",
-          "exact"
+          "state"
         ],
         "properties": {
           "count": {
@@ -6381,15 +6391,14 @@
               "null"
             ],
             "format": "int64",
-            "description": "`null` where section 5 allows no honest number: the document filters on a custom attribute,\nor the batch ran out of time. The list shows \"too many to count exactly\" for both."
-          },
-          "exact": {
-            "type": "boolean",
-            "description": "Always `true` alongside a number here: a batch is counted exactly or not at all."
+            "description": "The number, for `exact` and `estimated`. Null for the other two states, which is what\n`state` is there to explain."
           },
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CountState"
           }
         }
       },

@@ -618,11 +618,16 @@ const PREVIEW_PROBLEMS = {
  * What a count area has to show. One type for the builder and for a row of the list, so the
  * wording and the three shapes of section 5 are written once.
  */
+/** The server's per-row answer: what the number is, or which of the two reasons there is none. */
+export type RowState = components["schemas"]["CountState"];
+
 export type CountState =
   | { kind: "unfinished" }
   | { kind: "counting" }
   | { kind: "failed"; message: string; retry: () => void }
-  | { kind: "counted"; count: number | null | undefined; exact: boolean };
+  /** The batch failed; one alert for the page says so, and the rows stay quiet. */
+  | { kind: "unavailable" }
+  | { kind: "counted"; state: RowState; count: number | null | undefined };
 
 /**
  * The count for `doc`, refreshed on a debounce and **only when the document really changed**:
@@ -635,7 +640,12 @@ export type CountState =
  *
  * Nothing here is on the typing path. The controls are driven by `doc`, which this only reads.
  */
-export function usePreview(ws: string, doc: Doc, fields: FieldOption[]): CountState {
+export function usePreview(
+  ws: string,
+  doc: Doc,
+  fields: FieldOption[],
+  enabled = true,
+): CountState {
   const json = JSON.stringify(doc);
   const [settled, setSettled] = useState(json);
   useEffect(() => {
@@ -657,7 +667,7 @@ export function usePreview(ws: string, doc: Doc, fields: FieldOption[]): CountSt
       if (!data) throw new Error(problemText(error, PREVIEW_PROBLEMS, "The count could not be loaded."));
       return data;
     },
-    enabled: finished && json === settled,
+    enabled: enabled && finished && json === settled,
     retry: false,
     refetchOnWindowFocus: false,
     // A count is only ever a number about this moment, and the window it is drawn from is a
@@ -670,9 +680,12 @@ export function usePreview(ws: string, doc: Doc, fields: FieldOption[]): CountSt
   if (query.isError) {
     return { kind: "failed", message: query.error.message, retry: () => void query.refetch() };
   }
-  return query.data
-    ? { kind: "counted", count: query.data.count, exact: query.data.exact }
-    : { kind: "counting" };
+  if (!query.data) return { kind: "counting" };
+  // `preview`'s own shape is unambiguous — its `null` only ever means an `attr:` document — so
+  // it is mapped onto the per-row states the list uses rather than the other way round.
+  const { count, exact } = query.data;
+  if (count === null || count === undefined) return { kind: "counted", state: "no_estimate", count };
+  return { kind: "counted", state: exact ? "exact" : "estimated", count };
 }
 
 /** A count area: the pending, failed and unfinished states around [`CountText`]. */
@@ -690,6 +703,13 @@ export function Count({ state, testId }: { state: CountState; testId: string }) 
       </span>
     );
   }
+  if (state.kind === "unavailable") {
+    return (
+      <span className="text-fg-muted" data-testid={testId}>
+        —
+      </span>
+    );
+  }
   if (state.kind === "counting") {
     return (
       <div className="w-24">
@@ -697,7 +717,7 @@ export function Count({ state, testId }: { state: CountState; testId: string }) 
       </div>
     );
   }
-  return <CountText count={state.count} exact={state.exact} testId={testId} />;
+  return <CountText state={state.state} count={state.count} testId={testId} />;
 }
 
 /**
@@ -709,24 +729,35 @@ export function Count({ state, testId }: { state: CountState; testId: string }) 
  * colour-blind reader acts on as exact (WCAG 1.4.1).
  */
 export function CountText({
+  state,
   count,
-  exact,
   testId,
 }: {
+  state: RowState;
   count: number | null | undefined;
-  exact: boolean;
   testId: string;
 }) {
-  if (count === null || count === undefined) {
+  // Each sentence belongs to one state. "too many to count exactly" is section 5's wording for a
+  // document that cannot be estimated honestly, and a count that merely ran out of time borrowing
+  // it is how a page comes to say something false about segments it could have counted.
+  if (state === "no_estimate") {
     return <span data-testid={testId}>too many to count exactly</span>;
+  }
+  if (state === "unreadable") {
+    return <span data-testid={testId}>needs re-saving</span>;
+  }
+  if (count === null || count === undefined) {
+    // A number the server promises with these two states. Saying one of the sentences above
+    // would be guessing at which fact is missing, which is the thing the states exist to stop.
+    return <span data-testid={testId}>—</span>;
   }
   const number = count.toLocaleString();
   return (
     <>
       <span data-testid={testId} className="tabular-nums">
-        {exact ? number : `~${number}`}
+        {state === "exact" ? number : `~${number}`}
       </span>
-      {exact ? null : <span className="ms-2 text-fg-muted">estimate</span>}
+      {state === "exact" ? null : <span className="ms-2 text-fg-muted">estimate</span>}
     </>
   );
 }

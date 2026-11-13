@@ -549,8 +549,9 @@ fn parse_ids(raw: &str) -> ApiResult<Vec<Uuid>> {
     operation_id = "count_segments",
     params(("workspace_id" = Uuid, Path, description = "Workspace id"), CountParams),
     responses(
-        (status = 200, description = "One entry per id, in the order asked for. `count` is null \
-            where section 5 allows no honest number", body = Vec<SegmentCount>),
+        (status = 200, description = "One entry per id, in the order asked for, each carrying \
+            its own `state`: counted, estimated, or one of the two reasons there is no number",
+            body = Vec<SegmentCount>),
         (status = 404, description = "not a member, or an id that is not a segment of this \
             workspace"),
         (status = 422, description = "ids that are not a list of at most 25 uuids"),

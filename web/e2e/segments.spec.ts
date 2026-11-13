@@ -95,6 +95,27 @@ async function openBuilder(name: string): Promise<void> {
   await page.getByLabel("Name", { exact: true }).fill(name);
 }
 
+/**
+ * Every test starts with the page's counts stubbed away, and the ones the count is the subject
+ * of drop the stub with `realCounts()`.
+ *
+ * A workspace gets thirty counts and previews a minute between them (`PREVIEW_PER_MINUTE`) and
+ * this file opens the screen twenty times inside one, so without this the suite spends the
+ * window on tests that never look at a count and the ones that do fail for a reason they are not
+ * asserting. It is also the honest shape: a test should not exercise what it is not checking.
+ */
+test.beforeEach(async () => {
+  for (const p of [page, viewerPage]) {
+    await p.unroute(COUNTS);
+    await p.route(COUNTS, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+    );
+  }
+});
+
+/** This test asks the server for the real counts, or installs a stub of its own. */
+const realCounts = (p: Page = page) => p.unroute(COUNTS);
+
 const rule = (path: string) => page.getByRole("group", { name: `Rule ${path}`, exact: true });
 const fieldOf = (path: string) => page.getByLabel(`Field for rule ${path}`, { exact: true });
 const opOf = (path: string) => page.getByLabel(`Operator for rule ${path}`, { exact: true });
@@ -332,7 +353,11 @@ test("a_count_from_the_previous_document_is_never_shown_as_this_ones", async () 
     await route.continue().catch(() => undefined);
   });
   await valueOf("1").fill("one@acme");
-  await expect(count()).toHaveCount(0);
+  // Read *inside* the debounce, not after it. `toHaveCount(0)` on its own polls for five
+  // seconds and the stale number clears itself the moment the debounce fires, so a poll passes
+  // over the very window the defect lives in.
+  await page.waitForTimeout(150);
+  expect(await count().count(), "the previous document's number is still on screen").toBe(0);
   await expect(drawer().getByText("Counting contacts")).toBeAttached();
   await page.unroute(PREVIEW);
 });
@@ -389,9 +414,10 @@ test("a_rate_limited_count_says_to_slow_down", async () => {
   await opOf("1").selectOption("contains");
   await valueOf("1").fill("@acme.test");
   await expect(drawer().getByText(/slow down/i)).toBeVisible();
-  // The generic fallback is a string `problemText` really can emit, so this fails if the
-  // refusal is swallowed into it rather than read.
-  await expect(drawer().getByText("The count could not be loaded.")).toHaveCount(0);
+  // The stub sends `detail: "rate limited"`, which is what `problemText` falls through to when
+  // this screen has no wording of its own. Asserting the server's terse code is *not* what the
+  // person reads is an assertion the code under test can actually fail.
+  await expect(drawer().getByText(/rate limited/)).toHaveCount(0);
   await page.unroute(PREVIEW);
 });
 
@@ -460,6 +486,7 @@ test("a_segment_deleted_underneath_the_editor_is_a_404_it_names", async () => {
 });
 
 test("the_list_shows_its_rows_before_the_counts_arrive", async () => {
+  await realCounts();
   // The counts held for two seconds: the rows must be on screen well before that.
   await page.route(COUNTS, async (route) => {
     await new Promise((done) => setTimeout(done, 2000));
@@ -477,6 +504,7 @@ test("the_list_shows_its_rows_before_the_counts_arrive", async () => {
   await page.unroute(COUNTS);
 
   // And the count lands: "No empty group" matches the two @acme.test contacts.
+  await realCounts();
   await openSegments();
   const row = page.getByRole("row", { name: /No empty group/ });
   await expect(row.getByTestId("segment-count")).toHaveText("2");
@@ -499,6 +527,7 @@ test("the_page_is_counted_in_one_request_and_an_archived_field_still_counts", as
     if (r.url().includes("/segments/counts")) asked.push("counts");
     if (r.url().includes("/segments/preview")) asked.push("preview");
   });
+  await realCounts();
   await openSegments();
 
   // A stored document resolves archived definitions (section 4.2), so this counts rather than
@@ -518,6 +547,7 @@ test("a_rule_the_server_accepts_does_not_strand_the_editor", async () => {
   // `eq ""` is a document `check_value` accepts: "the value is empty", not "nothing chosen yet".
   const stored = { match: "all", rules: [{ field: "first_name", op: "eq", value: "" }] };
   await post("/segments", { name: "Empty value", description: "", rules: stored });
+  await realCounts();
   await openSegments();
   const row = page.getByRole("row", { name: /Empty value/ });
   // Every contact here was created without a first name, and the column is `not null default ''`.
@@ -544,12 +574,93 @@ test("a_catalog_that_failed_to_load_is_never_read_as_archived", async () => {
   // false statement with a destructive fix attached.
   await expect(drawer().getByText(/could not be loaded/i)).toBeVisible();
   await expect(drawer().getByText(/archived/i)).toHaveCount(0);
-  await expect(drawer().getByRole("button", { name: "Remove", exact: true })).toHaveCount(0);
+  await expect(drawer().getByRole("button", { name: "Remove rule 1", exact: true })).toHaveCount(0);
 
   await page.unroute(CUSTOM_FIELDS);
   await drawer().getByRole("button", { name: "Retry", exact: true }).click();
   await expect(fieldOf("1")).toHaveValue("attr:company");
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
+});
+
+test("a_saved_edit_changes_the_row_count_without_a_reload", async () => {
+  await post("/segments", {
+    name: "Two then one",
+    description: "",
+    rules: { match: "all", rules: [{ field: "email", op: "contains", value: "@acme.test" }] },
+  });
+  await realCounts();
+  await openSegments();
+  const row = page.getByRole("row", { name: /Two then one/ });
+  await expect(row.getByTestId("segment-count")).toHaveText("2");
+
+  await page.getByRole("button", { name: "Edit Two then one", exact: true }).click();
+  await valueOf("1").fill("one@acme");
+  // The drawer works out the new answer for itself, so the row has no excuse.
+  await expect(count()).toHaveText("1");
+  await page.getByRole("button", { name: "Save segment", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Edit segment", exact: true })).toBeHidden();
+
+  // The counts are keyed by the ids on the page, which an edit does not change. Without the
+  // invalidation the row keeps saying 2 until a reload, with nothing to say it is stale.
+  await expect(row.getByTestId("segment-count")).toHaveText("1");
+});
+
+test("each_row_says_which_kind_of_answer_it_has", async () => {
+  await realCounts();
+  const all = await apiSegments();
+  expect(all.length, "four rows are needed to show four states").toBeGreaterThan(3);
+  const states = ["exact", "estimated", "no_estimate", "unreadable"] as const;
+  const counts = [7, 12400, null, null];
+  await page.route(COUNTS, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(
+        all.map((s, i) => ({ id: s.id, state: states[i % 4], count: counts[i % 4] })),
+      ),
+    }),
+  );
+  await openSegments();
+  // One sentence per state. "too many to count exactly" is section 5's wording for a document
+  // that cannot be estimated honestly; a row that merely ran out of time must not borrow it.
+  await expect(page.getByTestId("segment-count").first()).toHaveText("7");
+  await expect(page.getByText("~12,400").first()).toBeVisible();
+  await expect(page.getByText("estimate", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("too many to count exactly").first()).toBeVisible();
+  await expect(page.getByText("needs re-saving").first()).toBeVisible();
+  await page.unroute(COUNTS);
+});
+
+test("a_failed_batch_is_announced_once_and_the_rows_stay_quiet", async () => {
+  await realCounts();
+  await page.route(COUNTS, (route) => route.fulfill(BROKEN));
+  await openSegments();
+  // One failure, one announcement: a row each would read the same event twenty-five times, and
+  // twenty-five Retry buttons would all have the same name.
+  await expect(page.getByRole("alert")).toHaveCount(1);
+  await expect(
+    page.getByRole("button", { name: "Count the segments again", exact: true }),
+  ).toHaveCount(1);
+  await expect(page.getByTestId("segment-count").first()).toHaveText("—");
+  await page.unroute(COUNTS);
+});
+
+test("the_drawer_can_be_left_while_the_pickers_are_still_loading", async () => {
+  await page.route(CUSTOM_FIELDS, async (route) => {
+    await new Promise((done) => setTimeout(done, 3000));
+    await route.continue().catch(() => undefined);
+  });
+  await openSegments();
+  await page.getByRole("button", { name: "Edit On a live field", exact: true }).click();
+
+  // The name, the description and the way out are there from the first frame; only the rules
+  // wait. A drawer that is nothing but a heading and a skeleton has no way out for a mouse, and
+  // leaves focus on the heading when the form finally arrives.
+  await expect(page.getByLabel("Name", { exact: true })).toBeFocused();
+  await expect(drawer().getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Edit segment", exact: true })).toBeHidden();
+  await page.unroute(CUSTOM_FIELDS);
 });
 
 test("a_viewer_reads_segments_and_is_offered_no_way_to_change_one", async () => {
@@ -562,6 +673,7 @@ test("a_viewer_reads_segments_and_is_offered_no_way_to_change_one", async () => 
 });
 
 test("the_segments_screen_and_its_builder_are_axe_clean", async () => {
+  await realCounts();
   await openSegments();
   await expectNoViolations(new AxeBuilder({ page }), "segments list");
 

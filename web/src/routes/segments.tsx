@@ -89,6 +89,17 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
   });
 
   const catalog = useCatalog(ws);
+  /**
+   * Both, always. `["segment-counts", ws, ids]` is keyed by the ids on the page, so a saved edit
+   * that changes what a segment matches does not change the key: without this the row keeps the
+   * number from before the edit, unmarked, until a reload — and `staleTime` is a minute.
+   */
+  const refreshSegments = async () => {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["segments", ws] }),
+      qc.invalidateQueries({ queryKey: ["segment-counts", ws] }),
+    ]);
+  };
   const rows = segments.data?.data ?? [];
   const ids = rows.map((s) => s.id).join(",");
 
@@ -116,12 +127,13 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
     refetchOnWindowFocus: false,
     staleTime: 60_000,
   });
+  // A failed batch is one event, so it is announced once for the page (below) and the rows go
+  // quiet: twenty-five `role="alert"` spans and twenty-five identically named Retry buttons are
+  // the same failure read twenty-five times.
   const countOf = (id: string): CountState => {
-    if (counts.isError) {
-      return { kind: "failed", message: counts.error.message, retry: () => void counts.refetch() };
-    }
+    if (counts.isError) return { kind: "unavailable" };
     const found = counts.data?.get(id);
-    return found ? { kind: "counted", count: found.count, exact: found.exact } : { kind: "counting" };
+    return found ? { kind: "counted", state: found.state, count: found.count } : { kind: "counting" };
   };
 
   // Its own key rather than the members screen's: one cache entry served by two queryFns is one
@@ -151,7 +163,7 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
     },
     onSuccess: async () => {
       setDeleting(null);
-      await qc.invalidateQueries({ queryKey: ["segments", ws] });
+      await refreshSegments();
     },
   });
 
@@ -194,6 +206,15 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
           </EmptyState>
         ) : (
           <>
+            {/* One alert for one failure. The rows show "—" rather than repeating it. */}
+            {counts.isError ? (
+              <p role="alert" className="mb-3 text-danger-text">
+                {counts.error.message}{" "}
+                <Button variant="ghost" onClick={() => void counts.refetch()}>
+                  Count the segments again
+                </Button>
+              </p>
+            ) : null}
             <TableScroller label="Segments table">
               <table className="w-full">
                 <caption className="sr-only">Segments</caption>
@@ -267,34 +288,15 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
         variant="drawer"
         title={form === "new" ? "New segment" : "Edit segment"}
       >
-        {/* The builder is not rendered until the fields, lists and tags are really loaded. It
-            reads "not in the catalog" as "archived", which is true only of a catalog that
-            arrived: against a failed request it would tell someone a live field was archived and
-            offer to delete their rule. */}
-        {form === null ? null : catalog.isError ? (
-          <>
-            <ErrorState
-              title="The fields, lists and tags could not be loaded."
-              onRetry={catalog.retry}
-            >
-              Without them this segment cannot be shown correctly, so it is not shown at all.
-            </ErrorState>
-            <div className="mt-6 flex justify-end">
-              <Button onClick={() => setForm(null)}>Cancel</Button>
-            </div>
-          </>
-        ) : catalog.isPending ? (
-          <Skeleton label="Loading the fields, lists and tags" rows={3} />
-        ) : (
+        {form === null ? null : (
           <SegmentForm
             ws={ws}
             existing={form === "new" ? undefined : form}
-            catalog={catalog.catalog}
-            truncated={catalog.truncated}
+            catalog={catalog}
             onCancel={() => setForm(null)}
             onDone={async () => {
               setForm(null);
-              await qc.invalidateQueries({ queryKey: ["segments", ws] });
+              await refreshSegments();
             }}
           />
         )}
@@ -389,14 +391,12 @@ function SegmentForm({
   ws,
   existing,
   catalog,
-  truncated,
   onCancel,
   onDone,
 }: {
   ws: string;
   existing?: Segment;
-  catalog: Catalog;
-  truncated: boolean;
+  catalog: ReturnType<typeof useCatalog>;
   onCancel: () => void;
   onDone: () => void;
 }) {
@@ -405,7 +405,12 @@ function SegmentForm({
   const [doc, setDoc] = useState<Doc>(existing ? asDoc(existing.rules) : emptyDoc());
   const [unfinished, setUnfinished] = useState("");
 
-  const count = usePreview(ws, doc, catalog.fields);
+  // The name, the description and the way out are here from the first frame; only the rules wait
+  // for the pickers. The drawer used to render nothing but a skeleton and a heading until the
+  // catalog landed: no Cancel for a mouse, and first focus stuck on the heading afterwards.
+  const ready = !catalog.isPending && !catalog.isError;
+  const fields = catalog.catalog.fields;
+  const count = usePreview(ws, doc, fields, ready);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -431,7 +436,11 @@ function SegmentForm({
       setUnfinished("A segment needs at least one rule: an empty one would match every contact.");
       return;
     }
-    if (!complete(doc, catalog.fields)) {
+    if (!ready) {
+      setUnfinished("The fields, lists and tags are still loading.");
+      return;
+    }
+    if (!complete(doc, fields)) {
       setUnfinished("Finish every rule first — each one still needs a value.");
       return;
     }
@@ -466,19 +475,42 @@ function SegmentForm({
 
       <div className="mt-6">
         <h3 className="font-medium">Rules</h3>
-        <RuleBuilder doc={doc} onChange={setDoc} catalog={catalog} />
-        {truncated ? (
-          <p className="mt-3 text-fg-muted">
-            The pickers offer the first {CATALOG_LIMIT} custom fields, lists and tags. A workspace
-            with more than that has some that cannot be chosen here yet.
-          </p>
-        ) : null}
+        {/* The builder is not drawn until the fields, lists and tags are really loaded: it reads
+            "not in the catalog" as "archived", which is true only of a catalog that arrived.
+            Against a failed request it would tell someone a live field had been archived and
+            offer removal as the only way on. */}
+        {catalog.isError ? (
+          <div className="mt-3">
+            <ErrorState
+              title="The fields, lists and tags could not be loaded."
+              onRetry={catalog.retry}
+            >
+              Until they are, the rules cannot be shown correctly, so they are not shown at all.
+            </ErrorState>
+          </div>
+        ) : catalog.isPending ? (
+          <div className="mt-3">
+            <Skeleton label="Loading the fields, lists and tags" rows={3} />
+          </div>
+        ) : (
+          <>
+            <RuleBuilder doc={doc} onChange={setDoc} catalog={catalog.catalog} />
+            {catalog.truncated ? (
+              <p className="mt-3 text-fg-muted">
+                The pickers offer the first {CATALOG_LIMIT} custom fields, lists and tags. A
+                workspace with more than that has some that cannot be chosen here yet.
+              </p>
+            ) : null}
+          </>
+        )}
       </div>
 
-      <div className="mt-4 rounded-md border border-border p-3">
-        <span className="text-fg-muted">Matching contacts: </span>
-        <Count state={count} testId="preview-count" />
-      </div>
+      {ready ? (
+        <div className="mt-4 rounded-md border border-border p-3">
+          <span className="text-fg-muted">Matching contacts: </span>
+          <Count state={count} testId="preview-count" />
+        </div>
+      ) : null}
 
       {unfinished ? <Alert>{unfinished}</Alert> : null}
       {save.error ? <Alert>{save.error.message}</Alert> : null}

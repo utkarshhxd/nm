@@ -1410,12 +1410,13 @@ async fn counts_answer_a_page_at_once_and_resolve_an_archived_field(pool: PgPool
     r.assert_status_ok();
     let body: Value = r.json();
     assert_eq!(body[0]["id"], by_name.to_string(), "{body}");
+    assert_eq!(body[0]["state"], "exact", "{body}");
     assert_eq!(body[0]["count"], 2, "{body}");
-    assert_eq!(body[0]["exact"], true, "{body}");
-    // Section 5: a document filtering on a custom attribute gets no number, ever.
+    // Section 5: a document filtering on a custom attribute gets no number, ever — and says so
+    // in its own state, so the list cannot read a timeout as this.
     assert_eq!(body[1]["id"], by_attr.to_string(), "{body}");
+    assert_eq!(body[1]["state"], "no_estimate", "{body}");
     assert_eq!(body[1]["count"], Value::Null, "{body}");
-    assert_eq!(body[1]["exact"], false, "{body}");
     assert_eq!(
         r.header("ratelimit-limit").to_str().unwrap(),
         PREVIEW_PER_MINUTE.to_string(),
@@ -1461,4 +1462,92 @@ async fn counts_refuse_an_unknown_id_a_bad_id_and_more_than_a_page(pool: PgPool)
     let r = app.get(&counts_path(ws, &[mine, mine])).await;
     r.assert_status_ok();
     assert_eq!(r.json::<Value>().as_array().unwrap().len(), 1);
+}
+
+/// A batch that runs out of time falls back to the planner's estimate **per row**, in a fresh
+/// transaction, exactly as `preview` does.
+///
+/// The row that cannot be estimated honestly keeps saying so: section 5's "too many to count
+/// exactly" belongs to an `attr:` document and to nothing else, so a timeout must not borrow it.
+/// Without the fallback every countable row on a slow page would claim to be one of those.
+///
+/// Like the preview timeout test, this asserts *when* the answer came back: `estimated` on its
+/// own would pass vacuously if the timeout never engaged, which is exactly what `SET LOCAL`
+/// outside a transaction would give.
+#[sqlx::test]
+async fn a_timed_out_batch_estimates_each_countable_row_and_says_which(pool: PgPool) {
+    let (ws, app) = expensive_fixture(&pool).await;
+    create_field(&app, ws, "plan").await;
+    let slow = create(&app, ws, "slow", expensive_rules()).await;
+    let cheap = create(&app, ws, "cheap", first_name_is("nobody")).await;
+    let attr = create(&app, ws, "attr", plan_is("pro")).await;
+
+    let started = std::time::Instant::now();
+    let r = app.get(&counts_path(ws, &[slow, cheap, attr])).await;
+    let took = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    r.assert_status_ok();
+    let body: Value = r.json();
+
+    // One statement, so the cheap segment times out with the slow one — and gets its own figure
+    // rather than the page losing every number to the slowest row on it.
+    for i in 0..2 {
+        assert_eq!(body[i]["state"], "estimated", "{body}");
+        assert!(
+            body[i]["count"]
+                .as_i64()
+                .is_some_and(|n| (0..=15_000).contains(&n)),
+            "the planner's estimate for this workspace's 10 000 contacts, not the one row an \
+             `EXPLAIN` of a `count(*)` reports and not the 20 000 of a query that forgot its \
+             workspace: {body}"
+        );
+    }
+    assert!(
+        body[0]["count"].as_i64().is_some_and(|n| n >= 5_000),
+        "every contact matches the expensive document, so its estimate is near 10 000: {body}"
+    );
+    // The attribute row is untouched by any of it: no number, for its own reason.
+    assert_eq!(body[2]["state"], "no_estimate", "{body}");
+    assert_eq!(body[2]["count"], Value::Null, "{body}");
+
+    assert!(
+        (TEST_TIMEOUT_MS..TEST_TIMEOUT_MS + 3_000).contains(&took),
+        "the count must have run until the {TEST_TIMEOUT_MS} ms timeout cut it off, then planned: \
+         not finished early, and not run to completion (18.3 s uncapped). took = {took} ms"
+    );
+}
+
+/// A stored document that no longer parses costs that row its count and nothing else. Before the
+/// per-row state it failed the whole request, so one unreadable segment blanked the page.
+#[sqlx::test]
+async fn an_unreadable_stored_document_costs_only_its_own_row(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    insert_contact(&pool, ws, "a@acme.com", "Ann", json!({})).await;
+    let good = create(&app, ws, "anns", first_name_is("Ann")).await;
+    let broken = create(&app, ws, "broken", first_name_is("Ann")).await;
+    // Past the parser, which is the only way such a row can exist: a document naming a field that
+    // is not on the whitelist cannot be saved through the API.
+    sqlx::query("update segments set rules = $2 where id = $1")
+        .bind(broken)
+        .bind(json!({"match": "all", "rules": [{"field": "nope", "op": "eq", "value": "x"}]}))
+        .execute(&pool)
+        .await
+        .expect("break the stored document");
+
+    let r = app.get(&counts_path(ws, &[good, broken])).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body[0]["state"], "exact", "{body}");
+    assert_eq!(body[0]["count"], 1, "{body}");
+    assert_eq!(body[1]["state"], "unreadable", "{body}");
+    assert_eq!(body[1]["count"], Value::Null, "{body}");
+
+    // The paths that need the document itself still refuse it, with the parser's own code.
+    let one = app.get(&format!("{}/{broken}", segments(ws))).await;
+    one.assert_status_ok();
+    let selection = app
+        .post(&format!("/api/v1/workspaces/{ws}/contacts/selection"))
+        .json(&json!({"segment_id": broken}))
+        .await;
+    selection.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&selection), "urn:nm:problem:unknown-field");
 }

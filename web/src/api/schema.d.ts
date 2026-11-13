@@ -1277,6 +1277,15 @@ export interface components {
          * @enum {string}
          */
         ContactSort: "created" | "email";
+        /**
+         * @description What one row of a batch count is, and why.
+         *
+         *     A nullable number stood for three different facts here — no estimate is honest, the batch ran
+         *     out of time, the stored document no longer parses — and the list told all three of them with
+         *     section 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.
+         * @enum {string}
+         */
+        CountState: "exact" | "estimated" | "no_estimate" | "unreadable";
         /** @description The one response that carries the key. */
         CreatedApiKey: {
             /** Format: date-time */
@@ -1880,14 +1889,13 @@ export interface components {
         SegmentCount: {
             /**
              * Format: int64
-             * @description `null` where section 5 allows no honest number: the document filters on a custom attribute,
-             *     or the batch ran out of time. The list shows "too many to count exactly" for both.
+             * @description The number, for `exact` and `estimated`. Null for the other two states, which is what
+             *     `state` is there to explain.
              */
             count?: number | null;
-            /** @description Always `true` alongside a number here: a batch is counted exactly or not at all. */
-            exact: boolean;
             /** Format: uuid */
             id: string;
+            state: components["schemas"]["CountState"];
         };
         /** @description A materialised selection: the snapshot that was written, and the token for it. */
         SelectionToken: {
@@ -5007,7 +5015,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One entry per id, in the order asked for. `count` is null where section 5 allows no honest number */
+            /** @description One entry per id, in the order asked for, each carrying its own `state`: counted, estimated, or one of the two reasons there is no number */
             200: {
                 headers: {
                     [name: string]: unknown;
