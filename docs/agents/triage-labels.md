@@ -9,6 +9,9 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 | `ready-for-agent`          | `ready-for-agent`    | Fully specified, ready for an AFK agent  |
 | `ready-for-human`          | `ready-for-human`    | Requires human implementation            |
 | `wontfix`                  | `wontfix`            | Will not be actioned                     |
+| —                          | `resolved`           | Fixed, with the evidence in `## Comments` |
+
+The five canonical roles all describe the state of **incoming triage**; `resolved` is not one of them but an **outcome**, reused from the `Status:` values in `issue-tracker.md` rather than minting a `closed`/`done`/`fixed` of its own, and it is only honest with the commit and the test that closed the issue appended under the file's `## Comments` heading.
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 

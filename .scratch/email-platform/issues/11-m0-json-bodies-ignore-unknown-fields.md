@@ -56,3 +56,24 @@ flipping any of them.
 
 Unlike the query-string case there is no analytics-parameter problem here: nothing appends keys to
 a JSON body in transit.
+
+## Comments
+
+**2026-11-14 — re-checked after M1b. Nothing changed, and that is the finding.** All twelve
+structs still lack the attribute, at the same twelve line numbers this issue records; none of the
+files was touched by this milestone.
+
+What did change is the strength of the argument against them. Every body added in M1b denies
+unknown fields -- `NewSegment`, `UpdateSegment`, `PreviewRequest`, `NewSelection`, `BulkTarget`,
+`BulkTag`, `BulkList` -- and `NewSelection` carries a doc comment saying explicitly not to factor
+the bulk bodies back into one `serde(flatten)` struct, because flatten cannot deny unknown fields.
+So the convention now holds across two milestones and twenty-odd bodies, and these twelve are the
+only exceptions in the codebase rather than one side of a split.
+
+M1b also supplies the sharpest precedent yet for the sentence "it is a property of today's field
+lists, not of the types". `confirmed_count` is a **new required field on five existing bodies**
+(issue `03`), added precisely because a number that may be omitted is a number nothing checks --
+and it is enforced by an explicit `is_none()` check rather than by serde, since the field is
+optional on the wire for the `ids` case. A body that silently tolerates unknown keys cannot have a
+field added to it that way at all: the next build's new field is indistinguishable, to the
+previous build, from a typo. `ChangeRole` is still the one to look at first.

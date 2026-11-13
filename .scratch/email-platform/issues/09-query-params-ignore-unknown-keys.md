@@ -42,3 +42,28 @@ someone shared through a tracker into a 422. Either strip known-benign prefixes 
 only on routes a browser never navigates to.
 
 That decision is the work. The attribute is one line.
+
+## Comments
+
+**2026-11-14 — updated after M1b. Status unchanged; the exposure is not.** Two things moved.
+
+**1. "No present exploit" is now too strong, on the one screen where it matters.**
+`SortedPageParams` gained `snapshot_id` (`src/pagination/sorted.rs:63-70`), which is how the
+contacts grid shows the **frozen set** of a selection rather than the live filter. The field is
+`Option<Uuid>`, and because the struct discards keys it does not know, a client that misspells it
+is served the live-filter page with a `200` and no indication that the narrowing did not happen.
+That is exactly this issue's sentence -- "a client that believes it is narrowing a listing and is
+not" -- except that here the narrowing is a safety property: the frozen set is what makes a bulk
+action act on the contacts a person was shown. Note the server is still correct about a
+*well-spelled* snapshot it cannot honour: an expired, swept, superseded or foreign `snapshot_id`
+is `422 selection-expired`, never an empty page. It is only the misspelling that is silent.
+
+**2. The convention now exists on this side of the API too.** `CountParams`
+(`src/segments/routes.rs:507-513`, `?ids=` for the batch segment count) carries
+`#[serde(deny_unknown_fields)]`. So the count of query structs that ignore unknown keys is still
+three, but they are now the exception rather than the whole population, and the scope note's worry
+about `utm_*` and link-rewriters does not apply to any of the four equally -- `?ids=` is posted to
+by one screen and navigated to by nobody, which is precisely the "deny only on routes a browser
+never navigates to" line this issue proposed. The three M1a structs are unchanged:
+`SortedPageParams` (`src/pagination/sorted.rs`), `PageParams` (`src/pagination/mod.rs`),
+`SuppressionParams` (`src/suppressions/routes.rs`).
