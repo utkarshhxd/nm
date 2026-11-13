@@ -401,7 +401,11 @@ async fn roles_and_validation(pool: PgPool) {
             .await,
     );
     let by_contact = format!("/api/v1/workspaces/{ws}/contacts/{member}/lists");
-    forbidden(viewer.delete(&format!("{by_contact}/{list}")).await);
+    forbidden(
+        viewer
+            .post(&format!("{by_contact}/{list}/unsubscribe"))
+            .await,
+    );
     // And none of it took effect.
     assert_eq!(editor.get(&one).await.json::<Value>()["name"], "news");
     assert_eq!(count_memberships(&pool).await, 1);
@@ -471,7 +475,7 @@ async fn list_actions_are_audited_without_personal_data(pool: PgPool) {
         .json(&json!({"list_id": list}))
         .await
         .assert_status_ok();
-    app.delete(&format!("{by_contact}/{list}"))
+    app.post(&format!("{by_contact}/{list}/unsubscribe"))
         .await
         .assert_status(StatusCode::NO_CONTENT);
     app.patch(&format!("{}/{list}", lists_path(ws)))
@@ -547,6 +551,26 @@ async fn the_old_delete_route_is_gone_and_does_nothing(pool: PgPool) {
         ("subscribed".into(), true, false)
     );
     unsubscribe(&app, ws, list, contact)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
+}
+
+/// The contact-side twin of the test above: the same operation, the same verb and name.
+#[sqlx::test]
+async fn the_old_contact_side_delete_route_is_gone_and_does_nothing(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let list = create_list(&app, ws, "news", false).await;
+    let contact = create_contact(&app, ws, "a@ex.test").await;
+    add(&app, ws, list, contact).await;
+    let by_contact = format!("/api/v1/workspaces/{ws}/contacts/{contact}/lists/{list}");
+
+    app.delete(&by_contact).await.assert_status_not_found();
+    assert_eq!(
+        row(&pool, list, contact).await,
+        ("subscribed".into(), true, false)
+    );
+    app.post(&format!("{by_contact}/unsubscribe"))
         .await
         .assert_status(StatusCode::NO_CONTENT);
     assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
@@ -734,7 +758,7 @@ async fn a_contacts_lists_can_be_read_and_changed_from_the_contact(pool: PgPool)
     assert_eq!(page["data"][0]["list_id"], single.to_string());
     assert!(page["next_cursor"].is_null());
 
-    app.delete(&format!("{path}/{single}"))
+    app.post(&format!("{path}/{single}/unsubscribe"))
         .await
         .assert_status(StatusCode::NO_CONTENT);
     assert_eq!(
@@ -743,7 +767,7 @@ async fn a_contacts_lists_can_be_read_and_changed_from_the_contact(pool: PgPool)
     );
     // Never on that list: nothing to remove.
     let other = create_list(&app, ws, "other", false).await;
-    app.delete(&format!("{path}/{other}"))
+    app.post(&format!("{path}/{other}/unsubscribe"))
         .await
         .assert_status_not_found();
 

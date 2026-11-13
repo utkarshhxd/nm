@@ -395,8 +395,8 @@ function Lists({
   });
   const unsubscribe = useMutation({
     mutationFn: async (listId: string) => {
-      const { response, error } = await api.DELETE(
-        "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}",
+      const { response, error } = await api.POST(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}/unsubscribe",
         { params: { path: { workspace_id: ws, id: contactId, list_id: listId } } },
       );
       if (!response.ok) throw new Error(problemText(error, KNOWN, "The contact could not be unsubscribed."));

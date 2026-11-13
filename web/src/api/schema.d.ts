@@ -673,7 +673,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}": {
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}/unsubscribe": {
         parameters: {
             query?: never;
             header?: never;
@@ -682,12 +682,12 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post?: never;
         /**
          * The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,
          *     and keeps the membership.
          */
-        delete: operations["remove_contact_from_list"];
+        post: operations["unsubscribe_contact_from_list"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -4017,7 +4017,7 @@ export interface operations {
             };
         };
     };
-    remove_contact_from_list: {
+    unsubscribe_contact_from_list: {
         parameters: {
             query?: never;
             header?: never;

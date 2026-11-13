@@ -71,7 +71,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::lists::routes::unsubscribe_list_member,
         crate::lists::routes::list_contact_lists,
         crate::lists::routes::add_contact_to_list,
-        crate::lists::routes::remove_contact_from_list,
+        crate::lists::routes::unsubscribe_contact_from_list,
         crate::segments::routes::list_segments,
         crate::segments::routes::get_segment,
         crate::segments::routes::create_segment,

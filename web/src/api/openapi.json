@@ -2222,13 +2222,13 @@
         }
       }
     },
-    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}": {
-      "delete": {
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}/unsubscribe": {
+      "post": {
         "tags": [
           "crate::lists::routes"
         ],
         "summary": "The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,\nand keeps the membership.",
-        "operationId": "remove_contact_from_list",
+        "operationId": "unsubscribe_contact_from_list",
         "parameters": [
           {
             "name": "workspace_id",

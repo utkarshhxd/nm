@@ -371,9 +371,12 @@ async fn not_member_of_is_frozen_in_both_directions(pool: PgPool) {
     assert_eq!(sel.selected, 1, "only the contact off the list");
 
     // `on` unsubscribes, which makes a re-evaluated `not_member_of(subscribed)` true for them.
-    app.delete(&format!("{}/contacts/{on}/lists/{news}", base(ws)))
-        .await
-        .assert_status_success();
+    app.post(&format!(
+        "{}/contacts/{on}/lists/{news}/unsubscribe",
+        base(ws)
+    ))
+    .await
+    .assert_status_success();
     // `off` joins, which makes it false for them.
     join_list(&app, ws, off, news).await;
 
@@ -1067,9 +1070,13 @@ async fn response_reports_the_count_actually_affected(pool: PgPool) {
     assert_eq!(pending, 4);
 
     // Unsubscribing one by hand first leaves three for the bulk action to do.
-    app.delete(&format!("{}/contacts/{}/lists/{double}", base(ws), ids[1]))
-        .await
-        .assert_status_success();
+    app.post(&format!(
+        "{}/contacts/{}/lists/{double}/unsubscribe",
+        base(ws),
+        ids[1]
+    ))
+    .await
+    .assert_status_success();
     assert_eq!(
         affected(bulk(&app, ws, "unsubscribe", sub()).await).await,
         3
@@ -1099,9 +1106,13 @@ async fn all_four_filter_fields_apply(pool: PgPool) {
         join_list(&app, ws, *id, news).await;
     }
     // `match-b` is unsubscribed, so `list_status` takes it out; `other` fails the search.
-    app.delete(&format!("{}/contacts/{}/lists/{news}", base(ws), ids[1]))
-        .await
-        .assert_status_success();
+    app.post(&format!(
+        "{}/contacts/{}/lists/{news}/unsubscribe",
+        base(ws),
+        ids[1]
+    ))
+    .await
+    .assert_status_success();
     apply_tag(&app, ws, vip, &ids).await;
 
     let sel = select(
@@ -1216,9 +1227,13 @@ async fn a_contact_who_unsubscribes_after_the_selection_is_not_resubscribed(pool
     join_list(&app, ws, ids[0], news).await;
     let sel = select(&app, ws, json!({})).await;
 
-    app.delete(&format!("{}/contacts/{}/lists/{news}", base(ws), ids[0]))
-        .await
-        .assert_status_success();
+    app.post(&format!(
+        "{}/contacts/{}/lists/{news}/unsubscribe",
+        base(ws),
+        ids[0]
+    ))
+    .await
+    .assert_status_success();
     assert_eq!(
         status_of(&pool, ids[0], news).await.unwrap(),
         "unsubscribed"

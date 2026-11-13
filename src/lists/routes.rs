@@ -50,8 +50,8 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(list_contact_lists).post(add_contact_to_list),
         )
         .route(
-            "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}",
-            axum::routing::delete(remove_contact_from_list),
+            "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}/unsubscribe",
+            axum::routing::post(unsubscribe_contact_from_list),
         )
 }
 
@@ -692,9 +692,9 @@ pub async fn add_contact_to_list(
 /// The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,
 /// and keeps the membership.
 #[utoipa::path(
-    delete,
-    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}",
-    operation_id = "remove_contact_from_list",
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}/unsubscribe",
+    operation_id = "unsubscribe_contact_from_list",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace id"),
         ("id" = Uuid, Path, description = "Contact id"),
@@ -706,7 +706,7 @@ pub async fn add_contact_to_list(
         (status = 404, description = "not a member, or the contact was never on this list"),
     ),
 )]
-pub async fn remove_contact_from_list(
+pub async fn unsubscribe_contact_from_list(
     State(state): State<AppState>,
     meta: RequestMeta,
     principal: Principal,
