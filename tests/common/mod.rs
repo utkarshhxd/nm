@@ -167,11 +167,23 @@ pub async fn post_raw(
     uri: &str,
     body: &Value,
 ) -> axum::response::Response {
+    post_router(&app::router(state.clone()), key, uri, body).await
+}
+
+/// `post_raw` against a router built earlier. `app::router` merges the OpenAPI document and the
+/// Swagger UI and allocates about 3.8 MB doing it, so a test that measures heap builds it once,
+/// before its baseline.
+pub async fn post_router(
+    router: &Router,
+    key: &str,
+    uri: &str,
+    body: &Value,
+) -> axum::response::Response {
     use tower::ServiceExt;
     let req = axum::http::Request::post(uri)
         .header("authorization", format!("Bearer {key}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(body.to_string()))
         .unwrap();
-    app::router(state.clone()).oneshot(req).await.unwrap()
+    router.clone().oneshot(req).await.unwrap()
 }

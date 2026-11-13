@@ -41,6 +41,13 @@ pub const PREVIEW_PER_MINUTE: u32 = 30;
 /// connection time per window.
 pub const SELECTION_PER_MINUTE: u32 = 10;
 
+/// How many exports one workspace may start per window. An export holds a pooled connection for as
+/// long as the client takes to read the book, so five a minute is more than a person with a
+/// spreadsheet needs and well under the pool's 20. It bounds how many start; how long each may
+/// last is `contacts::export::SEND_TIMEOUT`, because a count does nothing about a request that
+/// never ends.
+pub const EXPORT_PER_MINUTE: u32 = 5;
+
 const WINDOW: Duration = Duration::from_secs(60);
 
 pub struct RateLimiter {

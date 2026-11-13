@@ -8,9 +8,16 @@ mod common;
 use axum::http::StatusCode;
 use common::{PW, TestApp, add_member, api_key, create_user, create_workspace, post_raw};
 use futures_util::StreamExt;
-use nm::workspaces::roles::Role;
+use nm::{
+    audit::Actor,
+    contacts::{ContactFilter, export},
+    http::request_meta::RequestMeta,
+    workspaces::roles::Role,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 fn base(ws: Uuid) -> String {
@@ -54,7 +61,9 @@ async fn insert(pool: &PgPool, ws: Uuid, email: &str, first: &str) -> Uuid {
     id
 }
 
-/// RFC 4180, enough of it to read our own output back: quoted cells, doubled quotes, CRLF rows.
+/// RFC 4180, enough of it to read our own output back: quoted cells, doubled quotes. **A bare CR or
+/// LF outside quotes ends a record too**, as it does for the many readers that split lines first:
+/// a cell holding a line break that was not quoted would show up here as an extra record.
 fn parse_csv(text: &str) -> Vec<Vec<String>> {
     let (mut rows, mut row, mut cell) = (vec![], vec![], String::new());
     let mut chars = text.chars().peekable();
@@ -69,8 +78,10 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
             (true, c) => cell.push(c),
             (false, '"') => quoted = true,
             (false, ',') => row.push(std::mem::take(&mut cell)),
-            (false, '\r') if chars.peek() == Some(&'\n') => {
-                chars.next();
+            (false, '\r' | '\n') => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
                 row.push(std::mem::take(&mut cell));
                 rows.push(std::mem::take(&mut row));
             }
@@ -96,10 +107,12 @@ fn col(head: &[String], name: &str) -> usize {
 }
 
 async fn audit_rows(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_scalar("select metadata from audit_log where action = 'contacts.exported'")
-        .fetch_all(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(
+        "select metadata from audit_log where action = 'contacts.exported' order by id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }
 
 fn problem_type(r: &axum_test::TestResponse) -> String {
@@ -121,8 +134,8 @@ async fn a_cell_that_would_be_a_formula_is_prefixed(pool: PgPool) {
     let tab = insert(&pool, ws, "tab@example.com", "\tx").await;
     insert(&pool, ws, "cr@example.com", "\rx").await;
     for (email, first) in [
-        ("plus@example.com", "+1"),
-        ("minus@example.com", "-1"),
+        ("plus@example.com", "+1+1"),
+        ("minus@example.com", "-1-1"),
         ("at@example.com", "@sum"),
         ("plain@example.com", "ada"),
     ] {
@@ -152,8 +165,8 @@ async fn a_cell_that_would_be_a_formula_is_prefixed(pool: PgPool) {
     for (e, want) in [
         ("tab@example.com", "'\tx"),
         ("cr@example.com", "'\rx"),
-        ("plus@example.com", "'+1"),
-        ("minus@example.com", "'-1"),
+        ("plus@example.com", "'+1+1"),
+        ("minus@example.com", "'-1-1"),
         ("at@example.com", "'@sum"),
         // Not a formula: left exactly as it was.
         ("plain@example.com", "ada"),
@@ -227,27 +240,30 @@ async fn columns_are_the_contacts_fields_live_custom_fields_lists_tags_and_suppr
         .await
         .unwrap();
     }
-    let l = admin
-        .post(&format!("{}/lists", base(ws)))
-        .json(&json!({"name": "News"}))
-        .await;
-    l.assert_status(StatusCode::CREATED);
-    sqlx::query(
-        "insert into list_memberships (workspace_id, contact_id, list_id, status) \
-         values ($1, $2, $3, 'subscribed')",
-    )
-    .bind(ws)
-    .bind(a)
-    .bind(
-        l.json::<Value>()["id"]
-            .as_str()
-            .unwrap()
-            .parse::<Uuid>()
-            .unwrap(),
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    for (name, status) in [("News", "subscribed"), ("Old", "unsubscribed")] {
+        let l = admin
+            .post(&format!("{}/lists", base(ws)))
+            .json(&json!({"name": name}))
+            .await;
+        l.assert_status(StatusCode::CREATED);
+        sqlx::query(
+            "insert into list_memberships (workspace_id, contact_id, list_id, status) \
+             values ($1, $2, $3, $4)",
+        )
+        .bind(ws)
+        .bind(a)
+        .bind(
+            l.json::<Value>()["id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap(),
+        )
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     sqlx::query(
         "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
          values ($1, $2, 'address', 'b@example.com', '\\x00', 'manual')",
@@ -279,7 +295,8 @@ async fn columns_are_the_contacts_fields_live_custom_fields_lists_tags_and_suppr
     let a = rows.iter().find(|r| r[1] == "a@example.com").unwrap();
     assert_eq!(a[col(&head, "attr:plan")], "pro");
     assert_eq!(a[col(&head, "attr:interests")], "b;a");
-    assert_eq!(a[col(&head, "lists")], "News");
+    // The status travels with the name: `unsubscribed` must not read as `subscribed` on re-import.
+    assert_eq!(a[col(&head, "lists")], "News:subscribed;Old:unsubscribed");
     assert_eq!(a[col(&head, "tags")], "alpha;zeta");
     assert_eq!(a[col(&head, "suppressed")], "false");
     let b = rows.iter().find(|r| r[1] == "b@example.com").unwrap();
@@ -389,6 +406,14 @@ async fn an_api_key_must_be_an_admin_key_too(pool: PgPool) {
     let r = post_raw(&app.state, &admin_key, &export_uri(ws), &json!({})).await;
     assert_eq!(r.status(), StatusCode::OK);
     let _ = r.into_body().into_data_stream().count().await;
+    // Attributed to the key, not to a user.
+    let (user, key): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "select actor_user_id, actor_api_key_id from audit_log where action = 'contacts.exported'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(user.is_none() && key.is_some());
 }
 
 #[sqlx::test]
@@ -557,7 +582,206 @@ async fn a_client_that_leaves_is_still_audited_as_incomplete(pool: PgPool) {
     }
     assert_eq!(audit.len(), 1, "no audit row for an abandoned export");
     assert_eq!(audit[0]["complete"], false);
-    assert!(audit[0]["rows"].as_u64().unwrap() < 20_000);
+    // The producer *stopped*: the client took one chunk, so at most the channel's two slots, the
+    // chunk blocked in `send` and a few more are ahead of it, which is a few hundred rows of
+    // 20,000. A producer that ignored the send error would read the book for nobody and report
+    // all of it; `< 20_000` alone would pass for it on the final partial chunk failing to send.
+    let rows = audit[0]["rows"].as_u64().unwrap();
+    assert!(
+        rows < 2_000,
+        "the producer read {rows} rows for a client that had gone"
+    );
+}
+
+/// Two exports on a pool of two, both paused mid-result, both then finished. The audit write needs
+/// a connection of its own, so a producer that still holds its export's connection when it asks
+/// waits on one only the other export can free: after the acquire timeout one row is lost and the
+/// body stalls, which in production is thirty seconds and a completed export that went unrecorded.
+#[sqlx::test]
+async fn finishing_exports_do_not_wait_on_each_other_for_the_audit_connection(pool: PgPool) {
+    let (ws, owner, _admin) = workspace(&pool, "acme").await;
+    seed(&pool, ws, 20_000).await;
+    let key = api_key(&owner, ws, "admin").await;
+    let small = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let app = TestApp::new(small).await;
+
+    let mut bodies = vec![];
+    for _ in 0..2 {
+        let r = post_raw(&app.state, &key, &export_uri(ws), &json!({})).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let mut body = r.into_body().into_data_stream();
+        body.next().await.unwrap().unwrap();
+        body.next().await.unwrap().unwrap();
+        bodies.push(body);
+    }
+    let (mut a, mut b) = (bodies.remove(0), bodies.remove(0));
+    let started = Instant::now();
+    tokio::join!(async { while a.next().await.is_some() {} }, async {
+        while b.next().await.is_some() {}
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the exports waited {:?} on the pool",
+        started.elapsed()
+    );
+    let audit = audit_rows(&pool).await;
+    assert_eq!(audit.len(), 2, "a completed export went unrecorded");
+    assert!(
+        audit
+            .iter()
+            .all(|m| m["complete"] == true && m["rows"] == 20_000)
+    );
+}
+
+/// A client that stops reading does not hold a connection for ever. The body is kept alive and
+/// unread throughout, so this is the send timeout and not a disconnect.
+#[sqlx::test]
+async fn a_client_that_stops_reading_is_cut_off_after_the_send_timeout(pool: PgPool) {
+    let (ws, _owner, _admin) = workspace(&pool, "acme").await;
+    seed(&pool, ws, 20_000).await;
+    let conn = pool.acquire().await.unwrap();
+    let owner_id: Uuid = sqlx::query_scalar("select id from users where email = $1")
+        .bind("owner-acme@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let body = export::start(
+        pool.clone(),
+        conn,
+        export::Export {
+            workspace_id: ws,
+            filter: ContactFilter::default(),
+            rules: None,
+            live: vec![],
+        },
+        export::Audit {
+            meta: RequestMeta::default(),
+            actor: Actor::User(owner_id),
+            filter: json!({}),
+        },
+        Duration::from_millis(200),
+    );
+    let mut body = body.into_data_stream();
+    body.next().await.unwrap().unwrap();
+
+    let mut audit = vec![];
+    for _ in 0..50 {
+        audit = audit_rows(&pool).await;
+        if !audit.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        audit.len(),
+        1,
+        "an export held for a client that stopped reading"
+    );
+    assert_eq!(audit[0]["complete"], false);
+    drop(body);
+}
+
+#[sqlx::test]
+async fn exports_are_rate_limited_per_workspace(pool: PgPool) {
+    let (ws, _owner, admin) = workspace(&pool, "acme").await;
+    insert(&pool, ws, "a@example.com", "A").await;
+    for _ in 0..nm::http::rate_limit::EXPORT_PER_MINUTE {
+        let r = admin.post(&export_uri(ws)).json(&json!({})).await;
+        r.assert_status_ok();
+        assert!(r.headers().contains_key("ratelimit-remaining"));
+    }
+    let r = admin.post(&export_uri(ws)).json(&json!({})).await;
+    r.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.headers().contains_key("retry-after"));
+    assert!(!r.text().contains("a@example.com"));
+    assert_eq!(
+        audit_rows(&pool).await.len(),
+        nm::http::rate_limit::EXPORT_PER_MINUTE as usize,
+        "a refused export is not an export"
+    );
+}
+
+/// A number is not a formula, so `-5` comes back as `-5`; nothing that merely starts like one does.
+#[sqlx::test]
+async fn a_number_field_round_trips_and_lookalikes_stay_prefixed(pool: PgPool) {
+    let (ws, _owner, admin) = workspace(&pool, "acme").await;
+    admin
+        .post(&format!("{}/custom-fields", base(ws)))
+        .json(&json!({"key": "score", "label": "Score", "kind": "number"}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let id = insert(&pool, ws, "n@example.com", "-5").await;
+    sqlx::query("update contacts set attributes = $2 where id = $1")
+        .bind(id)
+        .bind(json!({"score": -5}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (email, first) in [
+        ("a@example.com", "-5-5"),
+        ("b@example.com", "-inf"),
+        ("c@example.com", "-nan"),
+        ("d@example.com", "\t5"),
+    ] {
+        insert(&pool, ws, email, first).await;
+    }
+    let (head, rows) = export(&admin, ws, json!({})).await;
+    let (email, first, score) = (
+        col(&head, "email"),
+        col(&head, "first_name"),
+        col(&head, "attr:score"),
+    );
+    let by = |e: &str| rows.iter().find(|r| r[email] == e).unwrap().clone();
+    assert_eq!(by("n@example.com")[score], "-5");
+    assert_eq!(by("n@example.com")[first], "-5");
+    for (e, want) in [
+        ("a@example.com", "'-5-5"),
+        ("b@example.com", "'-inf"),
+        ("c@example.com", "'-nan"),
+        ("d@example.com", "'\t5"),
+    ] {
+        assert_eq!(by(e)[first], want, "{e}");
+    }
+}
+
+/// A line break inside a cell is quoted, so a reader that splits lines first still finds one
+/// record per contact. `x\r=HYPERLINK(...)` unquoted would start a new record whose first cell is
+/// an unprefixed formula.
+#[sqlx::test]
+async fn a_line_break_inside_a_cell_does_not_start_a_new_record(pool: PgPool) {
+    let (ws, _owner, admin) = workspace(&pool, "acme").await;
+    admin
+        .post(&format!("{}/custom-fields", base(ws)))
+        .json(&json!({"key": "note", "label": "Note", "kind": "text"}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let notes = [
+        ("lf@example.com", "a\n=1+1"),
+        ("cr@example.com", "x\r=HYPERLINK(\"http://evil/\")"),
+        ("crlf@example.com", "p\r\n@q"),
+    ];
+    for (email, note) in notes {
+        let id = insert(&pool, ws, email, "n").await;
+        sqlx::query("update contacts set attributes = $2 where id = $1")
+            .bind(id)
+            .bind(json!({"note": note}))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let (head, rows) = export(&admin, ws, json!({})).await;
+    assert_eq!(rows.len(), notes.len(), "a line break started a new record");
+    assert!(rows.iter().all(|r| r.len() == head.len()));
+    let (email, note) = (col(&head, "email"), col(&head, "attr:note"));
+    for (e, want) in notes {
+        let row = rows.iter().find(|r| r[email] == e).unwrap();
+        assert_eq!(row[note], want, "{e}");
+    }
 }
 
 async fn seed(pool: &PgPool, ws: Uuid, n: i64) {

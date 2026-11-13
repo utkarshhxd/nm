@@ -13,7 +13,8 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use common::{PW, TestApp, api_key, create_user, create_workspace, post_raw};
+use axum::Router;
+use common::{PW, TestApp, api_key, create_user, create_workspace, post_router};
 use futures_util::StreamExt;
 use serde_json::json;
 use sqlx::PgPool;
@@ -69,12 +70,14 @@ async fn seed(pool: &PgPool, ws: Uuid, from: i64, to: i64) {
 }
 
 /// Drains one export, dropping every chunk; returns `(bytes, peak heap above where it started)`.
-async fn drain(app: &TestApp, ws: Uuid, key: &str) -> (usize, usize) {
+async fn drain(router: &Router, ws: Uuid, key: &str) -> (usize, usize) {
     let uri = format!("/api/v1/workspaces/{ws}/contacts/export");
-    // A warm-up request first, so connection setup is not counted against the first measurement.
+    // The router is built by the caller, before any baseline: `app::router` allocates about 3.8 MB
+    // (the OpenAPI document and the Swagger UI), and measured inside the window that transient
+    // would be the high-water mark, hiding everything the export itself holds below it.
     let baseline = LIVE.load(Relaxed);
     PEAK.store(baseline, Relaxed);
-    let r = post_raw(&app.state, key, &uri, &json!({})).await;
+    let r = post_router(router, key, &uri, &json!({})).await;
     assert_eq!(r.status(), 200);
     let mut body = r.into_body().into_data_stream();
     let mut bytes = 0;
@@ -92,22 +95,29 @@ async fn memory_does_not_grow_with_the_row_count(pool: PgPool) {
     o.login("owner@example.com", PW).await;
     let key = api_key(&o, ws, "admin").await;
 
+    // Built once, before every baseline; see `drain`.
+    let router = nm::app::router(o.state.clone());
     seed(&pool, ws, 1, 5_000).await;
-    drain(&o, ws, &key).await;
-    let (small_bytes, small) = drain(&o, ws, &key).await;
+    drain(&router, ws, &key).await;
+    let (small_bytes, small) = drain(&router, ws, &key).await;
     seed(&pool, ws, 5_001, 50_000).await;
-    let (big_bytes, big) = drain(&o, ws, &key).await;
+    let (big_bytes, big) = drain(&router, ws, &key).await;
 
     eprintln!("5k rows: {small_bytes} B, peak +{small} B; 50k rows: {big_bytes} B, peak +{big} B");
     assert!(
         big_bytes > 9 * small_bytes,
         "the second export did not carry ten times the rows"
     );
-    // Nine times the output and the peak did not move by more than allocator noise. The fixed part
-    // (about 3.8 MB here: the router, the connection, the runtime) is the same in both and is not
-    // what is being measured. A buffering export holds the whole result, which is 6.6 MB more.
+    // Nine times the output and the peak did not move by more than allocator noise, and the peak
+    // itself is a fraction of what the result weighs. With the router built outside the window the
+    // floor is the export's own: about 0.11 MB, the chunks in flight. A buffering export holds the
+    // whole result, which is 6.6 MB more at 50k rows.
     assert!(
-        big < small + 256 * 1024,
+        big < small + 64 * 1024,
         "peak heap grew with the result: {small} B at 5k rows, {big} B at 50k"
+    );
+    assert!(
+        big < 512 * 1024,
+        "peak heap {big} B is not bounded by the chunk size (the result is {big_bytes} B)"
     );
 }

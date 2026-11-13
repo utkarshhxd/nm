@@ -16,7 +16,7 @@ use crate::{
     error::ApiError,
     http,
     http::csrf,
-    http::rate_limit::{PREVIEW_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE},
+    http::rate_limit::{EXPORT_PER_MINUTE, PREVIEW_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE},
     http::security_headers::security_headers,
     telemetry,
 };
@@ -35,6 +35,9 @@ pub struct AppState {
     /// Per-workspace cap on `POST /contacts/selection`, the most expensive endpoint in the
     /// product: it materialises the match, measured at 4,887 ms and 158 MB for a million rows.
     pub selection_limit: Arc<RateLimiter>,
+    /// Per-workspace cap on `POST /contacts/export`, which holds a pooled connection for as long
+    /// as the client takes to read the book.
+    pub export_limit: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -48,6 +51,7 @@ impl AppState {
             webauthn,
             preview_limit: Arc::new(RateLimiter::per_minute(PREVIEW_PER_MINUTE)),
             selection_limit: Arc::new(RateLimiter::per_minute(SELECTION_PER_MINUTE)),
+            export_limit: Arc::new(RateLimiter::per_minute(EXPORT_PER_MINUTE)),
         })
     }
 

@@ -1862,6 +1862,9 @@
           },
           "422": {
             "description": "a `q` under 3 characters, or a `list_status` without a `list_id`"
+          },
+          "429": {
+            "description": "rate-limited: too many exports for this workspace"
           }
         }
       }

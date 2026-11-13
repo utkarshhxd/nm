@@ -3760,6 +3760,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description rate-limited: too many exports for this workspace */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     create_contact_selection: {

@@ -1225,6 +1225,7 @@ fn redact_q(filter: &mut Value) {
         (status = 403, description = "insufficient-role: export takes admin"),
         (status = 404, description = "not a member, no such workspace, or no such segment"),
         (status = 422, description = "a `q` under 3 characters, or a `list_status` without a `list_id`"),
+        (status = 429, description = "rate-limited: too many exports for this workspace"),
     ),
 )]
 pub async fn export_contacts(
@@ -1236,6 +1237,16 @@ pub async fn export_contacts(
 ) -> ApiResult<Response> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Admin).await?;
+    // After `authorize`, so a stranger cannot spend the workspace's quota. The headers ride on the
+    // answer whichever way it goes, as `create_selection`'s do.
+    let quota = state.export_limit.check(workspace_id);
+    if let Some(retry_after_secs) = quota.over {
+        return Ok((
+            quota.headers,
+            ApiError::TooManyRequests { retry_after_secs },
+        )
+            .into_response());
+    }
     let filter = input.filter()?;
     // `404` for a segment that is not this workspace's, decided in `load_rules`: read as "no
     // rules" it would export the whole workspace. Nothing here builds a `Group` by hand.
@@ -1255,16 +1266,15 @@ pub async fn export_contacts(
         actor: principal.actor(),
         filter: doc,
     };
-    let body = export::start(
-        state.pool.clone(),
-        conn,
+    let job = export::Export {
         workspace_id,
         filter,
         rules,
         live,
-        audit,
-    );
+    };
+    let body = export::start(state.pool.clone(), conn, job, audit, export::SEND_TIMEOUT);
     Ok((
+        quota.headers,
         [
             ("content-type", "text/csv; charset=utf-8"),
             (
