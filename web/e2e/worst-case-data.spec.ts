@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import AxeBuilder from "@axe-core/playwright";
-import { type BrowserContext, type Locator, type Page, expect, test } from "@playwright/test";
+import { type BrowserContext, type Locator, type Page, type Route, expect, test } from "@playwright/test";
 
 import { axeProblems } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
@@ -203,11 +203,14 @@ type Screen = {
 };
 const heading = (name: string | RegExp) => (p: Page) => p.getByRole("heading", { name });
 /**
- * The segments screen, and nothing else.
+ * The segments screen with its rows really on it, and nothing else.
  *
- * Not `heading("Segments")`: the nav carries that word on every screen in the workspace, and a
- * `ready` that is true on the wrong page makes this whole harness measure the previous screen
- * twice and report nothing. The seeded name is on the segments list and nowhere else.
+ * Not `heading("Segments")`. That `<h2>` sits outside the block the query renders into, so it is
+ * still there when the query fails and the screen is an `ErrorState` — which carries
+ * `role="alert"` and no `aria-busy` (`error-state.tsx`), so it passes both of `visit()`'s gates.
+ * `heading("Segments")` would therefore gate **green** on a segments screen with no table on it at
+ * all, and the harness would measure an error box and report nothing. The seeded name is in a
+ * cell, so it is true only when the rows arrived.
  */
 const segmentRow = (p: Page) => p.getByRole("cell", { name: LONG_SEGMENT, exact: true });
 
@@ -649,6 +652,10 @@ test("the_longest_suppression_reason_fits_its_badge", async () => {
 
 test("a_50_rule_segment_does_not_burst_the_rule_builder", async () => {
   test.setTimeout(180_000);
+  // Pinned, because the scroller assertion below is about desktop: nothing else in this file sets
+  // the viewport back on its way out except the three sweeps, and a future test that leaves it
+  // narrow would red that assertion for a reason that has nothing to do with its own change.
+  await page.setViewportSize({ width: 1280, height: 720 });
   const found: string[] = [];
   for (const theme of THEMES) {
     await visit(`/w/${SLUG}/segments`, theme, segmentRow);
@@ -676,6 +683,83 @@ test("a_50_rule_segment_does_not_burst_the_rule_builder", async () => {
     // estimate (`filters_on_an_attribute`) before it touches the database at all.
     await expect(page.getByTestId("preview-count")).toHaveText("too many to count exactly");
     found.push(...(await sound(`edit segment, 50 rules two deep (${theme})`)));
+  }
+  expect(found).toEqual([]);
+});
+
+/**
+ * The one page-level count alert, which is the only M1b state on this screen a healthy workspace
+ * never shows — and both of its sentences, because they are two different facts: the batch that
+ * failed outright, and the batch that arrived with rows in it that could not be counted.
+ *
+ * It needs no `SCREENS` entry, which is what round 0 got wrong: `visit()` gating `ready` before
+ * `open` is a fact about `SCREENS`, and nine tests in this file reach `sound()` without it. The
+ * list and the counts are two separate queries, so with the counts intercepted the rows still
+ * render and `segmentRow` is still a true `ready`; `unroute` in a `finally` is the whole of the
+ * leak problem.
+ */
+test("the_count_alert_says_which_failure_it_is_without_widening_the_page", async () => {
+  const COUNTS = "**/segments/counts*";
+  const failures = [
+    {
+      what: "the whole batch failed",
+      // A real problem document, so the client reads it the way it reads the server's.
+      route: (r: Route) =>
+        r.fulfill({
+          status: 503,
+          contentType: "application/problem+json",
+          body: JSON.stringify({
+            type: "urn:nm:problem:internal",
+            title: "Service Unavailable",
+            status: 503,
+          }),
+        }),
+      says: "The counts could not be loaded.",
+    },
+    {
+      what: "some rows in it could not be counted",
+      // Every id the page asked for, echoed back as `failed`, so this needs no segment id of its
+      // own. `failed` is the state that means "not this time", and the rows answer it with "—".
+      route: (r: Route) => {
+        const asked = new URL(r.request().url()).searchParams.get("ids") ?? "";
+        return r.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(
+            asked.split(",").map((id) => ({ id, state: "failed", count: null })),
+          ),
+        });
+      },
+      says: "Some of these counts could not be worked out this time.",
+    },
+  ];
+  const found: string[] = [];
+  try {
+    // The alert is a sentence with a ghost button inline in it, so the narrow case is the one that
+    // can break: 320 px first, then desktop.
+    for (const width of [320, 1280]) {
+      await page.setViewportSize({ width, height: 640 });
+      for (const failure of failures) {
+        await page.route(COUNTS, failure.route);
+        try {
+          for (const theme of THEMES) {
+            await visit(`/w/${SLUG}/segments`, theme, segmentRow);
+            await expect(page.getByRole("alert").filter({ hasText: failure.says })).toBeVisible();
+            await expect(
+              page.getByRole("button", { name: "Count the segments again", exact: true }),
+            ).toBeVisible();
+            // One failure is one event: said once for the page, never once per row. Twenty-five
+            // identically named Retry buttons came off this screen already (Task 10 round 3).
+            await expect(page.getByRole("alert")).toHaveCount(1);
+            found.push(...(await sound(`count alert, ${failure.what} (${theme}, ${width}px)`)));
+          }
+        } finally {
+          await page.unroute(COUNTS);
+        }
+      }
+    }
+  } finally {
+    await page.setViewportSize({ width: 1280, height: 720 });
   }
   expect(found).toEqual([]);
 });
