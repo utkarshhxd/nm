@@ -38,6 +38,14 @@ const FIELD_KEY = "interests";
 const OPTIONS = Array.from({ length: 40 }, (_, n) =>
   n === 0 ? "O".repeat(100) : `Interest number ${n}`,
 );
+/**
+ * A segment name at the server's limit. A different letter from `LONG_NAME` on purpose: the list
+ * and the tag already carry that one, and a locator that matched all three would measure the
+ * wrong screen and report nothing.
+ */
+const LONG_SEGMENT = "M".repeat(100);
+/** A description at the server's limit, as two unbreakable runs with the one line break it allows. */
+const LONG_DESCRIPTION = `${"q".repeat(499)}\n${"r".repeat(500)}`;
 
 let admin: BrowserContext;
 let page: Page;
@@ -53,6 +61,53 @@ async function send(method: "post" | "put", path: string, data?: unknown): Promi
   return res.status() === 204 ? { id: "" } : ((await res.json()) as { id: string });
 }
 const post = (path: string, data?: unknown) => send("post", `${base()}${path}`, data);
+
+/**
+ * A fifty-rule document, which cannot be a flat list of fifty.
+ *
+ * `src/segments/rules.rs` allows `MAX_RULES = 50` but `MAX_RULES_PER_GROUP = 20` and
+ * `MAX_DEPTH = 3`, so fifty rules have to nest: a root group holding three subgroups of 17, 17
+ * and 16 leaves — three entries at the root, depth 2. Fifty nested two deep is a harder layout
+ * than fifty in a row, which is why the count is not reduced to fit a flat shape.
+ *
+ * The third subgroup is the one that matters: it is where a workspace's own words reach the
+ * builder — a 100-character list name and tag name inside a picker, a 100-character select
+ * option, and a multi-select whose forty checkboxes include one 100 characters long. Those rules
+ * also make the document one the server will not estimate (`filters_on_an_attribute`), so its
+ * count is section 5's "too many to count exactly" every run rather than a number that moves
+ * with the fixture.
+ */
+function fiftyRules(): unknown {
+  const plain = (n: number) => ({ field: "email", op: "contains", value: `${n}@example.test` });
+  const builtIn = [
+    { field: "first_name", op: "eq", value: LONG_NAME },
+    // The one empty string the server takes as a value, which the builder must not call unfinished.
+    { field: "last_name", op: "neq", value: "" },
+    { field: "timezone", op: "starts_with", value: "Europe/" },
+    { field: "created_at", op: "before", value: "2030-01-01" },
+    { field: "updated_at", op: "in_last_days", value: 36500 },
+    { field: "suppressed", op: "is_true" },
+  ];
+  const theirWords = [
+    { field: "list", op: "member_of", value: ids.list, status: "subscribed" },
+    { field: "list", op: "not_member_of", value: ids.list },
+    { field: "tag", op: "has", value: ids.tag },
+    { field: "tag", op: "not_has", value: ids.tag },
+    { field: "attr:long_text", op: "contains", value: LONG_NAME },
+    { field: "attr:long_text", op: "is_not_set" },
+    { field: "attr:long_select", op: "eq", value: OPTIONS[0] },
+    { field: `attr:${FIELD_KEY}`, op: "has_any", value: OPTIONS },
+  ];
+  const group = (rules: unknown[]) => ({ group: { match: "all", rules } });
+  return {
+    match: "any",
+    rules: [
+      group(Array.from({ length: 17 }, (_, n) => plain(n))),
+      group(Array.from({ length: 17 }, (_, n) => builtIn[n % builtIn.length])),
+      group([...theirWords, ...Array.from({ length: 8 }, (_, n) => plain(100 + n))]),
+    ],
+  };
+}
 
 /** Loads `path` in `theme` the way a returning visitor has it: a stored choice, then a reload. */
 async function visit(path: string, theme: Theme, ready: (p: Page) => Locator): Promise<void> {
@@ -147,6 +202,14 @@ type Screen = {
   open?: (p: Page) => Promise<void>;
 };
 const heading = (name: string | RegExp) => (p: Page) => p.getByRole("heading", { name });
+/**
+ * The segments screen, and nothing else.
+ *
+ * Not `heading("Segments")`: the nav carries that word on every screen in the workspace, and a
+ * `ready` that is true on the wrong page makes this whole harness measure the previous screen
+ * twice and report nothing. The seeded name is on the segments list and nowhere else.
+ */
+const segmentRow = (p: Page) => p.getByRole("cell", { name: LONG_SEGMENT, exact: true });
 
 /**
  * A dialog is a screen too, and the one place a workspace's own words — a 100-character field
@@ -172,6 +235,7 @@ const SCREENS: Screen[] = [
   { name: "list detail", path: () => `/w/${SLUG}/lists/${ids.list}`, ready: heading(LONG_NAME) },
   { name: "tags", path: () => `/w/${SLUG}/tags`, ready: heading("Tags") },
   { name: "custom fields", path: () => `/w/${SLUG}/custom-fields`, ready: heading("Custom fields") },
+  { name: "segments", path: () => `/w/${SLUG}/segments`, ready: segmentRow },
   { name: "suppressions", path: () => `/w/${SLUG}/suppressions`, ready: heading("Suppressions") },
   {
     name: "instance suppressions",
@@ -226,6 +290,27 @@ const SCREENS: Screen[] = [
     path: () => `/w/${SLUG}/lists/${ids.list}`,
     ready: heading(LONG_NAME),
     open: opens("Delete list", "Delete this list"),
+  },
+  // The rule builder, which is the one place in the product where a workspace's own words meet a
+  // nested, repeating control inside a drawer. The edit form opens on the fifty-rule document;
+  // the new form opens on one empty rule, which is the other extreme of the same box.
+  {
+    name: "new segment dialog",
+    path: () => `/w/${SLUG}/segments`,
+    ready: segmentRow,
+    open: opens("New segment", "New segment"),
+  },
+  {
+    name: "edit segment dialog",
+    path: () => `/w/${SLUG}/segments`,
+    ready: segmentRow,
+    open: opens(`Edit ${LONG_SEGMENT}`, "Edit segment"),
+  },
+  {
+    name: "delete segment dialog",
+    path: () => `/w/${SLUG}/segments`,
+    ready: segmentRow,
+    open: opens(`Delete ${LONG_SEGMENT}`, "Delete this segment"),
   },
   // The bulk confirmations: the only dialogs whose copy carries a list name, and the only ones
   // that need a selection before they exist at all.
@@ -429,6 +514,24 @@ test("seed_the_worst_case_data", async () => {
     await guest.context().close();
   }
   ids.key = (await post("/api-keys", { name: LONG_NAME, role: "viewer" })).id;
+
+  // Segments last: the rule document names the list, the tag and the custom fields above.
+  await post("/segments", {
+    name: LONG_SEGMENT,
+    description: LONG_DESCRIPTION,
+    rules: fiftyRules(),
+  });
+  // One ordinary segment beside it, because an exact count is the only state that offers
+  // "Select contacts" (section 14) and so the only one whose actions cell holds three buttons.
+  // The fifty-rule document above is `no_estimate` and never will be.
+  await post("/segments", {
+    name: "Everyone at the long domain",
+    description: "",
+    rules: {
+      match: "all",
+      rules: [{ field: "email_domain", op: "contains", value: "example.test" }],
+    },
+  });
 });
 
 test("a_254_character_email_does_not_overflow_the_row", async () => {
@@ -540,6 +643,39 @@ test("the_longest_suppression_reason_fits_its_badge", async () => {
     await expect(page.getByText("Not mailable")).toBeVisible();
     await expect(page.getByText("Unsubscribed from everything")).toBeVisible();
     found.push(...(await sound(`contact detail, suppressed (${theme})`)));
+  }
+  expect(found).toEqual([]);
+});
+
+test("a_50_rule_segment_does_not_burst_the_rule_builder", async () => {
+  test.setTimeout(180_000);
+  const found: string[] = [];
+  for (const theme of THEMES) {
+    await visit(`/w/${SLUG}/segments`, theme, segmentRow);
+    // A 100-character name and a 1000-character description wrap rather than widening the table:
+    // at this width its scroller has nothing to scroll, so nobody has to scroll to read a name.
+    const scroller = page.getByRole("region", { name: "Segments table", exact: true });
+    const over = await scroller.evaluate((el) => el.scrollWidth - el.clientWidth);
+    expect(over, "the segments table fits its scroller on desktop").toBeLessThanOrEqual(1);
+    found.push(...(await sound(`segments list, ${LONG_SEGMENT.length}-character name (${theme})`)));
+
+    await opens(`Edit ${LONG_SEGMENT}`, "Edit segment")(page);
+    // Every one of the fifty rules is really drawn, and drawn open. `layoutProblems` skips
+    // `display: none` and zero-size boxes, so a builder that collapsed its groups would measure
+    // almost nothing and report nothing — a closed accordion fits on a phone.
+    const rules = page.getByRole("group", { name: /^Rule \d+\.\d+$/ });
+    await expect(rules).toHaveCount(50);
+    await expect(page.getByRole("group", { name: /^Group \d+$/ })).toHaveCount(3);
+    const drawn = await rules.evaluateAll(
+      (all) => all.filter((el) => el.getBoundingClientRect().height > 0).length,
+    );
+    expect(drawn, "all fifty rules are open, not a collapsed accordion").toBe(50);
+    // The count area is a sentence rather than a skeleton, so what follows measures the form and
+    // not a placeholder. It is this sentence every run, and not a number that moves with the
+    // fixture, because the `attr:` rules above make the document one the server refuses to
+    // estimate (`filters_on_an_attribute`) before it touches the database at all.
+    await expect(page.getByTestId("preview-count")).toHaveText("too many to count exactly");
+    found.push(...(await sound(`edit segment, 50 rules two deep (${theme})`)));
   }
   expect(found).toEqual([]);
 });
