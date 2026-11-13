@@ -2227,7 +2227,8 @@
         "tags": [
           "crate::lists::routes"
         ],
-        "summary": "The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,\nand keeps the membership.",
+        "summary": "Unsubscribes a contact from a list, and keeps the membership.",
+        "description": "The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side.",
         "operationId": "unsubscribe_contact_from_list",
         "parameters": [
           {

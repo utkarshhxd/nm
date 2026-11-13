@@ -683,8 +683,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,
-         *     and keeps the membership.
+         * Unsubscribes a contact from a list, and keeps the membership.
+         * @description The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side.
          */
         post: operations["unsubscribe_contact_from_list"];
         delete?: never;

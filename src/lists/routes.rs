@@ -689,8 +689,9 @@ pub async fn add_contact_to_list(
     Ok(Json(membership))
 }
 
-/// The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,
-/// and keeps the membership.
+/// Unsubscribes a contact from a list, and keeps the membership.
+///
+/// The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists/{list_id}/unsubscribe",

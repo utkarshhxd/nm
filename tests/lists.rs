@@ -576,6 +576,55 @@ async fn the_old_contact_side_delete_route_is_gone_and_does_nothing(pool: PgPool
     assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
 }
 
+/// Both unsubscribe routes are workspace-scoped. A non-member, and another workspace's editor
+/// (through their own workspace and through this one), get 404 and change nothing. Each request is
+/// one that succeeds for an editor of the right workspace, so the 404 can only be the tenancy.
+#[sqlx::test]
+async fn neither_unsubscribe_route_crosses_a_workspace(pool: PgPool) {
+    let (ws_a, editor_a) = workspace(&pool, "acme").await;
+    let (ws_b, editor_b) = workspace(&pool, "globex").await;
+    create_user(&pool, "nobody@example.com", PW, false).await;
+    let mut nobody = TestApp::new(pool.clone()).await;
+    nobody.login("nobody@example.com", PW).await;
+    let list = create_list(&editor_a, ws_a, "news", false).await;
+    let contact = create_contact(&editor_a, ws_a, "a@ex.test").await;
+    add(&editor_a, ws_a, list, contact).await;
+    let routes = |ws: Uuid| {
+        [
+            format!("{}/{contact}/unsubscribe", members_path(ws, list)),
+            format!("/api/v1/workspaces/{ws}/contacts/{contact}/lists/{list}/unsubscribe"),
+        ]
+    };
+
+    for path in routes(ws_a) {
+        nobody.post(&path).await.assert_status_not_found();
+        editor_b.post(&path).await.assert_status_not_found();
+    }
+    for path in routes(ws_b) {
+        editor_b.post(&path).await.assert_status_not_found();
+        nobody.post(&path).await.assert_status_not_found();
+    }
+    assert_eq!(
+        row(&pool, list, contact).await,
+        ("subscribed".into(), true, false)
+    );
+    assert!(
+        list_audit(&pool, ws_a)
+            .await
+            .iter()
+            .all(|a| a.0 != "list.member_unsubscribed")
+    );
+
+    // Control: the right workspace's editor succeeds on both, one after the other.
+    for path in routes(ws_a) {
+        editor_a
+            .post(&path)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+    assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
+}
+
 /// Existing audit rows keep `list.member_removed`: rewriting history would make the log a worse
 /// record of what the system called the operation at the time. A row written under each name
 /// reads back as it was written, side by side, and the rename did not touch the old one.
@@ -630,25 +679,57 @@ async fn an_old_and_a_new_unsubscribe_row_both_read_as_written(pool: PgPool) {
     );
 }
 
-/// No migration rewrites the old rows. A migration runs before any row exists in a test database,
-/// so the test above cannot see one; this is the only handle on a backfill that "tidies" history.
-#[test]
-fn no_migration_rewrites_the_old_audit_action() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
-    let mut seen = 0;
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "sql") {
-            seen += 1;
-            let sql = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                !sql.contains("member_removed"),
-                "{} names the old audit action; history is not rewritten",
-                path.display()
-            );
-        }
-    }
-    assert!(seen > 10, "found {seen} migrations: the directory moved");
+/// No migration rewrites an old audit row. This has to be a test that runs the migrations over a
+/// row that already exists. The `#[sqlx::test]` default hands over a database that is already fully
+/// migrated and holds no rows, which is exactly the wrong shape: a migration that rewrites history
+/// finds nothing to rewrite and every ordinary test stays green. `migrations = false` plus
+/// `run_to(1)` (the audit table is migration 1) gives a database where the row predates the rest.
+///
+/// A grep of `migrations/*.sql` for the old string is not a substitute: it is defeated by
+/// `where action like 'list.member\_r%'`, which never names the string at all.
+#[sqlx::test(migrations = false)]
+async fn migrations_leave_an_old_audit_row_as_written(pool: PgPool) {
+    let migrations = &nm::db::MIGRATOR;
+    migrations.run_to(1, &pool).await.unwrap();
+    let applied = || async {
+        sqlx::query_scalar::<_, i64>("select count(*) from _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        applied().await,
+        1,
+        "the row must predate the other migrations"
+    );
+
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into audit_log (id, action, target_type, target_id, metadata)          values ($1, 'list.member_removed', 'list', 'l-1', '{\"contact_id\": \"c-1\"}')",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrations.run(&pool).await.unwrap();
+    assert_eq!(applied().await, migrations.iter().count() as i64);
+    let row: (String, Option<String>, Option<String>, Value) = sqlx::query_as(
+        "select action, target_type, target_id, metadata from audit_log where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            "list.member_removed".to_owned(),
+            Some("list".to_owned()),
+            Some("l-1".to_owned()),
+            json!({"contact_id": "c-1"}),
+        )
+    );
 }
 
 /// `null` on a field that is `not null` and has nothing to clear to is refused, not ignored (the

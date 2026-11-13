@@ -27,15 +27,13 @@ let csrf = "";
 
 const ids = { tag: "", single: "", double: "" };
 
-async function api(method: "post" | "get" | "delete", path: string, data?: unknown) {
+async function api(method: "post" | "get", path: string, data?: unknown) {
   const url = `/api/v1/workspaces/${workspaceId}${path}`;
   const headers = { "X-CSRF-Token": csrf };
   const res =
     method === "get"
       ? await context.request.get(url)
-      : method === "delete"
-        ? await context.request.delete(url, { headers })
-        : await context.request.post(url, { data, headers });
+      : await context.request.post(url, { data, headers });
   expect(res.ok(), `${method} ${path} -> ${res.status()}`).toBe(true);
   return (res.status() === 204 ? {} : await res.json()) as {
     id?: string;
