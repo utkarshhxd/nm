@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
 import { api, problemMessage, problemText } from "../api/client";
@@ -28,6 +29,7 @@ import {
 import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
+import { handOver } from "../lib/selection";
 import { useWorkspace } from "./workspace-layout";
 
 type Segment = components["schemas"]["Segment"];
@@ -67,11 +69,18 @@ export default function Segments() {
   const { workspace } = useWorkspace();
   // The layout renders no `Outlet` until the workspace resolves, so this is only a type guard.
   if (!workspace) return null;
-  return <AllSegments ws={workspace.id} canEdit={atLeast(workspace.role, "editor")} />;
+  return (
+    <AllSegments
+      ws={workspace.id}
+      slug={workspace.slug}
+      canEdit={atLeast(workspace.role, "editor")}
+    />
+  );
 }
 
-function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
+function AllSegments({ ws, slug, canEdit }: { ws: string; slug: string; canEdit: boolean }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   // `null` is closed; `"new"` is the create form; a segment is the edit form for it.
   const [form, setForm] = useState<Segment | "new" | null>(null);
   const [deleting, setDeleting] = useState<Segment | null>(null);
@@ -135,6 +144,45 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
     const found = counts.data?.get(id);
     return found ? { kind: "counted", state: found.state, count: found.count } : { kind: "counting" };
   };
+  /**
+   * Whether this row may offer to select its contacts.
+   *
+   * **Only from an exact count** (spec §14). Freezing a selection from an estimate — or from a
+   * row that has no number at all — costs five seconds and may end in `422 selection-too-large`,
+   * and there is nothing the person could do from this screen to make it work. So the control is
+   * absent rather than disabled with a tooltip: a control nobody may use is not a control.
+   */
+  const countedExactly = (id: string): boolean => {
+    const state = countOf(id);
+    return state.kind === "counted" && state.state === "exact";
+  };
+
+  /**
+   * Freezes the segment's contacts server-side and shows them on the contacts grid.
+   *
+   * The token goes to the grid through module state, never the URL: it is signed, and a URL
+   * would put it in the back/forward stack, the referer header and every proxy log.
+   */
+  const select = useMutation({
+    mutationFn: async (segment: Segment) => {
+      const { data, error } = await api.POST(
+        "/api/v1/workspaces/{workspace_id}/contacts/selection",
+        { params: { path: { workspace_id: ws } }, body: { segment_id: segment.id } },
+      );
+      // The server's own sentence, which for `selection-too-large` names the limit it is over.
+      // A generic "that did not work" would leave the person with nothing to act on.
+      if (!data) throw new Error(problemMessage(error, "The contacts could not be selected."));
+      return data;
+    },
+    onSuccess: (data) => {
+      handOver({
+        token: data.selection_token,
+        snapshot: data.snapshot_id,
+        matched: data.selected,
+      });
+      void navigate({ to: "/w/$slug/contacts", params: { slug } });
+    },
+  });
 
   // Its own key rather than the members screen's: one cache entry served by two queryFns is one
   // whose failure behaviour depends on which screen mounted last.
@@ -206,6 +254,7 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
           </EmptyState>
         ) : (
           <>
+            {select.error ? <Alert>{select.error.message}</Alert> : null}
             {/* One alert for one failure. The rows show "—" rather than repeating it. */}
             {counts.isError ? (
               <p role="alert" className="mb-3 text-danger-text">
@@ -257,6 +306,15 @@ function AllSegments({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                       {canEdit ? (
                         <td className="py-2">
                           <span className="flex flex-wrap gap-2">
+                            {countedExactly(s.id) ? (
+                              <Button
+                                aria-label={`Select contacts in ${s.name}`}
+                                busy={select.isPending && select.variables?.id === s.id}
+                                onClick={() => select.mutate(s)}
+                              >
+                                Select contacts
+                              </Button>
+                            ) : null}
                             <Button aria-label={`Edit ${s.name}`} onClick={() => setForm(s)}>
                               Edit
                             </Button>

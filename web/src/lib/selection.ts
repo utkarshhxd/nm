@@ -9,7 +9,36 @@
 export type Selection =
   | { mode: "none" }
   | { mode: "ids"; ids: ReadonlySet<string> }
-  | { mode: "all"; token: string; matched: number; excluded: ReadonlySet<string> };
+  | {
+      mode: "all";
+      token: string;
+      /** The frozen set the server wrote down, for `GET /contacts?snapshot_id=`. */
+      snapshot: string;
+      matched: number;
+      excluded: ReadonlySet<string>;
+    };
+
+/** A selection made on another screen, waiting for the contacts grid to pick it up. */
+export type Handover = { token: string; snapshot: string; matched: number };
+
+let handed: Handover | null = null;
+
+/**
+ * Hands a selection to the contacts grid, which reads it when it mounts and then forgets it.
+ *
+ * Module state rather than the URL or `history.state`: the token is signed, and a URL would put
+ * it in the back/forward stack, in the referer header and in every proxy log on the way. It
+ * therefore dies with the tab, which is the safer direction anyway — a selection that outlives
+ * the page is one the person may not remember making.
+ */
+export function handOver(selection: Handover | null): void {
+  handed = selection;
+}
+
+/** Pure, so React may call it twice while rendering; the grid clears it with `handOver(null)`. */
+export function handedOver(): Handover | null {
+  return handed;
+}
 
 /** The server refuses more than 10,000 `excluded_ids` and 10,000 `ids`. */
 export const MAX_EXCLUDED = 10_000;
@@ -66,9 +95,9 @@ export function createSelection() {
       set(ids.length ? { mode: "ids", ids: new Set(ids.slice(0, MAX_IDS)) } : { mode: "none" });
       return Math.max(0, ids.length - MAX_IDS);
     },
-    /** `matched` is how many contacts the token's filter matched when it was issued. */
-    selectAll: (token: string, matched: number) =>
-      set({ mode: "all", token, matched, excluded: new Set() }),
+    /** `matched` is how many contacts the snapshot froze, which is exact by construction. */
+    selectAll: (token: string, snapshot: string, matched: number) =>
+      set({ mode: "all", token, snapshot, matched, excluded: new Set() }),
     clear() {
       if (state.mode !== "none") set({ mode: "none" });
     },

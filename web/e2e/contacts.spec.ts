@@ -187,7 +187,7 @@ test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
   await page.getByRole("button", { name: "Select all contacts matching this view" }).click();
   // The real count, not an estimate, and from now on the grid may say how many rows there are.
   await expect(
-    page.getByText(`All ${TOTAL.toLocaleString("en-US")} contacts matching this view are selected`),
+    page.getByText(`Here is what you selected: all ${TOTAL.toLocaleString("en-US")} contacts.`),
   ).toBeVisible();
   await expect(grid()).toHaveAttribute("aria-rowcount", String(TOTAL + 1));
 
@@ -195,11 +195,15 @@ test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
   const excluded = (await first.getAttribute("aria-label"))?.replace("Select ", "") ?? "";
   await first.uncheck();
   await expect(
-    page.getByText(`${(TOTAL - 1).toLocaleString("en-US")} of ${TOTAL.toLocaleString("en-US")} contacts matching`),
+    page.getByText(`${(TOTAL - 1).toLocaleString("en-US")} of ${TOTAL.toLocaleString("en-US")} contacts`),
   ).toBeVisible();
 
   await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "vip" });
   await page.getByRole("button", { name: "Add tag", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Tag these contacts", exact: true })
+    .getByRole("button", { name: `Tag ${(TOTAL - 1).toLocaleString("en-US")} contacts`, exact: true })
+    .click();
   await expect(result()).toContainText(`Tagged ${(TOTAL - 1).toLocaleString("en-US")} contacts`);
   await page.unroute("**/contacts/bulk/tag");
 

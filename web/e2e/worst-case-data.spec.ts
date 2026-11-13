@@ -242,6 +242,16 @@ const SCREENS: Screen[] = [
     },
   },
   {
+    name: "bulk tag dialog",
+    path: () => `/w/${SLUG}/contacts`,
+    ready: (p) => p.getByRole("grid", { name: "Contacts" }),
+    open: async (p) => {
+      await p.getByRole("checkbox", { name: `Select ${LONG_EMAIL}`, exact: true }).check();
+      await p.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: LONG_NAME });
+      await opens("Add tag", "Tag these contacts")(p);
+    },
+  },
+  {
     name: "bulk delete dialog",
     path: () => `/w/${SLUG}/contacts`,
     ready: (p) => p.getByRole("grid", { name: "Contacts" }),

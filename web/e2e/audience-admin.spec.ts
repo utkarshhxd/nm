@@ -149,6 +149,10 @@ test.beforeAll(async ({ browser }) => {
     if (letter === "a" || letter === "b") await put(`/contacts/${c.id}/tags/${ids.churn}`);
   }
 
+  // Two that no other test deletes: a frozen selection the search can then show less of.
+  await post("/contacts", { email: "view-a@example.test" });
+  await post("/contacts", { email: "view-b@example.test" });
+
   ids.raceA = (await post("/contacts", { email: "race-a@example.test" })).id;
   await post("/contacts", { email: "race-b@example.test" });
   await post("/contacts", { email: "race-c@example.test" });
@@ -341,6 +345,33 @@ test("bulk_untag_over_a_selection", async () => {
   expect(await named(`/contacts/${ids.bulkB}/tags`)).toEqual([]);
 });
 
+test("the_bulk_tag_confirmation_says_what_a_tag_will_mean", async () => {
+  // Spec §9.1: snapshots answer *which* contacts an action reaches, structurally. What they
+  // cannot answer is what the operator understood they were agreeing to — and tagging is about to
+  // become the thing a campaign is aimed at.
+  await selectMatching("bulk-", 3);
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
+  await page.getByRole("button", { name: "Add tag", exact: true }).click();
+
+  const confirm = page.getByRole("dialog", { name: "Tag these contacts", exact: true });
+  // The sentence, not the button: "Tag 3 contacts" on the button satisfies a whole-dialog
+  // substring check on its own, so that check passes with the count in the copy made up.
+  await expect(confirm.getByRole("paragraph").first()).toContainText("3 contacts");
+  await expect(confirm).toContainText("crowd");
+  await expect(confirm).toContainText("campaign");
+  await expect(confirm).toContainText("mailable");
+  // The honest tense: nothing can send to a tag in this milestone, and copy that said otherwise
+  // would be describing a feature that does not exist.
+  await expect(confirm).toContainText("Nothing sends to a tag yet");
+  // A tag is not a list membership. Saying "subscribed" here would describe the one action that
+  // really does put people on a mailing list, which this is not.
+  await expect(confirm).not.toContainText(/subscrib/i);
+  await confirm.getByRole("button", { name: "Tag 3 contacts", exact: true }).click();
+
+  await expect(result()).toContainText("Tagged 3 contacts with “crowd”");
+  expect(await named(`/contacts/${ids.bulkA}/tags`)).toMatchObject([{ name: "crowd" }]);
+});
+
 test("bulk_unsubscribe_names_the_list_and_reports_affected_of_selected", async () => {
   await selectMatching("bulk-", 3);
   await page
@@ -405,14 +436,14 @@ test("an_empty_selection_offers_no_action_to_run_on_it", async () => {
   await page
     .getByRole("button", { name: "Select all contacts matching this view", exact: true })
     .click();
-  await expect(page.getByText("All 3 contacts matching this view are selected.")).toBeVisible();
+  await expect(page.getByText("Here is what you selected: all 3 contacts.")).toBeVisible();
   for (const letter of ["a", "b", "c"]) {
     await page
       .getByRole("checkbox", { name: `Select bulk-${letter}@example.test`, exact: true })
       .uncheck();
   }
   await expect(
-    page.getByText("0 of 3 contacts matching this view are selected (3 left out)."),
+    page.getByText("Here is what you selected: 0 of 3 contacts (3 left out)."),
   ).toBeVisible();
 
   await expect(page.getByRole("button", { name: "Delete contacts", exact: true })).toBeDisabled();
@@ -439,10 +470,10 @@ test("a_predicate_selection_spares_the_excluded_contact_in_all_three_actions", a
   await page
     .getByRole("button", { name: "Select all contacts matching this view", exact: true })
     .click();
-  await expect(page.getByText("All 3 contacts matching this view are selected.")).toBeVisible();
+  await expect(page.getByText("Here is what you selected: all 3 contacts.")).toBeVisible();
   await page.getByRole("checkbox", { name: "Select pred-c@example.test", exact: true }).uncheck();
   await expect(
-    page.getByText("2 of 3 contacts matching this view are selected (1 left out)."),
+    page.getByText("Here is what you selected: 2 of 3 contacts (1 left out)."),
   ).toBeVisible();
 
   await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "herd" });
@@ -497,10 +528,24 @@ test("a_delete_that_lost_a_race_is_measured_against_what_it_promised", async () 
   await expect(result()).toContainText("someone else");
 });
 
-test("a_selection_acts_on_the_frozen_set_and_refuses_to_reach_past_the_confirmation", async () => {
-  // The end-to-end shape that matters: a signed token, rows unticked, and the real engine. A tag
-  // filter, so a second editor can change the live view from outside this page while the frozen
-  // set stays what it was.
+/** Every `snapshot_id` the grid has asked `GET /contacts` for, newest last; `null` for none. */
+function watchGrid(): (string | null)[] {
+  const seen: (string | null)[] = [];
+  page.on("request", (r) => {
+    const url = new URL(r.url());
+    if (r.method() === "GET" && url.pathname.endsWith("/contacts")) {
+      seen.push(url.searchParams.get("snapshot_id"));
+    }
+  });
+  return seen;
+}
+
+test("the_grid_shows_the_frozen_set_and_a_newcomer_never_joins_it", async () => {
+  // Spec §14's "here is what you selected": once a selection exists the grid is the snapshot,
+  // not the live filter. That removes at source the divergence §8.9 had to fix arithmetically —
+  // a contact tagged into the filter after selection used to appear as a ticked row the
+  // selection never held, and unticking it refused the action.
+  const asked = watchGrid();
   await page.goto(contactsPath);
   await page.getByLabel("Filter by tag", { exact: true }).selectOption({ label: "churn" });
   await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
@@ -508,66 +553,144 @@ test("a_selection_acts_on_the_frozen_set_and_refuses_to_reach_past_the_confirmat
   await page
     .getByRole("button", { name: "Select all contacts matching this view", exact: true })
     .click();
-  await expect(page.getByText("All 2 contacts matching this view are selected.")).toBeVisible();
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+  // The parameter itself, on the wire: without it every assertion below would be satisfied by a
+  // grid that simply had not refetched yet.
+  await expect
+    .poll(() => asked.at(-1), { message: "the grid never asked for the snapshot" })
+    .toMatch(/^[0-9a-f-]{36}$/);
 
-  // A second editor tags one more into the filter. Under a re-evaluated predicate the actions
-  // below would reach it; it is not in the frozen set, so they must not.
+  // A second editor tags one more into the filter. The live filter now matches three; the frozen
+  // set is still the two that were written down.
   const found = await get<{ data: { id: string }[] }>("/contacts?q=wide-c@");
   const wideC = found.data[0]?.id ?? "";
   await put(`/contacts/${wideC}/tags/${ids.churn}`);
 
-  // An action over the token: exactly the two that were frozen, and the grid refetches after it,
-  // which is how the newcomer appears as a ticked row the selection never held.
+  // An action over the token, which refetches the grid afterwards because the view is filtered
+  // by a tag the action changed.
   await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
   await page.getByRole("button", { name: "Add tag", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Tag these contacts", exact: true })
+    .getByRole("button", { name: "Tag 2 contacts", exact: true })
+    .click();
   await expect(result()).toContainText("Tagged 2 contacts with “crowd”");
   expect(await named(`/contacts/${wideC}/tags`)).toMatchObject([{ name: "churn" }]);
-  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
-  await expect(page.getByText("All 2 contacts matching this view are selected.")).toBeVisible();
 
-  // Untick the newcomer. The button now says one less than the action would reach, because the
-  // row unticked was never in the frozen set — the divergence a live grid produces.
-  await page.getByRole("checkbox", { name: "Select wide-c@example.test", exact: true }).uncheck();
-  await expect(
-    page.getByText("1 of 2 contacts matching this view are selected (1 left out)."),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
-  const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
-  await expect(confirm.getByRole("paragraph").first()).toContainText("1 contact");
-  await confirm.getByRole("button", { name: "Delete 1 contact", exact: true }).click();
+  // Two rows, not three: the newcomer matches the filter and is not in the snapshot, so the grid
+  // does not show it and there is no row to untick that the action would not reach.
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await expect(row(page, "wide-c@example.test")).toHaveCount(0);
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
 
-  // Refused, naming both numbers, with nothing deleted — a dialog reading "Delete 1 contact"
-  // must never delete two.
-  const alert = page.getByRole("alert").filter({ hasText: "nothing was done" });
-  await expect(alert).toBeVisible();
-  await expect(alert).toContainText("acted on 2 contacts");
-  await expect(alert).toContainText("the confirmation said 1");
-  const left = await get<{ data: { email: string }[] }>("/contacts?q=wide-");
-  expect(left.data).toHaveLength(4);
-  // And the selection it refused is dropped, so the same button cannot repeat the same refusal.
-  await expect(page.getByText("contacts matching this view are selected")).toHaveCount(0);
-
-  // Select again — three match now — and untick one that *is* in the new frozen set: the
-  // ordinary case proceeds and spares exactly the row that was unticked.
-  await page
-    .getByRole("checkbox", { name: "Select all loaded contacts", exact: true })
-    .check({ force: true });
-  await page
-    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
-    .click();
-  await expect(page.getByText("All 3 contacts matching this view are selected.")).toBeVisible();
+  // Untick one that *is* in the frozen set: the ordinary case proceeds and spares exactly it.
   await page.getByRole("checkbox", { name: "Select wide-a@example.test", exact: true }).uncheck();
+  await expect(page.getByText("Here is what you selected: 1 of 2 contacts (1 left out).")).toBeVisible();
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
   await page
     .getByRole("dialog", { name: "Delete these contacts", exact: true })
-    .getByRole("button", { name: "Delete 2 contacts", exact: true })
+    .getByRole("button", { name: "Delete 1 contact", exact: true })
     .click();
-  await expect(result()).toContainText("Deleted 2 contacts");
+  await expect(result()).toContainText("Deleted 1 contact");
   const after = await get<{ data: { email: string }[] }>("/contacts?q=wide-");
   expect(after.data.map((c) => c.email).sort()).toEqual([
     "wide-a@example.test",
+    "wide-c@example.test",
     "wide-d@example.test",
   ]);
+  page.removeAllListeners("request");
+});
+
+test("filtering_a_frozen_selection_narrows_the_view_and_not_the_selection", async () => {
+  // The filters stay usable over a frozen set, and they narrow what is *shown*. The screen has to
+  // say so in both numbers, or someone unticks what they can see and misjudges the rest.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("view-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+
+  // Reachable at all: the toolbar used to be hidden the moment anything was selected.
+  const search = page.getByLabel("Search contacts", { exact: true });
+  await expect(search).toBeVisible();
+  await search.fill("view-b");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(1);
+
+  // Both numbers, and which of the two the filter moved.
+  await expect(
+    page.getByText(
+      "Showing 1 of the 2 contacts you selected. Filtering changes what is shown here, not what is selected.",
+    ),
+  ).toBeVisible();
+  // The selection itself did not move: not the bar, not the button, not the announcement that a
+  // ticked set gets when the filters change.
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+  // Past the live region's 500 ms debounce, so "nothing was announced" is a fact and not a race:
+  // a selection that had been thrown away would have said so by now.
+  await page.waitForTimeout(900);
+  await expect(page.getByRole("status").filter({ hasText: /Selection cleared/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
+  await expect(confirm.getByRole("paragraph").first()).toContainText("2 contacts");
+  await page.keyboard.press("Escape");
+  await expect(confirm).toBeHidden();
+
+  // And back: widening the view again puts the second row back and retires the sentence.
+  await search.fill("view-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await expect(page.getByText("Filtering changes what is shown here")).toHaveCount(0);
+});
+
+test("a_refused_bulk_action_shows_the_servers_sentence_and_drops_the_selection", async () => {
+  // `selection-count-mismatch` is no longer reachable through this screen — that is what the
+  // frozen grid above removes — but the client path that renders it is not: a refusal must come
+  // out in the server's own words and take the dead selection with it.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 3 contacts.")).toBeVisible();
+
+  await page.route("**/contacts/bulk/delete", (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/problem+json",
+      body: JSON.stringify({
+        type: "urn:nm:problem:selection-count-mismatch",
+        title: "Conflict",
+        status: 409,
+        detail:
+          "This would have acted on 4 contacts and the confirmation said 3, so nothing was done. Select again to see what you would be acting on.",
+      }),
+    }),
+  );
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Delete these contacts", exact: true })
+    .getByRole("button", { name: "Delete 3 contacts", exact: true })
+    .click();
+
+  // The server's sentence, whole and on its own: the client's fallback says nothing a person
+  // could act on, and an exact match catches it where a substring check would not. It waits for
+  // the alert rather than racing it, which a bare "the fallback is absent" could never do.
+  await expect(page.getByRole("alert")).toHaveText(
+    "This would have acted on 4 contacts and the confirmation said 3, so nothing was done. " +
+      "Select again to see what you would be acting on.",
+  );
+  // The selection it refused is dropped, so the same button cannot repeat the same refusal. The
+  // tick box is what makes this wait: it stays checked until the selection goes.
+  await expect(
+    page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }),
+  ).not.toBeChecked();
+  await expect(page.getByText(/^Here is what you selected/)).toHaveCount(0);
+  await page.unroute("**/contacts/bulk/delete");
+  expect((await get<{ data: unknown[] }>("/contacts?q=bulk-")).data).toHaveLength(3);
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {
@@ -665,6 +788,9 @@ test("axe_reports_no_violations_with_each_destructive_dialog_open", async () => 
     .selectOption({ label: "Weekly digest" });
   await page.getByRole("button", { name: "Unsubscribe from list", exact: true }).click();
   await scan("Unsubscribe from this list");
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
+  await page.getByRole("button", { name: "Add tag", exact: true }).click();
+  await scan("Tag these contacts");
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
   await scan("Delete these contacts");
 });

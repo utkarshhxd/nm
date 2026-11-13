@@ -121,6 +121,15 @@ const fieldOf = (path: string) => page.getByLabel(`Field for rule ${path}`, { ex
 const opOf = (path: string) => page.getByLabel(`Operator for rule ${path}`, { exact: true });
 const valueOf = (path: string) => page.getByLabel(`Value for rule ${path}`, { exact: true });
 const count = () => page.getByTestId("preview-count");
+/** The four per-row answers, over however many rows the page has. */
+const STATES = ["exact", "estimated", "no_estimate", "unreadable"] as const;
+const stubbed = (all: ApiSegment[]) =>
+  all.map((s, i) => ({
+    id: s.id,
+    state: STATES[i % 4],
+    count: [7, 12400, null, null][i % 4],
+  }));
+
 /** The open builder, so a count or a refusal on the list behind it cannot answer for it. */
 const drawer = () => page.getByRole("dialog");
 
@@ -609,15 +618,11 @@ test("each_row_says_which_kind_of_answer_it_has", async () => {
   await realCounts();
   const all = await apiSegments();
   expect(all.length, "four rows are needed to show four states").toBeGreaterThan(3);
-  const states = ["exact", "estimated", "no_estimate", "unreadable"] as const;
-  const counts = [7, 12400, null, null];
   await page.route(COUNTS, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(
-        all.map((s, i) => ({ id: s.id, state: states[i % 4], count: counts[i % 4] })),
-      ),
+      body: JSON.stringify(stubbed(all)),
     }),
   );
   await openSegments();
@@ -628,6 +633,133 @@ test("each_row_says_which_kind_of_answer_it_has", async () => {
   await expect(page.getByText("estimate", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("too many to count exactly").first()).toBeVisible();
   await expect(page.getByText("needs re-saving").first()).toBeVisible();
+  await page.unroute(COUNTS);
+});
+
+test("select_these_contacts_is_offered_from_an_exact_count_and_from_nothing_else", async () => {
+  // Spec §14: never offered from an estimate. The click costs five seconds and may end in
+  // `422 selection-too-large`, and nothing the person can do on this screen would change that —
+  // so the control is absent, not disabled with a tooltip.
+  await realCounts();
+  const all = await apiSegments();
+  expect(all.length, "four rows are needed to cover four states").toBeGreaterThan(3);
+  await page.route(COUNTS, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(stubbed(all)),
+    }),
+  );
+  await openSegments();
+
+  for (const [i, s] of all.entries()) {
+    const offered = page.getByRole("button", {
+      name: `Select contacts in ${s.name}`,
+      exact: true,
+    });
+    // The row's other control, so "no button" cannot pass because the row never rendered.
+    await expect(page.getByRole("button", { name: `Edit ${s.name}`, exact: true })).toHaveCount(1);
+    await expect(offered, `${s.name} is ${STATES[i % 4]}`).toHaveCount(
+      STATES[i % 4] === "exact" ? 1 : 0,
+    );
+  }
+  await page.unroute(COUNTS);
+});
+
+test("selecting_a_segments_contacts_shows_the_frozen_set_on_the_contacts_grid", async () => {
+  // The gap Task 6 left: the server has taken `segment_id` on `POST /contacts/selection` since
+  // then and no screen offered it.
+  await post("/segments", {
+    name: "Pickable",
+    description: "",
+    rules: { match: "all", rules: [{ field: "email", op: "contains", value: "@acme.test" }] },
+  });
+  let body: { segment_id?: string } | null = null;
+  await page.route("**/contacts/selection", async (route) => {
+    body = route.request().postDataJSON() as { segment_id?: string };
+    await route.continue();
+  });
+  const asked: (string | null)[] = [];
+  page.on("request", (r) => {
+    const url = new URL(r.url());
+    if (r.method() === "GET" && url.pathname.endsWith("/contacts")) {
+      asked.push(url.searchParams.get("snapshot_id"));
+    }
+  });
+
+  await realCounts();
+  await openSegments();
+  const pickable = await apiSegment("Pickable");
+  const row = page.getByRole("row", { name: /Pickable/ });
+  await expect(row.getByTestId("segment-count")).toHaveText("2");
+  await page.getByRole("button", { name: "Select contacts in Pickable", exact: true }).click();
+
+  // Landed on the contacts screen, holding the two the segment matches.
+  await expect(page).toHaveURL(new RegExp(`/w/${SLUG}/contacts$`));
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+  // The frozen set, not the workspace: the segment matches two of the three contacts here.
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  // Newest first, so an unfiltered grid would put three@other.test — the one contact the segment
+  // does not match — at the top. Both of these wait for the grid, where "is it absent yet" would
+  // pass on a grid that has not drawn a row.
+  await expect(page.locator("tbody tr[aria-rowindex]").first()).toContainText("two@acme.test");
+  await expect
+    .poll(() => asked.at(-1), { message: "the grid never asked for the snapshot" })
+    .toMatch(/^[0-9a-f-]{36}$/);
+  expect(body).toEqual({ segment_id: pickable.id });
+
+  // Taken once. Walking back here through the router must not re-apply a selection made minutes
+  // ago: the handover is module state, and the grid forgets it as it mounts.
+  await page.getByRole("link", { name: "Segments", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Segments", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Contacts", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Contacts", exact: true })).toBeVisible();
+  // The row count first, because it is what waits for the grid: the bar's absence on its own
+  // would be satisfied by a page that has not finished mounting.
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await expect(page.getByText(/^Here is what you selected/)).toHaveCount(0);
+
+  page.removeAllListeners("request");
+  await page.unroute("**/contacts/selection");
+});
+
+test("a_selection_the_server_refuses_as_too_large_says_so_in_the_servers_words", async () => {
+  await realCounts();
+  const all = await apiSegments();
+  // Every row exact, so the control is on the row this test clicks.
+  await page.route(COUNTS, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(all.map((s) => ({ id: s.id, state: "exact", count: 7 }))),
+    }),
+  );
+  // `MAX_SELECTION` is a million, so the real refusal cannot be provoked with three contacts.
+  // This is the exact body `selection.rs` builds for it.
+  await page.route("**/contacts/selection", (route) =>
+    route.fulfill({
+      status: 422,
+      contentType: "application/problem+json",
+      body: JSON.stringify({
+        type: "urn:nm:problem:selection-too-large",
+        title: "Unprocessable Entity",
+        status: 422,
+        detail: "more than 1,000,000 contacts match; narrow the selection and try again",
+      }),
+    }),
+  );
+  await openSegments();
+  await page.getByRole("button", { name: "Select contacts in Pickable", exact: true }).click();
+
+  // The server's sentence, whole: it names the limit, where this screen's own fallback would
+  // leave the person with nothing to act on, and a sentence written here would go stale the day
+  // the limit moves. Matched exactly, and it waits for the alert rather than racing it.
+  await expect(page.getByRole("alert")).toHaveText(
+    "more than 1,000,000 contacts match; narrow the selection and try again",
+  );
+  // Refused, so nothing was handed over and nothing navigated.
+  await expect(page).toHaveURL(new RegExp(`/w/${SLUG}/segments$`));
+  await page.unroute("**/contacts/selection");
   await page.unroute(COUNTS);
 });
 

@@ -22,7 +22,7 @@ import { Input } from "../components/input";
 import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
 import { atLeast } from "../lib/roles";
-import { MAX_EXCLUDED, MAX_IDS, createSelection } from "../lib/selection";
+import { MAX_EXCLUDED, MAX_IDS, createSelection, handOver, handedOver } from "../lib/selection";
 import { Alert } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
 
@@ -100,7 +100,7 @@ type Filters = {
 
 type Result = { tone: "ok" | "warn"; text: string };
 
-/** The five bulk routes. Only the last two are destructive enough to be confirmed first. */
+/** The five bulk routes. Three of them are confirmed first; see `Confirming`. */
 type Kind = "tag" | "untag" | "subscribe" | "unsubscribe" | "delete";
 
 /**
@@ -114,7 +114,7 @@ const STALE_SELECTION = new Set([
   "selection-count-mismatch",
 ]);
 type Confirming = {
-  kind: "unsubscribe" | "delete";
+  kind: "tag" | "unsubscribe" | "delete";
   target: string;
   name: string;
   /**
@@ -124,6 +124,16 @@ type Confirming = {
    * otherwise leave the person told "deleted 4,980" after agreeing to 5,000, with nothing said.
    */
   promised: number;
+};
+
+/** The title and the button of each confirmation, so the dialog is not three nested ternaries. */
+const CONFIRM: Record<Confirming["kind"], { title: string; label: (n: number) => string }> = {
+  tag: { title: "Tag these contacts", label: (n) => `Tag ${count(n, "contact")}` },
+  unsubscribe: {
+    title: "Unsubscribe from this list",
+    label: () => "Unsubscribe these contacts",
+  },
+  delete: { title: "Delete these contacts", label: (n) => `Delete ${count(n, "contact")}` },
 };
 
 function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit: boolean }) {
@@ -176,17 +186,37 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     },
   });
 
+  /**
+   * The selection, which the grid's own query reads: once it is a frozen set, the grid shows
+   * **that set** rather than the live filter (spec §14, "here is what you selected").
+   *
+   * A selection handed over by another screen — the segments list — is picked up as this mounts,
+   * and forgotten immediately, so returning here later never re-applies it.
+   */
+  const store = useMemo(() => {
+    const made = createSelection();
+    const handoff = handedOver();
+    if (handoff) made.selectAll(handoff.token, handoff.snapshot, handoff.matched);
+    return made;
+  }, []);
+  useEffect(() => handOver(null), []);
+  const selection = useSyncExternalStore(store.subscribe, store.get);
+  const snapshot = selection.mode === "all" ? selection.snapshot : undefined;
+  // The grid's identity: two different sets of rows must never share one cache entry, and a
+  // snapshot's page cursors are not the live filter's.
+  const viewKey = `${filterKey}|${snapshot ?? ""}`;
+
   // Page start -> the cursor that fetched it. The API only pages forward, so this is how a page
   // dropped off the front by `maxPages` is fetched again when the user scrolls back.
-  const cursors = useMemo(() => new Map<number, string | undefined>(), [filterKey]);
+  const cursors = useMemo(() => new Map<number, string | undefined>(), [viewKey]);
   const query = useInfiniteQuery({
-    queryKey: ["contacts", id, filterKey],
+    queryKey: ["contacts", id, viewKey],
     initialPageParam: { start: 0 } as { cursor?: string; start: number },
     queryFn: async ({ pageParam, signal }) => {
       const { data, error } = await api.GET("/api/v1/workspaces/{workspace_id}/contacts", {
         params: {
           path: { workspace_id: id },
-          query: { ...filters, limit: PAGE, cursor: pageParam.cursor },
+          query: { ...filters, snapshot_id: snapshot, limit: PAGE, cursor: pageParam.cursor },
         },
         signal,
       });
@@ -210,21 +240,17 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
 
   const rows = useMemo(() => query.data?.pages.flatMap((p) => p.rows) ?? [], [query.data]);
   const rowOffset = query.data?.pages[0]?.start ?? 0;
+  // How many rows this view holds, known only once its last page is in.
+  const shown = query.hasNextPage ? null : rowOffset + rows.length;
   // How many contacts the current filter matched, once someone has asked to select them all.
   // Until then (or after the filters change) it is unknown, and an unknown total is `-1`.
   const [matched, setMatched] = useState<{ key: string; n: number } | null>(null);
-  const total = !query.hasNextPage
-    ? rowOffset + rows.length
-    : matched?.key === filterKey
-      ? matched.n
-      : null;
+  const total = shown ?? (matched?.key === filterKey ? matched.n : null);
 
   // Remounts the grid (scroll, focus, virtualiser) once the new query's data is what is shown.
-  const shownKey = useRef(filterKey);
-  if (!query.isPlaceholderData) shownKey.current = filterKey;
+  const shownKey = useRef(viewKey);
+  if (!query.isPlaceholderData) shownKey.current = viewKey;
 
-  const store = useMemo(createSelection, []);
-  const selection = useSyncExternalStore(store.subscribe, store.get);
   const [result, setResult] = useState<Result | null>(null);
   const resultRef = useRef<HTMLParagraphElement>(null);
   const toFocus = useRef(false);
@@ -236,10 +262,12 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   const live = useRef(filterKey);
   live.current = filterKey;
 
-  // Changing the query clears the selection and says so: a selection carried across a filter is
-  // how someone acts on the wrong million rows.
+  // Ticked rows are rows somebody saw in *this* view, so changing the filter clears them: a
+  // selection carried across a filter is how someone acts on the wrong million rows. A frozen
+  // selection is different — it is written down on the server, the grid is narrowed to it, and a
+  // filter from here narrows only what is shown (spec §14).
   useEffect(() => {
-    if (store.get().mode !== "none") {
+    if (store.get().mode === "ids") {
       store.clear();
       announce("Selection cleared because the filters changed.");
     }
@@ -247,7 +275,6 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     setFailure("");
   }, [filterKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectedCount = selection.mode === "ids" ? selection.ids.size : 0;
   // How many contacts an action would run on, whichever way they were chosen.
   const chosen =
     selection.mode === "ids"
@@ -272,8 +299,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     }
     if (silentClear.current) silentClear.current = false;
     else if (selection.mode === "none") announce("Selection cleared");
-    else if (selection.mode === "ids") announce(`${count(selectedCount, "contact")} selected`);
-    else announce("All contacts matching this view selected");
+    else announce(`${count(chosen, "contact")} selected`);
   }, [selection]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selecting = useMemo(
@@ -331,7 +357,10 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       return;
     }
     setMatched({ key: mine, n: data.selected });
-    store.selectAll(data.selection_token, data.selected);
+    // `selected` is the materialising insert's own `rows_affected`, so it is exact by
+    // construction and never an estimate (spec §5's last bullet) — which is why this control,
+    // unlike the segments list's, needs no "only from an exact count" rule.
+    store.selectAll(data.selection_token, data.snapshot_id, data.selected);
   }
 
   async function bulk(kind: Kind, target: string, name: string, promised?: number) {
@@ -441,7 +470,9 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       </div>
 
       <div className="mt-4">
-        <div hidden={selection.mode !== "none"} className="flex flex-wrap items-start gap-3">
+        {/* Hidden only while rows are ticked by hand, because changing a filter throws those
+            away. A frozen selection survives one, so its filters stay where they are. */}
+        <div hidden={selection.mode === "ids"} className="flex flex-wrap items-start gap-3">
           <SearchBox
             initial={search.q ?? ""}
             onSearch={(q) => setSearch({ q })}
@@ -493,14 +524,17 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
           <div
             role="region"
             aria-label="Bulk actions"
-            className="flex flex-wrap items-center gap-3 rounded-md border-s-4 border-accent bg-accent-subtle p-3"
+            className="mt-3 flex flex-wrap items-center gap-3 rounded-md border-s-4 border-accent bg-accent-subtle p-3"
           >
+            {/* Never "matching this view" any more. The grid below is the frozen set, and a
+                filter typed here narrows what is shown without changing what was selected, so a
+                sentence tying the selection to the view would be false the moment one is. */}
             <p className="font-medium">
               {selection.mode === "ids"
                 ? `${count(selection.ids.size, "contact")} selected`
                 : selection.excluded.size
-                  ? `${(selection.matched - selection.excluded.size).toLocaleString()} of ${selection.matched.toLocaleString()} contacts matching this view are selected (${selection.excluded.size.toLocaleString()} left out).`
-                  : `All ${selection.matched.toLocaleString()} contacts matching this view are selected.`}
+                  ? `Here is what you selected: ${(selection.matched - selection.excluded.size).toLocaleString()} of ${count(selection.matched, "contact")} (${selection.excluded.size.toLocaleString()} left out).`
+                  : `Here is what you selected: all ${count(selection.matched, "contact")}.`}
             </p>
             {selection.mode === "ids" ? (
               counting ? (
@@ -519,7 +553,11 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
               options={tags.data ?? []}
               disabled={busy || chosen === 0}
               actions={[
-                { label: "Add tag", run: (t, n) => void bulk("tag", t, n) },
+                {
+                  label: "Add tag",
+                  run: (target, name) =>
+                    setConfirming({ kind: "tag", target, name, promised: chosen }),
+                },
                 { label: "Remove tag", run: (t, n) => void bulk("untag", t, n) },
               ]}
             />
@@ -571,6 +609,15 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       {failure ? <Alert>{failure}</Alert> : null}
 
       <div className="mt-4">
+        {/* The frozen set, seen through a narrower filter. Both numbers, and which of the two the
+            filter moved: without this someone filters, unticks what they can see, and misjudges
+            the rest. The bulk bar's number never moves, and the confirmation names it. */}
+        {selection.mode === "all" && shown !== null && shown < selection.matched ? (
+          <p className="mb-3 text-fg-muted">
+            Showing {shown.toLocaleString()} of the {count(selection.matched, "contact")} you
+            selected. Filtering changes what is shown here, not what is selected.
+          </p>
+        ) : null}
         {query.isPending ? (
           <Skeleton label="Loading contacts" rows={8} />
         ) : query.isError && !query.data ? (
@@ -641,21 +688,34 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       <ConfirmDialog
         open={confirming !== null}
         onClose={() => setConfirming(null)}
-        title={
-          confirming?.kind === "delete" ? "Delete these contacts" : "Unsubscribe from this list"
-        }
-        confirmLabel={
-          confirming?.kind === "delete"
-            ? `Delete ${count(confirming.promised, "contact")}`
-            : "Unsubscribe these contacts"
-        }
+        title={confirming ? CONFIRM[confirming.kind].title : ""}
+        confirmLabel={confirming ? CONFIRM[confirming.kind].label(confirming.promised) : ""}
         onConfirm={() => {
           const go = confirming;
           setConfirming(null);
           if (go) void bulk(go.kind, go.target, go.name, go.promised);
         }}
       >
-        {confirming?.kind === "delete" ? (
+        {confirming?.kind === "tag" ? (
+          <>
+            <p>
+              <strong>{count(confirming.promised, "contact")}</strong> are tagged with{" "}
+              <strong className="wrap-anywhere">{confirming.name}</strong>. Anyone who already has
+              it is left alone, and nothing else about them changes.
+            </p>
+            {/* Spec §9.1: snapshots answer *which* contacts an action reaches, structurally. What
+                they cannot answer is what the operator understood they were agreeing to, and a
+                tag is about to become a thing a campaign can be aimed at. */}
+            <p>
+              A tag is how a campaign will choose who to mail. Nothing sends to a tag yet, but once
+              it can, tagging these{" "}
+              <strong>{confirming.promised.toLocaleString()}</strong> contacts is what makes{" "}
+              {confirming.promised === 1 ? "that person" : "those people"} mailable by anyone who
+              sends to it — and nobody is asked again at that point. Tag people who agreed to hear
+              from you about this.
+            </p>
+          </>
+        ) : confirming?.kind === "delete" ? (
           <>
             <p>
               <strong>{count(confirming.promised, "contact")}</strong> and everything recorded
