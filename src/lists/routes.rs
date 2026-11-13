@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    ContactList, List, ListMember, MembershipStatus, Visibility, add_member, get,
+    ContactList, List, ListMember, MembershipSource, MembershipStatus, Visibility, add_member, get,
     unsubscribe_member, validate_description, validate_name,
 };
 use crate::{
@@ -567,7 +567,14 @@ async fn add_audited(
 ) -> ApiResult<Membership> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
-    let status = add_member(&mut tx, workspace_id, list_id, contact_id).await?;
+    let status = add_member(
+        &mut tx,
+        workspace_id,
+        list_id,
+        contact_id,
+        MembershipSource::of_single_add(principal),
+    )
+    .await?;
     audit::record(
         &mut *tx,
         meta,

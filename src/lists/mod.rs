@@ -9,6 +9,7 @@ use sqlx::PgConnection;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult, FieldError};
 
 pub mod routes;
@@ -39,6 +40,28 @@ impl MembershipStatus {
     /// Only `Subscribed` may be mailed. The send-time view must agree with this.
     pub fn is_mailable(self) -> bool {
         self == MembershipStatus::Subscribed
+    }
+}
+
+/// How a membership was created, for the consent log. `import` and `form` have no writer yet
+/// (M1c, M1d) and are therefore not variants; the table's `check` already admits them. A row
+/// written before the column existed reads as NULL, never as one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum MembershipSource {
+    Ui,
+    Api,
+    Bulk,
+}
+
+impl MembershipSource {
+    /// A single add by a signed-in user is the web UI; by a workspace key it is the API. A
+    /// cookie session is taken to be the UI: it cannot tell a script that reuses a cookie.
+    pub fn of_single_add(principal: &Principal) -> Self {
+        match principal {
+            Principal::User { .. } => Self::Ui,
+            Principal::ApiKey { .. } => Self::Api,
+        }
     }
 }
 
@@ -123,12 +146,14 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 ///
 /// A contact who is already `pending` or `subscribed` is left as it is: adding someone twice must
 /// not demote a confirmed subscriber back to `pending`. An `unsubscribed` one is let back in, as a
-/// fresh member (so `unsubscribed_at` is cleared; the audit log keeps the history).
+/// fresh member (so `unsubscribed_at` is cleared and `source` is the new add's; the audit log keeps
+/// the history).
 pub async fn add_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
     list_id: Uuid,
     contact_id: Uuid,
+    source: MembershipSource,
 ) -> ApiResult<MembershipStatus> {
     let double_optin = sqlx::query_scalar!(
         "select double_optin from lists where workspace_id = $1 and id = $2",
@@ -143,17 +168,18 @@ pub async fn add_member(
         MembershipStatus::Subscribed
     };
     let written = sqlx::query_scalar!(
-        r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at)
-           values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end)
+        r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source)
+           values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end, $5)
            on conflict (contact_id, list_id) do update
            set status = excluded.status, subscribed_at = excluded.subscribed_at,
-               unsubscribed_at = null
+               unsubscribed_at = null, source = excluded.source
            where list_memberships.status = 'unsubscribed'
            returning status as "status: MembershipStatus""#,
         workspace_id,
         contact_id,
         list_id,
         status as MembershipStatus,
+        source as MembershipSource,
     )
     .fetch_optional(&mut *db)
     .await

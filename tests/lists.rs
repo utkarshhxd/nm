@@ -3,7 +3,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{PW, TestApp, add_member, create_user, create_workspace};
+use common::{PW, TestApp, add_member, api_key, create_user, create_workspace};
 use nm::lists::MembershipStatus;
 use nm::workspaces::roles::Role;
 use serde_json::{Value, json};
@@ -896,4 +896,165 @@ async fn deleting_a_list_removes_its_memberships_not_the_contacts(pool: PgPool) 
         .await
         .unwrap();
     assert_eq!((count_memberships(&pool).await, contacts), (0, 1));
+}
+
+/// `list_memberships.source` of the one row; `None` is NULL, the row has no provenance.
+async fn source_of(pool: &PgPool, list: Uuid, contact: Uuid) -> Option<String> {
+    sqlx::query_scalar("select source from list_memberships where list_id = $1 and contact_id = $2")
+        .bind(list)
+        .bind(contact)
+        .fetch_one(pool)
+        .await
+        .expect("the membership row exists")
+}
+
+/// Provenance is what M1d's consent log reads, so each way in must record its own: a signed-in
+/// user is `ui`, a workspace key is `api`, on the list-side route and the contact-side one alike
+/// (they share `add_audited`, but a second writer must not be able to diverge unseen). Every
+/// assertion is an exact value: `is_some()` would stay green if `ui` were recorded for a key.
+#[sqlx::test]
+async fn a_membership_records_how_it_was_created(pool: PgPool) {
+    let (ws, ui) = workspace(&pool, "acme").await;
+    let admin = client(&pool, "admin@example.com", ws, Role::Admin).await;
+    let key = format!("Bearer {}", api_key(&admin, ws, "editor").await);
+    let keyed = TestApp::new(pool.clone()).await; // empty cookie jar: only the key authenticates
+    let news = create_list(&ui, ws, "news", false).await;
+    let people = [
+        create_contact(&ui, ws, "ui-list@ex.test").await,
+        create_contact(&ui, ws, "ui-contact@ex.test").await,
+        create_contact(&ui, ws, "key-list@ex.test").await,
+        create_contact(&ui, ws, "key-contact@ex.test").await,
+    ];
+    let contact_side = |c: Uuid| format!("/api/v1/workspaces/{ws}/contacts/{c}/lists");
+
+    add(&ui, ws, news, people[0]).await;
+    ui.post(&contact_side(people[1]))
+        .json(&json!({"list_id": news}))
+        .await
+        .assert_status_ok();
+    keyed
+        .post(&members_path(ws, news))
+        .add_header("authorization", key.clone())
+        .json(&json!({"contact_id": people[2]}))
+        .await
+        .assert_status_ok();
+    keyed
+        .post(&contact_side(people[3]))
+        .add_header("authorization", key.clone())
+        .json(&json!({"list_id": news}))
+        .await
+        .assert_status_ok();
+
+    let mut got = vec![];
+    for c in people {
+        got.push(source_of(&pool, news, c).await);
+    }
+    assert_eq!(
+        got,
+        [Some("ui"), Some("ui"), Some("api"), Some("api")].map(|s| s.map(str::to_owned))
+    );
+
+    // Letting an unsubscribed contact back in makes a fresh member, so the new add's provenance
+    // replaces the old one; leaving `ui` there would explain a re-subscription by the wrong door.
+    unsubscribe(&ui, ws, news, people[0])
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    keyed
+        .post(&members_path(ws, news))
+        .add_header("authorization", key)
+        .json(&json!({"contact_id": people[0]}))
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        source_of(&pool, news, people[0]).await.as_deref(),
+        Some("api")
+    );
+    // And a repeat add of a live member is a no-op: it does not rewrite how they first came in.
+    add(&ui, ws, news, people[0]).await;
+    assert_eq!(
+        source_of(&pool, news, people[0]).await.as_deref(),
+        Some("api")
+    );
+}
+
+/// The check admits the five values of the spec and refuses anything else. `import` and `form`
+/// have no writer yet, so the only thing proving they are admitted is inserting them directly.
+#[sqlx::test]
+async fn the_source_column_refuses_an_unknown_source(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let news = create_list(&app, ws, "news", false).await;
+    let insert = |source: Option<&'static str>, contact: Uuid| {
+        sqlx::query(
+            "insert into list_memberships (workspace_id, contact_id, list_id, status, source) \
+             values ($1, $2, $3, 'subscribed', $4)",
+        )
+        .bind(ws)
+        .bind(contact)
+        .bind(news)
+        .bind(source)
+        .execute(&pool)
+    };
+    for (i, ok) in [
+        None,
+        Some("ui"),
+        Some("api"),
+        Some("import"),
+        Some("form"),
+        Some("bulk"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let c = create_contact(&app, ws, &format!("ok{i}@ex.test")).await;
+        insert(ok, c).await.expect("a listed source is writable");
+    }
+    for (i, bad) in ["carrier-pigeon", "UI", ""].into_iter().enumerate() {
+        let c = create_contact(&app, ws, &format!("bad{i}@ex.test")).await;
+        let err = insert(Some(bad), c)
+            .await
+            .expect_err("an unknown source must not be writable");
+        let db = err.as_database_error().expect("a database error");
+        assert_eq!(db.kind(), sqlx::error::ErrorKind::CheckViolation);
+        assert_eq!(db.constraint(), Some("list_memberships_source_check"));
+    }
+}
+
+/// A membership written before 0018 reads as NULL after it. The column has no default, so the
+/// migration adds nothing to an existing row: `'api'` there would be a provenance nobody
+/// recorded. As with the audit-row test above, this needs `run_to` with a row that already exists;
+/// the default migrated-and-empty database cannot see a backfill.
+#[sqlx::test(migrations = false)]
+async fn a_membership_from_before_provenance_reads_as_null(pool: PgPool) {
+    let migrations = &nm::db::MIGRATOR;
+    migrations.run_to(17, &pool).await.unwrap();
+    let (ws, list, contact) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for (sql, id) in [
+        (
+            "insert into workspaces (id, slug, name) values ($1, 'acme', 'acme')",
+            ws,
+        ),
+        (
+            "insert into lists (id, workspace_id, name) select $1, id, 'news' from workspaces",
+            list,
+        ),
+        (
+            "insert into contacts (id, workspace_id, email) select $1, id, 'a@ex.test' from workspaces",
+            contact,
+        ),
+    ] {
+        sqlx::query(sql).bind(id).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status) \
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(ws)
+    .bind(contact)
+    .bind(list)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrations.run(&pool).await.unwrap();
+    assert_eq!(source_of(&pool, list, contact).await, None);
 }

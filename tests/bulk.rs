@@ -1216,6 +1216,34 @@ async fn bulk_subscribe_never_changes_an_existing_membership(pool: PgPool) {
     }
 }
 
+/// Bulk subscribe records `bulk`, and leaves the provenance of a membership that already exists
+/// alone: `on conflict do nothing` must not become a rewrite of how somebody first came in.
+#[sqlx::test]
+async fn bulk_subscribe_records_bulk_and_keeps_an_existing_source(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let news = list(&app, ws, "news", false).await;
+    let ids = contacts(&app, ws, "c", 2).await;
+    join_list(&app, ws, ids[1], news).await; // by the UI route: `ui`
+    let sel = select(&app, ws, json!({})).await;
+    let target = body(sel.target(), json!({"list_id": news}));
+    assert_eq!(affected(bulk(&app, ws, "subscribe", target).await).await, 1);
+
+    let mut got = vec![];
+    for id in &ids {
+        got.push(
+            sqlx::query_scalar::<_, Option<String>>(
+                "select source from list_memberships where contact_id = $1 and list_id = $2",
+            )
+            .bind(id)
+            .bind(news)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        );
+    }
+    assert_eq!(got, [Some("bulk".to_owned()), Some("ui".to_owned())]);
+}
+
 /// Somebody who unsubscribes between the selection and the action, which is section 8.3's case:
 /// they are still frozen, the statement runs against them, and `on conflict do nothing` is the
 /// whole reason that is harmless.
