@@ -3,8 +3,20 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Page, expect, test } from "@playwright/test";
 
+import type { components } from "../src/api/schema";
 import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
+
+/**
+ * The server's own per-row answer. Stubbed count bodies are typed against it, because a stub is a
+ * promise about what the server sends: an untyped one goes on passing against a shape the server
+ * has stopped sending, and a wire change should fail `pnpm -C web typecheck` instead.
+ *
+ * `stubbed` below is deliberately left unannotated: its `STATES[i % 4]` is possibly-undefined
+ * under `noUncheckedIndexedAccess`, so pinning it would need a cast — and a cast inside a type pin
+ * defeats the pin. A shape change still fails here, at the two sites that are annotated.
+ */
+type SegmentCount = components["schemas"]["SegmentCount"];
 
 /**
  * The segments list and the rule builder (spec M1b sections 4.1 to 4.3, 5, 13 and 14).
@@ -868,7 +880,9 @@ test("a_selection_the_server_refuses_as_too_large_says_so_in_the_servers_words",
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(all.map((s) => ({ id: s.id, state: "exact", count: 7 }))),
+      body: JSON.stringify(
+        all.map((s): SegmentCount => ({ id: s.id, state: "exact", count: 7 })),
+      ),
     }),
   );
   // `MAX_SELECTION` is a million, so the real refusal cannot be provoked with three contacts.
@@ -932,7 +946,7 @@ test("a_row_the_count_could_not_work_out_is_quiet_and_the_page_says_so_once", as
       status: 200,
       contentType: "application/json",
       body: JSON.stringify(
-        all.map((seg, i) =>
+        all.map((seg, i): SegmentCount =>
           i === 0 ? { id: seg.id, state: "failed", count: null } : { id: seg.id, state: "exact", count: 4 },
         ),
       ),

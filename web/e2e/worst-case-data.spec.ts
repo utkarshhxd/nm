@@ -3,6 +3,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Locator, type Page, type Route, expect, test } from "@playwright/test";
 
+import type { components } from "../src/api/schema";
 import { axeProblems } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
@@ -720,14 +721,19 @@ test("the_count_alert_says_which_failure_it_is_without_widening_the_page", async
       what: "some rows in it could not be counted",
       // Every id the page asked for, echoed back as `failed`, so this needs no segment id of its
       // own. `failed` is the state that means "not this time", and the rows answer it with "—".
+      //
+      // Typed against the generated schema, not hand-written: a stub is a promise about what the
+      // server sends, and an untyped one goes on passing against a shape the server has stopped
+      // sending. With this annotation that change fails `pnpm -C web typecheck` instead.
       route: (r: Route) => {
         const asked = new URL(r.request().url()).searchParams.get("ids") ?? "";
+        const rows: components["schemas"]["SegmentCount"][] = asked
+          .split(",")
+          .map((id) => ({ id, state: "failed", count: null }));
         return r.fulfill({
           status: 200,
           contentType: "application/json",
-          body: JSON.stringify(
-            asked.split(",").map((id) => ({ id, state: "failed", count: null })),
-          ),
+          body: JSON.stringify(rows),
         });
       },
       says: "Some of these counts could not be worked out this time.",
@@ -736,8 +742,9 @@ test("the_count_alert_says_which_failure_it_is_without_widening_the_page", async
   const found: string[] = [];
   try {
     // The alert is a sentence with a ghost button inline in it, so the narrow case is the one that
-    // can break: 320 px first, then desktop.
-    for (const width of [320, 1280]) {
+    // can break — and the three widths every `SCREENS` screen gets, so a reader comparing the two
+    // does not have to work out whether the difference was deliberate. 640 is 200 % zoom.
+    for (const width of [320, 640, 1280]) {
       await page.setViewportSize({ width, height: 640 });
       for (const failure of failures) {
         await page.route(COUNTS, failure.route);
