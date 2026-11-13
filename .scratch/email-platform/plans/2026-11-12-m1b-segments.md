@@ -185,6 +185,12 @@ model and the hardest review.
       rejects the action if it disagrees with `selection_snapshots.size`.
 - [ ] The bulk audit row copies `selection_snapshots.filter`, with `q` **redacted** (§8.7).
 - [ ] `Selection::of_ids` is unchanged and carries no `snapshot_id`.
+- [ ] **`GET /contacts?snapshot_id=…` returns the frozen set.** Spec §14 needs it and the plan
+      gave it no owner; Task 11 is web-only. It belongs here, with the rest of the snapshot read
+      path.
+- [ ] **The selection token becomes unconditional again.** Task 5 returns `selection_token: null`
+      for a segment selection on purpose, because a v2 token carries a `ContactFilter` that cannot
+      express a segment and would describe every contact the remaining filter matches.
 - [ ] **ADR 0004** carries the new design, the two measured counterexamples that killed the
       timestamp variant, and §8.4's cost table. **ADR 0003 is marked superseded and kept.** The
       doc comments on `Selection` and `Selection::widened` carry the superseded argument and must

