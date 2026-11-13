@@ -476,8 +476,9 @@ row and not for a 158 MB one. It only runs while somebody is logged in, so Frida
 survive to Monday, and the measured 850 ms cascade would land on the hot path of a stranger's
 authenticated request.
 
-Instead: a bounded sweep that deletes **one** expired snapshot per pass, so the worst case any
-request pays is one cascade. §19 records partitioning by expiry hour and dropping the partition
+Instead: a bounded sweep that deletes **one** expired snapshot per pass. As built,
+`sweep_expired_snapshots` is its own task, so the worst case a request pays is **nothing at all** —
+this section's "one cascade" was written against a draft that still rode a request. §19 records partitioning by expiry hour and dropping the partition
 as the upgrade if churn measures badly.
 
 ---
@@ -503,8 +504,19 @@ That is confirmation copy, not a refusal: §14 carries it.
 
 Issue `03` — the confirmed count never reaches the server — has been open since M1a because
 fixing it meant a design change. Snapshots make it a comparison: the client sends the size it
-displayed, and the server rejects the action if it disagrees with `selection_snapshots.size`.
-Cheap now, so it is done now.
+displayed, and the server rejects the action if it disagrees.
+
+**It is compared against `counts.selected`, not against `selection_snapshots.size`** — the
+snapshot's size is the set as issued, while the action is bounded by the set *minus this
+selection's exclusions*, which is what the person was actually shown. Comparing against `size`
+is the check Task 6's review ruled out, and this sentence described it for longer than the code
+did. Cheap now, so it is done now.
+
+The residual is honest and worth stating here rather than leaving for someone to find: the server
+is bounding by a number **the client supplies**. That catches the realistic failure — a stale
+screen, a concurrent edit — and it is what ADR 0004 specifies. A client that lies about its own
+confirmed count is undefended, and undefendable at this layer; what bounds *that* is the snapshot
+itself, through `issued`.
 
 ---
 
