@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { readFile } from "node:fs/promises";
+
 import AxeBuilder from "@axe-core/playwright";
 import { type BrowserContext, type Page, expect, test } from "@playwright/test";
 
@@ -830,6 +832,236 @@ test("a_view_that_shrank_for_another_reason_states_the_fact_and_not_a_cause", as
   await expect(page.getByText("Filtering changes what is shown here")).toHaveCount(0);
 });
 
+/**
+ * The columns `src/contacts/export.rs` writes: the contact's own fields, every **live** custom
+ * field — `region` and `tier` are archived by the tests above, `plan` is not — then the three
+ * spec §10 adds.
+ */
+const CSV_HEADER =
+  "id,email,first_name,last_name,timezone,created_at,updated_at,attr:plan,lists,tags,suppressed";
+
+const exportDialog = (p: Page) =>
+  p.getByRole("dialog", { name: "Export these contacts", exact: true });
+
+test("an_editor_never_sees_the_export_control", async () => {
+  await editorPage.goto(contactsPath);
+  // A waiting neighbour for the absence below: the grid is drawn and the editor's own controls
+  // are on it, so "no Export" is an absence and not a page that has not drawn its buttons yet.
+  await expect(editorPage.getByRole("grid", { name: "Contacts" })).toBeVisible();
+  // The assertion that both waits and discriminates: the two header buttons as a list, so an
+  // Export that appeared would make the list two long. Checked the other way round — "no Export
+  // button" on its own passes against a page that has not drawn its buttons yet, which is why it
+  // is not left to carry this alone.
+  await expect(editorPage.getByRole("button", { name: /^(Export CSV|New contact)$/ })).toHaveText([
+    "New contact",
+  ]);
+  // Absent, not disabled (spec §14): a greyed-out Export names the door for every editor to knock
+  // on, and §10 is explicit that admin-only is about raising the cost of exfiltration.
+  await expect(editorPage.getByRole("button", { name: /export/i })).toHaveCount(0);
+
+  // The screen is only a courtesy; the route refuses them too. The problem code is asserted
+  // because a missing CSRF header is also a 403, and that would pass while proving nothing.
+  const me = (await (await editor.request.get("/api/v1/me")).json()) as { csrf_token: string };
+  const refused = await editor.request.post(`${base()}/contacts/export`, {
+    data: {},
+    headers: { "X-CSRF-Token": me.csrf_token },
+  });
+  expect(refused.status()).toBe(403);
+  expect(await refused.json()).toMatchObject({ type: "urn:nm:problem:insufficient-role" });
+});
+
+test("exporting_says_what_leaves_and_the_download_starts", async () => {
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+
+  const dialog = exportDialog(page);
+  await expect(dialog).toContainText("personal data");
+  await expect(dialog).toContainText("audit log");
+  // Of the filter, never of a selection: `POST /contacts/export` takes a `NewSelection` and has
+  // no `snapshot_id`, so it re-runs the filter and cannot be aimed at a frozen set.
+  await expect(dialog).toContainText("everything matching the filters on this screen");
+  // Nobody has counted this filter, so no number is named. `Page` carries no total and the one
+  // endpoint that counts a filter exactly writes a snapshot to do it; a number here is invented.
+  await expect(dialog).toContainText("The number of rows is not known here");
+  expect(await dialog.innerText()).not.toMatch(/\d/);
+
+  // Red, and not by the bulk-tag dialog's reasoning: a downloaded file cannot be un-downloaded.
+  const go = dialog.getByRole("button", { name: "Export CSV", exact: true });
+  await expect(go).toHaveClass(/bg-danger/);
+
+  const [file] = await Promise.all([page.waitForEvent("download"), go.click()]);
+  expect(file.suggestedFilename()).toBe("contacts.csv");
+  const csv = await readFile(await file.path(), "utf8");
+
+  const lines = csv.trim().split("\r\n");
+  expect(lines[0]).toBe(CSV_HEADER);
+  // The filter reached the server: the three it matched, and nothing else in the workspace.
+  expect(lines).toHaveLength(4);
+  expect(csv).toContain("bulk-a@example.test");
+  expect(csv).not.toContain("ada@example.test");
+  // §10: every membership carries its status, or M1c's importer reads this file back as a
+  // re-subscribe for someone who unsubscribed.
+  expect(lines.find((l) => l.includes("bulk-a@"))).toContain("Weekly digest:unsubscribed");
+
+  // Closed when the file arrived, and nothing was refused.
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("a_slow_export_says_it_is_not_stuck", async () => {
+  // The whole CSV is read into the page before the download can start, so a large export looks
+  // hung for as long as it takes. The dialog has to say so while it waits, and say it to a screen
+  // reader and not only to a screen.
+  let release = () => {};
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  let holding = true;
+  await page.route("**/contacts/export", async (route) => {
+    if (holding) {
+      holding = false;
+      await held;
+    }
+    await route.continue().catch(() => undefined);
+  });
+
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dialog = exportDialog(page);
+  await dialog.getByRole("button", { name: "Export CSV", exact: true }).click();
+
+  await expect(dialog.getByRole("status")).toHaveText(
+    "Preparing the file. The whole export has to arrive before the download starts, so a large " +
+      "one takes a while — nothing is stuck.",
+  );
+  await expect(dialog.getByRole("button", { name: "Export CSV", exact: true })).toHaveAttribute(
+    "aria-busy",
+    "true",
+  );
+
+  const arriving = page.waitForEvent("download");
+  release();
+  expect((await arriving).suggestedFilename()).toBe("contacts.csv");
+  await page.unroute("**/contacts/export");
+  await expect(dialog).toBeHidden();
+});
+
+test("an_export_that_never_arrives_says_so_instead_of_closing_quietly", async () => {
+  // A connection that goes, or the abort `export.rs` sends when the query fails mid-book rather
+  // than passing a short file off as a whole one. There is no refusal to render — reading the
+  // body simply rejects — and the dialog is closing either way, so without a sentence of its own
+  // the screen would say nothing at all.
+  await page.route("**/contacts/export", (route) => route.abort("failed"));
+
+  let started = 0;
+  page.on("download", () => {
+    started += 1;
+  });
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dialog = exportDialog(page);
+  await dialog.getByRole("button", { name: "Export CSV", exact: true }).click();
+
+  await expect(page.getByRole("alert")).toHaveText(
+    "The export did not finish, so no file was saved. Try again.",
+  );
+  await expect(dialog).toBeHidden();
+  expect(started).toBe(0);
+  page.removeAllListeners("download");
+  await page.unroute("**/contacts/export");
+});
+
+test("the_export_dialog_names_a_count_only_when_one_was_taken_for_this_filter", async () => {
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 3 contacts.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dialog = exportDialog(page);
+  // The one exact count of this filter anybody paid for, named as what it is: taken then, not now.
+  await expect(dialog).toContainText(
+    "3 contacts matched when you selected them, and the export runs the filters again, so the " +
+      "file holds whatever matches when it runs.",
+  );
+  // Nothing was left out and the filter has not moved, so the selection *is* this filter and
+  // there is nothing to disown. The paragraph count is the assertion that waits — "a sentence is
+  // absent" has nothing to wait on and passes against a dialog that has not drawn yet.
+  await expect(dialog.getByRole("paragraph")).toHaveCount(2);
+  await expect(dialog).not.toContainText("An export cannot be pointed at a selection");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+
+  // Leave one out and the two part company: the export would still take all three.
+  await page.getByRole("checkbox", { name: "Select bulk-c@example.test", exact: true }).uncheck();
+  await expect(
+    page.getByText("Here is what you selected: 2 of 3 contacts (1 left out)."),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  await expect(dialog).toContainText("This is not the 2 contacts you selected");
+  await expect(dialog).toContainText("3 contacts matched when you selected them");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
+test("the_export_dialog_disowns_ticked_rows_too", async () => {
+  // The other way a selection exists: rows ticked by hand, with nothing written down on the
+  // server. The export still takes the filter, so the dialog still has to say it is not these.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select bulk-a@example.test", exact: true }).check();
+  await expect(page.getByText("1 contact selected", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dialog = exportDialog(page);
+  await expect(dialog).toContainText("This is not the 1 contact you selected");
+  // Ticking rows materialises nothing, so there is still no count of this filter to name.
+  await expect(dialog).toContainText("The number of rows is not known here");
+});
+
+test("a_rate_limited_export_shows_the_servers_sentence_and_downloads_nothing", async () => {
+  // Real, not stubbed. `EXPORT_PER_MINUTE` is 5 per workspace, so five over the API spend the
+  // window and the one through the UI is refused by the server that wrote the rule. This is the
+  // last export in this file: it leaves the window spent for a minute.
+  for (let n = 0; n < 5; n++) {
+    await admin.request.post(`${base()}/contacts/export`, {
+      data: { q: "bulk-" },
+      headers: { "X-CSRF-Token": csrf },
+    });
+  }
+
+  let started = 0;
+  page.on("download", () => {
+    started += 1;
+  });
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dialog = exportDialog(page);
+  await dialog.getByRole("button", { name: "Export CSV", exact: true }).click();
+
+  // `src/error.rs` wrote this sentence, not the client. A nicer one of the client's own would be
+  // the client guessing at a rule only the server knows.
+  await expect(page.getByRole("alert")).toHaveText("too many requests");
+  // The refusal arrives after the dialog was agreed to, so it lands where the person is looking:
+  // the dialog is gone and the page's own alert carries it.
+  await expect(dialog).toBeHidden();
+  expect(started).toBe(0);
+  page.removeAllListeners("download");
+});
+
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {
   await page.goto(contactsPath);
   await page.getByRole("link", { name: "Instance suppressions", exact: true }).click();
@@ -930,4 +1162,7 @@ test("axe_reports_no_violations_with_each_destructive_dialog_open", async () => 
   await scan("Tag these contacts");
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
   await scan("Delete these contacts");
+  // With the selection still in hand, so the paragraph that disowns it is scanned too.
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  await scan("Export these contacts");
 });

@@ -85,6 +85,9 @@ export default function Contacts() {
       id={workspace.id}
       slug={workspace.slug}
       canEdit={atLeast(workspace.role, "editor")}
+      // Spec §13: export is admin. The control is absent below rather than disabled — a greyed-out
+      // Export tells every editor exactly which door to knock on.
+      canExport={atLeast(workspace.role, "admin")}
     />
   );
 }
@@ -139,7 +142,17 @@ const CONFIRM: Record<Confirming["kind"], { title: string; label: (n: number) =>
   delete: { title: "Delete these contacts", label: (n) => `Delete ${count(n, "contact")}` },
 };
 
-function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit: boolean }) {
+function ContactsPage({
+  id,
+  slug,
+  canEdit,
+  canExport,
+}: {
+  id: string;
+  slug: string;
+  canEdit: boolean;
+  canExport: boolean;
+}) {
   const queryClient = useQueryClient();
   const navigate = useNavigate({ from: "/w/$slug/contacts" });
   const search = useSearch({ from: "/w/$slug/contacts" });
@@ -267,6 +280,8 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
   const [failure, setFailure] = useState("");
   const [creating, setCreating] = useState(false);
   const [confirming, setConfirming] = useState<Confirming | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [counting, setCounting] = useState(false);
   const live = useRef(filterKey);
@@ -384,6 +399,70 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     store.selectAll(data.selection_token, data.snapshot_id, data.selected);
   }
 
+  /**
+   * The only exact count of *this* filter in hand (spec §10, ruling E2). `Page` carries no total,
+   * and the one endpoint that counts a filter exactly materialises a snapshot — up to a million
+   * rows written, and a bite out of `SELECTION_PER_MINUTE` — so no number is asked for to label a
+   * dialog. This is the count "Select all matching" already wrote down, and it is used only while
+   * the filter it was taken for is still the filter.
+   */
+  const exportCount = matched?.key === filterKey ? matched.n : null;
+  /**
+   * Whether the export would cover the same contacts as the selection. `POST /contacts/export`
+   * takes a `NewSelection` and has no `snapshot_id`: it re-runs the filter, so it can never be
+   * pointed at a frozen set. The two are the same set only when the selection *is* the whole of
+   * this filter — taken from it, nothing left out, nothing changed since. Task 11 made the grid
+   * show the frozen set, so in every other case the dialog has to say so out loud.
+   */
+  const exportIsSelection =
+    selection.mode === "all" && selection.excluded.size === 0 && exportCount !== null;
+
+  /**
+   * The CSV, through `fetch` into a blob.
+   *
+   * shortcut: the whole file is held in browser memory before the download starts, which is what
+   * §10 refuses to do on the server; upgrade to a signed short-lived GET URL the browser streams
+   * straight to disk when an export outgrows a tab. `fetch` is forced either way — CSRF takes an
+   * `X-CSRF-Token` header (`src/http/csrf.rs`), which neither a form post nor an `<a>` can send.
+   */
+  async function exportCsv() {
+    if (exportBusy) return;
+    setExportBusy(true);
+    setFailure("");
+    try {
+      const { data, error } = await api.POST(
+        "/api/v1/workspaces/{workspace_id}/contacts/export",
+        {
+          params: { path: { workspace_id: id } },
+          body: {
+            q: filters.q,
+            list_id: filters.list_id,
+            list_status: filters.list_status,
+            tag_id: filters.tag_id,
+          },
+          parseAs: "blob",
+        },
+      );
+      if (error || !data) {
+        // The refusal arrives after the dialog was agreed to, so it lands in the page's own alert
+        // rather than in the dialog `finally` is about to close. 403 and 429 are the server's own
+        // sentences, like every other refusal here.
+        setFailure(problemMessage(error, "The export failed and no file was downloaded."));
+        return;
+      }
+      download(data, "contacts.csv");
+    } catch {
+      // No refusal to render: the connection went, or the stream was aborted part-way — which is
+      // how `export.rs` reports a query that failed mid-book, rather than ending the response and
+      // passing off a short file as a whole one. Reading the blob rejects, and without this the
+      // dialog would simply close with nothing said.
+      setFailure("The export did not finish, so no file was saved. Try again.");
+    } finally {
+      setExportBusy(false);
+      setExporting(false);
+    }
+  }
+
   async function bulk(kind: Kind, target: string, name: string, promised?: number) {
     const current = store.get();
     if (current.mode === "none" || (kind !== "delete" && !target)) return;
@@ -483,11 +562,14 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     <section className="mt-8">
       <div className="flex flex-wrap items-baseline justify-between gap-3">
         <h2 className="text-xl font-semibold">Contacts</h2>
-        {canEdit ? (
-          <Button variant="solid" onClick={() => setCreating(true)}>
-            New contact
-          </Button>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-3">
+          {canExport ? <Button onClick={() => setExporting(true)}>Export CSV</Button> : null}
+          {canEdit ? (
+            <Button variant="solid" onClick={() => setCreating(true)}>
+              New contact
+            </Button>
+          ) : null}
+        </div>
       </div>
 
       <div className="mt-4">
@@ -784,6 +866,51 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         )}
       </ConfirmDialog>
 
+      {/* Red, by the default `variant`, and for the opposite reason to the tag dialog's `solid`:
+          you cannot un-download a file. §10 is explicit that admin-only "does not prevent
+          exfiltration — it raises the cost and creates one audit point where there was none", and
+          the red button is part of raising that cost. */}
+      <ConfirmDialog
+        open={exporting}
+        onClose={() => setExporting(false)}
+        title="Export these contacts"
+        confirmLabel="Export CSV"
+        busy={exportBusy}
+        onConfirm={() => void exportCsv()}
+      >
+        <p>
+          The file contains <strong>personal data</strong>: every contact&apos;s name, email
+          address, tags, list memberships and custom field values, in plain text. A file that has
+          been downloaded cannot be recalled. Who exported, what was filtered and how many rows
+          left are recorded in the audit log.
+        </p>
+        <p>
+          It covers{" "}
+          {narrowed
+            ? "everything matching the filters on this screen"
+            : "every contact in this workspace, because no filters are set"}
+          .{" "}
+          {exportCount === null
+            ? "The number of rows is not known here; it is recorded in the audit log."
+            : `${count(exportCount, "contact")} matched when you selected them, and the export runs the filters again, so the file holds whatever matches when it runs.`}
+        </p>
+        {/* Ruling E1. The grid shows the frozen set whenever a selection exists, so "export the
+            contacts you selected" would be false in exactly the situation the person is most
+            likely to be in. The export route takes a filter and has no `snapshot_id`. */}
+        {selection.mode !== "none" && !exportIsSelection ? (
+          <p>
+            This is <strong>not</strong> the {count(chosen, "contact")} you selected. An export
+            cannot be pointed at a selection: it runs the filters on this screen.
+          </p>
+        ) : null}
+        {exportBusy ? (
+          <p role="status">
+            Preparing the file. The whole export has to arrive before the download starts, so a
+            large one takes a while — nothing is stuck.
+          </p>
+        ) : null}
+      </ConfirmDialog>
+
       <Dialog open={creating} onClose={() => setCreating(false)} title="New contact">
         <ContactForm
           ws={id}
@@ -797,6 +924,25 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       </Dialog>
     </section>
   );
+}
+
+/**
+ * Saves a blob as a file. `name` repeats the server's own `content-disposition` filename: a body
+ * the page read itself never reaches the browser's download machinery, so that header is not
+ * applied and the name has to be given here.
+ */
+function download(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  // Firefox only downloads from a link that is in the document.
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // One task later: the browser has taken the blob by then, and never revoking it would hold the
+  // whole CSV in memory until the tab closes.
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 /**

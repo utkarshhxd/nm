@@ -260,6 +260,12 @@ const SCREENS: Screen[] = [
       await opens("Delete contacts", "Delete these contacts")(p);
     },
   },
+  {
+    name: "export contacts dialog",
+    path: () => `/w/${SLUG}/contacts`,
+    ready: (p) => p.getByRole("grid", { name: "Contacts" }),
+    open: opens("Export CSV", "Export these contacts"),
+  },
 ];
 
 async function everyScreen(screens: Screen[], suffix = ""): Promise<string[]> {
