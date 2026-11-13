@@ -2,7 +2,7 @@
 
 import type { ReactNode } from "react";
 
-import { Button } from "./button";
+import { Button, type ButtonVariant } from "./button";
 import { Dialog } from "./dialog";
 import { Alert } from "./field";
 
@@ -11,6 +11,10 @@ import { Alert } from "./field";
  * ("Archive field", never "OK"). The caller owns the request: `onConfirm` starts it, `busy` is
  * its pending state and `error` the sentence for a refusal, which stays on screen so the person
  * sees why nothing changed. Focus starts on the heading, never on the destructive button.
+ *
+ * `variant` is red by default because most confirmations here guard something irreversible. An
+ * action that is merely weighty passes `solid`: red on something "Remove tag" undoes completely,
+ * two controls from a bulk delete, is how red stops meaning anything.
  */
 export function ConfirmDialog({
   open,
@@ -20,6 +24,7 @@ export function ConfirmDialog({
   onConfirm,
   busy,
   error,
+  variant = "danger-solid",
   children,
 }: {
   open: boolean;
@@ -29,6 +34,7 @@ export function ConfirmDialog({
   onConfirm: () => void;
   busy?: boolean;
   error?: string | undefined;
+  variant?: ButtonVariant;
   children: ReactNode;
 }) {
   return (
@@ -37,7 +43,7 @@ export function ConfirmDialog({
       {error ? <Alert>{error}</Alert> : null}
       <div className="mt-6 flex flex-wrap justify-end gap-3">
         <Button onClick={onClose}>Cancel</Button>
-        <Button variant="danger-solid" busy={busy ?? false} onClick={onConfirm}>
+        <Button variant={variant} busy={busy ?? false} onClick={onConfirm}>
           {confirmLabel}
         </Button>
       </div>

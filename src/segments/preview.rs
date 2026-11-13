@@ -106,6 +106,13 @@ pub enum CountState {
     /// The stored document no longer parses, so it cannot be compiled or counted. `count` is null
     /// and the segment needs re-saving. One such row no longer costs the other 24 their counts.
     Unreadable,
+    /// We could not work out a number for this row **this time**: the batch count ran out of its
+    /// budget and the fallback estimate failed too. `count` is null and a retry may well work.
+    ///
+    /// It is its own state because saying either of the two above would be a lie about a
+    /// different thing — `no_estimate` says no honest number exists for this document, and
+    /// `unreadable` says the document is broken. Neither is true of a planner that stumbled.
+    Failed,
 }
 
 /// One segment's count in a batch. `Preview`'s `took_ms` has no meaning per row: the batch is one
@@ -170,8 +177,22 @@ pub async fn counts(
             // them gets its own estimate rather than the whole page losing its numbers.
             Err(e) if timed_out(&e) => {
                 for (id, group) in &countable {
-                    let n = estimate(pool, workspace_id, group, timeout_ms).await?;
-                    rows.insert(*id, SegmentCount::new(*id, CountState::Estimated, Some(n)));
+                    // Per row, never `?`. One segment whose `EXPLAIN` fails — it timed out too,
+                    // the planner stumbled — used to turn the whole page's counts into a 500,
+                    // which is the shape the parse path above had removed from it and this path
+                    // kept. The row says `failed` and the other 24 keep their numbers.
+                    let row = match estimate(pool, workspace_id, group, timeout_ms).await {
+                        Ok(n) => SegmentCount::new(*id, CountState::Estimated, Some(n)),
+                        Err(failure) => {
+                            tracing::warn!(
+                                segment_id = %id,
+                                error = ?failure,
+                                "the fallback estimate failed for one segment",
+                            );
+                            SegmentCount::new(*id, CountState::Failed, None)
+                        }
+                    };
+                    rows.insert(*id, row);
                 }
             }
             Err(e) => return Err(e.into()),
@@ -277,7 +298,17 @@ async fn estimate(
     push_rules(&mut q, group);
     let plan = q.build_query_scalar::<Value>().fetch_one(&mut *tx).await?;
     tx.rollback().await?;
-    // The top node of the first (only) plan. Nested `Plans` are per worker and per scan.
+    plan_rows(&plan)
+}
+
+/// The estimate out of an `EXPLAIN (FORMAT JSON)` document: the **top** node of the first (and
+/// only) plan.
+///
+/// Nested `Plans` are per worker and per scan, so a `Gather`'s child reports what **one** worker
+/// expects — read it and the answer is short by the worker count. Pure, and pinned by a unit test
+/// against a captured parallel plan, because a fixture that reliably plans in parallel is
+/// expensive and moves with the planner's version.
+fn plan_rows(plan: &Value) -> ApiResult<i64> {
     plan[0]["Plan"]["Plan Rows"].as_i64().ok_or_else(|| {
         ApiError::Internal(anyhow::anyhow!("no `Plan Rows` in the plan for a preview"))
     })
@@ -287,4 +318,52 @@ fn timed_out(e: &sqlx::Error) -> bool {
     e.as_database_error()
         .and_then(sqlx::error::DatabaseError::code)
         .is_some_and(|code| code == QUERY_CANCELED)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::plan_rows;
+
+    /// A real `EXPLAIN (FORMAT JSON)` of a parallel sequential scan, trimmed to the fields
+    /// `plan_rows` reads. The `Gather` expects 10,000 rows; its child expects 4,167 — what **one**
+    /// of two workers plus the leader produces. Reading the child under-reports by the worker
+    /// count, which is the mistake section 5 records as measured.
+    ///
+    /// shortcut: a captured plan rather than a fixture that really plans in parallel. A live one
+    /// needs a table large enough to beat `min_parallel_table_scan_size` and costs seconds per
+    /// run, and which node the planner picks moves between Postgres versions. Recapture this from
+    /// a real `EXPLAIN` the day the shape of a plan document changes.
+    fn parallel_plan() -> serde_json::Value {
+        json!([{
+            "Plan": {
+                "Node Type": "Gather",
+                "Plan Rows": 10000,
+                "Workers Planned": 2,
+                "Plans": [{
+                    "Node Type": "Seq Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": true,
+                    "Plan Rows": 4167,
+                }],
+            },
+        }])
+    }
+
+    #[test]
+    fn the_estimate_is_the_top_node_not_the_per_worker_child() {
+        let plan = parallel_plan();
+        assert_eq!(plan_rows(&plan).expect("a plan with a top node"), 10_000);
+        // The figure this must never return, stated so the assertion above cannot be satisfied
+        // by a coincidence: the child really does carry a different number.
+        assert_eq!(plan[0]["Plan"]["Plans"][0]["Plan Rows"], 4167);
+    }
+
+    #[test]
+    fn a_plan_with_no_row_estimate_is_an_error_not_a_zero() {
+        // `0` would read as "nothing matches", which is a number somebody would act on.
+        assert!(plan_rows(&json!([{"Plan": {"Node Type": "Seq Scan"}}])).is_err());
+        assert!(plan_rows(&json!([])).is_err());
+    }
 }

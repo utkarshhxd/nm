@@ -219,6 +219,60 @@ test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
   expect((await tagged(FIRST)).length + (await tagged(LAST)).length).toBeGreaterThan(0);
 });
 
+test("a_frozen_set_wider_than_a_page_pages_and_says_so_without_inventing_a_figure", async () => {
+  test.setTimeout(120_000);
+  // The case R2 was written for. Everything below needs a selection that does not fit on one
+  // page, which is also the only shape in which the sentence's figure is unknowable.
+  const snapshots: (string | null)[] = [];
+  const watch = (r: import("@playwright/test").Request) => {
+    const url = new URL(r.url());
+    if (r.method() === "GET" && url.pathname.endsWith("/contacts")) {
+      snapshots.push(url.searchParams.get("snapshot_id"));
+    }
+  };
+
+  await open();
+  await grid().getByRole("checkbox", { name: "Select all loaded contacts" }).check();
+  await page.getByRole("button", { name: "Select all contacts matching this view" }).click();
+  await expect(
+    page.getByText(`Here is what you selected: all ${TOTAL.toLocaleString("en-US")} contacts.`),
+  ).toBeVisible();
+
+  // Page two of the frozen set, and every page of it, carries the snapshot: a next page fetched
+  // without it would quietly go back to the live filter halfway down the grid.
+  page.on("request", watch);
+  await expect
+    .poll(
+      async () => {
+        await scroller().evaluate((el) => {
+          el.scrollTop = el.scrollHeight;
+        });
+        return Math.max(...(await indexes(rows())));
+      },
+      { timeout: 30_000 },
+    )
+    .toBeGreaterThan(102);
+  page.removeListener("request", watch);
+  expect(snapshots.length, "no page was fetched, so this proves nothing").toBeGreaterThan(0);
+  expect(
+    snapshots.every((id) => id !== null),
+    `a page of the frozen set was fetched without it: ${snapshots.join(", ")}`,
+  ).toBe(true);
+
+  // Now narrow it to more than one page. The view's size is unknown until its last page is in, so
+  // there is no "N of M" to give — but the selection's size and the reason are both known, and
+  // withholding them is the one answer R2 rules out.
+  await page.getByRole("searchbox", { name: "Search contacts", exact: true }).fill("user1");
+  await expect(rows().first()).toContainText("user1");
+  await expect(
+    page.getByText(
+      `${TOTAL.toLocaleString("en-US")} contacts are selected. Filtering changes what is shown here, not what is selected.`,
+    ),
+  ).toBeVisible();
+  // And no figure invented to fill the gap.
+  await expect(page.getByText("Showing")).toHaveCount(0);
+});
+
 test("subscribing_to_a_double_opt_in_list_says_pending_and_never_resurrects", async () => {
   await open("?q=aaa");
   await expect(rows()).toHaveCount(1);

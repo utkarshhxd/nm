@@ -34,6 +34,11 @@ export type Sort = { id: string; dir: "asc" | "desc" };
 
 export type Selecting<T> = {
   store: SelectionStore;
+  /**
+   * Ticking is off: the rows on screen are not the set the selection holds, so a tick here could
+   * not mean what it appears to. The caller says why in its own words beside the grid.
+   */
+  locked?: boolean;
   /** The checkbox's accessible name, e.g. `Select jo@example.com`. Never a bare "Select". */
   label: (row: T) => string;
   onToggle: (id: string) => void;
@@ -201,7 +206,7 @@ export function DataGrid<T>({
         return go(here - screen);
       case " ":
         // A checkbox inside the row toggles itself; this is the row's own Space.
-        if (event.target === row && selecting) {
+        if (event.target === row && selecting && !selecting.locked) {
           event.preventDefault();
           selecting.onToggle(getId(rows[here] as T));
         }
@@ -213,7 +218,7 @@ export function DataGrid<T>({
       case "Escape":
         return selecting?.onClear();
       case "a":
-        if ((event.ctrlKey || event.metaKey) && selecting) {
+        if ((event.ctrlKey || event.metaKey) && selecting && !selecting.locked) {
           event.preventDefault();
           selecting.onSelectLoaded();
         }
@@ -364,6 +369,7 @@ const GridRow = memo(function GridRow<T>({
           <Checkbox
             tabIndex={-1}
             checked={selected}
+            disabled={selecting.locked ?? false}
             onChange={() => selecting.onToggle(id)}
             aria-label={selecting.label(row)}
           />
@@ -400,6 +406,7 @@ function SelectAll<T>({
     <Checkbox
       aria-label="Select all loaded contacts"
       checked={all}
+      disabled={selecting.locked ?? false}
       indeterminate={state.mode !== "none" && !all}
       onChange={selecting.onToggleAll}
     />

@@ -363,10 +363,18 @@ test("the_bulk_tag_confirmation_says_what_a_tag_will_mean", async () => {
   // The honest tense: nothing can send to a tag in this milestone, and copy that said otherwise
   // would be describing a feature that does not exist.
   await expect(confirm).toContainText("Nothing sends to a tag yet");
+  // §9.1's paragraph names the count too, and it is a *different* paragraph from the one above:
+  // a whole-dialog check is satisfied by the other one and by the button, so this names `.nth(1)`.
+  await expect(confirm.getByRole("paragraph").nth(1)).toContainText("3 contacts");
   // A tag is not a list membership. Saying "subscribed" here would describe the one action that
   // really does put people on a mailing list, which this is not.
   await expect(confirm).not.toContainText(/subscrib/i);
-  await confirm.getByRole("button", { name: "Tag 3 contacts", exact: true }).click();
+  // Not red. §9.1 puts `bulk/tag` on the reporting side, "Remove tag" undoes it completely, and
+  // the bulk delete two controls along is the one thing on this bar that cannot be undone.
+  const tag = confirm.getByRole("button", { name: "Tag 3 contacts", exact: true });
+  await expect(tag).toHaveClass(/bg-accent/);
+  await expect(tag).not.toHaveClass(/bg-danger/);
+  await tag.click();
 
   await expect(result()).toContainText("Tagged 3 contacts with “crowd”");
   expect(await named(`/contacts/${ids.bulkA}/tags`)).toMatchObject([{ name: "crowd" }]);
@@ -632,6 +640,11 @@ test("filtering_a_frozen_selection_narrows_the_view_and_not_the_selection", asyn
   // a selection that had been thrown away would have said so by now.
   await page.waitForTimeout(900);
   await expect(page.getByRole("status").filter({ hasText: /Selection cleared/ })).toHaveCount(0);
+  // What it *does* say. R3's other false sentence lived here — "All contacts matching this view
+  // selected" — and it is the one surface in this screen a screen-reader user hears.
+  await expect(
+    page.getByRole("status").filter({ hasText: /^2 contacts selected$/ }),
+  ).toHaveCount(1);
   await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
   const confirm = page.getByRole("dialog", { name: "Delete these contacts", exact: true });
   await expect(confirm.getByRole("paragraph").first()).toContainText("2 contacts");
@@ -644,10 +657,91 @@ test("filtering_a_frozen_selection_narrows_the_view_and_not_the_selection", asyn
   await expect(page.getByText("Filtering changes what is shown here")).toHaveCount(0);
 });
 
+/** `GET /contacts`, whatever its query string. A glob would have to guess at `?`. */
+const gridRequests = (url: URL) => url.pathname.endsWith("/contacts");
+
+test("the_rows_cannot_be_ticked_while_the_frozen_page_is_in_flight", async () => {
+  // The window a real `409 selection-count-mismatch` came through. `placeholderData` keeps the
+  // previous, live-filter rows on screen while the snapshot page loads, and `shownKey` does not
+  // remount the grid — so a row that had left the filter before the snapshot was taken was still
+  // tickable, and unticking it excluded an id the snapshot never held.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("view-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+
+  let release = () => {};
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  let holding = true;
+  await page.route(gridRequests, async (route) => {
+    if (holding && route.request().url().includes("snapshot_id=")) {
+      holding = false;
+      await held;
+    }
+    await route.continue().catch(() => undefined);
+  });
+
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+
+  // Off, and it says why: a disabled control that does not explain itself is one nobody can act on.
+  await expect(page.getByText("Loading the contacts you selected")).toBeVisible();
+  const row = page.getByRole("checkbox", { name: "Select view-a@example.test", exact: true });
+  await expect(row).toBeDisabled();
+  await expect(
+    page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }),
+  ).toBeDisabled();
+
+  release();
+  await page.unroute(gridRequests);
+  // And back on once the rows on screen really are the frozen set.
+  await expect(row).toBeEnabled();
+  await expect(page.getByText("Loading the contacts you selected")).toHaveCount(0);
+});
+
+test("a_real_server_409_count_mismatch_still_reaches_the_screen_in_its_own_words", async () => {
+  // The screen can no longer build a selection whose confirmed count is under what the action
+  // reaches — the test above closed the one window that allowed it — so the one field is forged
+  // here. Everything else is real: the server computes the mismatch, writes the sentence, and the
+  // client renders what it is given. A stub would be asserting the client against itself.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("view-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+
+  await page.route("**/contacts/bulk/delete", async (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    await route.continue({ postData: JSON.stringify({ ...body, confirmed_count: 1 }) });
+  });
+  await page.getByRole("button", { name: "Delete contacts", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Delete these contacts", exact: true })
+    .getByRole("button", { name: "Delete 2 contacts", exact: true })
+    .click();
+
+  // `selection.rs` wrote this, not the test.
+  await expect(page.getByRole("alert")).toHaveText(
+    "This would have acted on 2 contacts and the confirmation said 1, so nothing was done. " +
+      "Select again to see what you would be acting on.",
+  );
+  await page.unroute("**/contacts/bulk/delete");
+  // Refused before it deleted anything.
+  const left = await get<{ data: { email: string }[] }>("/contacts?q=view-");
+  expect(left.data).toHaveLength(2);
+});
+
 test("a_refused_bulk_action_shows_the_servers_sentence_and_drops_the_selection", async () => {
-  // `selection-count-mismatch` is no longer reachable through this screen — that is what the
-  // frozen grid above removes — but the client path that renders it is not: a refusal must come
-  // out in the server's own words and take the dead selection with it.
+  // The rendering, with the refusal stubbed. The test above it produces a real one from the real
+  // server; this one pins what the screen does with it — the server's own words, and the dead
+  // selection dropped — without depending on how the server was persuaded to send it.
   await page.goto(contactsPath);
   await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
   await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
@@ -691,6 +785,43 @@ test("a_refused_bulk_action_shows_the_servers_sentence_and_drops_the_selection",
   await expect(page.getByText(/^Here is what you selected/)).toHaveCount(0);
   await page.unroute("**/contacts/bulk/delete");
   expect((await get<{ data: unknown[] }>("/contacts?q=bulk-")).data).toHaveLength(3);
+});
+
+test("a_view_that_shrank_for_another_reason_states_the_fact_and_not_a_cause", async () => {
+  // Fewer of the frozen set on screen than were selected is true whenever it is true — a second
+  // editor deleting one does it with no filter typed. The *explanation* is about filtering, so it
+  // is said only when filtering is why; a sentence that always blames the filter is a sentence
+  // asserting something that did not happen.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("view-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 2 contacts.")).toBeVisible();
+
+  // The search goes. The grid is the snapshot, so it still shows exactly those two and there is
+  // nothing to say: the view and the selection are the same set.
+  await page.getByLabel("Search contacts", { exact: true }).fill("");
+  await expect(page).not.toHaveURL(/q=view/);
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(2);
+  await expect(page.getByText(/^Showing /)).toHaveCount(0);
+  await expect(page.getByText("Filtering changes what is shown here")).toHaveCount(0);
+
+  // A second editor removes one of them, and the grid is made to ask again by sorting — which is
+  // not a filter.
+  const found = await get<{ data: { id: string }[] }>("/contacts?q=view-b@");
+  const gone = await admin.request.delete(`${base()}/contacts/${found.data[0]?.id ?? ""}`, {
+    headers: { "X-CSRF-Token": csrf },
+  });
+  expect(gone.ok(), `delete -> ${gone.status()}`).toBe(true);
+  await page.getByRole("button", { name: "Email", exact: true }).click();
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(1);
+
+  // The fact, with both numbers. Not the reason, because filtering is not the reason.
+  await expect(page.getByText("Showing 1 of the 2 contacts you selected.")).toBeVisible();
+  await expect(page.getByText("Filtering changes what is shown here")).toHaveCount(0);
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {

@@ -59,6 +59,17 @@ const COUNT_PROBLEMS = {
   "rate-limited": "Counting is busy — the counts will catch up in a moment.",
 };
 
+/**
+ * What the one page-level alert says when the batch arrived but some rows in it have no number.
+ *
+ * `failed` is its own fact: not "no honest number exists for this document" (`no_estimate`) and
+ * not "the document is broken" (`unreadable`), but "we could not work one out this time". It is
+ * announced once for the page and the rows stay quiet, exactly as a wholly failed batch is —
+ * twenty-five Retry buttons with the same name were removed from this screen once already.
+ */
+const SOME_COUNTS_FAILED =
+  "Some of these counts could not be worked out this time. Nothing is wrong with the segments.";
+
 const SAVE_PROBLEMS = {
   "segment-name-taken": "A segment with that name already exists in this workspace.",
   "not-found": "This segment no longer exists. It may have been deleted in another window.",
@@ -136,6 +147,8 @@ function AllSegments({ ws, slug, canEdit }: { ws: string; slug: string; canEdit:
     refetchOnWindowFocus: false,
     staleTime: 60_000,
   });
+  /** True when the batch came back but one or more of its rows could not be counted. */
+  const someFailed = [...(counts.data?.values() ?? [])].some((c) => c.state === "failed");
   // A failed batch is one event, so it is announced once for the page (below) and the rows go
   // quiet: twenty-five `role="alert"` spans and twenty-five identically named Retry buttons are
   // the same failure read twenty-five times.
@@ -176,6 +189,7 @@ function AllSegments({ ws, slug, canEdit }: { ws: string; slug: string; canEdit:
     },
     onSuccess: (data) => {
       handOver({
+        ws,
         token: data.selection_token,
         snapshot: data.snapshot_id,
         matched: data.selected,
@@ -255,10 +269,11 @@ function AllSegments({ ws, slug, canEdit }: { ws: string; slug: string; canEdit:
         ) : (
           <>
             {select.error ? <Alert>{select.error.message}</Alert> : null}
-            {/* One alert for one failure. The rows show "—" rather than repeating it. */}
-            {counts.isError ? (
+            {/* One alert for one failure, whether the whole batch failed or some rows in it did.
+                The rows show "—" rather than repeating it. */}
+            {counts.isError || someFailed ? (
               <p role="alert" className="mb-3 text-danger-text">
-                {counts.error.message}{" "}
+                {counts.isError ? counts.error.message : SOME_COUNTS_FAILED}{" "}
                 <Button variant="ghost" onClick={() => void counts.refetch()}>
                   Count the segments again
                 </Button>

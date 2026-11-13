@@ -18,8 +18,15 @@ export type Selection =
       excluded: ReadonlySet<string>;
     };
 
-/** A selection made on another screen, waiting for the contacts grid to pick it up. */
-export type Handover = { token: string; snapshot: string; matched: number };
+/**
+ * A selection made on another screen, waiting for the contacts grid to pick it up.
+ *
+ * `ws` is which workspace it belongs to. A navigation that is abandoned before the grid mounts —
+ * the lazy chunk is still loading and the person goes Back — leaves this behind, and without the
+ * id the next contacts screen in *any* workspace would adopt it and show a bar claiming a
+ * selection over a snapshot that workspace does not have.
+ */
+export type Handover = { ws: string; token: string; snapshot: string; matched: number };
 
 let handed: Handover | null = null;
 
@@ -35,9 +42,14 @@ export function handOver(selection: Handover | null): void {
   handed = selection;
 }
 
-/** Pure, so React may call it twice while rendering; the grid clears it with `handOver(null)`. */
-export function handedOver(): Handover | null {
-  return handed;
+/**
+ * The waiting selection if it belongs to `ws`, else `null`.
+ *
+ * Pure, so React may call it twice while rendering. The grid clears it with `handOver(null)` as
+ * it mounts, whether or not it was this workspace's, so an abandoned one is not kept.
+ */
+export function handedOver(ws: string): Handover | null {
+  return handed?.ws === ws ? handed : null;
 }
 
 /** The server refuses more than 10,000 `excluded_ids` and 10,000 `ids`. */

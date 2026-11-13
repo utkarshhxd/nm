@@ -1516,6 +1516,53 @@ async fn a_timed_out_batch_estimates_each_countable_row_and_says_which(pool: PgP
     );
 }
 
+/// A row whose **fallback estimate** fails costs that row its number and nothing else.
+///
+/// `preview_timeout_ms = 1` makes both passes fail: the batch count runs out of its budget, and
+/// so does the `EXPLAIN` the fallback plans under the same cap. Before the `failed` state the
+/// fallback loop was `let n = estimate(..).await?`, so one segment whose planner stumbled turned
+/// the whole page's counts into a 500 — the exact shape the parse path had already had removed
+/// from it, still sitting on the estimate path.
+///
+/// Every countable row fails together here, because they share one statement and one budget. What
+/// this pins is that the failure is reported **per row, in the response**, and that the rows
+/// answered before the count ran — the `attr:` one and the unreadable one — keep their own
+/// answers rather than losing them to someone else's planner.
+///
+/// `failed` is also not `no_estimate`: section 5's "too many to count exactly" means no honest
+/// number exists for that document, which is a different fact from "not this time".
+#[sqlx::test]
+async fn a_failed_fallback_estimate_costs_only_the_rows_it_belongs_to(pool: PgPool) {
+    let (ws, _seeded) = expensive_fixture(&pool).await;
+    // A budget nothing can plan inside, on the same fixture: the count times out, and so does the
+    // `EXPLAIN` that was meant to rescue it.
+    let mut app = TestApp::with_config(pool.clone(), |c| c.preview_timeout_ms = 1).await;
+    app.login("admin-acme@example.com", PW).await;
+    create_field(&app, ws, "plan").await;
+    let slow = create(&app, ws, "slow", expensive_rules()).await;
+    let attr = create(&app, ws, "attr", plan_is("pro")).await;
+    let broken = create(&app, ws, "broken", first_name_is("Ann")).await;
+    sqlx::query("update segments set rules = $2 where id = $1")
+        .bind(broken)
+        .bind(json!({"match": "all", "rules": [{"field": "nope", "op": "eq", "value": "x"}]}))
+        .execute(&pool)
+        .await
+        .expect("break the stored document");
+
+    let r = app.get(&counts_path(ws, &[slow, attr, broken])).await;
+    // The whole point: a page of counts, not a 500.
+    r.assert_status_ok();
+    let body: Value = r.json();
+
+    assert_eq!(body[0]["state"], "failed", "{body}");
+    assert_eq!(body[0]["count"], Value::Null, "{body}");
+    // The two rows that never needed the planner keep exactly what they had.
+    assert_eq!(body[1]["state"], "no_estimate", "{body}");
+    assert_eq!(body[1]["count"], Value::Null, "{body}");
+    assert_eq!(body[2]["state"], "unreadable", "{body}");
+    assert_eq!(body[2]["count"], Value::Null, "{body}");
+}
+
 /// A stored document that no longer parses costs that row its count and nothing else. Before the
 /// per-row state it failed the whole request, so one unreadable segment blanked the page.
 #[sqlx::test]

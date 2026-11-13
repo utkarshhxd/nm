@@ -747,8 +747,11 @@ export function CountText({
     return <span data-testid={testId}>needs re-saving</span>;
   }
   if (count === null || count === undefined) {
-    // A number the server promises with these two states. Saying one of the sentences above
-    // would be guessing at which fact is missing, which is the thing the states exist to stop.
+    // `failed` lands here by design — the count could not be worked out this time, and the one
+    // page-level alert says so. `exact` and `estimated` promise a number, so arriving here with
+    // none is the server contradicting itself: the quiet dash is still right, because saying one
+    // of the sentences above would be guessing at which fact is missing, which is the thing the
+    // states exist to stop.
     return <span data-testid={testId}>—</span>;
   }
   const number = count.toLocaleString();

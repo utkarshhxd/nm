@@ -1285,7 +1285,7 @@ export interface components {
          *     section 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.
          * @enum {string}
          */
-        CountState: "exact" | "estimated" | "no_estimate" | "unreadable";
+        CountState: "exact" | "estimated" | "no_estimate" | "unreadable" | "failed";
         /** @description The one response that carries the key. */
         CreatedApiKey: {
             /** Format: date-time */
@@ -3393,9 +3393,10 @@ export interface operations {
                  * @description Only the contacts a selection snapshot froze: `snapshot_id` from
                  *     `POST /contacts/selection`, which is how the grid shows "here is what you selected".
                  *
-                 *     It narrows and never widens. A snapshot that has expired, been swept, been superseded, or
-                 *     belongs to another workspace holds no contacts here — the page is empty, rather than the
-                 *     whole workspace, which is what ignoring the parameter would show.
+                 *     It narrows and never widens. A snapshot that has expired, been swept, been superseded or
+                 *     belongs to another workspace is **`422 selection-expired`, not an empty page**: "zero
+                 *     contacts matched" and "this selection is gone" are different facts, and a client cannot
+                 *     tell someone to select again if the server will not say which it was.
                  */
                 snapshot_id?: string;
             };

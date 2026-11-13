@@ -195,7 +195,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
    */
   const store = useMemo(() => {
     const made = createSelection();
-    const handoff = handedOver();
+    const handoff = handedOver(id);
     if (handoff) made.selectAll(handoff.token, handoff.snapshot, handoff.matched);
     return made;
   }, []);
@@ -220,7 +220,14 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         },
         signal,
       });
-      if (error || !data) throw new Error(problemMessage(error, "The contacts could not be loaded."));
+      if (error || !data) {
+        // The same three codes the bulk path treats as a selection that can never be used again.
+        // Only `selection-expired` can reach the read path, and a Retry against it refuses for
+        // as long as the page is open — so the selection goes and the grid reloads itself as the
+        // live view, which is the recovery `bulk` already performs.
+        if (STALE_SELECTION.has(problemType(error).replace("urn:nm:problem:", ""))) store.clear();
+        throw new Error(problemMessage(error, "The contacts could not be loaded."));
+      }
       cursors.set(pageParam.start, pageParam.cursor);
       return { rows: data.data, next: data.next_cursor ?? null, start: pageParam.start };
     },
@@ -302,11 +309,22 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
     else announce(`${count(chosen, "contact")} selected`);
   }, [selection]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  /**
+   * The rows on screen are the *previous* view while the frozen page is in flight:
+   * `placeholderData` keeps them, and `shownKey` deliberately does not remount the grid. One of
+   * them may have left the filter before the snapshot was taken, so unticking it would exclude an
+   * id the snapshot never held — the dialog's number would then be lower than what the action
+   * reaches, and the server refuses with `409 selection-count-mismatch`. Ticking is off until the
+   * rows are the frozen set.
+   */
+  const locked = query.isPlaceholderData && selection.mode === "all";
+
   const selecting = useMemo(
     () =>
       canEdit
         ? {
             store,
+            locked,
             label: (c: Contact) => `Select ${c.email}`,
             onToggle: (contactId: string) => {
               if (!store.toggle(contactId)) {
@@ -324,7 +342,7 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         : undefined,
     // `selectLoaded` reads `rows` through the ref below, so it is always the current one.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [canEdit, store],
+    [canEdit, store, locked],
   );
   const loaded = useRef(rows);
   loaded.current = rows;
@@ -609,13 +627,26 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
       {failure ? <Alert>{failure}</Alert> : null}
 
       <div className="mt-4">
-        {/* The frozen set, seen through a narrower filter. Both numbers, and which of the two the
-            filter moved: without this someone filters, unticks what they can see, and misjudges
-            the rest. The bulk bar's number never moves, and the confirmation names it. */}
-        {selection.mode === "all" && shown !== null && shown < selection.matched ? (
+        {/* The frozen set, seen through a narrower view. Two facts, each said only when it is
+            one: how many of the selection are on screen, and — only when a filter is why — that
+            filtering changes what is shown and not what is selected. The figure needs the view's
+            size, which is unknown until its last page is in; the explanation never does, and
+            withholding it on a large selection would be silence in exactly the case it is for. */}
+        {selection.mode === "all" &&
+        (shown === null ? narrowed : shown < selection.matched) ? (
           <p className="mb-3 text-fg-muted">
-            Showing {shown.toLocaleString()} of the {count(selection.matched, "contact")} you
-            selected. Filtering changes what is shown here, not what is selected.
+            {shown === null
+              ? `${count(selection.matched, "contact")} are selected.`
+              : `Showing ${shown.toLocaleString()} of the ${count(selection.matched, "contact")} you selected.`}
+            {narrowed ? " Filtering changes what is shown here, not what is selected." : ""}
+          </p>
+        ) : null}
+        {/* Why the ticks are off. A disabled control that does not say why is a control nobody
+            can act on, which is the pattern `m1a-decisions.md` settled for the bulk bar. */}
+        {locked ? (
+          <p className="mb-3 text-fg-muted">
+            Loading the contacts you selected. These are the rows you were looking at before, so
+            they cannot be ticked until it arrives.
           </p>
         ) : null}
         {query.isPending ? (
@@ -690,6 +721,10 @@ function ContactsPage({ id, slug, canEdit }: { id: string; slug: string; canEdit
         onClose={() => setConfirming(null)}
         title={confirming ? CONFIRM[confirming.kind].title : ""}
         confirmLabel={confirming ? CONFIRM[confirming.kind].label(confirming.promised) : ""}
+        // Red is for what cannot be undone. "Remove tag" undoes this completely and §9.1 puts
+        // `bulk/tag` on the reporting side; red two controls from the bulk delete that really is
+        // irreversible is how red stops meaning anything. §9.1's weight is in the copy.
+        variant={confirming?.kind === "tag" ? "solid" : "danger-solid"}
         onConfirm={() => {
           const go = confirming;
           setConfirming(null);

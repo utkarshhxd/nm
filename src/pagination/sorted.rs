@@ -63,9 +63,10 @@ pub struct SortedPageParams {
     /// Only the contacts a selection snapshot froze: `snapshot_id` from
     /// `POST /contacts/selection`, which is how the grid shows "here is what you selected".
     ///
-    /// It narrows and never widens. A snapshot that has expired, been swept, been superseded, or
-    /// belongs to another workspace holds no contacts here — the page is empty, rather than the
-    /// whole workspace, which is what ignoring the parameter would show.
+    /// It narrows and never widens. A snapshot that has expired, been swept, been superseded or
+    /// belongs to another workspace is **`422 selection-expired`, not an empty page**: "zero
+    /// contacts matched" and "this selection is gone" are different facts, and a client cannot
+    /// tell someone to select again if the server will not say which it was.
     pub snapshot_id: Option<Uuid>,
 }
 

@@ -130,6 +130,9 @@ const stubbed = (all: ApiSegment[]) =>
     count: [7, 12400, null, null][i % 4],
   }));
 
+/** Segment names here are plain words, but a row locator takes a regex. */
+const escapeForRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /** The open builder, so a count or a refusal on the list behind it cannot answer for it. */
 const drawer = () => page.getByRole("dialog");
 
@@ -723,6 +726,41 @@ test("selecting_a_segments_contacts_shows_the_frozen_set_on_the_contacts_grid", 
   await page.unroute("**/contacts/selection");
 });
 
+test("a_snapshot_that_is_gone_drops_the_selection_rather_than_offering_a_retry", async () => {
+  // `GET /contacts?snapshot_id=` is `422 selection-expired` — not an empty page — when the
+  // snapshot has expired, been swept or been superseded. Retrying it refuses for as long as the
+  // page is open, so the selection goes and the grid reloads itself as the live view, which is
+  // the recovery the bulk path already performs for the same three codes.
+  await page.route(
+    (url) => url.pathname.endsWith("/contacts") && url.search.includes("snapshot_id="),
+    (route) =>
+      route.fulfill({
+        status: 422,
+        contentType: "application/problem+json",
+        // `ApiError::Unprocessable` renders the code as its own detail, which is why this is a
+        // bare phrase and why a screen must not put it in front of a person as an explanation.
+        body: JSON.stringify({
+          type: "urn:nm:problem:selection-expired",
+          title: "Unprocessable Entity",
+          status: 422,
+          detail: "selection expired",
+        }),
+      }),
+  );
+  await realCounts();
+  await openSegments();
+  await page.getByRole("button", { name: "Select contacts in Pickable", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/w/${SLUG}/contacts$`));
+
+  // The live view, all three contacts, and no selection left to act on.
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await expect(page.getByText(/^Here is what you selected/)).toHaveCount(0);
+  // Not an error state with a Retry that can only refuse again, and never the server's bare code.
+  await expect(page.getByText("The contacts could not be loaded.")).toHaveCount(0);
+  await expect(page.getByText("selection expired")).toHaveCount(0);
+  await page.unroute((url) => url.pathname.endsWith("/contacts"));
+});
+
 test("a_selection_the_server_refuses_as_too_large_says_so_in_the_servers_words", async () => {
   await realCounts();
   const all = await apiSegments();
@@ -774,6 +812,52 @@ test("a_failed_batch_is_announced_once_and_the_rows_stay_quiet", async () => {
     page.getByRole("button", { name: "Count the segments again", exact: true }),
   ).toHaveCount(1);
   await expect(page.getByTestId("segment-count").first()).toHaveText("—");
+  // And no row offers to select its contacts. R4's rule is about every state that is not
+  // `exact`, and a batch that failed is the state where offering it is most wrong: no number at
+  // all, five seconds of waiting, and possibly `422 selection-too-large` at the end of it.
+  await expect(page.getByRole("button", { name: /^Edit / }).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: /^Select contacts in / })).toHaveCount(0);
+  await page.unroute(COUNTS);
+});
+
+test("a_row_the_count_could_not_work_out_is_quiet_and_the_page_says_so_once", async () => {
+  // `failed` is the fourth distinct fact a row can carry: not "no honest number exists for this
+  // document" (`no_estimate`), not "the document is broken" (`unreadable`), but "not this time".
+  // Saying either of the others about a planner that stumbled is the lie this milestone keeps
+  // finding, and one such row must not cost the other rows their numbers.
+  await realCounts();
+  const all = await apiSegments();
+  expect(all.length, "two rows are needed to show one failing and one not").toBeGreaterThan(1);
+  await page.route(COUNTS, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(
+        all.map((seg, i) =>
+          i === 0 ? { id: seg.id, state: "failed", count: null } : { id: seg.id, state: "exact", count: 4 },
+        ),
+      ),
+    }),
+  );
+  await openSegments();
+
+  const failed = page.getByRole("row", { name: new RegExp(escapeForRegex(all[0]?.name ?? "")) });
+  // Exactly the dash, and nothing else: section 5's "too many to count exactly" belongs to a
+  // document no honest number exists for and "needs re-saving" to a broken one, so an exact match
+  // on this cell is what rejects either of them being borrowed for a planner that stumbled.
+  // Asserting those sentences are absent from the *page* instead would be a check with nothing
+  // before it to wait on — it passes on a grid that has not drawn a row.
+  await expect(failed.getByTestId("segment-count")).toHaveText("—");
+  // The other rows keep their numbers: one planner failure is not the page's failure.
+  await expect(page.getByTestId("segment-count").nth(1)).toHaveText("4");
+  // One alert for the page, one Retry, and the row itself stays quiet.
+  await expect(page.getByRole("alert")).toHaveCount(1);
+  await expect(page.getByRole("alert")).toContainText("could not be worked out this time");
+  await expect(
+    page.getByRole("button", { name: "Count the segments again", exact: true }),
+  ).toHaveCount(1);
+  // R4 again: no number, so no offer to select from it.
+  await expect(failed.getByRole("button", { name: /^Select contacts in / })).toHaveCount(0);
   await page.unroute(COUNTS);
 });
 

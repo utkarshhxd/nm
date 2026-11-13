@@ -1458,7 +1458,7 @@
           {
             "name": "snapshot_id",
             "in": "query",
-            "description": "Only the contacts a selection snapshot froze: `snapshot_id` from\n`POST /contacts/selection`, which is how the grid shows \"here is what you selected\".\n\nIt narrows and never widens. A snapshot that has expired, been swept, been superseded, or\nbelongs to another workspace holds no contacts here — the page is empty, rather than the\nwhole workspace, which is what ignoring the parameter would show.",
+            "description": "Only the contacts a selection snapshot froze: `snapshot_id` from\n`POST /contacts/selection`, which is how the grid shows \"here is what you selected\".\n\nIt narrows and never widens. A snapshot that has expired, been swept, been superseded or\nbelongs to another workspace is **`422 selection-expired`, not an empty page**: \"zero\ncontacts matched\" and \"this selection is gone\" are different facts, and a client cannot\ntell someone to select again if the server will not say which it was.",
             "required": false,
             "schema": {
               "type": "string",
@@ -4553,7 +4553,8 @@
           "exact",
           "estimated",
           "no_estimate",
-          "unreadable"
+          "unreadable",
+          "failed"
         ]
       },
       "CreatedApiKey": {
