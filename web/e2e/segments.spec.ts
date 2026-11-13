@@ -711,6 +711,21 @@ test("selecting_a_segments_contacts_shows_the_frozen_set_on_the_contacts_grid", 
     .toMatch(/^[0-9a-f-]{36}$/);
   expect(body).toEqual({ segment_id: pickable.id });
 
+  // The most dangerous state the export dialog has, and the only one no test on the contacts
+  // screen can reach: a frozen selection handed over from here, with **no filter** on the
+  // contacts screen at all. The grid shows the segment's two contacts; an export from here takes
+  // the whole workspace, because `POST /contacts/export` re-runs the filter and this screen has
+  // none. Every sentence in the dialog has to say that, not the comfortable opposite.
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const exporting = page.getByRole("dialog", { name: "Export these contacts", exact: true });
+  await expect(exporting).toContainText("every contact in this workspace, because no filters are set");
+  // No count was taken for "no filter": the handover carries the segment's count, which is a
+  // count of something else entirely.
+  await expect(exporting).toContainText("The number of rows is not known here");
+  await expect(exporting).toContainText("This is not the 2 contacts you selected");
+  await page.keyboard.press("Escape");
+  await expect(exporting).toBeHidden();
+
   // Taken once. Walking back here through the router must not re-apply a selection made minutes
   // ago: the handover is module state, and the grid forgets it as it mounts.
   await page.getByRole("link", { name: "Segments", exact: true }).click();

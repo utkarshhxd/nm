@@ -856,7 +856,9 @@ test("an_editor_never_sees_the_export_control", async () => {
     "New contact",
   ]);
   // Absent, not disabled (spec §14): a greyed-out Export names the door for every editor to knock
-  // on, and §10 is explicit that admin-only is about raising the cost of exfiltration.
+  // on, and §10 is explicit that admin-only is about raising the cost of exfiltration. Kept for
+  // its breadth — it catches a control under any other name — but it carries nothing on its own:
+  // a page-wide absence has nothing to wait on. Do not copy it into a test without the line above.
   await expect(editorPage.getByRole("button", { name: /export/i })).toHaveCount(0);
 
   // The screen is only a courtesy; the route refuses them too. The problem code is asserted
@@ -891,8 +893,16 @@ test("exporting_says_what_leaves_and_the_download_starts", async () => {
   const go = dialog.getByRole("button", { name: "Export CSV", exact: true });
   await expect(go).toHaveClass(/bg-danger/);
 
-  const [file] = await Promise.all([page.waitForEvent("download"), go.click()]);
+  const [file, res] = await Promise.all([
+    page.waitForEvent("download"),
+    page.waitForResponse("**/contacts/export"),
+    go.click(),
+  ]);
   expect(file.suggestedFilename()).toBe("contacts.csv");
+  // The client names the file itself — a body it reads into a blob never reaches the browser's
+  // download machinery, so `content-disposition` is not applied. Asserting the client's own name
+  // alone would let the two drift in silence; this ties it to what the server said.
+  expect(res.headers()["content-disposition"]).toContain(`filename="${file.suggestedFilename()}"`);
   const csv = await readFile(await file.path(), "utf8");
 
   const lines = csv.trim().split("\r\n");
@@ -951,19 +961,35 @@ test("a_slow_export_says_it_is_not_stuck", async () => {
 });
 
 test("an_export_that_never_arrives_says_so_instead_of_closing_quietly", async () => {
-  // A connection that goes, or the abort `export.rs` sends when the query fails mid-book rather
-  // than passing a short file off as a whole one. There is no refusal to render — reading the
-  // body simply rejects — and the dialog is closing either way, so without a sentence of its own
-  // the screen would say nothing at all.
+  // A request that produces no response document to render. There is no refusal to show, and the
+  // dialog is closing either way, so without a sentence of its own the screen would say nothing.
+  //
+  // This aborts **before** the response, which is one of the two ways in. The other is the abort
+  // `export.rs` sends when the query fails mid-book rather than passing a short file off as a
+  // whole one: `fetch` resolves and the body rejects instead. Both leave `api.POST` the same way
+  // — `openapi-fetch` reads an ok response as a bare `return await response[parseAs]()` — so the
+  // `catch` under test is the same one. Four attempts to synthesise the mid-body half from the
+  // browser side are written up in the fix report; Playwright and CDP both re-frame an
+  // intercepted body, so neither can deliver a response that starts and then fails.
   await page.route("**/contacts/export", (route) => route.abort("failed"));
 
   let started = 0;
-  page.on("download", () => {
+  const count = () => {
     started += 1;
-  });
+  };
+  page.on("download", count);
   await page.goto(contactsPath);
   await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
   await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+
+  // A bulk action first, so its success paragraph is on screen when the export fails. Removing a
+  // tag none of the three carries changes nothing and still reports. Two reports of "the last
+  // thing that happened", one green and one red, is the state this must not leave behind.
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "herd" });
+  await page.getByRole("button", { name: "Remove tag", exact: true }).click();
+  await expect(result()).toContainText("The other 3 did not have it");
+
   await page.getByRole("button", { name: "Export CSV", exact: true }).click();
   const dialog = exportDialog(page);
   await dialog.getByRole("button", { name: "Export CSV", exact: true }).click();
@@ -972,8 +998,10 @@ test("an_export_that_never_arrives_says_so_instead_of_closing_quietly", async ()
     "The export did not finish, so no file was saved. Try again.",
   );
   await expect(dialog).toBeHidden();
+  // The earlier success is gone with it, rather than sitting above the refusal.
+  await expect(result()).toHaveCount(0);
   expect(started).toBe(0);
-  page.removeAllListeners("download");
+  page.off("download", count);
   await page.unroute("**/contacts/export");
 });
 
@@ -1014,6 +1042,38 @@ test("the_export_dialog_names_a_count_only_when_one_was_taken_for_this_filter", 
   await expect(dialog).toBeHidden();
 });
 
+test("re_ordering_the_grid_changes_nothing_the_export_dialog_says", async () => {
+  // Sorting moves no contact in or out, so the count is still this filter's count and the
+  // selection is still the whole of it. Keying either on the grid's own cache identity — which
+  // has to carry `sort` and `dir` — made a column header throw the number away and, worse, add
+  // "This is not the 3 contacts you selected" about the very three it would export.
+  await page.goto(contactsPath);
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Select all loaded contacts", exact: true }).check();
+  await page
+    .getByRole("button", { name: "Select all contacts matching this view", exact: true })
+    .click();
+  await expect(page.getByText("Here is what you selected: all 3 contacts.")).toBeVisible();
+
+  // Default order is newest first. Sorting by email re-orders the same three rows.
+  await page.getByRole("button", { name: "Email", exact: true }).click();
+  await expect(page).toHaveURL(/sort=email/);
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
+  await expect(page.locator("tbody tr[aria-rowindex]").first()).toContainText("bulk-a@example.test");
+  await expect(page.getByText("Here is what you selected: all 3 contacts.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dialog = exportDialog(page);
+  await expect(dialog).toContainText("3 contacts matched when you selected them");
+  // Two paragraphs, so there is no third disowning a selection that has not changed. The count is
+  // the assertion that waits; "a sentence is absent" alone would pass on an undrawn dialog.
+  await expect(dialog.getByRole("paragraph")).toHaveCount(2);
+  await expect(dialog).not.toContainText("An export cannot be pointed at a selection");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
 test("the_export_dialog_disowns_ticked_rows_too", async () => {
   // The other way a selection exists: rows ticked by hand, with nothing written down on the
   // server. The export still takes the filter, so the dialog still has to say it is not these.
@@ -1028,6 +1088,8 @@ test("the_export_dialog_disowns_ticked_rows_too", async () => {
   await expect(dialog).toContainText("This is not the 1 contact you selected");
   // Ticking rows materialises nothing, so there is still no count of this filter to name.
   await expect(dialog).toContainText("The number of rows is not known here");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
 });
 
 test("a_rate_limited_export_shows_the_servers_sentence_and_downloads_nothing", async () => {
@@ -1042,9 +1104,10 @@ test("a_rate_limited_export_shows_the_servers_sentence_and_downloads_nothing", a
   }
 
   let started = 0;
-  page.on("download", () => {
+  const count = () => {
     started += 1;
-  });
+  };
+  page.on("download", count);
   await page.goto(contactsPath);
   await page.getByLabel("Search contacts", { exact: true }).fill("bulk-");
   await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(3);
@@ -1059,7 +1122,7 @@ test("a_rate_limited_export_shows_the_servers_sentence_and_downloads_nothing", a
   // the dialog is gone and the page's own alert carries it.
   await expect(dialog).toBeHidden();
   expect(started).toBe(0);
-  page.removeAllListeners("download");
+  page.off("download", count);
 });
 
 test("the_instance_suppression_screen_is_instance_admin_only", async () => {

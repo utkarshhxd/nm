@@ -42,6 +42,23 @@ const NAMES: Record<Status, string> = {
   unsubscribed: "Unsubscribed",
 };
 
+/**
+ * The fields of a view that decide **which** contacts it covers: the `NewSelection` body, exactly,
+ * and nothing else. `sort` and `dir` are not among them — re-ordering the grid changes not one row
+ * that would be selected or exported.
+ *
+ * It is written once and used three ways: as both request bodies, and as the key `matched` is
+ * stored under. Two lists that have to agree and are not made to is how the dialog came to say
+ * "this is not the 3 contacts you selected" about the very three it would export, after a click
+ * on a column header.
+ */
+const covered = (f: Filters) => ({
+  q: f.q,
+  list_id: f.list_id,
+  list_status: f.list_status,
+  tag_id: f.tag_id,
+});
+
 const fullName = (c: Contact) => `${c.first_name} ${c.last_name}`.trim();
 const date = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
 const count = (n: number, noun: string) => `${n.toLocaleString()} ${noun}${n === 1 ? "" : "s"}`;
@@ -167,7 +184,11 @@ function ContactsPage({
     sort,
     dir: search.dir ?? (sort === "email" ? "asc" : "desc"),
   };
+  // Two keys, deliberately. `filterKey` is the grid's identity, so it carries `sort` and `dir`:
+  // ordered differently, it really is a different view and a different set of page cursors.
+  // `coveredKey` is which contacts a request would reach, which the order has nothing to do with.
   const filterKey = JSON.stringify(filters);
+  const coveredKey = JSON.stringify(covered(filters));
   const narrowed = Boolean(filters.q || filters.list_id || filters.tag_id);
 
   const setSearch = (patch: Partial<typeof search>) =>
@@ -266,9 +287,10 @@ function ContactsPage({
   // How many rows this view holds, known only once its last page is in.
   const shown = query.hasNextPage ? null : rowOffset + rows.length;
   // How many contacts the current filter matched, once someone has asked to select them all.
-  // Until then (or after the filters change) it is unknown, and an unknown total is `-1`.
+  // Until then (or after the filters change) it is unknown, and an unknown total is `-1`. Keyed
+  // by what the count is a count *of*, so sorting the grid does not throw the number away.
   const [matched, setMatched] = useState<{ key: string; n: number } | null>(null);
-  const total = shown ?? (matched?.key === filterKey ? matched.n : null);
+  const total = shown ?? (matched?.key === coveredKey ? matched.n : null);
 
   // Remounts the grid (scroll, focus, virtualiser) once the new query's data is what is shown.
   const shownKey = useRef(viewKey);
@@ -284,8 +306,10 @@ function ContactsPage({
   const [exportBusy, setExportBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [counting, setCounting] = useState(false);
-  const live = useRef(filterKey);
-  live.current = filterKey;
+  // What the in-flight selection was asked for, so a token that arrives for a view nobody is on
+  // any more is dropped. Sorting is not such a change: it moves no contact in or out.
+  const live = useRef(coveredKey);
+  live.current = coveredKey;
 
   // Ticked rows are rows somebody saw in *this* view, so changing the filter clears them: a
   // selection carried across a filter is how someone acts on the wrong million rows. A frozen
@@ -376,15 +400,10 @@ function ContactsPage({
     // asked for here, and the bar shows a skeleton until it lands.
     setCounting(true);
     setFailure("");
-    const mine = filterKey;
+    const mine = coveredKey;
     const { data, error } = await api.POST("/api/v1/workspaces/{workspace_id}/contacts/selection", {
       params: { path: { workspace_id: id } },
-      body: {
-        q: filters.q,
-        list_id: filters.list_id,
-        list_status: filters.list_status,
-        tag_id: filters.tag_id,
-      },
+      body: covered(filters),
     });
     setCounting(false);
     if (mine !== live.current) return; // the filters moved on; this token is for a view that is gone
@@ -404,9 +423,10 @@ function ContactsPage({
    * and the one endpoint that counts a filter exactly materialises a snapshot — up to a million
    * rows written, and a bite out of `SELECTION_PER_MINUTE` — so no number is asked for to label a
    * dialog. This is the count "Select all matching" already wrote down, and it is used only while
-   * the filter it was taken for is still the filter.
+   * the filter it was taken for is still the filter — `coveredKey`, not `filterKey`, because a
+   * count is not stale for having been taken before someone clicked a column header.
    */
-  const exportCount = matched?.key === filterKey ? matched.n : null;
+  const exportCount = matched?.key === coveredKey ? matched.n : null;
   /**
    * Whether the export would cover the same contacts as the selection. `POST /contacts/export`
    * takes a `NewSelection` and has no `snapshot_id`: it re-runs the filter, so it can never be
@@ -429,19 +449,13 @@ function ContactsPage({
     if (exportBusy) return;
     setExportBusy(true);
     setFailure("");
+    // A bulk action's success paragraph is a report of the last thing that happened; leaving it
+    // above this one's refusal would put two of those on screen at once.
+    setResult(null);
     try {
       const { data, error } = await api.POST(
         "/api/v1/workspaces/{workspace_id}/contacts/export",
-        {
-          params: { path: { workspace_id: id } },
-          body: {
-            q: filters.q,
-            list_id: filters.list_id,
-            list_status: filters.list_status,
-            tag_id: filters.tag_id,
-          },
-          parseAs: "blob",
-        },
+        { params: { path: { workspace_id: id } }, body: covered(filters), parseAs: "blob" },
       );
       if (error || !data) {
         // The refusal arrives after the dialog was agreed to, so it lands in the page's own alert
@@ -456,6 +470,10 @@ function ContactsPage({
       // how `export.rs` reports a query that failed mid-book, rather than ending the response and
       // passing off a short file as a whole one. Reading the blob rejects, and without this the
       // dialog would simply close with nothing said.
+      //
+      // It covers `download` as well, on purpose: the five DOM calls in there will not throw, and
+      // if they ever did, "the export did not finish, so no file was saved — try again" is still
+      // both true and the right advice. Reviewed and left as is; not an oversight.
       setFailure("The export did not finish, so no file was saved. Try again.");
     } finally {
       setExportBusy(false);

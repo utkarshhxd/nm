@@ -217,6 +217,14 @@ test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
     (await api("get", `/contacts?tag_id=${ids.tag}&q=${encodeURIComponent(q)}`)).data ?? [];
   expect(await tagged(excluded)).toEqual([]);
   expect((await tagged(FIRST)).length + (await tagged(LAST)).length).toBeGreaterThan(0);
+
+  // Re-ordering the grid is not a change of filter: the count somebody paid five seconds for
+  // still describes these same 2,250 rows, so a column header must not take it away. The view is
+  // too big for its last page to be in, so this figure can only come from `matched` — which is
+  // what makes the assertion discriminate at all.
+  await page.getByRole("button", { name: "Email", exact: true }).click();
+  await expect(page).toHaveURL(/sort=email/);
+  await expect(grid()).toHaveAttribute("aria-rowcount", String(TOTAL + 1));
 });
 
 test("a_frozen_set_wider_than_a_page_pages_and_says_so_without_inventing_a_figure", async () => {
