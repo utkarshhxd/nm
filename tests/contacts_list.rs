@@ -303,7 +303,7 @@ async fn filters_by_list_id(pool: PgPool) {
     // An unsubscribed member keeps its row, and is still listed: the filter asks for the list's
     // membership rows, whatever their status.
     f.app
-        .delete(&format!("{}/{}", members(mine), f.seeded[3].1))
+        .post(&format!("{}/{}/unsubscribe", members(mine), f.seeded[3].1))
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
@@ -393,7 +393,7 @@ async fn list_status_narrows_list_id(pool: PgPool) {
     }
     for id in &ids[3..6] {
         f.app
-            .delete(&format!("{members}/{id}"))
+            .post(&format!("{members}/{id}/unsubscribe"))
             .await
             .assert_status(StatusCode::NO_CONTENT);
     }

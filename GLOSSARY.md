@@ -10,6 +10,10 @@ The domain vocabulary of NM. Use these terms, not synonyms, in code, issues and 
 
 **List membership** — the relationship between a contact and a list, carrying the subscription status. This is where "unsubscribed from this list" lives.
 
+**Unsubscribe (a list member)** — sets a membership to `unsubscribed` and keeps the row: that someone opted out of this list is the fact worth keeping, and a later import must not re-add them as new. Route `POST /lists/{list_id}/members/{contact_id}/unsubscribe`; handler `unsubscribe_list_member`; `lists::unsubscribe_member`; audit action `list.member_unsubscribed` (`LIST_MEMBER_UNSUBSCRIBED`). These names superseded `DELETE /lists/{id}/members/{contact_id}`, `remove_list_member`, `remove_member` and the audit action `list.member_removed` (`LIST_MEMBER_REMOVED`) in M1b (issue `08`, 2026-11-13). Nothing is removed, so nothing is called `remove`.
+
+**`list.member_removed`** — the audit action the system wrote for the same operation until M1b. Superseded by `list.member_unsubscribed`, but **never rewritten**: rows already in `audit_log` keep it, so the log still says what the system called the operation at the time. Anything that reads audit actions must accept both, and read them as the same operation.
+
 **Tag** — a label on a contact. Unlike a list, a tag is never a send target and carries no subscription state. Tags organise; lists receive mail.
 
 **Suppression** — a standing block on an address or a domain. Workspace-scoped or instance-wide. This is the only thing in the system that can say "never email this, whatever else says otherwise".

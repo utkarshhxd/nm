@@ -72,8 +72,13 @@ async fn add(app: &TestApp, ws: Uuid, list: Uuid, contact: Uuid) -> String {
     r.json::<Value>()["status"].as_str().unwrap().to_owned()
 }
 
-async fn remove(app: &TestApp, ws: Uuid, list: Uuid, contact: Uuid) -> axum_test::TestResponse {
-    app.delete(&format!("{}/{contact}", members_path(ws, list)))
+async fn unsubscribe(
+    app: &TestApp,
+    ws: Uuid,
+    list: Uuid,
+    contact: Uuid,
+) -> axum_test::TestResponse {
+    app.post(&format!("{}/{contact}/unsubscribe", members_path(ws, list)))
         .await
 }
 
@@ -179,7 +184,7 @@ async fn unsubscribe_sets_status_and_timestamp(pool: PgPool) {
     let contact = create_contact(&app, ws, "a@ex.test").await;
     add(&app, ws, list, contact).await;
 
-    remove(&app, ws, list, contact)
+    unsubscribe(&app, ws, list, contact)
         .await
         .assert_status(StatusCode::NO_CONTENT);
     // The row is kept: that they unsubscribed is the fact worth keeping.
@@ -202,14 +207,14 @@ async fn unsubscribe_sets_status_and_timestamp(pool: PgPool) {
         .unwrap()
     };
     let first = stamp().await;
-    remove(&app, ws, list, contact)
+    unsubscribe(&app, ws, list, contact)
         .await
         .assert_status(StatusCode::NO_CONTENT);
     assert_eq!(stamp().await, first);
 
     // Someone who was never on the list has nothing to unsubscribe from.
     let other = create_contact(&app, ws, "b@ex.test").await;
-    remove(&app, ws, list, other)
+    unsubscribe(&app, ws, list, other)
         .await
         .assert_status_not_found();
     assert_eq!(count_memberships(&pool).await, 1);
@@ -223,7 +228,7 @@ async fn resubscribe_after_unsubscribe_is_allowed(pool: PgPool) {
     let contact = create_contact(&app, ws, "a@ex.test").await;
     for (list, again) in [(single, "subscribed"), (double, "pending")] {
         add(&app, ws, list, contact).await;
-        remove(&app, ws, list, contact)
+        unsubscribe(&app, ws, list, contact)
             .await
             .assert_status(StatusCode::NO_CONTENT);
         assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
@@ -392,7 +397,7 @@ async fn roles_and_validation(pool: PgPool) {
     );
     forbidden(
         viewer
-            .delete(&format!("{}/{member}", members_path(ws, list)))
+            .post(&format!("{}/{member}/unsubscribe", members_path(ws, list)))
             .await,
     );
     let by_contact = format!("/api/v1/workspaces/{ws}/contacts/{member}/lists");
@@ -459,7 +464,7 @@ async fn list_actions_are_audited_without_personal_data(pool: PgPool) {
     let list = create_list(&app, ws, "news", false).await;
     let contact = create_contact(&app, ws, "pii.person@ex.test").await;
     add(&app, ws, list, contact).await;
-    remove(&app, ws, list, contact).await;
+    unsubscribe(&app, ws, list, contact).await;
     // The contact-side routes write the same rows.
     let by_contact = format!("/api/v1/workspaces/{ws}/contacts/{contact}/lists");
     app.post(&by_contact)
@@ -494,12 +499,18 @@ async fn list_actions_are_audited_without_personal_data(pool: PgPool) {
                 "list.member_added",
                 json!({"contact_id": contact_id, "status": "subscribed"})
             ),
-            target("list.member_removed", json!({"contact_id": contact_id})),
+            target(
+                "list.member_unsubscribed",
+                json!({"contact_id": contact_id})
+            ),
             target(
                 "list.member_added",
                 json!({"contact_id": contact_id, "status": "subscribed"})
             ),
-            target("list.member_removed", json!({"contact_id": contact_id})),
+            target(
+                "list.member_unsubscribed",
+                json!({"contact_id": contact_id})
+            ),
             target(
                 "list.updated",
                 json!({"fields": ["description", "visibility"]})
@@ -516,6 +527,173 @@ async fn list_actions_are_audited_without_personal_data(pool: PgPool) {
     assert!(
         !all.contains("pii.person"),
         "an address reached the audit log"
+    );
+}
+
+/// Issue `08`. The operation unsubscribes and keeps the row, so it is a POST named `unsubscribe`;
+/// the old `DELETE` is gone and must not quietly keep working (or, worse, start deleting).
+#[sqlx::test]
+async fn the_old_delete_route_is_gone_and_does_nothing(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let list = create_list(&app, ws, "news", false).await;
+    let contact = create_contact(&app, ws, "a@ex.test").await;
+    add(&app, ws, list, contact).await;
+
+    app.delete(&format!("{}/{contact}", members_path(ws, list)))
+        .await
+        .assert_status_not_found();
+    assert_eq!(
+        row(&pool, list, contact).await,
+        ("subscribed".into(), true, false)
+    );
+    unsubscribe(&app, ws, list, contact)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
+}
+
+/// Existing audit rows keep `list.member_removed`: rewriting history would make the log a worse
+/// record of what the system called the operation at the time. A row written under each name
+/// reads back as it was written, side by side, and the rename did not touch the old one.
+#[sqlx::test]
+async fn an_old_and_a_new_unsubscribe_row_both_read_as_written(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let admin = client(&pool, "admin@example.com", ws, Role::Admin).await;
+    let list = create_list(&app, ws, "news", false).await;
+    let contact = create_contact(&app, ws, "a@ex.test").await;
+    add(&app, ws, list, contact).await;
+    // A row from before the rename, written the way the old code wrote it.
+    sqlx::query(
+        "insert into audit_log (id, workspace_id, action, target_type, target_id, metadata)          values ($1, $2, 'list.member_removed', 'list', $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(list.to_string())
+    .bind(json!({"contact_id": contact}))
+    .execute(&pool)
+    .await
+    .unwrap();
+    unsubscribe(&app, ws, list, contact)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let body: Value = admin
+        .get(&format!("/api/v1/workspaces/{ws}/audit-log"))
+        .await
+        .json();
+    let mut seen: Vec<(&str, &str, &str)> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"].as_str().unwrap().contains("member_"))
+        .map(|e| {
+            (
+                e["action"].as_str().unwrap(),
+                e["target_id"].as_str().unwrap(),
+                e["metadata"]["contact_id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    seen.sort_unstable();
+    let (list, contact) = (list.to_string(), contact.to_string());
+    assert_eq!(
+        seen,
+        [
+            ("list.member_added", list.as_str(), contact.as_str()),
+            ("list.member_removed", list.as_str(), contact.as_str()),
+            ("list.member_unsubscribed", list.as_str(), contact.as_str()),
+        ]
+    );
+}
+
+/// No migration rewrites the old rows. A migration runs before any row exists in a test database,
+/// so the test above cannot see one; this is the only handle on a backfill that "tidies" history.
+#[test]
+fn no_migration_rewrites_the_old_audit_action() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "sql") {
+            seen += 1;
+            let sql = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !sql.contains("member_removed"),
+                "{} names the old audit action; history is not rewritten",
+                path.display()
+            );
+        }
+    }
+    assert!(seen > 10, "found {seen} migrations: the directory moved");
+}
+
+/// `null` on a field that is `not null` and has nothing to clear to is refused, not ignored (the
+/// shape of M1a's `timezone: null` doing nothing). `description` can be cleared, to `''`, as a
+/// contact's and a segment's can.
+#[sqlx::test]
+async fn patching_a_list_field_to_null_is_refused_or_clears_it(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let list = app
+        .post(&lists_path(ws))
+        .json(&json!({"name": "news", "description": "hello", "visibility": "public"}))
+        .await;
+    let list = id_of(&list);
+    let one = format!("{}/{list}", lists_path(ws));
+    let state = || async {
+        sqlx::query_as::<_, (String, String, bool, String)>(
+            "select name, description, double_optin, visibility from lists where id = $1",
+        )
+        .bind(list)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = state().await;
+    for field in ["name", "double_optin", "visibility"] {
+        let r = app.patch(&one).json(&json!({ field: null })).await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem_type(&r), "urn:nm:problem:validation", "{field}");
+        assert_eq!(state().await, before, "{field} was written");
+    }
+    // Refused as a whole: a valid field beside the null is not applied either.
+    app.patch(&one)
+        .json(&json!({"description": "changed", "name": null}))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(state().await, before);
+
+    app.patch(&one)
+        .json(&json!({"description": null}))
+        .await
+        .assert_status_ok();
+    assert_eq!(state().await.1, "");
+}
+
+/// The generated client is typed from this document: it must not offer `null` for what the server
+/// answers 422 to, and must for what `null` clears.
+#[test]
+fn the_list_patch_schema_is_nullable_only_where_null_means_something() {
+    let doc = serde_json::to_value(nm::openapi::spec()).unwrap();
+    let schema = &doc["components"]["schemas"]["UpdateList"];
+    let props = &schema["properties"];
+    let nullable = |field: &str| {
+        let t = &props[field]["type"];
+        t == "null"
+            || t.as_array().is_some_and(|a| a.iter().any(|x| x == "null"))
+            || ["oneOf", "anyOf"].iter().any(|k| {
+                props[field][k]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x["type"] == "null"))
+            })
+    };
+    for field in ["name", "double_optin", "visibility"] {
+        assert!(!nullable(field), "{field}: {props}");
+    }
+    assert!(nullable("description"), "{props}");
+    let required = &schema["required"];
+    assert!(
+        required.is_null() || required.as_array().is_some_and(Vec::is_empty),
+        "{required}"
     );
 }
 

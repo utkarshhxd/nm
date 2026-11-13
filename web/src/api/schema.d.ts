@@ -684,7 +684,7 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,
+         * The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,
          *     and keeps the membership.
          */
         delete: operations["remove_contact_from_list"];
@@ -853,7 +853,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}": {
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}/unsubscribe": {
         parameters: {
             query?: never;
             header?: never;
@@ -862,9 +862,9 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        post?: never;
         /** Unsubscribes; it does not delete the membership. */
-        delete: operations["remove_list_member"];
+        post: operations["unsubscribe_list_member"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1920,16 +1920,23 @@ export interface components {
             label?: string | null;
             options?: string[] | null;
         };
-        /** @description A field left out is left alone. */
+        /**
+         * @description A field left out is left alone. `null` clears `description` to an empty string; on any other
+         *     field it is `422`, because there is nothing to clear it to and ignoring it would look like
+         *     success.
+         */
         UpdateList: {
+            /** @description `null` clears it to an empty string. */
             description?: string | null;
             /**
              * @description Only decides the status of members added from now on. A member already `pending` stays
-             *     `pending` (not mailable) when this is switched off.
+             *     `pending` (not mailable) when this is switched off. Cannot be `null`.
              */
-            double_optin?: boolean | null;
-            name?: string | null;
-            visibility?: components["schemas"]["Visibility"] | null;
+            double_optin?: boolean;
+            /** @description Cannot be `null`. */
+            name?: string;
+            /** @description Cannot be `null`. */
+            visibility?: components["schemas"]["Visibility"];
         };
         /**
          * @description A merge patch (RFC 7386) of everything but `rules`: a field left out is left alone, `null`
@@ -4732,7 +4739,7 @@ export interface operations {
             };
         };
     };
-    remove_list_member: {
+    unsubscribe_list_member: {
         parameters: {
             query?: never;
             header?: never;

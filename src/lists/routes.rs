@@ -7,15 +7,15 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::{
-    ContactList, List, ListMember, MembershipStatus, Visibility, add_member, get, remove_member,
-    validate_description, validate_name,
+    ContactList, List, ListMember, MembershipStatus, Visibility, add_member, get,
+    unsubscribe_member, validate_description, validate_name,
 };
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
     contacts,
-    error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult},
+    error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
     pagination::{Page, PageParams},
     workspaces::roles::Role,
@@ -42,8 +42,8 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(list_list_members).post(add_list_member),
         )
         .route(
-            "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}",
-            axum::routing::delete(remove_list_member),
+            "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}/unsubscribe",
+            axum::routing::post(unsubscribe_list_member),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/contacts/{id}/lists",
@@ -67,16 +67,43 @@ pub struct NewList {
     pub visibility: Option<Visibility>,
 }
 
-/// A field left out is left alone.
+/// A field left out is left alone. `null` clears `description` to an empty string; on any other
+/// field it is `422`, because there is nothing to clear it to and ignoring it would look like
+/// success.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateList {
-    pub name: Option<String>,
-    pub description: Option<String>,
+    /// Cannot be `null`.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = String, required = false)]
+    pub name: Option<Option<String>>,
+    /// `null` clears it to an empty string.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>)]
+    pub description: Option<Option<String>>,
     /// Only decides the status of members added from now on. A member already `pending` stays
-    /// `pending` (not mailable) when this is switched off.
-    pub double_optin: Option<bool>,
-    pub visibility: Option<Visibility>,
+    /// `pending` (not mailable) when this is switched off. Cannot be `null`.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = bool, required = false)]
+    pub double_optin: Option<Option<bool>>,
+    /// Cannot be `null`.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Visibility, required = false)]
+    pub visibility: Option<Option<Visibility>>,
+}
+
+fn null<T>(field: &'static str) -> Result<T, FieldError> {
+    Err(FieldError::new(field, "cannot be null"))
+}
+
+/// Tells a key that is absent (`None`) from one present as `null` (`Some(None)`). A plain
+/// `Option<T>` maps both to `None`, which would silently ignore a `"name": null`.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -253,15 +280,33 @@ pub async fn update_list(
 ) -> ApiResult<Json<List>> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
-    let name = input.name.as_deref().map(validate_name).transpose();
-    let description = input
-        .description
-        .as_deref()
-        .map(validate_description)
-        .transpose();
-    let (Ok(name), Ok(description)) = (&name, &description) else {
-        let errors = [name.err(), description.err()].into_iter().flatten();
-        return Err(ApiError::Validation(errors.collect()));
+    let name = match &input.name {
+        Some(Some(n)) => validate_name(n).map(Some),
+        Some(None) => null("name"),
+        None => Ok(None),
+    };
+    let description = match &input.description {
+        Some(d) => validate_description(d.as_deref().unwrap_or("")).map(Some),
+        None => Ok(None),
+    };
+    let double_optin = match input.double_optin {
+        Some(None) => null("double_optin"),
+        d => Ok(d.flatten()),
+    };
+    let visibility = match input.visibility {
+        Some(None) => null("visibility"),
+        v => Ok(v.flatten()),
+    };
+    let (Ok(name), Ok(description), Ok(double_optin), Ok(visibility)) =
+        (&name, &description, &double_optin, &visibility)
+    else {
+        let errors = [
+            name.err(),
+            description.err(),
+            double_optin.err(),
+            visibility.err(),
+        ];
+        return Err(ApiError::Validation(errors.into_iter().flatten().collect()));
     };
     // `pending` rows may outlive a `double_optin` change: one left on a list that is now
     // single opt-in still means "not confirmed, not mailable", and nothing else can resolve it
@@ -274,8 +319,8 @@ pub async fn update_list(
         id,
         name.as_deref(),
         description.as_deref(),
-        input.double_optin,
-        input.visibility as Option<Visibility>,
+        *double_optin,
+        *visibility as Option<Visibility>,
     )
     .execute(&mut *tx)
     .await
@@ -289,8 +334,8 @@ pub async fn update_list(
     let fields: Vec<&str> = [
         ("name", input.name.is_some()),
         ("description", input.description.is_some()),
-        ("double_optin", input.double_optin.is_some()),
-        ("visibility", input.visibility.is_some()),
+        ("double_optin", double_optin.is_some()),
+        ("visibility", visibility.is_some()),
     ]
     .into_iter()
     .filter(|(_, sent)| *sent)
@@ -485,9 +530,9 @@ pub async fn add_list_member(
 
 /// Unsubscribes; it does not delete the membership.
 #[utoipa::path(
-    delete,
-    path = "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}",
-    operation_id = "remove_list_member",
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}/unsubscribe",
+    operation_id = "unsubscribe_list_member",
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace id"),
         ("id" = Uuid, Path, description = "List id"),
@@ -499,13 +544,13 @@ pub async fn add_list_member(
         (status = 404, description = "not a member, or the contact was never on this list"),
     ),
 )]
-pub async fn remove_list_member(
+pub async fn unsubscribe_list_member(
     State(state): State<AppState>,
     meta: RequestMeta,
     principal: Principal,
     ApiPath((workspace_id, id, contact_id)): ApiPath<(Uuid, Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
-    remove_audited(&state, &meta, &principal, workspace_id, id, contact_id).await?;
+    unsubscribe_audited(&state, &meta, &principal, workspace_id, id, contact_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -545,7 +590,7 @@ async fn add_audited(
 }
 
 /// The one place a membership is unsubscribed; see `add_audited`.
-async fn remove_audited(
+async fn unsubscribe_audited(
     state: &AppState,
     meta: &RequestMeta,
     principal: &Principal,
@@ -555,14 +600,14 @@ async fn remove_audited(
 ) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
-    remove_member(&mut tx, workspace_id, list_id, contact_id).await?;
+    unsubscribe_member(&mut tx, workspace_id, list_id, contact_id).await?;
     audit::record(
         &mut *tx,
         meta,
         AuditEvent {
             workspace_id: Some(workspace_id),
             actor: principal.actor(),
-            action: actions::LIST_MEMBER_REMOVED,
+            action: actions::LIST_MEMBER_UNSUBSCRIBED,
             target_type: Some("list"),
             target_id: Some(list_id.to_string()),
             metadata: json!({ "contact_id": contact_id }),
@@ -644,7 +689,7 @@ pub async fn add_contact_to_list(
     Ok(Json(membership))
 }
 
-/// The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,
+/// The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,
 /// and keeps the membership.
 #[utoipa::path(
     delete,
@@ -667,6 +712,6 @@ pub async fn remove_contact_from_list(
     principal: Principal,
     ApiPath((workspace_id, id, list_id)): ApiPath<(Uuid, Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
-    remove_audited(&state, &meta, &principal, workspace_id, list_id, id).await?;
+    unsubscribe_audited(&state, &meta, &principal, workspace_id, list_id, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

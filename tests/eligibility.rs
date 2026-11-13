@@ -210,9 +210,11 @@ async fn unsubscribed_membership_is_not_mailable(pool: PgPool) {
     let list = create_list(&app, ws, "news", false).await;
     let c = subscribed(&app, ws, list, "a@ex.test").await;
     assert_eq!(mailable(&pool, list).await, ["a@ex.test"]);
-    app.delete(&format!("/api/v1/workspaces/{ws}/lists/{list}/members/{c}"))
-        .await
-        .assert_status(StatusCode::NO_CONTENT);
+    app.post(&format!(
+        "/api/v1/workspaces/{ws}/lists/{list}/members/{c}/unsubscribe"
+    ))
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
     assert!(mailable(&pool, list).await.is_empty());
 }
 

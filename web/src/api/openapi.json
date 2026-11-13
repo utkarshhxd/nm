@@ -2227,7 +2227,7 @@
         "tags": [
           "crate::lists::routes"
         ],
-        "summary": "The same as `DELETE /lists/{id}/members/{contact_id}`, from the contact's side: unsubscribes,\nand keeps the membership.",
+        "summary": "The same as `POST /lists/{id}/members/{contact_id}/unsubscribe`, from the contact's side: unsubscribes,\nand keeps the membership.",
         "operationId": "remove_contact_from_list",
         "parameters": [
           {
@@ -3130,13 +3130,13 @@
         }
       }
     },
-    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}": {
-      "delete": {
+    "/api/v1/workspaces/{workspace_id}/lists/{id}/members/{contact_id}/unsubscribe": {
+      "post": {
         "tags": [
           "crate::lists::routes"
         ],
         "summary": "Unsubscribes; it does not delete the membership.",
-        "operationId": "remove_list_member",
+        "operationId": "unsubscribe_list_member",
         "parameters": [
           {
             "name": "workspace_id",
@@ -6460,36 +6460,26 @@
       },
       "UpdateList": {
         "type": "object",
-        "description": "A field left out is left alone.",
+        "description": "A field left out is left alone. `null` clears `description` to an empty string; on any other\nfield it is `422`, because there is nothing to clear it to and ignoring it would look like\nsuccess.",
         "properties": {
           "description": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "`null` clears it to an empty string."
           },
           "double_optin": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Only decides the status of members added from now on. A member already `pending` stays\n`pending` (not mailable) when this is switched off."
+            "type": "boolean",
+            "description": "Only decides the status of members added from now on. A member already `pending` stays\n`pending` (not mailable) when this is switched off. Cannot be `null`."
           },
           "name": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string",
+            "description": "Cannot be `null`."
           },
           "visibility": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Visibility"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "$ref": "#/components/schemas/Visibility",
+            "description": "Cannot be `null`."
           }
         },
         "additionalProperties": false

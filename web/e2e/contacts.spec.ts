@@ -243,7 +243,7 @@ test("ticked_rows_are_subscribed_by_id_and_an_unsubscribed_one_is_skipped", asyn
   const found = async (q: string) => (await api("get", `/contacts?q=${q}@`)).data?.[0]?.id ?? "";
   const gone = await found(three ?? "");
   await api("post", `/contacts/${gone}/lists`, { list_id: ids.single });
-  await api("delete", `/lists/${ids.single}/members/${gone}`); // unsubscribes, keeps the row
+  await api("post", `/lists/${ids.single}/members/${gone}/unsubscribe`); // keeps the row
 
   await open("?q=user100");
   const bodies: { selection_token?: string; ids?: string[] }[] = [];

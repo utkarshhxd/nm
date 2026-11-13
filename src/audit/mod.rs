@@ -44,7 +44,9 @@ pub mod actions {
     pub const LIST_UPDATED: &str = "list.updated";
     pub const LIST_DELETED: &str = "list.deleted";
     pub const LIST_MEMBER_ADDED: &str = "list.member_added";
-    pub const LIST_MEMBER_REMOVED: &str = "list.member_removed";
+    // Written as `list.member_removed` until M1b, when it was renamed for what it does. Rows
+    // already in the log keep the old string, on purpose: history is not rewritten.
+    pub const LIST_MEMBER_UNSUBSCRIBED: &str = "list.member_unsubscribed";
     pub const SEGMENT_CREATED: &str = "segment.created";
     pub const SEGMENT_UPDATED: &str = "segment.updated";
     pub const SEGMENT_DELETED: &str = "segment.deleted";

@@ -179,7 +179,7 @@ pub async fn add_member(
 /// Marks the membership `unsubscribed` and stamps `unsubscribed_at`; the row stays. Doing it again
 /// keeps the first stamp. `404` if the contact was never on this list, or it is not in this
 /// workspace.
-pub async fn remove_member(
+pub async fn unsubscribe_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
     list_id: Uuid,
