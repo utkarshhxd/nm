@@ -37,8 +37,11 @@ The cost is paid whether or not the decision is wrong and it is large — 4,887 
 not tuning: the 1,000,000 cap applied as `limit 1000001`, the rate limit on
 `POST /contacts/selection`, one live snapshot per actor (a new selection supersedes the same
 actor's previous one), and the materialising insert running in a detached task because a handler
-future is dropped when the client disconnects. `selection_snapshot_members` is `unlogged`, which
-is safe only while the "your selection expired, select again" path exists.
+future is dropped when the client disconnects. **Both** snapshot tables are `unlogged`, which is
+safe only while the "your selection expired, select again" path exists — and the parent had to
+join the members there in the whole-branch fix pass, because a crash that truncated only the
+members would leave the parent carrying its `size` and both readers would pass, answering
+`200 {selected: 0}` over an empty page instead of `422 selection-expired`.
 
 ### The confirmed count is compared with what the action reached, never with the snapshot's size
 `refuse_if_more_than_confirmed` in `src/contacts/routes.rs`, called at the top of `finish_bulk`, so
@@ -88,10 +91,12 @@ emitted fragment is more than a workspace clause; it cannot prove the caller add
 CRUD, preview, counts, the grid, selection and export each write their own. The suppression arms
 are the one place where the correlation is load-bearing rather than defence in depth: suppression
 matches on `contacts.email` and `email_domain`, not on a contact id, and one address legitimately
-exists in several workspaces. The list and tag arms *are* defence in depth, and the test that
-carries their tenancy asserts **the database refuses a crossing insert** (SQLSTATE 23503) rather
-than asserting on rows, because the composite foreign keys make such a row unwritable and no
-row-based test could ever go red.
+exists in several workspaces. The list and tag arms *are* defence in depth — the whole-branch fix
+pass put the first line in the parser, which resolves a `list` or `tag` id against the workspace
+and refuses one naming no row, so a foreign id no longer reaches the compiler at all. The test
+that carries their tenancy asserts that refusal, and then asserts **the database refuses a
+crossing insert** (SQLSTATE 23503) rather than asserting on rows, because the composite foreign
+keys make such a row unwritable and no row-based test could ever go red.
 
 ### `is_false` on a boolean attribute means stored false
 A boolean attribute is three-valued — true, false, absent — so `is_true` / `is_false` / `is_set` /
