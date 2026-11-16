@@ -1252,6 +1252,8 @@ fn redact_q(filter: &mut Value) {
         (status = 422, description = "a `q` under 3 characters, a `list_status` without a `list_id`, \
             or a `segment_id` whose stored rules no longer resolve (the parser's own code)"),
         (status = 429, description = "rate-limited: too many exports for this workspace"),
+        (status = 503, description = "export-capacity: this instance is already streaming as many \
+            exports as it may at once, whatever workspace they belong to; try again (Retry-After)"),
     ),
 )]
 pub async fn export_contacts(
@@ -1261,8 +1263,14 @@ pub async fn export_contacts(
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<NewSelection>,
 ) -> ApiResult<Response> {
+    // Short-lived, and given straight back: the connection an export holds for the whole of its
+    // stream is acquired below, **after** the permit. Authorising on the streaming connection
+    // instead would mean twenty concurrent requests took twenty pooled connections before a
+    // single permit was asked for, and the semaphore would bound nothing. The cost is one extra
+    // pool round trip per export, against a full CSV stream.
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Admin).await?;
+    drop(conn);
     // After `authorize`, so a stranger cannot spend the workspace's quota.
     let quota = state.export_limit.check(workspace_id);
     if let Some(retry_after_secs) = quota.over {
@@ -1272,13 +1280,33 @@ pub async fn export_contacts(
         )
             .into_response());
     }
+    // Also after `authorize`, so a stranger cannot sit on one of the instance's few export slots.
+    // `try_acquire` and not `acquire`: queueing here would only move the pool's hang into the
+    // semaphore, and the whole point is to answer now.
+    //
+    // **503, not 429.** The client refused here may have sent exactly one export and be well
+    // inside its own quota — "too many requests" would be a label asserting something untrue
+    // about it. What is true is that the instance has no export capacity at this moment, which is
+    // what 503 says, and `Retry-After` says to come back shortly rather than to give up. The
+    // quota headers go on it like every other answer from this handler: they report that
+    // workspace's remaining allowance, which is true and is what the client needs next.
+    let Ok(permit) = state.export_slots.clone().try_acquire_owned() else {
+        return Ok((
+            quota.headers,
+            [("retry-after", "5")],
+            ApiError::ServiceUnavailable("export-capacity"),
+        )
+            .into_response());
+    };
+    // The streaming connection, held until the client has the last chunk.
+    let conn = state.pool.acquire().await?;
     // Every answer from here carries the `RateLimit` headers, refusals included, as
     // `create_selection`'s and `preview_segment`'s do. The quota was spent whatever the outcome,
     // and this is the smallest of the three at five a minute: a client refused `422` for a short
     // `q` or `404` for a segment that is not its own is exactly the one that needs to know how
     // many of those five are left before it fixes the filter and tries again.
     Ok(
-        match stream_export(&state, meta, &principal, workspace_id, input, conn).await {
+        match stream_export(&state, meta, &principal, workspace_id, input, conn, permit).await {
             Ok(body) => (
                 quota.headers,
                 [
@@ -1307,6 +1335,7 @@ async fn stream_export(
     workspace_id: Uuid,
     input: NewSelection,
     mut conn: sqlx::pool::PoolConnection<Postgres>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> ApiResult<Body> {
     let filter = input.filter()?;
     // `404` for a segment that is not this workspace's, decided in `load_rules`: read as "no
@@ -1333,11 +1362,14 @@ async fn stream_export(
         rules,
         live,
     };
+    // Every `?` above leaves with the permit still a local here, so a refusal releases the slot
+    // on the spot; from here it belongs to the producer task.
     Ok(export::start(
         state.pool.clone(),
         conn,
         job,
         audit,
         export::SEND_TIMEOUT,
+        permit,
     ))
 }

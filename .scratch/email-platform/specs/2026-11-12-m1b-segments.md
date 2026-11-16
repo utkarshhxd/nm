@@ -556,6 +556,16 @@ itself, through `issued`.
   A membership without its status is not the data: an export listing an `unsubscribed` member
   indistinguishably from a `subscribed` one is a re-subscription waiting for M1c's importer to
   read it back. `tags` stay bare names, having no status.
+- **Exports are bounded instance-wide as well as per workspace**: only so many may be streaming at
+  once across the whole instance, every workspace together, and one past that is refused `503
+  export-capacity` with a `Retry-After` rather than queued. §12's limiter is keyed by workspace and
+  so cannot see this resource at all — an export holds a pooled connection for its entire stream,
+  the pool belongs to the instance rather than to a tenant, and four workspaces each inside their
+  own quota hold every connection in it between them; `/readyz` waits on the same pool, so the cost
+  is not slow exports but the node leaving rotation. The refusal is `503` and not `429` because the
+  client being refused may have sent one export and be well inside its quota: "too many requests"
+  would be a label asserting something untrue about it. The bound is a named constant beside the
+  pool size it has to stay under, not configuration.
 - **Audited**: actor, filter, row count; `q` is not recorded, for §8.7's reason.
 - `Role::Admin`. Stated honestly: this does not prevent exfiltration — an editor can already page
   the book out 100 rows at a time — it raises the cost and creates one audit point where there was

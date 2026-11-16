@@ -19,7 +19,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, pool::PoolConnection};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use uuid::Uuid;
 
 use super::{ContactFilter, push_filter};
@@ -45,6 +45,13 @@ const CHUNKS_IN_FLIGHT: usize = 2;
 /// and a Postgres backend until TCP gives up, and a request-count limit does nothing about a
 /// request that never ends. A browser draining a download takes a chunk in milliseconds.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many exports may be streaming at once **across the whole instance**, every workspace
+/// together. `src/db.rs` opens a pool of 20 connections and an export holds one of them for its
+/// entire stream, so this has to stay well under that 20: four workspaces each inside their own
+/// `EXPORT_PER_MINUTE` of five would otherwise hold all twenty, and `/readyz` waits on the same
+/// pool and so answers 503. Whoever changes either number has to look at the other.
+pub const MAX_CONCURRENT_EXPORTS: usize = 4;
 
 type Chunk = Result<Vec<u8>, std::io::Error>;
 
@@ -198,12 +205,19 @@ pub struct Export {
 }
 
 /// Starts the export and returns its body.
+///
+/// `permit` is one of [`MAX_CONCURRENT_EXPORTS`] and is **owned by the producer task**, never by
+/// the handler: a handler's future is dropped the moment the client disconnects, so a permit held
+/// there would be released while this export still held its connection. Held here, it is released
+/// on a clean finish, on a mid-stream error and on a client that left alike — a leaked permit
+/// lowers the ceiling for good, and only a restart would raise it again.
 pub fn start(
     pool: PgPool,
     mut conn: PoolConnection<Postgres>,
     job: Export,
     audit: Audit,
     send_timeout: Duration,
+    permit: OwnedSemaphorePermit,
 ) -> Body {
     let (tx, mut rx) = mpsc::channel::<Chunk>(CHUNKS_IN_FLIGHT);
     tokio::spawn(async move {
@@ -231,6 +245,10 @@ pub fn start(
         if let Err(e) = recorded {
             tracing::error!(error = ?e, "the export audit row could not be written");
         }
+        // Last, so the slot frees only once this export's connection is back in the pool and its
+        // audit row is written. Explicit, because a capture an `async move` block never mentions
+        // is not moved into the task at all: the permit would then drop at the end of `start`.
+        drop(permit);
     });
     Body::from_stream(stream::poll_fn(move |cx| rx.poll_recv(cx)))
 }

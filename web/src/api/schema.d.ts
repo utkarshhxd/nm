@@ -3798,6 +3798,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description export-capacity: this instance is already streaming as many exports as it may at once, whatever workspace they belong to; try again (Retry-After) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     create_contact_selection: {

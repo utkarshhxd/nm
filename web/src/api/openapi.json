@@ -1865,6 +1865,9 @@
           },
           "429": {
             "description": "rate-limited: too many exports for this workspace"
+          },
+          "503": {
+            "description": "export-capacity: this instance is already streaming as many exports as it may at once, whatever workspace they belong to; try again (Retry-After)"
           }
         }
       }

@@ -5,12 +5,13 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{Router, middleware};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore};
 use webauthn_rs::Webauthn;
 
 use crate::{
     auth::passkeys,
     config::Config,
+    contacts::export::MAX_CONCURRENT_EXPORTS,
     crypto::secrets::Secrets,
     db,
     error::ApiError,
@@ -38,6 +39,11 @@ pub struct AppState {
     /// Per-workspace cap on `POST /contacts/export`, which holds a pooled connection for as long
     /// as the client takes to read the book.
     pub export_limit: Arc<RateLimiter>,
+    /// Instance-wide cap on exports *streaming at once*, every workspace together. The limiter
+    /// above is keyed by workspace and so cannot see an instance-wide resource: four workspaces
+    /// each inside their own five-a-minute hold all twenty pooled connections between them, and
+    /// `/readyz` waits on the same pool. See `contacts::export::MAX_CONCURRENT_EXPORTS`.
+    pub export_slots: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -52,6 +58,7 @@ impl AppState {
             preview_limit: Arc::new(RateLimiter::per_minute(PREVIEW_PER_MINUTE)),
             selection_limit: Arc::new(RateLimiter::per_minute(SELECTION_PER_MINUTE)),
             export_limit: Arc::new(RateLimiter::per_minute(EXPORT_PER_MINUTE)),
+            export_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
         })
     }
 

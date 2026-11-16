@@ -21,13 +21,19 @@
 //! limit; move it to a shared store when NM is run as more than one instance.
 //!
 //! shortcut: the **key** is `workspace_id`, so every per-minute figure below bounds one workspace
-//! and the bound on the shared pool is `workspaces × limit`, which nothing bounds. Read the
-//! comparisons against the pool's 20 as "one workspace cannot do this on its own", never as a
-//! global ceiling — four workspaces starting five exports each inside one minute hold all 20
-//! connections, because an export holds one for its whole stream and `SEND_TIMEOUT` is 30 s per
-//! *chunk*, not a total. The keying is correct and stays: §12 says per workspace, and it is what
-//! keeps one tenant from spending another's quota. Add a global concurrency semaphore on export
-//! the day that matters; do not tune these constants against a ceiling they do not set.
+//! and the bound on the shared pool is `workspaces × limit`. Read the comparisons against the
+//! pool's 20 as "one workspace cannot do this on its own", never as a global ceiling — four
+//! workspaces starting five exports each inside one minute would hold all 20 connections, because
+//! an export holds one for its whole stream and `SEND_TIMEOUT` is 30 s per *chunk*, not a total.
+//! The keying is correct and stays: §12 says per workspace, and it is what keeps one tenant from
+//! spending another's quota.
+//!
+//! **Export is the one of the three that now has an instance-wide ceiling as well**, because that
+//! day came and was measured: `contacts::export::MAX_CONCURRENT_EXPORTS`, taken in
+//! `export_contacts` before the streaming connection is acquired. Preview and selection still have
+//! none — they are bounded only by how long each holds a connection, 1.5 s and one statement,
+//! where an export holds one for as long as a client takes to read. Do not tune these constants
+//! against a ceiling they do not set.
 
 use std::{
     collections::HashMap,

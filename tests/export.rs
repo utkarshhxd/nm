@@ -10,15 +10,23 @@ use common::{PW, TestApp, add_member, api_key, create_user, create_workspace, po
 use futures_util::StreamExt;
 use nm::{
     audit::Actor,
-    contacts::{ContactFilter, export},
-    http::request_meta::RequestMeta,
+    contacts::{ContactFilter, export, export::MAX_CONCURRENT_EXPORTS},
+    http::{rate_limit::EXPORT_PER_MINUTE, request_meta::RequestMeta},
     workspaces::roles::Role,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
+
+/// A permit from a semaphore of this test's own. The two tests that call `export::start` directly
+/// sit below the handler that takes one from `AppState`, and still have to hand it one.
+fn a_permit() -> OwnedSemaphorePermit {
+    Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
+}
 
 fn base(ws: Uuid) -> String {
     format!("/api/v1/workspaces/{ws}")
@@ -663,6 +671,191 @@ async fn finishing_exports_do_not_wait_on_each_other_for_the_audit_connection(po
     );
 }
 
+/// A workspace with its own contacts and an admin API key, with no signed-in `TestApp` left over.
+async fn tenant(pool: &PgPool, slug: &str, contacts: i64) -> (Uuid, String) {
+    let email = format!("owner-{slug}@example.com");
+    let owner_id = create_user(pool, &email, PW, false).await;
+    let ws = create_workspace(pool, owner_id, slug).await;
+    seed(pool, ws, contacts).await;
+    let mut owner = TestApp::new(pool.clone()).await;
+    owner.login(&email, PW).await;
+    let key = api_key(&owner, ws, "admin").await;
+    (ws, key)
+}
+
+/// The pool `src/db.rs` ships, which is what D5 measured on. `acquire_timeout` is 8 s rather than
+/// sqlx's default 30 so a request that would hang fails this test in seconds instead of hanging it.
+async fn pool_of_twenty(pool: &PgPool) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(20)
+        .acquire_timeout(Duration::from_secs(8))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap()
+}
+
+/// Four workspaces, five exports each. Every request is inside its own `EXPORT_PER_MINUTE` and no
+/// tenant is over anything, and D5 measured what that did to the instance before this bound
+/// existed: all twenty accepted `200`, all twenty pooled connections held for the length of their
+/// streams, a twenty-first request **still waiting at 8.00 s** (thirty seconds and then a `500` in
+/// production), and **`/readyz` answering `503` after 2.00 s** — because the readiness query waits
+/// on the same pool, which `src/http/health.rs` documents as deliberate. An orchestrator pulls the
+/// node. No single tenant can do it, which is exactly why the per-workspace limiter cannot be the
+/// thing that stops it: the resource being exhausted is the instance's, not a tenant's.
+///
+/// **Readiness is asserted first**, before any count, because readiness is what the defect cost.
+/// Raise `MAX_CONCURRENT_EXPORTS` above the twenty below and that assertion goes red — a
+/// concurrency test whose assertion cannot fail measures nothing.
+#[sqlx::test]
+async fn four_workspaces_inside_their_quotas_cannot_take_readiness_down(pool: PgPool) {
+    let mut tenants = vec![];
+    for slug in ["acme", "bravo", "comet", "delta"] {
+        tenants.push(tenant(&pool, slug, 20_000).await);
+    }
+    // The twenty-first request comes from a fifth workspace that has spent nothing this minute,
+    // so what it meets is the instance's ceiling and never its own quota. It is refused before it
+    // reads a row, so it needs no contacts.
+    let (fifth_ws, fifth_key) = tenant(&pool, "elgin", 0).await;
+    let app = TestApp::new(pool_of_twenty(&pool).await).await;
+
+    let mut open = vec![];
+    let mut refused = 0usize;
+    for (ws, key) in &tenants {
+        for _ in 0..EXPORT_PER_MINUTE {
+            let r = post_raw(&app.state, key, &export_uri(*ws), &json!({})).await;
+            match r.status() {
+                StatusCode::OK => {
+                    let mut body = r.into_body().into_data_stream();
+                    // Two chunks, so this export is mid-result and holding its connection — the
+                    // state D5 measured, not a finished one that gave it back.
+                    body.next().await.unwrap().unwrap();
+                    body.next().await.unwrap().unwrap();
+                    open.push(body);
+                }
+                StatusCode::SERVICE_UNAVAILABLE => {
+                    refused += 1;
+                    assert_eq!(r.headers()["retry-after"], "5", "a 503 with no Retry-After");
+                    // Still true about this tenant while the instance refuses it, and whole-branch
+                    // MUST 6 says every answer from this handler carries them.
+                    assert!(
+                        r.headers().contains_key("ratelimit-remaining"),
+                        "the refusal dropped the workspace's quota headers"
+                    );
+                    let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let v: Value = serde_json::from_slice(&body).unwrap();
+                    // Not `rate-limited`: this client may have sent one export and be well inside
+                    // its quota, and a 429 would be a label asserting something untrue about it.
+                    assert_eq!(v["type"], "urn:nm:problem:export-capacity");
+                    assert_eq!(v["status"], 503);
+                }
+                other => panic!("an export inside its workspace's own quota answered {other}"),
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let ready = app.server.get("/readyz").await;
+    let took = started.elapsed();
+    println!(
+        "FIX D5-1: /readyz answered {} after {took:?} with {} exports open",
+        ready.status_code(),
+        open.len()
+    );
+    assert_eq!(
+        ready.status_code(),
+        StatusCode::OK,
+        "/readyz answered {} after {took:?} with {} exports open: four workspaces inside their \
+         own quotas took the instance out of rotation",
+        ready.status_code(),
+        open.len()
+    );
+    assert!(took < Duration::from_secs(1), "/readyz waited {took:?}");
+
+    let started = Instant::now();
+    let r = post_raw(&app.state, &fifth_key, &export_uri(fifth_ws), &json!({})).await;
+    let took = started.elapsed();
+    println!(
+        "FIX D5-1: the 21st request answered {} after {took:?}",
+        r.status()
+    );
+    assert_eq!(
+        r.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the 21st request answered {} after {took:?}",
+        r.status()
+    );
+    assert!(
+        took < Duration::from_secs(1),
+        "the 21st request waited {took:?} on the pool instead of being told no"
+    );
+
+    assert_eq!(
+        open.len(),
+        MAX_CONCURRENT_EXPORTS,
+        "the instance streamed {} exports at once",
+        open.len()
+    );
+    assert_eq!(
+        refused,
+        4 * EXPORT_PER_MINUTE as usize - MAX_CONCURRENT_EXPORTS,
+        "every export past the instance's ceiling is refused, none is queued"
+    );
+    drop(open);
+}
+
+/// **An export that leaks its permit is worse than no semaphore**: the ceiling ratchets down to
+/// zero and only a restart raises it. The permit therefore belongs to the producer task and not to
+/// the handler future — a handler future is dropped the instant the client disconnects.
+///
+/// Every slot the instance has is taken by a client that reads one chunk and hangs up, which is
+/// `a_client_that_leaves_is_still_audited_as_incomplete`'s case and the common one. Five requests
+/// from one workspace, which is exactly `EXPORT_PER_MINUTE`, so nothing here is a 429.
+#[sqlx::test]
+async fn exports_their_clients_abandoned_give_their_slots_back(pool: PgPool) {
+    let (ws, key) = tenant(&pool, "acme", 20_000).await;
+    let app = TestApp::new(pool_of_twenty(&pool).await).await;
+
+    let mut open = vec![];
+    for i in 0..MAX_CONCURRENT_EXPORTS {
+        let r = post_raw(&app.state, &key, &export_uri(ws), &json!({})).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::OK,
+            "export {i} of the instance's slots"
+        );
+        let mut body = r.into_body().into_data_stream();
+        body.next().await.unwrap().unwrap();
+        open.push(body);
+    }
+    // All of them hang up at once, mid-result.
+    drop(open);
+    // The permit is released at the end of the producer task, which is after the audit row: wait
+    // for the rows rather than guessing a sleep.
+    let mut audit = vec![];
+    for _ in 0..50 {
+        audit = audit_rows(&pool).await;
+        if audit.len() == MAX_CONCURRENT_EXPORTS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        audit.len(),
+        MAX_CONCURRENT_EXPORTS,
+        "an abandoned export went unrecorded"
+    );
+    assert!(audit.iter().all(|m| m["complete"] == false));
+
+    let r = post_raw(&app.state, &key, &export_uri(ws), &json!({})).await;
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "the slots the abandoned exports held never came back: the ceiling has ratcheted down"
+    );
+}
+
 /// A client that stops reading does not hold a connection for ever. The body is kept alive and
 /// unread throughout, so this is the send timeout and not a disconnect.
 #[sqlx::test]
@@ -690,6 +883,7 @@ async fn a_client_that_stops_reading_is_cut_off_after_the_send_timeout(pool: PgP
             filter: json!({}),
         },
         Duration::from_millis(200),
+        a_permit(),
     );
     let mut body = body.into_data_stream();
     body.next().await.unwrap().unwrap();
@@ -748,6 +942,7 @@ async fn a_query_that_dies_mid_stream_aborts_the_body_and_is_audited_incomplete(
             filter: json!({}),
         },
         Duration::from_secs(5),
+        a_permit(),
     );
     let mut body = body.into_data_stream();
     // The header and a real data chunk: the 200 is committed and bytes are in the client's hands.
