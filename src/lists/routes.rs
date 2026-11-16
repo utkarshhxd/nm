@@ -268,7 +268,8 @@ pub async fn create_list(
         (status = 403, description = "insufficient-role: editing a list takes editor"),
         (status = 404, description = "not a member, or no such list in this workspace"),
         (status = 409, description = "list-name-taken"),
-        (status = 422, description = "invalid name or description, or an unknown field"),
+        (status = 422, description = "invalid name or description, an explicit null for `name`, \
+            `double_optin` or `visibility`, or an unknown field"),
     ),
 )]
 pub async fn update_list(

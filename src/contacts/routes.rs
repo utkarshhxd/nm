@@ -524,9 +524,9 @@ pub struct SelectionToken {
 
 /// The body of `POST /contacts/selection`: which contacts to freeze.
 ///
-/// `ContactFilter`'s fields, spelled out rather than flattened, for the reason `BulkTarget` gives:
-/// `serde(flatten)` cannot be combined with `deny_unknown_fields`, and a misspelt `tag_id_` that
-/// was quietly ignored here would freeze every contact in the workspace.
+/// The grid's filter fields, spelled out rather than nested, for the reason `BulkTarget` gives:
+/// unknown fields are refused, and a misspelt `tag_id_` that was quietly ignored here would
+/// freeze every contact in the workspace.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewSelection {
@@ -661,13 +661,13 @@ pub struct BulkResult {
     /// never be above it, because the set was written down and nothing re-evaluates a predicate.
     pub issued: u64,
     /// Only for `subscribe`: the status the new memberships were written with. `pending` means
-    /// the contacts are on a double-opt-in list and not mailable until they confirm, and nothing
-    /// in this milestone confirms them: `affected` is not a count of people who can be mailed.
+    /// the contacts are on a double-opt-in list and not mailable until they confirm, and NM has
+    /// no confirmation flow yet: `affected` is not a count of people who can be mailed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<MembershipStatus>,
 }
 
-/// Freezes the contacts this predicate matches, by writing their ids down (spec M1b section 8).
+/// Freezes the contacts this predicate matches, by writing their ids down.
 ///
 /// The set is decided here, once, and never re-derived: a predicate re-evaluated when the action
 /// runs resolves to whatever the table says then, and a colleague's write inside the hour changes
@@ -689,8 +689,9 @@ pub struct BulkResult {
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such workspace, or no such segment"),
         (status = 422, description = "a `q` under 3 characters, a `list_status` without a \
-            `list_id`, or `selection-too-large`: the predicate matches more than a million \
-            contacts"),
+            `list_id`, a `segment_id` whose stored rules no longer resolve (the parser's own \
+            code, such as unknown-field or invalid-value), or `selection-too-large`: the \
+            predicate matches more than a million contacts"),
         (status = 429, description = "rate-limited: too many selections for this workspace"),
     ),
 )]
@@ -996,7 +997,10 @@ async fn finish_bulk(
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing \
+            confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list \
+            that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of \
+            selection_token and ids"),
     ),
 )]
 pub async fn bulk_tag_contacts(
@@ -1037,7 +1041,10 @@ pub async fn bulk_tag_contacts(
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing \
+            confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list \
+            that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of \
+            selection_token and ids"),
     ),
 )]
 pub async fn bulk_untag_contacts(
@@ -1072,11 +1079,12 @@ pub async fn bulk_untag_contacts(
 /// This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
 /// back in. One admin re-adding one named person is a considered act they answer for; a bulk
 /// action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
-/// gets a sender blocklisted. Do not "fix" the asymmetry.
-///
-/// It keeps `refuse_if_widened`, as `bulk/delete` does, although a frozen set cannot widen: the
-/// guard costs one comparison and is the last line if the snapshot join is ever bypassed. Adding
-/// someone to a list is what makes them mailable, and an unsubscribe afterwards does not un-send.
+/// gets a sender blocklisted. Adding someone to a list is what makes them mailable, and an
+/// unsubscribe afterwards does not un-send. Do not "fix" the asymmetry.
+// Deliberately not a doc comment: this is for whoever edits the route, not for a client reading
+// the published document. The `409 selection-widened` this route declares cannot happen over a
+// frozen set; the guard is kept, as `bulk/delete` keeps it, because it costs one comparison and
+// is the last line if the snapshot join is ever bypassed.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/bulk/subscribe",
@@ -1088,7 +1096,10 @@ pub async fn bulk_untag_contacts(
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
         (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nobody was added"),
-        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing \
+            confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list \
+            that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of \
+            selection_token and ids"),
     ),
 )]
 pub async fn bulk_subscribe_contacts(
@@ -1135,7 +1146,10 @@ pub async fn bulk_subscribe_contacts(
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
-        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing \
+            confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list \
+            that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of \
+            selection_token and ids"),
     ),
 )]
 pub async fn bulk_unsubscribe_contacts(
@@ -1177,7 +1191,10 @@ pub async fn bulk_unsubscribe_contacts(
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, or a token for another workspace"),
         (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nothing was deleted"),
-        (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
+        (status = 422, description = "selection-expired, selection-invalid, a missing \
+            confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list \
+            that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of \
+            selection_token and ids"),
     ),
 )]
 pub async fn bulk_delete_contacts(
@@ -1217,10 +1234,11 @@ fn redact_q(filter: &mut Value) {
 
 /// Streams every contact the filter matches as CSV: the grid's filter, `segment_id` included.
 ///
-/// Never buffered (`export` explains how), formula cells are prefixed with `'`, and the audit row
-/// records the actor, the filter with `q` redacted, and the row count. Admin only. That does not
-/// stop exfiltration, since an editor can already page the book out 100 rows at a time; it raises
-/// the cost and makes one place where there was none.
+/// Rows are streamed as they are read and never buffered, formula cells are prefixed with `'`,
+/// and the audit row records the actor, the filter with `q` redacted, and the row count. Admin
+/// only. That does not stop exfiltration, since an editor can already page the book out through
+/// `GET /contacts` at up to 200 rows a time; it raises the cost and makes one place where there
+/// was none.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/contacts/export",
@@ -1231,7 +1249,8 @@ fn redact_q(filter: &mut Value) {
         (status = 200, description = "text/csv, streamed", content_type = "text/csv", body = String),
         (status = 403, description = "insufficient-role: export takes admin"),
         (status = 404, description = "not a member, no such workspace, or no such segment"),
-        (status = 422, description = "a `q` under 3 characters, or a `list_status` without a `list_id`"),
+        (status = 422, description = "a `q` under 3 characters, a `list_status` without a `list_id`, \
+            or a `segment_id` whose stored rules no longer resolve (the parser's own code)"),
         (status = 429, description = "rate-limited: too many exports for this workspace"),
     ),
 )]

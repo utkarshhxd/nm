@@ -502,11 +502,8 @@ export interface paths {
          * @description This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
          *     back in. One admin re-adding one named person is a considered act they answer for; a bulk
          *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
-         *     gets a sender blocklisted. Do not "fix" the asymmetry.
-         *
-         *     It keeps `refuse_if_widened`, as `bulk/delete` does, although a frozen set cannot widen: the
-         *     guard costs one comparison and is the last line if the snapshot join is ever bypassed. Adding
-         *     someone to a list is what makes them mailable, and an unsubscribe afterwards does not un-send.
+         *     gets a sender blocklisted. Adding someone to a list is what makes them mailable, and an
+         *     unsubscribe afterwards does not un-send. Do not "fix" the asymmetry.
          */
         post: operations["bulk_subscribe_contacts"];
         delete?: never;
@@ -577,10 +574,11 @@ export interface paths {
         put?: never;
         /**
          * Streams every contact the filter matches as CSV: the grid's filter, `segment_id` included.
-         * @description Never buffered (`export` explains how), formula cells are prefixed with `'`, and the audit row
-         *     records the actor, the filter with `q` redacted, and the row count. Admin only. That does not
-         *     stop exfiltration, since an editor can already page the book out 100 rows at a time; it raises
-         *     the cost and makes one place where there was none.
+         * @description Rows are streamed as they are read and never buffered, formula cells are prefixed with `'`,
+         *     and the audit row records the actor, the filter with `q` redacted, and the row count. Admin
+         *     only. That does not stop exfiltration, since an editor can already page the book out through
+         *     `GET /contacts` at up to 200 rows a time; it raises the cost and makes one place where there
+         *     was none.
          */
         post: operations["export_contacts"];
         delete?: never;
@@ -599,7 +597,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Freezes the contacts this predicate matches, by writing their ids down (spec M1b section 8).
+         * Freezes the contacts this predicate matches, by writing their ids down.
          * @description The set is decided here, once, and never re-derived: a predicate re-evaluated when the action
          *     runs resolves to whatever the table says then, and a colleague's write inside the hour changes
          *     what the action hits. A contact created afterwards is not in the set; a contact that no longer
@@ -917,12 +915,12 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Counts the contacts each named **stored** segment matches. A read: `viewer` (section 13).
-         * @description The list view's counts, in one request. It resolves through `load_many_rules`, which reads a
-         *     stored document — archived definitions included — so a segment naming a field that was
-         *     archived after it was saved counts here, where `preview` would refuse it as a new rule. It
-         *     costs one unit of the preview quota however many segments it names, which is the whole point:
-         *     a page of 25 rows used to cost 25 of the 30 a workspace has in a minute.
+         * Counts the contacts each named **stored** segment matches. A read: `viewer`.
+         * @description The list view's counts, in one request. A stored segment is resolved with archived
+         *     custom-field definitions **included**, so one naming a field archived since it was saved still
+         *     counts here, where `POST /segments/preview` refuses the same document as a new rule. It costs
+         *     one unit of the preview quota however many segments it names, which is the whole point: a page
+         *     of 25 rows used to cost 25 of the 30 a workspace has in a minute.
          */
         get: operations["count_segments"];
         put?: never;
@@ -943,15 +941,15 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Counts the contacts a rule document matches, without saving it. A read: `viewer` (section 13).
+         * Counts the contacts a rule document matches, without saving it. A read: `viewer`.
          * @description Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.
          *     The document is arbitrary, the caller needs only `viewer`, each call may hold a pooled
          *     connection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.
          *
-         *     The document is parsed against the **live** definitions (`parse_new_rules`), like a save and
-         *     unlike a load: previewing is how a new rule is written, and a new rule may not name an
-         *     archived field. Nothing builds a rule by hand — `Group::parse` is the only way in, and a
-         *     hand-built node can reach an `unreachable!` in the compiler.
+         *     The document is resolved against the **live** custom-field definitions, like a save and
+         *     unlike a read of a stored segment: previewing is how a new rule is written, and a new rule may
+         *     not name an archived field. So expect `422 unknown-field` here for a field a stored segment
+         *     naming the same one still counts under.
          */
         post: operations["preview_segment"];
         delete?: never;
@@ -1244,28 +1242,6 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
-        /**
-         * @description Which contacts a list shows. It is embedded in a signed selection token later, so its
-         *     serialised form is part of that token's payload: renaming a field, or adding one (the payload is
-         *     not tolerant of a missing field), would make tokens already issued fail to decode, as a
-         *     `422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.
-         */
-        ContactFilter: {
-            /**
-             * Format: uuid
-             * @description Contacts with a membership row on this list, whatever its status: a `pending` or
-             *     `unsubscribed` member is still a member here. A list of another workspace matches nothing.
-             */
-            list_id?: string | null;
-            list_status?: components["schemas"]["MembershipStatus"] | null;
-            /** @description Case-insensitive substring of the address or name. */
-            q?: string | null;
-            /**
-             * Format: uuid
-             * @description Contacts with this tag. A tag of another workspace matches nothing.
-             */
-            tag_id?: string | null;
-        };
         /** @description One list a contact is on, as the contact's page shows it. */
         ContactList: {
             /** Format: uuid */
@@ -1284,11 +1260,11 @@ export interface components {
          */
         ContactSort: "created" | "email";
         /**
-         * @description What one row of a batch count is, and why.
+         * @description Why a row has the number it has, or has none.
          *
-         *     A nullable number stood for three different facts here — no estimate is honest, the batch ran
-         *     out of time, the stored document no longer parses — and the list told all three of them with
-         *     section 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.
+         *     One value per fact, so a null `count` never has to be guessed at: `exact` and `estimated`
+         *     carry a number, and `no_estimate`, `unreadable` and `failed` each carry none for a different
+         *     reason, spelled out below.
          * @enum {string}
          */
         CountState: "exact" | "estimated" | "no_estimate" | "unreadable" | "failed";
@@ -1532,9 +1508,9 @@ export interface components {
         /**
          * @description The body of `POST /contacts/selection`: which contacts to freeze.
          *
-         *     `ContactFilter`'s fields, spelled out rather than flattened, for the reason `BulkTarget` gives:
-         *     `serde(flatten)` cannot be combined with `deny_unknown_fields`, and a misspelt `tag_id_` that
-         *     was quietly ignored here would freeze every contact in the workspace.
+         *     The grid's filter fields, spelled out rather than nested, for the reason `BulkTarget` gives:
+         *     unknown fields are refused, and a misspelt `tag_id_` that was quietly ignored here would
+         *     freeze every contact in the workspace.
          */
         NewSelection: {
             /**
@@ -1830,8 +1806,8 @@ export interface components {
             /**
              * Format: int64
              * @description The matching contacts, or `null` when no honest number can be given — the document filters
-             *     on a custom attribute, which has no statistics (section 6). The rule builder shows "too
-             *     many to count exactly" for `null`.
+             *     on a custom attribute, which carries no statistics for the planner to estimate from. The
+             *     rule builder shows "too many to count exactly" for `null`.
              */
             count?: number | null;
             /** @description `false` when `count` is the planner's estimate, or when there is no count at all. */
@@ -1895,8 +1871,8 @@ export interface components {
         SegmentCount: {
             /**
              * Format: int64
-             * @description The number, for `exact` and `estimated`. Null for the other two states, which is what
-             *     `state` is there to explain.
+             * @description The number, for `exact` and `estimated`. Null for `no_estimate`, `unreadable` and
+             *     `failed`, which is what `state` is there to tell apart.
              */
             count?: number | null;
             /** Format: uuid */
@@ -3540,7 +3516,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3595,7 +3571,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3650,7 +3626,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3705,7 +3681,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3760,7 +3736,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids */
+            /** @description selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3808,7 +3784,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a `q` under 3 characters, or a `list_status` without a `list_id` */
+            /** @description a `q` under 3 characters, a `list_status` without a `list_id`, or a `segment_id` whose stored rules no longer resolve (the parser's own code) */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3862,7 +3838,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a `q` under 3 characters, a `list_status` without a `list_id`, or `selection-too-large`: the predicate matches more than a million contacts */
+            /** @description a `q` under 3 characters, a `list_status` without a `list_id`, a `segment_id` whose stored rules no longer resolve (the parser's own code, such as unknown-field or invalid-value), or `selection-too-large`: the predicate matches more than a million contacts */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4745,7 +4721,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description invalid name or description, or an unknown field */
+            /** @description invalid name or description, an explicit null for `name`, `double_optin` or `visibility`, or an unknown field */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -5022,7 +4998,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One entry per id, in the order asked for, each carrying its own `state`: counted, estimated, or one of the two reasons there is no number */
+            /** @description One entry per id, in the order asked for, each carrying its own `state`: counted, estimated, or one of the three reasons there is no number */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5217,7 +5193,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description invalid name or description, an unknown field, or a rule document that is not a whole, valid one */
+            /** @description invalid name or description, an explicit null for `name`, an unknown field, or a rule document that is not a whole, valid one */
             422: {
                 headers: {
                     [name: string]: unknown;

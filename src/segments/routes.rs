@@ -265,8 +265,8 @@ pub async fn create_segment(
         (status = 403, description = "insufficient-role: editing a segment takes editor"),
         (status = 404, description = "not a member, or no such segment in this workspace"),
         (status = 409, description = "segment-name-taken"),
-        (status = 422, description = "invalid name or description, an unknown field, or a rule \
-            document that is not a whole, valid one"),
+        (status = 422, description = "invalid name or description, an explicit null for `name`, \
+            an unknown field, or a rule document that is not a whole, valid one"),
     ),
 )]
 pub async fn update_segment(
@@ -435,16 +435,16 @@ pub struct PreviewRequest {
     pub rules: Value,
 }
 
-/// Counts the contacts a rule document matches, without saving it. A read: `viewer` (section 13).
+/// Counts the contacts a rule document matches, without saving it. A read: `viewer`.
 ///
 /// Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.
 /// The document is arbitrary, the caller needs only `viewer`, each call may hold a pooled
 /// connection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.
 ///
-/// The document is parsed against the **live** definitions (`parse_new_rules`), like a save and
-/// unlike a load: previewing is how a new rule is written, and a new rule may not name an
-/// archived field. Nothing builds a rule by hand — `Group::parse` is the only way in, and a
-/// hand-built node can reach an `unreachable!` in the compiler.
+/// The document is resolved against the **live** custom-field definitions, like a save and
+/// unlike a read of a stored segment: previewing is how a new rule is written, and a new rule may
+/// not name an archived field. So expect `422 unknown-field` here for a field a stored segment
+/// naming the same one still counts under.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/segments/preview",
@@ -536,13 +536,13 @@ fn parse_ids(raw: &str) -> ApiResult<Vec<Uuid>> {
     Ok(ids)
 }
 
-/// Counts the contacts each named **stored** segment matches. A read: `viewer` (section 13).
+/// Counts the contacts each named **stored** segment matches. A read: `viewer`.
 ///
-/// The list view's counts, in one request. It resolves through `load_many_rules`, which reads a
-/// stored document — archived definitions included — so a segment naming a field that was
-/// archived after it was saved counts here, where `preview` would refuse it as a new rule. It
-/// costs one unit of the preview quota however many segments it names, which is the whole point:
-/// a page of 25 rows used to cost 25 of the 30 a workspace has in a minute.
+/// The list view's counts, in one request. A stored segment is resolved with archived
+/// custom-field definitions **included**, so one naming a field archived since it was saved still
+/// counts here, where `POST /segments/preview` refuses the same document as a new rule. It costs
+/// one unit of the preview quota however many segments it names, which is the whole point: a page
+/// of 25 rows used to cost 25 of the 30 a workspace has in a minute.
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{workspace_id}/segments/counts",
@@ -550,7 +550,7 @@ fn parse_ids(raw: &str) -> ApiResult<Vec<Uuid>> {
     params(("workspace_id" = Uuid, Path, description = "Workspace id"), CountParams),
     responses(
         (status = 200, description = "One entry per id, in the order asked for, each carrying \
-            its own `state`: counted, estimated, or one of the two reasons there is no number",
+            its own `state`: counted, estimated, or one of the three reasons there is no number",
             body = Vec<SegmentCount>),
         (status = 404, description = "not a member, or an id that is not a segment of this \
             workspace"),

@@ -54,8 +54,8 @@ fn timeout_statement(timeout_ms: u64) -> AssertSqlSafe<String> {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Preview {
     /// The matching contacts, or `null` when no honest number can be given — the document filters
-    /// on a custom attribute, which has no statistics (section 6). The rule builder shows "too
-    /// many to count exactly" for `null`.
+    /// on a custom attribute, which carries no statistics for the planner to estimate from. The
+    /// rule builder shows "too many to count exactly" for `null`.
     pub count: Option<i64>,
     /// `false` when `count` is the planner's estimate, or when there is no count at all.
     pub exact: bool,
@@ -87,11 +87,13 @@ pub async fn preview(
     }
 }
 
-/// What one row of a batch count is, and why.
+/// Why a row has the number it has, or has none.
 ///
-/// A nullable number stood for three different facts here — no estimate is honest, the batch ran
-/// out of time, the stored document no longer parses — and the list told all three of them with
-/// section 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.
+/// One value per fact, so a null `count` never has to be guessed at: `exact` and `estimated`
+/// carry a number, and `no_estimate`, `unreadable` and `failed` each carry none for a different
+/// reason, spelled out below.
+// Not published: a nullable number stood for all three of those facts here, and the list told all
+// three of them with the sentence that belongs to `no_estimate` alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CountState {
@@ -121,8 +123,8 @@ pub enum CountState {
 pub struct SegmentCount {
     pub id: Uuid,
     pub state: CountState,
-    /// The number, for `exact` and `estimated`. Null for the other two states, which is what
-    /// `state` is there to explain.
+    /// The number, for `exact` and `estimated`. Null for `no_estimate`, `unreadable` and
+    /// `failed`, which is what `state` is there to tell apart.
     pub count: Option<i64>,
 }
 

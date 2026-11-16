@@ -238,13 +238,16 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
-/// Which contacts a list shows. It is embedded in a signed selection token later, so its
-/// serialised form is part of that token's payload: renaming a field, or adding one (the payload is
-/// not tolerant of a missing field), would make tokens already issued fail to decode, as a
-/// `422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.
-// Unknown fields are refused: this is the body of `POST /contacts/selection`, and a misspelt
-// `tag_id_` ignored would be an all-`None` filter, which matches every contact in the workspace.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// Which contacts a list shows: the internal shape `list` and `export` narrow by.
+///
+/// **Not published, and no longer part of any token.** It carried the v2 selection token's
+/// payload, where renaming a field would have made issued tokens fail to decode; the v3 token is
+/// `{workspace_id, snapshot_id, issued}` and names a set that is already written down, so the
+/// serialised form of this struct binds nothing. The request body it is built from is
+/// `NewSelection`, which spells these fields out rather than flattening them.
+// Unknown fields are refused anyway: a misspelt `tag_id_` ignored would be an all-`None` filter,
+// which matches every contact in the workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContactFilter {
     /// Case-insensitive substring of the address or name.

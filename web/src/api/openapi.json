@@ -1587,7 +1587,7 @@
             "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nothing was deleted"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1598,7 +1598,7 @@
           "crate::contacts::routes"
         ],
         "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
-        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Do not \"fix\" the asymmetry.\n\nIt keeps `refuse_if_widened`, as `bulk/delete` does, although a frozen set cannot widen: the\nguard costs one comparison and is the last line if the snapshot join is ever bypassed. Adding\nsomeone to a list is what makes them mailable, and an unsubscribe afterwards does not un-send.",
+        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Adding someone to a list is what makes them mailable, and an\nunsubscribe afterwards does not un-send. Do not \"fix\" the asymmetry.",
         "operationId": "bulk_subscribe_contacts",
         "parameters": [
           {
@@ -1643,7 +1643,7 @@
             "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nobody was added"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1698,7 +1698,7 @@
             "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1753,7 +1753,7 @@
             "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1808,7 +1808,7 @@
             "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"
           },
           "422": {
-            "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
+            "description": "selection-expired, selection-invalid, a missing confirmed_count, a confirmed_count or excluded_ids sent alongside ids, an ids list that is empty or over 10 000, over 10 000 excluded_ids, or not exactly one of selection_token and ids"
           }
         }
       }
@@ -1819,7 +1819,7 @@
           "crate::contacts::routes"
         ],
         "summary": "Streams every contact the filter matches as CSV: the grid's filter, `segment_id` included.",
-        "description": "Never buffered (`export` explains how), formula cells are prefixed with `'`, and the audit row\nrecords the actor, the filter with `q` redacted, and the row count. Admin only. That does not\nstop exfiltration, since an editor can already page the book out 100 rows at a time; it raises\nthe cost and makes one place where there was none.",
+        "description": "Rows are streamed as they are read and never buffered, formula cells are prefixed with `'`,\nand the audit row records the actor, the filter with `q` redacted, and the row count. Admin\nonly. That does not stop exfiltration, since an editor can already page the book out through\n`GET /contacts` at up to 200 rows a time; it raises the cost and makes one place where there\nwas none.",
         "operationId": "export_contacts",
         "parameters": [
           {
@@ -1861,7 +1861,7 @@
             "description": "not a member, no such workspace, or no such segment"
           },
           "422": {
-            "description": "a `q` under 3 characters, or a `list_status` without a `list_id`"
+            "description": "a `q` under 3 characters, a `list_status` without a `list_id`, or a `segment_id` whose stored rules no longer resolve (the parser's own code)"
           },
           "429": {
             "description": "rate-limited: too many exports for this workspace"
@@ -1874,7 +1874,7 @@
         "tags": [
           "crate::contacts::routes"
         ],
-        "summary": "Freezes the contacts this predicate matches, by writing their ids down (spec M1b section 8).",
+        "summary": "Freezes the contacts this predicate matches, by writing their ids down.",
         "description": "The set is decided here, once, and never re-derived: a predicate re-evaluated when the action\nruns resolves to whatever the table says then, and a colleague's write inside the hour changes\nwhat the action hits. A contact created afterwards is not in the set; a contact that no longer\nmatches still is, because the person confirmed *these contacts*, not *this query*; and a\ncontact deleted in between is simply absent.\n\nRate-limited per workspace, harder than preview, with `RateLimit` headers on the answer as well\nas on the refusal: this is the most expensive call in the product, measured at 4,887 ms and\n158 MB for a million rows.",
         "operationId": "create_contact_selection",
         "parameters": [
@@ -1916,7 +1916,7 @@
             "description": "not a member, no such workspace, or no such segment"
           },
           "422": {
-            "description": "a `q` under 3 characters, a `list_status` without a `list_id`, or `selection-too-large`: the predicate matches more than a million contacts"
+            "description": "a `q` under 3 characters, a `list_status` without a `list_id`, a `segment_id` whose stored rules no longer resolve (the parser's own code, such as unknown-field or invalid-value), or `selection-too-large`: the predicate matches more than a million contacts"
           },
           "429": {
             "description": "rate-limited: too many selections for this workspace"
@@ -3012,7 +3012,7 @@
             "description": "list-name-taken"
           },
           "422": {
-            "description": "invalid name or description, or an unknown field"
+            "description": "invalid name or description, an explicit null for `name`, `double_optin` or `visibility`, or an unknown field"
           }
         }
       }
@@ -3353,8 +3353,8 @@
         "tags": [
           "crate::segments::routes"
         ],
-        "summary": "Counts the contacts each named **stored** segment matches. A read: `viewer` (section 13).",
-        "description": "The list view's counts, in one request. It resolves through `load_many_rules`, which reads a\nstored document — archived definitions included — so a segment naming a field that was\narchived after it was saved counts here, where `preview` would refuse it as a new rule. It\ncosts one unit of the preview quota however many segments it names, which is the whole point:\na page of 25 rows used to cost 25 of the 30 a workspace has in a minute.",
+        "summary": "Counts the contacts each named **stored** segment matches. A read: `viewer`.",
+        "description": "The list view's counts, in one request. A stored segment is resolved with archived\ncustom-field definitions **included**, so one naming a field archived since it was saved still\ncounts here, where `POST /segments/preview` refuses the same document as a new rule. It costs\none unit of the preview quota however many segments it names, which is the whole point: a page\nof 25 rows used to cost 25 of the 30 a workspace has in a minute.",
         "operationId": "count_segments",
         "parameters": [
           {
@@ -3379,7 +3379,7 @@
         ],
         "responses": {
           "200": {
-            "description": "One entry per id, in the order asked for, each carrying its own `state`: counted, estimated, or one of the two reasons there is no number",
+            "description": "One entry per id, in the order asked for, each carrying its own `state`: counted, estimated, or one of the three reasons there is no number",
             "content": {
               "application/json": {
                 "schema": {
@@ -3408,8 +3408,8 @@
         "tags": [
           "crate::segments::routes"
         ],
-        "summary": "Counts the contacts a rule document matches, without saving it. A read: `viewer` (section 13).",
-        "description": "Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.\nThe document is arbitrary, the caller needs only `viewer`, each call may hold a pooled\nconnection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.\n\nThe document is parsed against the **live** definitions (`parse_new_rules`), like a save and\nunlike a load: previewing is how a new rule is written, and a new rule may not name an\narchived field. Nothing builds a rule by hand — `Group::parse` is the only way in, and a\nhand-built node can reach an `unreachable!` in the compiler.",
+        "summary": "Counts the contacts a rule document matches, without saving it. A read: `viewer`.",
+        "description": "Rate-limited per workspace, with `RateLimit` headers on the answer as well as on the refusal.\nThe document is arbitrary, the caller needs only `viewer`, each call may hold a pooled\nconnection for 1.5 seconds, and the rule builder calls this on a debounce as someone types.\n\nThe document is resolved against the **live** custom-field definitions, like a save and\nunlike a read of a stored segment: previewing is how a new rule is written, and a new rule may\nnot name an archived field. So expect `422 unknown-field` here for a field a stored segment\nnaming the same one still counts under.",
         "operationId": "preview_segment",
         "parameters": [
           {
@@ -3596,7 +3596,7 @@
             "description": "segment-name-taken"
           },
           "422": {
-            "description": "invalid name or description, an unknown field, or a rule document that is not a whole, valid one"
+            "description": "invalid name or description, an explicit null for `name`, an unknown field, or a rule document that is not a whole, valid one"
           }
         }
       }
@@ -4248,7 +4248,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/MembershipStatus",
-                "description": "Only for `subscribe`: the status the new memberships were written with. `pending` means\nthe contacts are on a double-opt-in list and not mailable until they confirm, and nothing\nin this milestone confirms them: `affected` is not a count of people who can be mailed."
+                "description": "Only for `subscribe`: the status the new memberships were written with. `pending` means\nthe contacts are on a double-opt-in list and not mailable until they confirm, and NM has\nno confirmation flow yet: `affected` is not a count of people who can be mailed."
               },
               {
                 "type": "null"
@@ -4462,47 +4462,6 @@
           }
         }
       },
-      "ContactFilter": {
-        "type": "object",
-        "description": "Which contacts a list shows. It is embedded in a signed selection token later, so its\nserialised form is part of that token's payload: renaming a field, or adding one (the payload is\nnot tolerant of a missing field), would make tokens already issued fail to decode, as a\n`422 selection-invalid`, until they age out after an hour. Mind that during a rolling deploy.",
-        "properties": {
-          "list_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "uuid",
-            "description": "Contacts with a membership row on this list, whatever its status: a `pending` or\n`unsubscribed` member is still a member here. A list of another workspace matches nothing."
-          },
-          "list_status": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/MembershipStatus",
-                "description": "Narrows `list_id` to the memberships with this status. Meaningless without `list_id`: the\nhandler refuses it, and `list` ignores it."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "q": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Case-insensitive substring of the address or name."
-          },
-          "tag_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "uuid",
-            "description": "Contacts with this tag. A tag of another workspace matches nothing."
-          }
-        },
-        "additionalProperties": false
-      },
       "ContactList": {
         "type": "object",
         "description": "One list a contact is on, as the contact's page shows it.",
@@ -4548,7 +4507,7 @@
       },
       "CountState": {
         "type": "string",
-        "description": "What one row of a batch count is, and why.\n\nA nullable number stood for three different facts here — no estimate is honest, the batch ran\nout of time, the stored document no longer parses — and the list told all three of them with\nsection 5's sentence for the first. One state per fact, so the screen cannot say the wrong one.",
+        "description": "Why a row has the number it has, or has none.\n\nOne value per fact, so a null `count` never has to be guessed at: `exact` and `estimated`\ncarry a number, and `no_estimate`, `unreadable` and `failed` each carry none for a different\nreason, spelled out below.",
         "enum": [
           "exact",
           "estimated",
@@ -5268,7 +5227,7 @@
       },
       "NewSelection": {
         "type": "object",
-        "description": "The body of `POST /contacts/selection`: which contacts to freeze.\n\n`ContactFilter`'s fields, spelled out rather than flattened, for the reason `BulkTarget` gives:\n`serde(flatten)` cannot be combined with `deny_unknown_fields`, and a misspelt `tag_id_` that\nwas quietly ignored here would freeze every contact in the workspace.",
+        "description": "The body of `POST /contacts/selection`: which contacts to freeze.\n\nThe grid's filter fields, spelled out rather than nested, for the reason `BulkTarget` gives:\nunknown fields are refused, and a misspelt `tag_id_` that was quietly ignored here would\nfreeze every contact in the workspace.",
         "properties": {
           "list_id": {
             "type": [
@@ -6244,7 +6203,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The matching contacts, or `null` when no honest number can be given — the document filters\non a custom attribute, which has no statistics (section 6). The rule builder shows \"too\nmany to count exactly\" for `null`."
+            "description": "The matching contacts, or `null` when no honest number can be given — the document filters\non a custom attribute, which carries no statistics for the planner to estimate from. The\nrule builder shows \"too many to count exactly\" for `null`."
           },
           "exact": {
             "type": "boolean",
@@ -6392,7 +6351,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The number, for `exact` and `estimated`. Null for the other two states, which is what\n`state` is there to explain."
+            "description": "The number, for `exact` and `estimated`. Null for `no_estimate`, `unreadable` and\n`failed`, which is what `state` is there to tell apart."
           },
           "id": {
             "type": "string",
