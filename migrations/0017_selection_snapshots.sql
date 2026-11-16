@@ -8,7 +8,17 @@
 -- `filter` keeps the predicate for the audit row (section 8.7). The token carries none, so without
 -- this column a `bulk/delete` of 417,004 contacts would be recorded as a snapshot id that is
 -- deleted an hour later — a worse record than M1a had, on the one action that cannot be undone.
-create table selection_snapshots (
+--
+-- `unlogged`, like the members below and for the same reason — but the parent has a second one of
+-- its own. Postgres truncates an unlogged table on crash recovery, on standby promotion and on
+-- restore from a base backup, and it would truncate only the members: the parent would survive
+-- with `size = 417004` and nothing behind it. `resolve` and `require_live` read only the parent,
+-- so both would pass, and the action would answer `200 {selected: 0, affected: 0}` over a grid
+-- with no rows — the exact answer `selection.rs` argues must never be given, because "zero
+-- contacts matched" is a different fact from "this selection is gone". Truncating both makes the
+-- crash produce the `422 selection-expired` the members' comment already claims it does. The only
+-- thing lost is `filter` for the audit row of a bulk action that, by construction, cannot happen.
+create unlogged table selection_snapshots (
   id uuid primary key,                -- UUIDv7: carries its own issue time, see section 8.5
   workspace_id uuid not null references workspaces(id) on delete cascade,
   -- Exactly one of these is set: a selection is made by a signed-in user or by an API key, and
@@ -31,9 +41,9 @@ create index selection_snapshots_actor
   on selection_snapshots (workspace_id, created_by, created_by_key);
 
 -- `unlogged` on purpose: this table is ephemeral, hourly and recreatable. Logged, it would push
--- ~158 MB per 1M-row selection through WAL and into every base backup. A crash truncates it, which
--- produces the same "your selection expired, select again" path the one-hour TTL already produces.
--- The cost is that snapshots do not reach a physical standby.
+-- ~158 MB per 1M-row selection through WAL and into every base backup. A crash truncates it and
+-- its parent together, which produces the same "your selection expired, select again" path the
+-- one-hour TTL already produces. The cost is that snapshots do not reach a physical standby.
 --
 -- It is also the first tenant table holding a `contact_id` without a composite foreign key to
 -- `contacts`, against M1a's "unrepresentable, not merely unwritten" (section 8.6). The foreign key

@@ -390,15 +390,23 @@ async fn an_api_key_supersedes_only_its_own_previous_selection(pool: PgPool) {
     assert!(by_key.is_some(), "the key was not recorded");
 }
 
-/// `selection_snapshot_members` is `unlogged` (section 7): ~158 MB per million rows would
-/// otherwise go through WAL and into every base backup. The consequence is that a crash truncates
-/// the table, which is the same "select again" path the TTL already produces — so the decision is
-/// only safe while the TTL path exists, and only real while this holds.
+/// **Both** snapshot tables are `unlogged` (section 7): ~158 MB per million rows would otherwise
+/// go through WAL and into every base backup. The consequence is that a crash truncates them,
+/// which is the same "select again" path the TTL already produces — so the decision is only safe
+/// while the TTL path exists, and only real while this holds.
+///
+/// The parent is in this assertion because it is the half that is read. Logged, it would survive
+/// a crash carrying its `size` with no members behind it, `resolve` and `require_live` would both
+/// pass, and the action would answer `200 {selected: 0}` instead of `422 selection-expired` — an
+/// empty page where the one thing this milestone insists on is that "nothing matched" and "your
+/// selection is gone" are different answers.
 #[sqlx::test]
-async fn the_members_table_is_unlogged_and_the_parent_is_not(pool: PgPool) {
+async fn both_snapshot_tables_are_unlogged_so_a_crash_expires_the_selection(pool: PgPool) {
     let both: Vec<(String, String)> = sqlx::query_as(
+        // `contacts` is the control: with both snapshot tables answering "u", an assertion over
+        // those two alone would also pass on a server where every table came back unlogged.
         "select relname::text, relpersistence::text from pg_class \
-         where relname in ('selection_snapshots', 'selection_snapshot_members') \
+         where relname in ('contacts', 'selection_snapshots', 'selection_snapshot_members') \
          order by relname",
     )
     .fetch_all(&pool)
@@ -407,9 +415,9 @@ async fn the_members_table_is_unlogged_and_the_parent_is_not(pool: PgPool) {
     assert_eq!(
         both,
         vec![
-            // The parent is ordinary, so "u" below is not simply what every table here answers.
+            ("contacts".to_owned(), "p".to_owned()),
             ("selection_snapshot_members".to_owned(), "u".to_owned()),
-            ("selection_snapshots".to_owned(), "p".to_owned()),
+            ("selection_snapshots".to_owned(), "u".to_owned()),
         ]
     );
 }

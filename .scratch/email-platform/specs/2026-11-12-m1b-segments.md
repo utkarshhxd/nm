@@ -273,7 +273,7 @@ create table segments (
 create index segments_keyset on segments (workspace_id, id desc);
 
 -- 0017_selection_snapshots.sql
-create table selection_snapshots (
+create unlogged table selection_snapshots (
   id uuid primary key,                -- UUIDv7: carries its own issue time, see §8.5
   workspace_id uuid not null references workspaces(id) on delete cascade,
   created_by uuid references users(id) on delete set null,
@@ -302,10 +302,13 @@ alter table list_memberships add column source text
 
 Notes that are not obvious from the DDL:
 
-- **`selection_snapshot_members` is `unlogged`.** It is ephemeral, hourly and recreatable. Logged,
-  it would push ~158 MB per 1M-row selection through WAL and into every base backup. A crash
-  truncates it, which produces the same "your selection expired, select again" path the TTL
-  already produces.
+- **Both snapshot tables are `unlogged`.** They are ephemeral, hourly and recreatable. Logged,
+  the members would push ~158 MB per 1M-row selection through WAL and into every base backup. A
+  crash truncates them, which produces the same "your selection expired, select again" path the
+  TTL already produces. **The parent has to be unlogged too, or that sentence is false:** Postgres
+  would truncate only the members and leave the parent carrying its `size`, both readers look at
+  the parent alone, and the action would answer `200 {selected: 0}` over an empty page instead of
+  `422 selection-expired` — "nothing matched" said where "this selection is gone" is the fact.
 - **`source` is nullable with no default.** A `not null default 'api'` would backfill every
   existing row — every UI and `bulk/subscribe` membership — with a provenance that is simply
   false, destroying in the creating migration the distinction §15.1 argues cannot be
