@@ -334,6 +334,25 @@ async function selectMatching(q: string, n: number): Promise<void> {
   await expect(page.getByText(`${n} contacts selected`, { exact: true })).toBeVisible();
 }
 
+test("ticked_rows_survive_a_sort_and_still_go_on_a_filter", async () => {
+  // The clearing effect is keyed on which contacts a view *reaches*. Sorting moves no contact in
+  // or out, so a tick made before it is still a tick on a row the person saw; on the grid's own
+  // cache key — which carries `sort` and `dir`, because re-ordered really is a different page of
+  // cursors — a column click threw the selection away, announced that the filters had changed
+  // where they had not, and dropped the last bulk outcome with it.
+  //
+  // This spends no selection quota: ticking is `ids`, not a frozen set.
+  await selectMatching("bulk-", 3);
+  await page.getByRole("button", { name: "Email", exact: true }).click();
+  // The order really moved, so what follows is not an assertion about a click that did nothing.
+  await expect(page).toHaveURL(/sort=email/);
+  await expect(page.locator("tbody tr[aria-rowindex]").first()).toContainText("bulk-a@example.test");
+  await expect(page.getByText("3 contacts selected", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("checkbox", { name: "Select bulk-a@example.test", exact: true }),
+  ).toBeChecked();
+});
+
 test("bulk_untag_over_a_selection", async () => {
   await selectMatching("bulk-", 3);
   await page.getByLabel("Tag to add or remove", { exact: true }).selectOption({ label: "crowd" });
@@ -518,6 +537,17 @@ test("a_predicate_selection_spares_the_excluded_contact_in_all_three_actions", a
     expect(bodies[kind]?.ids, kind).toBeUndefined();
     await page.unroute(`**/contacts/bulk/${kind}`);
   }
+
+  // The selection went with the delete, and its count has to go with it: the figure counted
+  // contacts that no longer exist, and it was still feeding the grid's `aria-rowcount` — "row 5
+  // of 5,000" over 4,500 rows, once a view is past the 2,000 where `shown` goes null — and this
+  // dialog. Here, where the dialog is reachable with three rows, is where it can be seen.
+  await page.getByRole("button", { name: "Export CSV", exact: true }).click();
+  const dropped = exportDialog(page);
+  await expect(dropped).toContainText("The number of rows is not known here");
+  await expect(dropped).not.toContainText("matched when you selected them");
+  await page.keyboard.press("Escape");
+  await expect(dropped).toBeHidden();
 });
 
 test("a_delete_that_lost_a_race_is_measured_against_what_it_promised", async () => {

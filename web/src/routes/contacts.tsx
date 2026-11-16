@@ -315,14 +315,22 @@ function ContactsPage({
   // selection carried across a filter is how someone acts on the wrong million rows. A frozen
   // selection is different — it is written down on the server, the grid is narrowed to it, and a
   // filter from here narrows only what is shown (spec §14).
+  //
+  // `coveredKey`, not `filterKey`: which contacts a view reaches is what a tick belongs to, and
+  // sorting moves no contact in or out. On `filterKey` this threw ticked rows away on a column
+  // click, announced a filter change that had not happened, and made a bulk outcome — a report
+  // of something that already happened — vanish because the grid was re-ordered.
   useEffect(() => {
     if (store.get().mode === "ids") {
+      // Before `clear`, so the `[selection]` effect's generic "Selection cleared" does not
+      // overwrite this sentence inside the shared 500 ms debounce.
+      silentClear.current = true;
       store.clear();
       announce("Selection cleared because the filters changed.");
     }
     setResult(null);
     setFailure("");
-  }, [filterKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [coveredKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // How many contacts an action would run on, whichever way they were chosen.
   const chosen =
@@ -539,6 +547,9 @@ function ContactsPage({
         if (STALE_SELECTION.has(problemType(error).replace("urn:nm:problem:", ""))) {
           silentClear.current = true;
           store.clear();
+          // `selection-count-mismatch` is itself the news that this figure no longer describes
+          // anything. Left in place it keeps feeding `aria-rowcount` and the export dialog.
+          setMatched(null);
           await queryClient.invalidateQueries({ queryKey: ["contacts", id] });
         }
         return;
@@ -548,6 +559,10 @@ function ContactsPage({
       if (kind === "delete") {
         silentClear.current = true;
         store.clear();
+        // The count was a count of rows that no longer exist. Above 2,000 rows `shown` is null
+        // and this is what `aria-rowcount` reads, so a screen reader would say "row 5 of 5,000"
+        // over 4,500; the export dialog would quote the pre-delete figure as well.
+        setMatched(null);
         // The bar that held the button is about to unmount; focus goes to the outcome.
         toFocus.current = true;
       }
