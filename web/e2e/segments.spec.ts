@@ -681,6 +681,75 @@ test("select_these_contacts_is_offered_from_an_exact_count_and_from_nothing_else
   await page.unroute(COUNTS);
 });
 
+test("a_segment_matching_nobody_is_not_offered_and_never_claims_the_workspace_is_empty", async () => {
+  // Two doors, closed separately, because they fail separately. The control is absent for a count
+  // of zero — a frozen set of nobody is a bulk bar whose five actions are all disabled over a
+  // grid with no rows. And the grid behind it must not answer an empty *selection* with a
+  // sentence about the *workspace*, which is also the state a snapshot reaches when somebody else
+  // deletes every contact it froze.
+  //
+  // Its own workspace: this spends a selection, and `SELECTION_PER_MINUTE` is per workspace.
+  const SOLO = "emptysegco";
+  const solo = (await (
+    await admin.request.post("/api/v1/workspaces", {
+      data: { name: "Empty Seg Co", slug: SOLO },
+      headers: { "X-CSRF-Token": csrf },
+    })
+  ).json()) as { id: string };
+  const seed = async (path: string, data: unknown): Promise<{ id: string }> => {
+    const res = await admin.request.post(`/api/v1/workspaces/${solo.id}${path}`, {
+      data,
+      headers: { "X-CSRF-Token": csrf },
+    });
+    expect(res.ok(), `seed ${path} -> ${res.status()} ${await res.text()}`).toBe(true);
+    return (await res.json()) as { id: string };
+  };
+  // A workspace that is **not** empty, so "No contacts yet" below would be a false sentence.
+  await seed("/contacts", { email: "someone@empty.test" });
+  const nobody = await seed("/segments", {
+    name: "Nobody",
+    description: "",
+    rules: { match: "all", rules: [{ field: "email", op: "contains", value: "@nobody.invalid" }] },
+  });
+
+  await realCounts();
+  await page.goto(`/w/${SOLO}/segments`);
+  await expect(page.getByRole("heading", { name: "Segments", exact: true })).toBeVisible();
+  // The real count, and the row's other control, so "no button" cannot pass on a row that never
+  // rendered or on a count that never arrived.
+  await expect(page.getByRole("row", { name: /Nobody/ }).getByTestId("segment-count")).toHaveText("0");
+  await expect(page.getByRole("button", { name: "Edit Nobody", exact: true })).toHaveCount(1);
+  await expect(
+    page.getByRole("button", { name: "Select contacts in Nobody", exact: true }),
+  ).toHaveCount(0);
+
+  // The second door. Putting the control back is the only way to the grid state from here, and it
+  // is exactly what a snapshot emptied after it was taken hands the grid anyway.
+  await page.route(COUNTS, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([{ id: nobody.id, state: "exact", count: 1 } satisfies SegmentCount]),
+    }),
+  );
+  await page.goto(`/w/${SOLO}/segments`);
+  await page.getByRole("button", { name: "Select contacts in Nobody", exact: true }).click();
+
+  await expect(page).toHaveURL(new RegExp(`/w/${SOLO}/contacts$`));
+  await expect(page.getByText("Here is what you selected: all 0 contacts.")).toBeVisible();
+  const empty = page.getByRole("heading", { name: "No contacts in this selection", exact: true });
+  await expect(empty).toBeVisible();
+  await expect(page.getByRole("heading", { name: "No contacts yet", exact: true })).toHaveCount(0);
+
+  // The way back is on the screen, and taking it shows the contact the workspace does have.
+  await page
+    .getByRole("region", { name: "Bulk actions" })
+    .getByRole("button", { name: "Clear selection", exact: true })
+    .click();
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(1);
+  await page.unroute(COUNTS);
+});
+
 test("selecting_a_segments_contacts_shows_the_frozen_set_on_the_contacts_grid", async () => {
   // The gap Task 6 left: the server has taken `segment_id` on `POST /contacts/selection` since
   // then and no screen offered it.

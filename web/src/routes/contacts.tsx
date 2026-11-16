@@ -770,6 +770,19 @@ function ContactsPage({
             >
               {filters.q ? `Nothing matches “${filters.q}” with these filters.` : "Nothing matches these filters."}
             </EmptyState>
+          ) : selection.mode === "all" ? (
+            // A frozen selection narrows the grid to itself, so an empty one empties the grid —
+            // and "No contacts yet" would then be a claim about the *workspace*, made on a screen
+            // that is only showing a selection. It is reachable from a segment that matches
+            // nothing and from a snapshot whose contacts were all deleted elsewhere. Say which
+            // set is empty, and offer the way back to the other one.
+            <EmptyState
+              title="No contacts in this selection"
+              actions={<Button onClick={() => store.clear()}>Clear selection</Button>}
+            >
+              This selection is empty, so there is nothing to show or act on. Clearing it brings
+              the workspace&rsquo;s contacts back.
+            </EmptyState>
           ) : (
             <EmptyState title="No contacts yet">
               Contacts you add or import will appear here.

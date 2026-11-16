@@ -160,14 +160,21 @@ function AllSegments({ ws, slug, canEdit }: { ws: string; slug: string; canEdit:
   /**
    * Whether this row may offer to select its contacts.
    *
-   * **Only from an exact count** (spec §14). Freezing a selection from an estimate — or from a
-   * row that has no number at all — costs five seconds and may end in `422 selection-too-large`,
-   * and there is nothing the person could do from this screen to make it work. So the control is
-   * absent rather than disabled with a tooltip: a control nobody may use is not a control.
+   * **Only from an exact count, and only above zero** (spec §14). Freezing a selection from an
+   * estimate — or from a row that has no number at all — costs five seconds and may end in
+   * `422 selection-too-large`, and there is nothing the person could do from this screen to make
+   * it work. So the control is absent rather than disabled with a tooltip: a control nobody may
+   * use is not a control.
+   *
+   * Zero is the same rule read one step further. The server takes an empty selection happily, so
+   * the click would succeed and hand the grid a frozen set of nobody — a bulk bar whose five
+   * actions are all disabled, over a grid with no rows in it.
    */
   const countedExactly = (id: string): boolean => {
     const state = countOf(id);
-    return state.kind === "counted" && state.state === "exact";
+    // `?? 0` also absents the control for an `exact` row that arrived with no number, which the
+    // row itself renders as a dash: there is no figure to act on either way.
+    return state.kind === "counted" && state.state === "exact" && (state.count ?? 0) > 0;
   };
 
   /**
