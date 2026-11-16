@@ -1183,9 +1183,15 @@ export interface components {
         BulkTarget: {
             /**
              * Format: int64
-             * @description How many contacts the confirmation showed: the selection's `selected`, **before**
-             *     `excluded_ids`. Required with `selection_token`, refused with `ids`, and the action is
-             *     refused if it is not the size of the set that was frozen.
+             * @description How many contacts the confirmation showed: the size of the frozen set **less**
+             *     `excluded_ids` — the number on the button, not the number the token was issued for.
+             *     Required with `selection_token`, refused with `ids`.
+             *
+             *     The action is refused `409` if it would reach **more** contacts than this. Reaching fewer
+             *     is not refused: a contact deleted between the selection and the action is simply absent,
+             *     and the gap between `selected` and `affected` reports it. Sending the pre-exclusion size
+             *     instead would send a number the server already holds signed into the token, which can
+             *     never be below what the action reaches and so can never refuse anything.
              */
             confirmed_count?: number | null;
             /** @description Contacts to leave out of a `selection_token`. At most 10 000. */
@@ -3527,7 +3533,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nothing was deleted */
+            /** @description selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nothing was deleted */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -3582,7 +3588,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nobody was added */
+            /** @description selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nobody was added */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -3637,7 +3643,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed */
+            /** @description selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -3692,7 +3698,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed */
+            /** @description selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -3747,7 +3753,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed */
+            /** @description selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed */
             409: {
                 headers: {
                     [name: string]: unknown;

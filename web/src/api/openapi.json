@@ -1584,7 +1584,7 @@
             "description": "not a member, or a token for another workspace"
           },
           "409": {
-            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nothing was deleted"
+            "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nothing was deleted"
           },
           "422": {
             "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
@@ -1640,7 +1640,7 @@
             "description": "not a member, no such list, or a token for another workspace"
           },
           "409": {
-            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nobody was added"
+            "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nobody was added"
           },
           "422": {
             "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
@@ -1695,7 +1695,7 @@
             "description": "not a member, no such tag, or a token for another workspace"
           },
           "409": {
-            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"
+            "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"
           },
           "422": {
             "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
@@ -1750,7 +1750,7 @@
             "description": "not a member, no such list, or a token for another workspace"
           },
           "409": {
-            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"
+            "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"
           },
           "422": {
             "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
@@ -1805,7 +1805,7 @@
             "description": "not a member, no such tag, or a token for another workspace"
           },
           "409": {
-            "description": "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"
+            "description": "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"
           },
           "422": {
             "description": "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"
@@ -4316,7 +4316,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "How many contacts the confirmation showed: the selection's `selected`, **before**\n`excluded_ids`. Required with `selection_token`, refused with `ids`, and the action is\nrefused if it is not the size of the set that was frozen.",
+            "description": "How many contacts the confirmation showed: the size of the frozen set **less**\n`excluded_ids` — the number on the button, not the number the token was issued for.\nRequired with `selection_token`, refused with `ids`.\n\nThe action is refused `409` if it would reach **more** contacts than this. Reaching fewer\nis not refused: a contact deleted between the selection and the action is simply absent,\nand the gap between `selected` and `affected` reports it. Sending the pre-exclusion size\ninstead would send a number the server already holds signed into the token, which can\nnever be below what the action reaches and so can never refuse anything.",
             "minimum": 0
           },
           "excluded_ids": {

@@ -579,9 +579,15 @@ pub struct BulkTarget {
     /// Contacts to leave out of a `selection_token`. At most 10 000.
     #[serde(default)]
     pub excluded_ids: Vec<Uuid>,
-    /// How many contacts the confirmation showed: the selection's `selected`, **before**
-    /// `excluded_ids`. Required with `selection_token`, refused with `ids`, and the action is
-    /// refused if it is not the size of the set that was frozen.
+    /// How many contacts the confirmation showed: the size of the frozen set **less**
+    /// `excluded_ids` — the number on the button, not the number the token was issued for.
+    /// Required with `selection_token`, refused with `ids`.
+    ///
+    /// The action is refused `409` if it would reach **more** contacts than this. Reaching fewer
+    /// is not refused: a contact deleted between the selection and the action is simply absent,
+    /// and the gap between `selected` and `affected` reports it. Sending the pre-exclusion size
+    /// instead would send a number the server already holds signed into the token, which can
+    /// never be below what the action reaches and so can never refuse anything.
     pub confirmed_count: Option<u64>,
 }
 
@@ -987,7 +993,7 @@ async fn finish_bulk(
     responses(
         (status = 200, description = "How many were newly tagged", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
-        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"),
+        (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
         (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
@@ -1028,7 +1034,7 @@ pub async fn bulk_tag_contacts(
     responses(
         (status = 200, description = "How many had the tag", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
-        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"),
+        (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"),
         (status = 404, description = "not a member, no such tag, or a token for another workspace"),
         (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
@@ -1080,7 +1086,7 @@ pub async fn bulk_untag_contacts(
         (status = 200, description = "How many memberships were added; contacts already on the list, whatever their status, are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
-        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nobody was added"),
+        (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nobody was added"),
         (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
@@ -1126,7 +1132,7 @@ pub async fn bulk_subscribe_contacts(
     responses(
         (status = 200, description = "How many were unsubscribed now; those already unsubscribed or not on the list are not counted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
-        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; nothing was changed"),
+        (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; nothing was changed"),
         (status = 404, description = "not a member, no such list, or a token for another workspace"),
         (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
@@ -1169,7 +1175,7 @@ pub async fn bulk_unsubscribe_contacts(
         (status = 200, description = "How many were deleted", body = BulkResult),
         (status = 403, description = "insufficient-role: bulk actions take editor"),
         (status = 404, description = "not a member, or a token for another workspace"),
-        (status = 409, description = "selection-count-mismatch: confirmed_count is not the size of the frozen set; or selection-widened, which a frozen set cannot produce; nothing was deleted"),
+        (status = 409, description = "selection-count-mismatch: the action would have reached more contacts than confirmed_count; or selection-widened, which a frozen set cannot produce; nothing was deleted"),
         (status = 422, description = "selection-expired, selection-invalid, a missing confirmed_count, too many excluded_ids or ids, or not exactly one of selection_token and ids"),
     ),
 )]
