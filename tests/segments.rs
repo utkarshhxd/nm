@@ -1598,3 +1598,89 @@ async fn an_unreadable_stored_document_costs_only_its_own_row(pool: PgPool) {
     selection.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(problem_type(&selection), "urn:nm:problem:unknown-field");
 }
+
+/// Deleting a tag a saved `not_has` names makes that segment unreadable — **not** a predicate that
+/// matches every contact in the workspace.
+///
+/// Nobody misbehaves in this test: an editor saves "not tagged VIP", another deletes the VIP tag
+/// on the tags screen, `contact_tags` cascades, and before the parser resolved the id the stored
+/// `not exists (… and t.tag_id = $1)` quietly became true for everybody. The count was the whole
+/// book and `POST /contacts/selection` froze it.
+#[sqlx::test]
+async fn deleting_a_tag_a_segment_names_makes_it_unreadable_not_everyone(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    for email in ["a@acme.com", "b@acme.com", "c@acme.com"] {
+        insert_contact(&pool, ws, email, "Ann", json!({})).await;
+    }
+    let tag = id_of(
+        &app.post(&format!("/api/v1/workspaces/{ws}/tags"))
+            .json(&json!({"name": "VIP"}))
+            .await,
+    );
+    let rules = json!({"match": "all", "rules": [{"field": "tag", "op": "not_has", "value": tag}]});
+    let id = create(&app, ws, "not vip", rules).await;
+
+    // While the tag is there the segment counts, and it counts everyone, because nobody carries
+    // the tag yet. That is the number the assertions below must be able to tell apart from the
+    // same number arrived at by a vanished reference — so the state is what they read, never the
+    // count.
+    let r = app.get(&counts_path(ws, &[id])).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()[0]["state"], "exact");
+    assert_eq!(r.json::<Value>()[0]["count"], 3);
+
+    app.delete(&format!("/api/v1/workspaces/{ws}/tags/{tag}"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let r = app.get(&counts_path(ws, &[id])).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body[0]["state"], "unreadable", "{body}");
+    assert_eq!(body[0]["count"], Value::Null, "{body}");
+
+    // And the one path that would act on it refuses rather than freezing the whole workspace.
+    let selection = app
+        .post(&format!("/api/v1/workspaces/{ws}/contacts/selection"))
+        .json(&json!({"segment_id": id}))
+        .await;
+    selection.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(problem_type(&selection), "urn:nm:problem:invalid-value");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from selection_snapshots")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0,
+        "a segment naming a deleted tag must not freeze a selection at all"
+    );
+}
+
+/// A new document may not name a list or a tag that is not this workspace's, which is the same
+/// resolution as above arriving through the save and preview paths instead of through a load.
+#[sqlx::test]
+async fn a_new_rule_may_not_name_another_workspaces_list_or_tag(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (other, other_app) = workspace(&pool, "globex").await;
+    let theirs = id_of(
+        &other_app
+            .post(&format!("/api/v1/workspaces/{other}/lists"))
+            .json(&json!({"name": "news", "double_optin": false}))
+            .await,
+    );
+    let doc =
+        json!({"match": "all", "rules": [{"field": "list", "op": "member_of", "value": theirs}]});
+
+    for r in [
+        app.post(&segments(ws))
+            .json(&json!({"name": "theirs", "rules": doc}))
+            .await,
+        app.post(&format!("{}/preview", segments(ws)))
+            .json(&json!({"rules": doc}))
+            .await,
+    ] {
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(problem_type(&r), "urn:nm:problem:invalid-value");
+    }
+    assert_eq!(count(&pool).await, 0, "nothing was written");
+}

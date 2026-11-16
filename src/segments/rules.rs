@@ -3,7 +3,10 @@
 //! The segment rule AST (spec M1b section 4.1 to 4.3 and 4.6) and its parser. Parsing is the only
 //! way to build a tree, so a tree that exists has passed every check here. No SQL.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use chrono::{DateTime, NaiveDate};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
@@ -104,15 +107,30 @@ impl From<RuleError> for ApiError {
     }
 }
 
-/// Resolves an `attr:<key>` to its definition's kind. The parser validates shape only; the caller
-/// owns the database lookup (and decides whether an archived definition may be named).
-pub trait AttrKinds {
-    fn kind_of(&self, key: &str) -> Option<FieldKind>;
+/// What a document's references resolve against. The parser validates shape only; the caller owns
+/// the database lookups (and decides whether an archived definition may be named).
+///
+/// **Every reference a rule can carry is resolved here, and one that names nothing is refused.**
+/// The negations are why that is not a nicety: `not_has` compiles to a `NOT EXISTS` over
+/// `contact_tags`, which for a tag this workspace does not have is true for *every* contact — so a
+/// saved "not tagged churned" would quietly become "every contact" the moment somebody deletes the
+/// `churned` tag, and a one-rule `match: "all"` segment would select the whole book. Refusing
+/// leaves the segment unreadable until it is saved again, which is the direction a dangling
+/// reference has to break in: it is the one `attr:` already breaks in, and the one
+/// `custom_fields`' purge guard reasons about when it calls being left unusable the safe outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refs {
+    /// `attr:<key>` to its definition's kind.
+    pub kinds: HashMap<String, FieldKind>,
+    /// This workspace's list ids, for `member_of` / `not_member_of`.
+    pub lists: HashSet<Uuid>,
+    /// This workspace's tag ids, for `has` / `not_has`.
+    pub tags: HashSet<Uuid>,
 }
 
-impl AttrKinds for HashMap<String, FieldKind> {
+impl Refs {
     fn kind_of(&self, key: &str) -> Option<FieldKind> {
-        self.get(key).copied()
+        self.kinds.get(key).copied()
     }
 }
 
@@ -142,7 +160,7 @@ pub enum Field {
 }
 
 impl Field {
-    fn parse(name: &str, attrs: &dyn AttrKinds) -> Result<Field, RuleError> {
+    fn parse(name: &str, refs: &Refs) -> Result<Field, RuleError> {
         Ok(match name {
             "email" => Field::Email,
             "first_name" => Field::FirstName,
@@ -160,7 +178,7 @@ impl Field {
                 return Err(RuleError::NotYetAvailable(name.to_owned()));
             }
             _ => match name.strip_prefix("attr:") {
-                Some(key) => match attrs.kind_of(key) {
+                Some(key) => match refs.kind_of(key) {
                     Some(kind) => Field::Attr {
                         key: key.to_owned(),
                         kind,
@@ -388,15 +406,15 @@ fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
 }
 
 impl Group {
-    /// Parses and validates a rule document. `attrs` resolves `attr:<key>` fields.
-    pub fn parse(doc: &Value, attrs: &dyn AttrKinds) -> Result<Group, RuleError> {
+    /// Parses and validates a rule document. `refs` resolves every reference it can carry.
+    pub fn parse(doc: &Value, refs: &Refs) -> Result<Group, RuleError> {
         let raw = RawGroup::deserialize(doc).map_err(|_| RuleError::Malformed)?;
-        Walk { attrs, rules: 0 }.group(raw, 1)
+        Walk { refs, rules: 0 }.group(raw, 1)
     }
 }
 
 struct Walk<'a> {
-    attrs: &'a dyn AttrKinds,
+    refs: &'a Refs,
     rules: usize,
 }
 
@@ -433,7 +451,7 @@ impl Walk<'_> {
     }
 
     fn rule(&self, raw: RawRule) -> Result<Rule, RuleError> {
-        let field = Field::parse(&raw.field, self.attrs)?;
+        let field = Field::parse(&raw.field, self.refs)?;
         let invalid_op = || RuleError::InvalidOperator {
             field: raw.field.clone(),
             op: raw.op.clone(),
@@ -458,7 +476,7 @@ impl Walk<'_> {
             ),
             (Some(_), _) => return Err(bad("status applies to list membership only")),
         };
-        check_value(op, operand, raw.value.as_ref()).map_err(bad)?;
+        check_value(op, operand, raw.value.as_ref(), self.refs).map_err(bad)?;
         Ok(Rule {
             field,
             op,
@@ -468,7 +486,19 @@ impl Walk<'_> {
     }
 }
 
-fn check_value(op: Op, operand: Operand, value: Option<&Value>) -> Result<(), &'static str> {
+fn uuid_value(value: &Value) -> Result<Uuid, &'static str> {
+    value
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or("value must be a UUID")
+}
+
+fn check_value(
+    op: Op,
+    operand: Operand,
+    value: Option<&Value>,
+    refs: &Refs,
+) -> Result<(), &'static str> {
     use Op::*;
     match op {
         IsSet | IsNotSet | IsTrue | IsFalse => match value {
@@ -509,11 +539,18 @@ fn check_value(op: Op, operand: Operand, value: Option<&Value>) -> Result<(), &'
                     Some(a) if a.iter().all(Value::is_string) => Ok(()),
                     _ => Err("value must be a list of strings"),
                 },
-                MemberOf | NotMemberOf | Has | NotHas => v
-                    .as_str()
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                    .map(|_| ())
-                    .ok_or("value must be a UUID"),
+                // Resolved against the workspace, not merely parsed as a UUID: an id naming
+                // nothing makes `not_member_of` / `not_has` true for every contact. See [`Refs`].
+                MemberOf | NotMemberOf => refs
+                    .lists
+                    .contains(&uuid_value(v)?)
+                    .then_some(())
+                    .ok_or("no list in this workspace has this id"),
+                Has | NotHas => refs
+                    .tags
+                    .contains(&uuid_value(v)?)
+                    .then_some(())
+                    .ok_or("no tag in this workspace has this id"),
                 IsSet | IsNotSet | IsTrue | IsFalse => unreachable!(),
             }
         }
@@ -525,22 +562,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn attrs() -> HashMap<String, FieldKind> {
-        [
-            ("plan", FieldKind::Text),
-            ("seats", FieldKind::Number),
-            ("joined", FieldKind::Date),
-            ("vip", FieldKind::Boolean),
-            ("tier", FieldKind::Select),
-            ("interests", FieldKind::MultiSelect),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v))
-        .collect()
+    /// A workspace holding six definitions, and one list and one tag that happen to share `ID`.
+    fn refs() -> Refs {
+        Refs {
+            kinds: [
+                ("plan", FieldKind::Text),
+                ("seats", FieldKind::Number),
+                ("joined", FieldKind::Date),
+                ("vip", FieldKind::Boolean),
+                ("tier", FieldKind::Select),
+                ("interests", FieldKind::MultiSelect),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
+            lists: [id(ID)].into_iter().collect(),
+            tags: [id(ID)].into_iter().collect(),
+        }
+    }
+
+    fn id(text: &str) -> Uuid {
+        Uuid::parse_str(text).expect("a test uuid")
     }
 
     fn parse(doc: Value) -> Result<Group, RuleError> {
-        Group::parse(&doc, &attrs())
+        Group::parse(&doc, &refs())
     }
 
     fn code(doc: Value) -> &'static str {
@@ -719,8 +765,8 @@ mod tests {
     #[test]
     fn the_operator_set_follows_the_definitions_kind_not_the_key() {
         // The same key, defined as a number, takes number operators and refuses text ones.
-        let mut numeric = attrs();
-        numeric.insert("plan".to_owned(), FieldKind::Number);
+        let mut numeric = refs();
+        numeric.kinds.insert("plan".to_owned(), FieldKind::Number);
         let doc = all(vec![json!({"field": "attr:plan", "op": "gt", "value": 1})]);
         assert!(Group::parse(&doc, &numeric).is_ok());
         assert!(parse(doc).is_err());
@@ -803,6 +849,45 @@ mod tests {
         // Absent value on an operator that needs one.
         assert_eq!(
             code(all(vec![json!({"field": "email", "op": "eq"})])),
+            "invalid-value"
+        );
+    }
+
+    /// A UUID that names no row of this workspace is refused, on all four operators.
+    ///
+    /// The two negations are the ones that matter: `not_has` of a tag the workspace does not have
+    /// compiles to a `NOT EXISTS` that is true for every contact, so a document holding one would
+    /// select the whole book under `match: "all"`. The two positives are refused with them so a
+    /// `has` and its `not_has` cannot disagree about whether the same id is nameable.
+    #[test]
+    fn a_list_or_tag_id_naming_nothing_in_this_workspace_is_refused() {
+        const STRANGER: &str = "7b0f2c3e-0000-4000-8000-0000000000ff";
+        for (field, op) in [
+            ("tag", "has"),
+            ("tag", "not_has"),
+            ("list", "member_of"),
+            ("list", "not_member_of"),
+        ] {
+            // The same rule naming the workspace's own row parses, so the refusal below is about
+            // the id and not about the operator.
+            parse(all(vec![json!({"field": field, "op": op, "value": ID})]))
+                .unwrap_or_else(|e| panic!("{field} {op} of its own row: {e}"));
+            let err = parse(all(vec![
+                json!({"field": field, "op": op, "value": STRANGER}),
+            ]))
+            .expect_err(field);
+            assert_eq!(err.code(), "invalid-value", "{field} {op}");
+        }
+        // A list id is not a tag id: the two sets are resolved separately, so swapping them is
+        // refused even though both rows exist.
+        let mut crossed = refs();
+        crossed.tags.clear();
+        crossed.lists.insert(id(ID));
+        let doc = all(vec![json!({"field": "tag", "op": "not_has", "value": ID})]);
+        assert_eq!(
+            Group::parse(&doc, &crossed)
+                .expect_err("a tag rule must not resolve against the lists")
+                .code(),
             "invalid-value"
         );
     }

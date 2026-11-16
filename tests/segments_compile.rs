@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use common::{PW, create_user, create_workspace};
 use nm::{
     custom_fields::FieldKind,
-    segments::{compile::push_rules, rules::Group},
+    segments::{
+        compile::push_rules,
+        rules::{Group, Refs},
+    },
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -53,6 +56,44 @@ fn attrs() -> HashMap<String, FieldKind> {
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
     .collect()
+}
+
+/// The one list and tag id the two database-free tests name.
+const NAMED: &str = "7b0f2c3e-0000-4000-8000-000000000001";
+
+/// [`refs`] for a test with no pool: the definitions, and `ids` as both this workspace's lists and
+/// its tags, so a document naming one of them parses.
+fn attr_refs(ids: &[&str]) -> Refs {
+    let ids: std::collections::HashSet<Uuid> = ids
+        .iter()
+        .map(|s| Uuid::parse_str(s).expect("a test uuid"))
+        .collect();
+    Refs {
+        kinds: attrs(),
+        lists: ids.clone(),
+        tags: ids,
+    }
+}
+
+/// What the parser resolves a document against: the definitions above, plus the lists and tags
+/// this workspace really holds — read back from the database rather than listed here, so a test
+/// cannot name a row that is not there without saying so in its own body.
+async fn refs(pool: &PgPool, ws: Uuid) -> Refs {
+    let lists = sqlx::query_scalar("select id from lists where workspace_id = $1")
+        .bind(ws)
+        .fetch_all(pool)
+        .await
+        .expect("the workspace's lists");
+    let tags = sqlx::query_scalar("select id from tags where workspace_id = $1")
+        .bind(ws)
+        .fetch_all(pool)
+        .await
+        .expect("the workspace's tags");
+    Refs {
+        kinds: attrs(),
+        lists: lists.into_iter().collect(),
+        tags: tags.into_iter().collect(),
+    }
 }
 
 const INJECTION: &str = "plan'); drop table contacts; --";
@@ -254,7 +295,13 @@ fn all(rules: Vec<Value>) -> Value {
 /// parsed, so the absent-versus-null distinction `rules`'s `present` deserializer introduced is
 /// asserted on every case below, not only in its own test.
 async fn matching(pool: &PgPool, ws: Uuid, doc: &Value) -> Vec<String> {
-    let group = Group::parse(doc, &attrs()).expect("the document parses");
+    matching_against(pool, ws, doc, &refs(pool, ws).await).await
+}
+
+/// [`matching`] with the references the parser resolves against supplied by the caller, for the
+/// one test that has to compile a rule the parser would now refuse.
+async fn matching_against(pool: &PgPool, ws: Uuid, doc: &Value, refs: &Refs) -> Vec<String> {
+    let group = Group::parse(doc, refs).expect("the document parses");
     assert_eq!(
         serde_json::to_value(&group).expect("a parsed group serialises"),
         *doc,
@@ -732,24 +779,57 @@ async fn a_list_or_tag_of_another_workspace_matches_nothing(pool: PgPool) {
             );
         }
     }
+    // The parser refuses the foreign id outright, which is the first of the two defences and the
+    // one that matters: `not_member_of` of a row this workspace does not have is a `NOT EXISTS`
+    // that is true for every contact, so compiling it at all would be "select the whole book".
+    for (field, op) in [
+        ("list", "member_of"),
+        ("list", "not_member_of"),
+        ("tag", "has"),
+        ("tag", "not_has"),
+    ] {
+        let other = if field == "list" {
+            fx.other_list
+        } else {
+            fx.other_tag
+        };
+        let doc = all(vec![json!({"field": field, "op": op, "value": id(other)})]);
+        let err = Group::parse(&doc, &refs(&pool, fx.ws).await)
+            .expect_err("another workspace's id must not parse");
+        assert_eq!(err.code(), "invalid-value", "{field} {op}");
+    }
+
+    // The second defence, which has to hold on its own: *if* a foreign id ever reached the
+    // compiler — a resolver with a bug, a row deleted between the resolve and the compile — the
+    // correlation on `contacts.workspace_id` must still make the positives match nothing...
+    let foreign = Refs {
+        kinds: attrs(),
+        lists: [fx.other_list].into_iter().collect(),
+        tags: [fx.other_tag].into_iter().collect(),
+    };
     for rule in [
         json!({"field": "list", "op": "member_of", "value": id(fx.other_list)}),
         json!({"field": "tag", "op": "has", "value": id(fx.other_tag)}),
     ] {
         let doc = all(vec![rule.clone()]);
         assert_eq!(
-            matching(&pool, fx.ws, &doc).await,
+            matching_against(&pool, fx.ws, &doc, &foreign).await,
             Vec::<String>::new(),
             "{rule}"
         );
     }
     // ... and their negations match everyone, rather than failing closed on the wrong workspace.
+    // This is the shape the parser now keeps out of the database entirely.
     for rule in [
         json!({"field": "list", "op": "not_member_of", "value": id(fx.other_list)}),
         json!({"field": "tag", "op": "not_has", "value": id(fx.other_tag)}),
     ] {
         let doc = all(vec![rule.clone()]);
-        assert_eq!(matching(&pool, fx.ws, &doc).await, ALL, "{rule}");
+        assert_eq!(
+            matching_against(&pool, fx.ws, &doc, &foreign).await,
+            ALL,
+            "{rule}"
+        );
     }
 }
 
@@ -879,7 +959,7 @@ async fn absent_and_null_values_stay_apart_through_compilation(pool: PgPool) {
         ]),
     ] {
         assert!(
-            Group::parse(&doc, &attrs()).is_err(),
+            Group::parse(&doc, &attr_refs(&[])).is_err(),
             "an explicit null must not reach the compiler: {doc}"
         );
     }
@@ -937,11 +1017,11 @@ fn no_caller_supplied_text_reaches_the_sql() {
         {"field": "attr:interests", "op": "has_none", "value": ["rust"]},
         {"field": "attr:vip", "op": "is_true"},
         {"field": "attr:vip", "op": "is_false"},
-        {"field": "tag", "op": "not_has", "value": "7b0f2c3e-0000-4000-8000-000000000001"},
-        {"field": "list", "op": "member_of", "value": "7b0f2c3e-0000-4000-8000-000000000001",
+        {"field": "tag", "op": "not_has", "value": NAMED},
+        {"field": "list", "op": "member_of", "value": NAMED,
          "status": "subscribed"},
     ]});
-    let group = Group::parse(&doc, &attrs()).expect("the document parses");
+    let group = Group::parse(&doc, &attr_refs(&[NAMED])).expect("the document parses");
     let mut q =
         QueryBuilder::<Postgres>::new("select id from contacts where workspace_id = $0 and ");
     push_rules(&mut q, &group);

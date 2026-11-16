@@ -100,6 +100,16 @@ Anything else is `422 unknown-field`. An `attr:` key naming no definition is `42
 always-false rule, for §4.1's reason. Archived definitions resolve for reading so existing
 segments keep working; a new rule cannot name one.
 
+**A `list` or `tag` value is resolved against the workspace at parse too, and one naming no row is
+`422 invalid-value`.** The negations are why, and they are the same "matches everything" shape as
+an empty rule set: `not_has` of a tag this workspace does not have compiles to a `NOT EXISTS` that
+is true for *every* contact, so a saved "not tagged churned" would become "every contact" the
+moment somebody deletes the `churned` tag. Of the four references a document can carry, the two
+that degrade harmlessly were already refused and these two were not; now all four are. A stored
+document whose list or tag has since been deleted is that row's `unreadable` (§5) and a `422` on
+the paths that need the document itself — unusable until it is saved again, which is the safe
+direction. Deleting a list or a tag stays unguarded: the predicate reports itself broken instead.
+
 **A field resolves to a fixed SQL fragment chosen by a match on this table.** The compiler has no
 branch that writes a caller-supplied identifier.
 

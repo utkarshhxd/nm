@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select\n             coalesce((select array_agg(l.id) from lists l where l.workspace_id = $1),\n                      '{}'::uuid[]) as \"lists!: Vec<Uuid>\",\n             coalesce((select array_agg(t.id) from tags t where t.workspace_id = $1),\n                      '{}'::uuid[]) as \"tags!: Vec<Uuid>\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lists!: Vec<Uuid>",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "tags!: Vec<Uuid>",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4256e1524d4e760978fd284c8c83fef50eb227adb2425efa10350837cde20c4e"
+}
