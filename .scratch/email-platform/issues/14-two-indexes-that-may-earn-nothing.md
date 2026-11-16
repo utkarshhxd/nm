@@ -6,7 +6,7 @@ Found in the M1b whole-branch review (D2-L1 and D2-L2, `final-d2-sql.md`) and **
 `EXPLAIN` in D5's pass** (`final-d5-report.md`), read from the top node on 50,000 segments and
 50,000 snapshots in a migrated throwaway database. The plans below are **no longer hypotheses and
 this issue does not retire**: both predictions were right, including the spelling D2 predicted for
-the second. The output is under `## Comments`.
+the second. Each run and its output sit with the finding they confirm, below.
 
 Both are still harmless at today's row counts, which is why this stays filed rather than fixed, and
 both fixes are forward-only `drop index` migrations that change no result. One correction to what
