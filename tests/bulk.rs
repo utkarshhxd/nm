@@ -1006,6 +1006,50 @@ async fn bulk_writes_exactly_one_audit_row(pool: PgPool) {
     assert_eq!(meta["snapshot_id"], json!(sel.snapshot_id));
 }
 
+/// **The number the person confirmed reaches the record.** `issued`, `selected`, `affected` and
+/// `excluded` were all in the audit row; the one number issue `03` is named after was compared by
+/// `refuse_if_more_than_confirmed` and then dropped on the floor — on the one action that cannot
+/// be undone.
+///
+/// D5 ran the pair and found them byte-identical in every observable: an honest client sending 4
+/// and a client sending the pre-exclusion 5 get the same `200`, the same body, the same side
+/// effects, and the same audit row but for `snapshot_id`. Neither is refused, because the guard is
+/// one-sided by design — fewer than confirmed is section 8.2's deleted-in-between case, and
+/// `refuse_if_widened_never_fires` pins that. So the log is the only place the two can ever be
+/// told apart, and this is the line that tells them apart. The guard itself is untouched: both are
+/// still accepted.
+#[sqlx::test]
+async fn the_audit_row_records_the_number_the_person_confirmed(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let ids = contacts(&app, ws, "c", 5).await;
+    let sel = select(&app, ws, json!({})).await;
+    // The dialog said 5, one row was unticked, four are deleted: a client that sent the count it
+    // had before the exclusion. Accepted, and until now indistinguishable from an honest 4.
+    let n = affected(bulk(&app, ws, "delete", sel.excluding_confirming(&[ids[0]], 5)).await).await;
+    assert_eq!(n, 4);
+
+    let meta = audit_meta(&pool).await;
+    assert_eq!(meta["confirmed"], 5, "the number that was on the button");
+    assert_eq!(
+        meta["selected"], 4,
+        "what the frozen set less the exclusion resolved to"
+    );
+    assert_eq!(meta["affected"], 4);
+    assert_eq!(meta["issued"], 5);
+    assert_eq!(meta["excluded"], 1);
+}
+
+/// An id list carries no confirmation — the ids are the number, and the route refuses a
+/// `confirmed_count` sent alongside them — so the field is `null` rather than absent or a guess.
+#[sqlx::test]
+async fn an_id_list_records_no_confirmed_count_because_it_has_none(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let ids = contacts(&app, ws, "c", 2).await;
+    let n = affected(bulk(&app, ws, "delete", json!({"ids": ids})).await).await;
+    assert_eq!(n, 2);
+    assert_eq!(audit_meta(&pool).await["confirmed"], Value::Null);
+}
+
 #[sqlx::test]
 async fn bulk_is_editor_and_above(pool: PgPool) {
     let (ws, editor) = workspace(&pool, "acme").await;

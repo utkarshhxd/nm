@@ -969,6 +969,14 @@ async fn finish_bulk(
                 // different exclusions cannot be told apart afterwards. Do not turn this into a list.
                 "excluded": target.excluded_ids.len(),
                 "issued": selection.issued(),
+                // The number on the button, which `refuse_if_more_than_confirmed` compares and
+                // then threw away — the one number issue `03` is named after, missing from the
+                // record of the one action that cannot be undone. `null` for an id list, which
+                // carries no confirmation because the ids are the number. With it, "you
+                // confirmed 5,000 and we deleted 4,980" is answerable from the log while the
+                // guard holds, which it is designed to do: fewer than confirmed is accepted
+                // (section 8.2), so it is the gap the log has to be able to show.
+                "confirmed": target.confirmed_count,
                 "selected": counts.selected,
                 "affected": counts.affected,
                 "with": extra,
