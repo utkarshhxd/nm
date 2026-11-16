@@ -174,6 +174,29 @@ test("search_filters_the_rows", async () => {
   page.removeAllListeners("request");
 });
 
+/**
+ * Changing the filter throws ticked rows away, and the screen has to say *why* it did â€” the
+ * generic "Selection cleared" leaves a screen-reader user with no reason. One live region and one
+ * 500 ms debounce are shared with the `[selection]` effect, which is what made this sentence
+ * unreachable twice; the ordering that repairs it had nothing asserting it.
+ */
+test("clearing_ticked_rows_on_a_filter_change_says_why_it_cleared_them", async () => {
+  await open();
+  await rows().first().getByRole("checkbox").check();
+  // Past the debounce, so the generic sentence is on screen before the filter moves and this is
+  // not a race that would pass against a region that never updated.
+  await expect(page.getByRole("status").filter({ hasText: /^1 contact selected$/ })).toHaveCount(1);
+
+  await page.getByRole("searchbox", { name: "Search contacts", exact: true }).fill("aaa");
+  await expect(rows()).toHaveCount(1);
+  const cleared = page.getByRole("status").filter({ hasText: /Selection cleared/ });
+  await expect(cleared).toHaveText("Selection cleared because the filters changed.");
+  // Still that sentence once everything has settled: the generic one must not land on top of it
+  // a commit later, which is exactly how it was lost before.
+  await page.waitForTimeout(900);
+  await expect(cleared).toHaveText("Selection cleared because the filters changed.");
+});
+
 test("select_all_matching_then_exclude_one_bulk_tags_the_rest", async () => {
   await open();
   const bodies: { selection_token?: string; excluded_ids?: string[]; ids?: string[] }[] = [];

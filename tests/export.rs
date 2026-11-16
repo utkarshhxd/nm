@@ -711,6 +711,97 @@ async fn a_client_that_stops_reading_is_cut_off_after_the_send_timeout(pool: PgP
     drop(body);
 }
 
+/// The query dies **mid-stream**, after the 200 and the first bytes are already the client's. The
+/// response cannot become an error status any more, so the only honest ending is an aborted body:
+/// a truncated CSV that ends cleanly is a short file that looks whole, and a reader cannot tell.
+///
+/// Reached by terminating the backend serving the open cursor, which is what a failover, an
+/// administrator or the OOM killer does. The connection is acquired here so its pid is known
+/// before it is handed over; nothing else on the pool is touched.
+#[sqlx::test]
+async fn a_query_that_dies_mid_stream_aborts_the_body_and_is_audited_incomplete(pool: PgPool) {
+    let (ws, _owner, _admin) = workspace(&pool, "acme").await;
+    seed(&pool, ws, 20_000).await;
+    let owner_id: Uuid = sqlx::query_scalar("select id from users where email = $1")
+        .bind("owner-acme@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("select pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    let body = export::start(
+        pool.clone(),
+        conn,
+        export::Export {
+            workspace_id: ws,
+            filter: ContactFilter::default(),
+            rules: None,
+            live: vec![],
+        },
+        export::Audit {
+            meta: RequestMeta::default(),
+            actor: Actor::User(owner_id),
+            filter: json!({}),
+        },
+        Duration::from_secs(5),
+    );
+    let mut body = body.into_data_stream();
+    // The header and a real data chunk: the 200 is committed and bytes are in the client's hands.
+    let head = body.next().await.unwrap().unwrap();
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("id,email"),
+        "the header goes first"
+    );
+    assert!(
+        !body.next().await.unwrap().unwrap().is_empty(),
+        "a data chunk"
+    );
+
+    let killed: bool = sqlx::query_scalar("select pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(killed, "the export's own backend was terminated");
+
+    let mut rows = 0;
+    let mut failed = false;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(c) => rows += c.len(),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        failed,
+        "the body ended cleanly after {rows} more bytes: a truncated export that looks whole"
+    );
+
+    // And it is recorded as incomplete, so the log does not claim an export that never finished.
+    let mut audit = vec![];
+    for _ in 0..50 {
+        audit = audit_rows(&pool).await;
+        if !audit.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(audit.len(), 1, "a failed export went unrecorded");
+    assert_eq!(audit[0]["complete"], false);
+    assert!(
+        audit[0]["rows"].as_u64().unwrap() < 20_000,
+        "it stopped short of the whole book: {}",
+        audit[0]["rows"]
+    );
+}
+
 #[sqlx::test]
 async fn exports_are_rate_limited_per_workspace(pool: PgPool) {
     let (ws, _owner, admin) = workspace(&pool, "acme").await;
