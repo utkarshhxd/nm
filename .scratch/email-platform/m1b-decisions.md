@@ -339,28 +339,50 @@ This is the part worth more than any line of the diff.
   - **Vacuous evidence** — an assertion that **passes against deliberately broken code**. Running
     total **22**, of which **13 are M1b's**; the bullet above is that tally and nothing else.
   - **A false fact** — a comment, report or label **asserting something untrue**, whatever the
-    tests do. Four in M1b: the `confirmed_count` doc comment, which described the opposite of what
+    tests do. Six in M1b: the `confirmed_count` doc comment, which described the opposite of what
     the server compares and reached third-party clients through `openapi.json`; the
     `worst-case-data.spec.ts` navigation comment; the `segments_compile.rs` "their negations match
-    everyone" comment; and the fix pass's own claim that nothing gates `openapi.json`, which CI
-    does.
+    everyone" comment; the fix pass's own claim that nothing gates `openapi.json`, which CI does;
+    issue `14`'s claim that `contacts` has "no composite unique", in a ticket marked
+    `ready-for-agent`, i.e. one an agent is cleared to action without a human reading it (D6-F1);
+    and the "six for six" entry this file carried until D6, inherited from the D5 brief (D6-F2,
+    below). The wrong numbers and stale pointers D6 also found are not in this tally — a pointer
+    that drifted is cured by re-reading the pointer, not by reading the sentence against the code.
 
   The two are different defects with different cures. A vacuous assertion is found by mutating the
   code and watching nothing go red; a false fact is found by reading the sentence against the code
   it describes, and no mutation will ever surface it. **A tally that merges them stops meaning
   anything** — it can neither be checked nor acted on, because the two numbers answer different
   questions.
-- **Seven of them were one single shape: a negative assertion with nothing to wait on.** An absence
-  checked before the thing could appear, an absence racing an alert, an absence on a grid that had
-  not drawn, an absence of a page-wide element, and an accessible description asserted empty against
-  a paragraph the transition itself unmounts. `toHaveCount(0)` polls, so a stale value clears itself
-  while the test watches. **Six of the seven were found by implementers in their own isolation
-  runs** — mutate each negative twice, once with its positive neighbour present and once with the
-  neighbours stripped. That is the specific thing to grep for; it is not a general exhortation to
-  check negatives.
-- **"Untestable" and "unreachable" are hypotheses, not findings — and this milestone went six for
-  six.** Six such claims were written and **every one of them was wrong. None was upheld.** Listed
-  by the task that wrote them, so the number is checkable rather than quoted:
+- **Seven of them were one single shape: a negative assertion with nothing to wait on.**
+  `toHaveCount(0)` polls, so a stale value clears itself while the test watches. Enumerated,
+  because a count nobody can check is not evidence, and the one list in this file that *was*
+  enumerated is the one whose wrong entry got found:
+
+  1. `"Selection cleared because the filters changed."` absent — the live region's *next*
+     announcement always overwrites it, so the text is never there to find
+     (`task-11-report.md:161-165`).
+  2. `"The action failed and nothing was changed."` absent — raced the alert (`:166-168`).
+  3. a row absent on a grid that had not drawn a row yet (`:169-172`).
+  4. the page-wide `"too many to count exactly"` pair in the failed-row test — a page-wide absence
+     has nothing to wait on (`:297-303`).
+  5. `toHaveAccessibleDescription("")` after the lock lifts — the paragraph it points at is
+     unmounted by the very transition being checked (`:419-423`).
+  6. the export control absent on the editor page — passed against a build that shows it to
+     everyone, once its neighbours were stripped (`task-12-report.md:157-176`).
+  7. **not identified anywhere.** `task-11-report.md:425-426` counts "five of this family found in
+     my own tests … against one the reviewers found", and that reviewer's one is never named in
+     any report or in `progress.md`, which numbers a fourth and a sixth and no fifth
+     (`task-11-rereview.md:338` went looking for a fifth in that round and found none). The
+     arithmetic closes — five from Task 11's implementer, one from a reviewer, one from Task
+     12's — so seven is right, but entry 7 is the part of this bullet a reader takes on trust.
+
+  **Six of the seven were found by implementers in their own isolation runs** — mutate each
+  negative twice, once with its positive neighbour present and once with the neighbours stripped.
+  That is the specific thing to grep for; it is not a general exhortation to check negatives.
+- **"Untestable" and "unreachable" are hypotheses, not findings — and this milestone went five for
+  five.** Five such claims were written and **every one of them was wrong. None was upheld.**
+  Listed by the task that wrote them, so the number is checkable rather than quoted:
 
   1. Task 4's per-worker plan node — fell to three zeroed parallel GUCs.
   2. Task 7's history rewrite — fell to `migrations = false` plus `run_to(1)`.
@@ -368,29 +390,56 @@ This is the part worth more than any line of the diff.
   4. Task 11's L4 untestable client guard — fell to holding the real lazy chunk in a fresh browser
      context.
   5. Task 13's "cannot be measured" page alert — fell to a twelve-line test.
-  6. Task 12's F2 stream abort, the one that had held — fell to D5's fifth attack:
-     `pg_terminate_backend` on the export's own backend, whose pid the test knows because it
-     acquired the connection itself. 35 chunks, then `Err("export failed")`, audit row
-     `{"complete":false,"rows":7627}`.
 
-  **The tell is the wording.** The first five were written at the end of a task, about a
-  precondition the writer had not attacked, and all five said *"I cannot see how"* rather than
-  *"I tried X, Y and Z."* The sixth is the sharper lesson, because it was written in the **good**
-  form — four named attacks against a stream abort, each printing what the page actually saw — and
-  it was still wrong. Four named attacks is not a proof of impossibility; it is four attacks. D5
-  tried four of its own, all rejected for stated reasons (a session `statement_timeout` the test
-  cannot aim at a pooled connection, `ALTER DATABASE` that binds only later sessions, DDL that the
-  open cursor's lock blocks, and dropping a pool the stream no longer needs), and the fifth worked.
-  Attack it for ten minutes before you write it down; a reviewer who accepts such a claim without
-  trying has not reviewed it; and a claim in the good form buys scrutiny, never exemption.
+  **The tell is the wording.** All five were written at the end of a task, about a precondition the
+  writer had not attacked, and all five said *"I cannot see how"* rather than *"I tried X, Y and
+  Z."* Attack it for ten minutes before you write it down, and a reviewer who accepts such a claim
+  without trying has not reviewed it.
 
-  The count moved twice before it settled, which is its own warning. The ledger wrote "four for
-  four" at Task 11, then "FIFTH such claim, FOURTH DISPROVEN", which does not reconcile with it;
-  Task 14 corrected it to five disproven with Task 12's upheld; D5's report counts the survivor as
-  the fifth of five, so a reader of D5 alone gets five. **Six is the enumeration above.** Count the
-  list, do not quote the sentence.
+  The count has moved four times, which is its own warning. The ledger wrote "four for four" at
+  Task 11; Task 14 made it six claims, five disproven, with Task 12's F2 upheld, and enumerated
+  exactly the five above; D5 made it "five claimed, five disproven, none upheld" — a five that
+  counts F2, so not the five above; the record then committed "six for six". **D6 found that the
+  sixth entry was never one of these claims at all** — see the entry below. Count the list, do not
+  quote the sentence.
+- **A false premise travelled from a controller's brief into the repo through three hands, and no
+  hand checked it.** Until D6 this file's list above had a sixth entry: Task 12's F2 stream abort,
+  "the one that had held", said to have fallen to D5's fifth attack. It is false in both halves.
+  Task 12's F2 (`task-12-review.md:133-143`) is about `web/e2e/audience-admin.spec.ts:958` —
+  `route.abort("failed")` firing a pre-response abort where the comment claimed a mid-body one —
+  and its four named attacks (`task-12-fix-1-report.md:78-97`) are all browser-interception
+  attacks: `route.fulfill` twice, CDP `Fetch.fulfillRequest`, CDP `Fetch.continueResponse`. What
+  D5 refuted (`final-d5-report.md` D5-4) is a **Rust server test** against
+  `src/contacts/export.rs:274-285`. No browser is involved at any point, and **none of Task 12's
+  four attacks was shown wrong**.
+
+  The path is fully traceable, which is why it is worth more than the entry it replaces. **The
+  controller wrote it**, in the D5 brief (`final-d5-tests.md:88-97`): "Task 12 claimed this one
+  was untestable and that claim was upheld." Task 12 never claimed it. D5 inherited the sentence
+  and repeated it as fact because the brief asserted it; the next fix round committed it to this
+  file in `211e9f3` because the report said it. Each hand was reasonable. Nobody read the Task 12
+  record, which took D6 one `sed` to do. This file already carries "the spec says what was
+  decided, not what was built"; this is its sibling — **a brief says what the controller believes,
+  not what happened**, and a factual claim inherited from a brief gets checked exactly as hard as
+  one inherited from a comment. The route is brief → report → record, and the first of those three
+  is the one seat nobody reviews.
+- **An out-of-scope observation that names its lever is a prediction, and this one paid.** Task
+  12's rereviewer saw the same gap from the other side, declined to widen the task, and wrote it
+  up as an out-of-scope observation (`task-12-rereview.md:183-187`): `src/contacts/export.rs`'s
+  `Err` branch "has no test on the server side either … this is the cheaper and more honest lever
+  than any browser-side synthesis: it tests the thing that actually produces the state." Two tasks
+  and a whole-branch review later, D5 ran exactly that lever. Four server-side attacks were
+  rejected for stated reasons (a session `statement_timeout` the test cannot aim at a pooled
+  connection, `ALTER DATABASE` that
+  binds only later sessions, DDL the open cursor's lock blocks, and dropping a pool the stream no
+  longer needs) and the fifth worked: `pg_terminate_backend` on the export's own backend, whose
+  pid the test knows because it acquired the connection itself. 35 chunks, then
+  `Err("export failed")`, audit row `{"complete":false,"rows":7627}`, now pinned by
+  `tests/export.rs::a_query_that_dies_mid_stream_aborts_the_body_and_is_audited_incomplete`. That
+  is an out-of-scope note doing its whole job, and the counter-example to the instinct that an
+  observation deferred is an observation wasted.
 - **A green consistency gate is evidence of propagation, not of correctness.** This is how one of
-  the four false facts above reached third-party clients with every gate green at every step, and
+  the false facts above reached third-party clients with every gate green at every step, and
   it was itself recorded wrongly once: the fix pass wrote that nothing gates `openapi.json`, and CI
   does. `.github/workflows/ci.yml:42` diffs the committed spec against the live server, and
   `:62-63` regenerates `schema.d.ts` and fails on any diff. The chain is tight and it held. What it
@@ -427,11 +476,14 @@ This is the part worth more than any line of the diff.
 
 ## Known gaps at the end of M1b
 
-**Eighteen** issues are filed under `.scratch/email-platform/issues/` — twelve at Task 14, plus
-`13`–`18`, which the whole-branch pass filed afterwards and which this sentence said "twelve" about
-for three commits. `03`, `04` and `08` are resolved by this milestone, with the evidence in their
-own `## Comments`; `14` is `ready-for-agent`, its two plans confirmed by `EXPLAIN`. The rest are
-open, and these are the ones that shape what comes next:
+Issues are filed under `.scratch/email-platform/issues/`, numbered from `01` and still being added
+to: `01`–`12` by Task 14, `13`–`18` by the whole-branch pass, `19` by the fix round after D5.
+**This sentence carries no total on purpose.** It said "twelve" for three commits, then
+"eighteen" against nineteen files; a count here goes stale every time somebody files a ticket, and
+nothing checks it. List the directory and read each file's `Status:` line. `03`, `04` and `08` are
+resolved by this milestone, with the evidence in their own `## Comments`; `14` is
+`ready-for-agent` on its §1 and §2, whose two plans are confirmed by `EXPLAIN`, and explicitly not
+on its §3. The rest are open, and these are the ones that shape what comes next:
 
 - **`09` — query-string params ignore unknown keys** has grown teeth. `GET /contacts` now takes
   `snapshot_id`, so a client that misspells it is served the **live filter** instead of the frozen
@@ -451,15 +503,19 @@ open, and these are the ones that shape what comes next:
   half of the repair had no test — removing `silentClear.current = true` left all 127 committed
   e2e tests green — and added one.
 - **The one-hour TTL is still a guess.** Nobody has watched a real operator work a bulk action.
-- **Still almost no load testing.** Three things are measured now and nothing else is: the snapshot
-  numbers in ADR 0004, the index plans in issue `14`, and the export pool-saturation figure — four
-  workspaces × five exports held all twenty connections, a twenty-first request still waiting at
-  8.00 s, `/readyz` at `503` after 2.00 s, which is what `MAX_CONCURRENT_EXPORTS` now bounds. Two
-  of the three changed a conclusion the reasoning had reached: ADR 0004's timestamp variant died of
-  its measurement, and the supersede delete turned out to spend 96% of its time in the members FK
-  cascade and not in the index everyone was looking at. The third, issue `14`'s two plans, merely
-  confirmed what reading had predicted — which is the outcome you cannot know in advance, and is
-  the reason to run it. The segment compiler has never run against 10M rows,
+- **Still almost no load testing.** Three things have been measured and nothing else has: the
+  snapshot numbers in ADR 0004, issue `14`'s `EXPLAIN` run on 50,000 segments and 50,000
+  snapshots, and the export pool saturation — four workspaces × five exports held all twenty
+  connections, a twenty-first request still waiting at 8.00 s, `/readyz` at `503` after 2.00 s,
+  which is what `MAX_CONCURRENT_EXPORTS` now bounds. **All three changed a conclusion the
+  reasoning had reached**: ADR 0004's timestamp variant died of its measurement; the export figure
+  produced a new constant, a new `503` and a new spec bullet; and issue `14`'s run showed the
+  supersede delete spends 96% of its time in the members FK cascade and not in the index everyone
+  was looking at. What *merely confirmed* what reading had predicted is one half of that same
+  run — the two index plans themselves — which is the outcome you cannot know in advance, and is
+  the reason to run it. (Written first as "two of the three changed a conclusion, the third merely
+  confirmed", which counted issue `14`'s run on both sides and left the export figure on neither.)
+  The segment compiler has never run against 10M rows,
   `estimate()`'s fallback has never been watched on a real table, and issues `01` and `02` remain
   open and untriaged.
 - **A merge feature breaks the frozen set.** Identity is the only thing a snapshot records, so an
