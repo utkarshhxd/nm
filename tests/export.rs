@@ -731,6 +731,60 @@ async fn exports_are_rate_limited_per_workspace(pool: PgPool) {
     );
 }
 
+/// Every answer carries the `RateLimit` headers, refusals included, as `create_selection`'s and
+/// `preview_segment`'s do — and the quota was spent whichever way it went. This is the smallest of
+/// the three at five a minute, so a client refused `422` or `404` is exactly the one that needs to
+/// know what is left of its window before it fixes the filter and tries again.
+#[sqlx::test]
+async fn a_refused_export_keeps_the_rate_limit_headers_it_spent(pool: PgPool) {
+    let (ws, _owner, admin) = workspace(&pool, "acme").await;
+    insert(&pool, ws, "a@example.com", "A").await;
+    let limit = nm::http::rate_limit::EXPORT_PER_MINUTE.to_string();
+    for (body, status, why) in [
+        // Every refusal that leaves the handler past the quota check: `filter()`'s two, and the
+        // segment that is not this workspace's.
+        (
+            json!({"q": "ab"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a short q",
+        ),
+        (
+            json!({"list_status": "subscribed"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a list_status with no list_id",
+        ),
+        (
+            json!({"segment_id": Uuid::now_v7()}),
+            StatusCode::NOT_FOUND,
+            "an unresolvable segment",
+        ),
+    ] {
+        let r = admin.post(&export_uri(ws)).json(&body).await;
+        r.assert_status(status);
+        assert_eq!(
+            r.header("ratelimit-limit").to_str().unwrap(),
+            limit,
+            "{why} dropped the headers the contract promises"
+        );
+        assert!(
+            r.maybe_header("ratelimit-remaining").is_some(),
+            "{why} dropped ratelimit-remaining"
+        );
+    }
+    // All three were counted, so the quota has two of its five left.
+    assert_eq!(
+        admin
+            .post(&export_uri(ws))
+            .json(&json!({}))
+            .await
+            .header("ratelimit-remaining")
+            .to_str()
+            .unwrap(),
+        "1",
+        "a refused export did not spend a unit"
+    );
+}
+
 /// `lists` and `tags` read back to exactly the names that went in, whatever those names hold. A
 /// list named `A;B` must not come back as two lists, nor `C:D` as a list `C` with the status `D:...`.
 #[sqlx::test]
@@ -819,6 +873,39 @@ async fn list_and_tag_names_with_separators_round_trip(pool: PgPool) {
     let mut want_tags: Vec<String> = tags.iter().map(|t| (*t).to_owned()).collect();
     want_tags.sort();
     assert_eq!(got_tags, want_tags);
+}
+
+/// A `multi_select` column is semicolon-joined like `lists` and `tags`, so it needs their escaping
+/// for their reason: `validate_options` admits a `;`, so an option of `EMEA; APAC` would otherwise
+/// read back as two and be indistinguishable from two. The importer's contract
+/// (`export.rs`'s module doc) is written against this, so it has to be one rule for every
+/// multi-valued column, not two.
+#[sqlx::test]
+async fn multi_select_options_with_separators_round_trip(pool: PgPool) {
+    let (ws, _owner, admin) = workspace(&pool, "acme").await;
+    let options = ["EMEA; APAC", "C:D", r"E\F", r"G\;H:I", "plain"];
+    admin
+        .post(&format!("{}/custom-fields", base(ws)))
+        .json(
+            &json!({"key": "regions", "label": "Regions", "kind": "multi_select",
+                      "options": options}),
+        )
+        .await
+        .assert_status(StatusCode::CREATED);
+    admin
+        .post(&format!("{}/contacts", base(ws)))
+        .json(&json!({"email": "a@example.com", "attributes": {"regions": options}}))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let (head, rows) = export(&admin, ws, json!({})).await;
+    let cell = &rows[0][col(&head, "attr:regions")];
+    // The cell splits into exactly as many values as went in — `EMEA; APAC` is one, not two.
+    let got: Vec<String> = split_unescaped(cell, ';')
+        .iter()
+        .map(|v| unescape(v))
+        .collect();
+    assert_eq!(got, options, "raw cell {cell:?}");
 }
 
 /// A number is not a formula, so `-5` comes back as `-5`; nothing that merely starts like one does.

@@ -72,9 +72,10 @@ pub struct Audit {
 /// spreadsheet's parser per column.
 ///
 /// **What M1c's importer must undo when it reads this file back, both of them lossless:** (1) a
-/// leading `'` on a cell, and (2) the backslash escapes in the `lists` and `tags` columns: split
-/// on a `;` that no backslash precedes, split a list entry at its one unescaped `:` into name and
-/// status, then turn `\\`, `\;` and `\:` back into `\`, `;` and `:`.
+/// leading `'` on a cell, and (2) the backslash escapes in every multi-valued column — `lists`,
+/// `tags` and each `attr:<key>` of a multi_select: split on a `;` that no backslash precedes,
+/// then turn `\\`, `\;` and `\:` back into `\`, `;` and `:`. One rule, one unescape function. For
+/// `lists` only, split each entry at its one unescaped `:` into name and status first.
 fn push_cell(out: &mut String, cell: &str) {
     let formula = matches!(
         cell.chars().next(),
@@ -104,7 +105,14 @@ fn push_row<'a>(out: &mut String, cells: impl IntoIterator<Item = &'a str>) {
     out.push_str("\r\n");
 }
 
-/// A custom field's stored value as text; absent is empty, a multi_select is semicolon-joined.
+/// A custom field's stored value as text; absent is empty, a multi_select is semicolon-joined
+/// with each option escaped the way [`escaped`] escapes a list or tag name, and for the same
+/// reason: `validate_options` admits a `;`, so an option of `EMEA; APAC` would otherwise read back
+/// as two options and be indistinguishable from two.
+///
+/// The same three characters as `escaped`, `:` included, although this column has no `name:status`
+/// shape to protect — so the importer undoes **one** rule across every multi-valued column rather
+/// than one rule per column.
 fn attr_text(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
@@ -112,10 +120,19 @@ fn attr_text(value: Option<&Value>) -> String {
         Some(Value::Array(items)) => items
             .iter()
             .filter_map(Value::as_str)
+            .map(escape_in_rust)
             .collect::<Vec<_>>()
             .join(";"),
         Some(other) => other.to_string(),
     }
+}
+
+/// [`escaped`]'s rule, applied in Rust rather than by the database. `\` first, so the escaping is
+/// not self-cancelling. Keep the two in step: they are one contract with the importer.
+fn escape_in_rust(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace(';', "\\;")
+        .replace(':', "\\:")
 }
 
 /// The export query. **The workspace clause is written here**: neither `push_filter` nor

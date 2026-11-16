@@ -2,6 +2,7 @@
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -1243,8 +1244,7 @@ pub async fn export_contacts(
 ) -> ApiResult<Response> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Admin).await?;
-    // After `authorize`, so a stranger cannot spend the workspace's quota. The headers ride on the
-    // answer whichever way it goes, as `create_selection`'s do.
+    // After `authorize`, so a stranger cannot spend the workspace's quota.
     let quota = state.export_limit.check(workspace_id);
     if let Some(retry_after_secs) = quota.over {
         return Ok((
@@ -1253,6 +1253,42 @@ pub async fn export_contacts(
         )
             .into_response());
     }
+    // Every answer from here carries the `RateLimit` headers, refusals included, as
+    // `create_selection`'s and `preview_segment`'s do. The quota was spent whatever the outcome,
+    // and this is the smallest of the three at five a minute: a client refused `422` for a short
+    // `q` or `404` for a segment that is not its own is exactly the one that needs to know how
+    // many of those five are left before it fixes the filter and tries again.
+    Ok(
+        match stream_export(&state, meta, &principal, workspace_id, input, conn).await {
+            Ok(body) => (
+                quota.headers,
+                [
+                    ("content-type", "text/csv; charset=utf-8"),
+                    (
+                        "content-disposition",
+                        "attachment; filename=\"contacts.csv\"",
+                    ),
+                    ("cache-control", "no-store"),
+                ],
+                body,
+            )
+                .into_response(),
+            Err(e) => (quota.headers, e).into_response(),
+        },
+    )
+}
+
+/// `export_contacts` past the role check and the quota: validate, resolve the segment, start the
+/// stream. Every refusal in here leaves through `?` and so through the caller's `Err` arm, which
+/// is what puts the headers on it.
+async fn stream_export(
+    state: &AppState,
+    meta: RequestMeta,
+    principal: &Principal,
+    workspace_id: Uuid,
+    input: NewSelection,
+    mut conn: sqlx::pool::PoolConnection<Postgres>,
+) -> ApiResult<Body> {
     let filter = input.filter()?;
     // `404` for a segment that is not this workspace's, decided in `load_rules`: read as "no
     // rules" it would export the whole workspace. Nothing here builds a `Group` by hand.
@@ -1278,18 +1314,11 @@ pub async fn export_contacts(
         rules,
         live,
     };
-    let body = export::start(state.pool.clone(), conn, job, audit, export::SEND_TIMEOUT);
-    Ok((
-        quota.headers,
-        [
-            ("content-type", "text/csv; charset=utf-8"),
-            (
-                "content-disposition",
-                "attachment; filename=\"contacts.csv\"",
-            ),
-            ("cache-control", "no-store"),
-        ],
-        body,
-    )
-        .into_response())
+    Ok(export::start(
+        state.pool.clone(),
+        conn,
+        job,
+        audit,
+        export::SEND_TIMEOUT,
+    ))
 }
