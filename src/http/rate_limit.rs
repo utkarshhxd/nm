@@ -19,6 +19,15 @@
 //!
 //! shortcut: the counter is per process, so N instances behind a load balancer allow N times the
 //! limit; move it to a shared store when NM is run as more than one instance.
+//!
+//! shortcut: the **key** is `workspace_id`, so every per-minute figure below bounds one workspace
+//! and the bound on the shared pool is `workspaces × limit`, which nothing bounds. Read the
+//! comparisons against the pool's 20 as "one workspace cannot do this on its own", never as a
+//! global ceiling — four workspaces starting five exports each inside one minute hold all 20
+//! connections, because an export holds one for its whole stream and `SEND_TIMEOUT` is 30 s per
+//! *chunk*, not a total. The keying is correct and stays: §12 says per workspace, and it is what
+//! keeps one tenant from spending another's quota. Add a global concurrency semaphore on export
+//! the day that matters; do not tune these constants against a ceiling they do not set.
 
 use std::{
     collections::HashMap,
@@ -30,8 +39,13 @@ use axum::http::{HeaderMap, HeaderValue};
 use uuid::Uuid;
 
 /// How many previews one workspace may run per window. Enough for one person typing against a
-/// 300 ms debounce with room for a colleague, and well under what would hold the pool's 20
-/// connections for the 1.5 seconds each preview may cost.
+/// 300 ms debounce with room for a colleague, and well under what one workspace would need to
+/// hold the pool's 20 connections for the 1.5 seconds each preview may cost.
+///
+/// **`GET /segments/counts` spends from this same budget**, one unit per call for up to 25
+/// segments — a deliberate decision, recorded in `m1b-decisions.md` as "Counts and previews share
+/// one budget". So this number is not "previews a minute": it is previews plus segment-list page
+/// loads, and lowering it takes both.
 pub const PREVIEW_PER_MINUTE: u32 = 30;
 
 /// How many selections one workspace may materialise per window. Harder than preview, because a
@@ -88,6 +102,14 @@ impl RateLimiter {
         let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
         // Finished windows are dropped on every check, so the map holds one small entry per
         // workspace that previewed in the last minute rather than one per workspace ever seen.
+        //
+        // shortcut: this is O(active workspaces) per request, under a `std::sync::Mutex` held on
+        // an async runtime worker. It is bounded and safe today because `check` is reached only
+        // after `authorize` succeeds — verified at all four call sites — so an unauthenticated
+        // caller cannot grow the map at all, and a self-hosted instance has few workspaces. The
+        // two things that would make it hurt are many workspaces and 30 previews a minute each,
+        // which are the same growth this file is sized against: sweep lazily (every Nth check, or
+        // only past a threshold) if it ever shows up in a profile.
         windows.retain(|_, w| w.ends > now);
         let window = windows.entry(key).or_insert(Window {
             ends: now + WINDOW,

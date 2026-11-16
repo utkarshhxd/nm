@@ -296,8 +296,15 @@ fn push_like(
     q.push(prefix)
         .push_bind(escape_like(text(&r.value)))
         .push(suffix)
-        // The escape character the escaping above used. Postgres defaults to backslash, but the
-        // clause is written out so the pairing cannot be broken by a server setting.
+        // The escape character the escaping above used, written out so the clause and
+        // `escape_like` state the same character in one place each rather than relying on the
+        // reader to know the default. It defends against no setting: nothing changes LIKE's
+        // default escape character, and the one setting that *could* break this clause is the
+        // one this spelling is exposed to — under `standard_conforming_strings = off` the `\'`
+        // is an escaped quote, the literal never closes, and the statement is a syntax error.
+        // `escape E'\\'` is the setting-independent spelling. Left as is: the default has been
+        // `on` since Postgres 9.1, and it fails loudly rather than silently. `escaped()` in
+        // `contacts::export` has the same exposure, for the same reason, with the same verdict.
         .push(" escape '\\'");
     if negated {
         q.push(")");
