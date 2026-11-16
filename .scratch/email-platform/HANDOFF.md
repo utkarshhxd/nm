@@ -1,6 +1,6 @@
 # Handoff — where NM stands
 
-Last updated 2026-11-16. Read this first, then the files it points to.
+Last updated 2026-11-17. Read this first, then the files it points to.
 
 ## What this is
 
@@ -29,13 +29,13 @@ where the two disagree the spec wins.
 
 ## Where it stands
 
-**M0 (foundations) and M1a (contact core) are complete and merged.** `main` is at `fb1afc6`.
+**M0 (foundations), M1a (contact core) and M1b (segments) are all merged into `main`**, which
+is pushed. `main` is 168 commits; `2522640` is the last commit before M1b began.
 
-**M1b (segments) is complete on the `m1b-segments` branch**, not pushed. All 14 tasks are
-implemented and reviewed. At `26c324b` the branch was **54 commits, 90 files, 21,490 insertions
-and 1,375 deletions** ahead of `main` — a measurement of that commit, not of your HEAD, and the
-record pass kept adding to it afterwards. Recount rather than quote:
-`git diff --shortstat fb1afc6..HEAD` and `git rev-list --count fb1afc6..HEAD`. The branch went
+**M1b is done.** All 14 tasks are implemented and reviewed. Against `2522640` it is **59 commits,
+92 files, 21,758 insertions and 1,375 deletions** — a measurement of `562af95`, not of your HEAD.
+Recount rather than quote: `git diff --shortstat 2522640..HEAD` and
+`git rev-list --count 2522640..HEAD`. The branch went
 through a whole-branch review split into six dimensions, because one review seat across a diff
 that size is a rubber stamp:
 
@@ -48,7 +48,7 @@ that size is a rubber stamp:
 | D5 | The test suite as evidence (builds and runs) | reported, `final-d5-report.md` |
 | D6 | Record accuracy | reported, `final-d6-report.md` |
 
-A fix pass has landed every must-fix finding from D1–D4 (twelve commits, ending at `74b2539`) and
+A fix pass has landed every must-fix finding from D1–D4 (twelve commits, ending at `aeaaa1c`) and
 filed the deferred ones as issues `13`–`18`. All gates were green at that commit: `cargo test`,
 `clippy -D warnings`, `fmt --check`, `sqlx prepare --check`, `check-spdx.sh`, `typecheck`, `build`,
 `check:bundle`, and e2e at **127 passed, 0 failed**.
@@ -66,7 +66,7 @@ not, so crash recovery could report a selection of 417,004 contacts with zero me
    briefs and every report are in the review workspace under
    `.superpowers/sdd/2026-11-12-m1b-segments/` (git-ignored scratch — if you ran `git clean -fdx`
    it is gone, and `git log` is then your only recovery map).
-3. Then open the PR and merge `m1b-segments` into `main`.
+3. M1b is already merged into `main` and pushed, so there is no PR left to open.
 4. M1c follows. Its contract is already referenced by a comment in the CSV export's multi-select
    escaping — find it before you design M1c's import.
 
@@ -99,5 +99,11 @@ not, so crash recovery could report a selection of 417,004 contacts with zero me
 
 ## Repository
 
-The canonical remote is `https://github.com/utkarshhxd/nm.git`. Nothing on this branch has been
-pushed yet. An earlier remote under a different account is retired; do not push to it.
+The canonical remote is `https://github.com/utkarshhxd/nm.git`, private, holding `main` and no
+other branch. An earlier remote under a different account is retired; do not push to it.
+
+**The history was rewritten on 2026-11-17, so every commit SHA changed.** A clone taken before
+that date shares no commit with this one and cannot be merged or rebased onto it — delete it and
+clone again. The SHAs quoted in these records were remapped to the rewritten history and resolve;
+any SHA you find in an older note, report or log does not, and the subject line is then the only
+way to find the commit it meant.

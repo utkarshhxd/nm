@@ -2,7 +2,7 @@ Status: needs-triage
 
 # Contact search cost at ten million rows
 
-Found in M1a task 4 (`GET /contacts`, commit `11778f3`). Two separate cost problems in the
+Found in M1a task 4 (`GET /contacts`, commit `7b62cd1`). Two separate cost problems in the
 search path. Neither is measured yet.
 
 ## This is a cost problem, not a tenancy breach

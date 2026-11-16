@@ -55,9 +55,9 @@ member, not a list membership. The rest of the hits are the deliberate historica
 at the time. The reasoning is in the constant's own comment and in `GLOSSARY.md`, which carries an
 entry under the **old** name -- that is the convention for anything renamed here.
 
-- Commits: **`33676a1`** ("feat: remove becomes unsubscribe"), **`bd0e363`** (the contact-side
+- Commits: **`999e30a`** ("feat: remove becomes unsubscribe"), **`7a17694`** (the contact-side
   route, which the spec had not named and which is the one the UI actually calls -- it is listed
-  first in this issue's own table), **`d1c4b98`** (the migration test and cross-workspace pinning).
+  first in this issue's own table), **`b675186`** (the migration test and cross-workspace pinning).
 - Tests, `tests/lists.rs`: both action strings are accepted and read as one operation (`:628-...`);
   `migrations_leave_an_old_audit_row_as_written` uses `#[sqlx::test(migrations = false)]`,
   `MIGRATOR.run_to(1)`, inserts the old-action row, then runs the rest and asserts it unchanged --

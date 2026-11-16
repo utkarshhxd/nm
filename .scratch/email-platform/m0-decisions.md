@@ -171,9 +171,10 @@ unsalted means one sweep covers every user at once.
 
 ## Known gaps at the end of M0
 
-- **No CI job has ever run on GitHub.** Nothing has been pushed. `pnpm/action-setup`, the pnpm
-  cache, `playwright install --with-deps` and `cargo install sqlx-cli` are all unverified on a
-  real runner, and the first push may need a fixup.
+- **No CI job had ever run on GitHub while M0 was open, because nothing was pushed.** The first
+  push happened on 2026-11-17, so `pnpm/action-setup`, the pnpm cache,
+  `playwright install --with-deps` and `cargo install sqlx-cli` meet a real runner for the first
+  time there. Read that run before trusting it: a green local gate set says nothing about them.
 - **No e2e coverage** for passkey add/remove (needs a WebAuthn virtual authenticator, which is a
   task of its own), change-password, audit "Load more", the Copy buttons, or invite revoke.
 - **The integration path for a built UI is never exercised by CI.** The `rust` job has no Node

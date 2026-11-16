@@ -8,7 +8,7 @@ fragility, not a product defect: nothing a user can reach is affected.
 
 ## What it is
 
-`d790d59` added two server tests that prove the export concurrency bound — most importantly
+`b723c8a` added two server tests that prove the export concurrency bound — most importantly
 `four_workspaces_inside_their_quotas_cannot_take_readiness_down`, which is the only test that reds
 when `MAX_CONCURRENT_EXPORTS` is raised above the pool size, and therefore the only thing standing
 between this branch and the defect D5 measured (four tenants inside their own quotas taking

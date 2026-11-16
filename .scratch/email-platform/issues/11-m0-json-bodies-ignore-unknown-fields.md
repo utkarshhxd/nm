@@ -2,7 +2,7 @@ Status: needs-triage
 
 # Twelve M0 JSON bodies ignore unknown fields
 
-Found by the PR gate review of `6464c2e..077d8da`, while checking a claim in issue 09. Split out
+Found by the PR gate review of `351fd62..80f2936`, while checking a claim in issue 09. Split out
 of that issue on purpose: twelve auth, invite, workspace and API-key bodies accepting fields they
 do not understand is a larger drift than the query-string one, and it stays buried if it is a
 paragraph inside an issue about something else.

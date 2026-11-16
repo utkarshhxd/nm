@@ -417,7 +417,7 @@ This is the part worth more than any line of the diff.
   controller wrote it**, in the D5 brief (`final-d5-tests.md:88-97`): "Task 12 claimed this one
   was untestable and that claim was upheld." Task 12 never claimed it. D5 inherited the sentence
   and repeated it as fact because the brief asserted it; the next fix round committed it to this
-  file in `211e9f3` because the report said it. Each hand was reasonable. Nobody read the Task 12
+  file in `83f05cb` because the report said it. Each hand was reasonable. Nobody read the Task 12
   record, which took D6 one `sed` to do. This file already carries "the spec says what was
   decided, not what was built"; this is its sibling — **a brief says what the controller believes,
   not what happened**, and a factual claim inherited from a brief gets checked exactly as hard as
@@ -497,7 +497,7 @@ on its §3. The rest are open, and these are the ones that shape what comes next
 - **`12` — M0 PATCH bodies ignore an explicit null**, filed during this milestone. The real work is
   one extraction: `present` is copy-pasted in four places.
 - **The reserved finding is closed, not reserved.** `web/src/routes/contacts.tsx`'s effect now
-  depends on `[coveredKey]` and not `filterKey` (whole-branch MUST 5/7, `1e29091`), so ticking
+  depends on `[coveredKey]` and not `filterKey` (whole-branch MUST 5/7, `4a2df0f`), so ticking
   three rows and then sorting the grid keeps the ticks: which contacts a view reaches is what a
   tick belongs to, and sorting moves no contact in or out. D5 then found that the *announcement*
   half of the repair had no test — removing `silentClear.current = true` left all 127 committed

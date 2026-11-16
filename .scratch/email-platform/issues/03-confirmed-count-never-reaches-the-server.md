@@ -61,17 +61,17 @@ against **what the action reached** (`counts.selected`), not against `selection_
 Comparing against the size compares the client's echo with the token's own signed `issued`, a
 number the server already had, which a replayed token with fewer exclusions satisfies -- i.e. this
 issue renamed rather than closed. The number that matters is the one on the button: the snapshot's
-size less the rows the person unticked. That was caught in Task 6's review and fixed in `3ce6470`.
+size less the rows the person unticked. That was caught in Task 6's review and fixed in `852ffa5`.
 When this comment was written the spec still described the rejected design; §9.2 was corrected in
-`142372f`, the commit straight after the one that wrote this comment, and
+`07bebbe`, the commit straight after the one that wrote this comment, and
 `specs/2026-11-12-m1b-segments.md:522` now opens with the sentence above.
 
 The comparison is **one-sided** on purpose. Fewer than confirmed is not refused: a contact somebody
 else deleted in between is simply absent, the `issued`/`selected`/`affected` gap reports it, and
 refusing would turn their delete into this person's error.
 
-- Commits: `8ed2389` (the snapshot design this depended on), **`3ce6470`** (the close -- "fix:
-  compare the confirmed count with what the action reaches"), `124be23`/`1e881d5` (the client).
+- Commits: `6f8aaa1` (the snapshot design this depended on), **`852ffa5`** (the close -- "fix:
+  compare the confirmed count with what the action reaches"), `9b04003`/`eabfcba` (the client).
 - Rust test: `an_action_reaching_more_than_the_dialog_said_is_refused`, `tests/bulk.rs:714-760`.
   It pins all three directions -- more is `409` and names both numbers, absent is `422`, fewer is
   `200` -- and asserts a refused action wrote **no** audit row.
@@ -91,7 +91,7 @@ count is now caught by the server instead of only by the browser that made the r
 
 **2026-11-16 — one false sentence and six stale pointers in the comment above (D6-F3, D6-F12).**
 The sentence saying the spec "still" describes the rejected design went stale one commit after it
-was written, and nobody reread it: `142372f` corrected §9.2 immediately after `411fe0c` wrote this
+was written, and nobody reread it: `07bebbe` corrected §9.2 immediately after `80b5cce` wrote this
 comment. The pointers had drifted with the code underneath them --
 `refuse_if_more_than_confirmed` `:889` -> `:897`, the five bulk bodies `:585,600,628` ->
 `:592,607,635`, the required-with-token block `:797-803` -> `:805-810`, the refused-with-ids block

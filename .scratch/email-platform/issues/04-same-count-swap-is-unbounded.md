@@ -79,9 +79,9 @@ The cost this issue predicted is real and is recorded rather than hidden: 4,887 
 one live snapshot per actor, a detached materialising task and an `unlogged` members table. ADR
 0004's "Cost if wrong" carries all of it.
 
-- Commits: **`580ec5e`** (snapshots: migration, `materialise`, cap, supersede, reaper), `417b910`
-  (its review items, including the API-key supersede), **`8ed2389`** ("feat: bulk actions read the
-  frozen set, never a predicate" -- the commit that actually closes this), `3ce6470` (its review
+- Commits: **`7306d70`** (snapshots: migration, `materialise`, cap, supersede, reaper), `8376982`
+  (its review items, including the API-key supersede), **`6f8aaa1`** ("feat: bulk actions read the
+  frozen set, never a predicate" -- the commit that actually closes this), `852ffa5` (its review
   items).
 - Rust tests, `tests/bulk.rs`: `a_tag_applied_after_the_selection_does_not_bring_its_contact_in`
   (`:265`) is the swap in the joining direction -- a colleague tags three more contacts into the
