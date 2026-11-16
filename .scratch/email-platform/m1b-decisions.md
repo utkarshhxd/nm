@@ -284,6 +284,22 @@ be written out twice.
   once**, print a hash before and after, and confirm the file changed, before concluding anything
   from a green suite. Later rounds also guarded on the build: three mutations that did not compile
   would otherwise have run against a stale `dist`.
+- **The working tree is CRLF in places, so a patch written with LF newlines matches nothing.** Not
+  "matches badly" — matches zero times and changes zero bytes, which is indistinguishable from a
+  mutation that proved an assertion vacuous. D5's occurrence-count assertion caught it; a grep
+  would not have. The tree is **mixed**: `src/contacts/export.rs` and the spec under `.scratch` are
+  CRLF while `src/app.rs`, `src/contacts/routes.rs` and `tests/*.rs` are LF, so a patch tool must
+  detect the ending **per file** rather than assume one. This is the third face of the same trap as
+  the `grep -F` and `diff` entries above, and the same cure answers all three: assert the
+  replacement matched exactly once and compare against a byte copy.
+- **`export A=$DB B=$A` expands `$A` before the assignment lands.** The shell evaluates the whole
+  command's word list first, so `B` gets whatever `A` held *before* the line, which is usually
+  nothing. That aimed a `nm migrate` at the real `nm` database instead of the intended throwaway,
+  and is how the migration-17 checksum error in the handoff was produced. Use two statements.
+- **A Playwright serial skip prints one character away from a pass.** A skipped test is
+  `-  28 [chromium] › …` against a pass's `✓`, and the only unambiguous statement is the summary
+  line's `9 did not run`. A mutation report on a serial file must quote **`did not run`**, never
+  `passed`: the two look identical in a scrollback and the second is a claim the run did not make.
 - **A mutation that reds the wrong test proves nothing about the new one.** In a serial Playwright
   file the first failure **skips** the rest rather than passing them, so an over-broad mutation
   looks like proof and is not. Two mutations were correctly discarded for this before being counted.
@@ -318,6 +334,22 @@ This is the part worth more than any line of the diff.
   (The count runs continuously from the nine recorded in `m1a-decisions.md`, so thirteen of the
   twenty-two are M1b's; the ledger calls the running total "this milestone" in places, which
   overstates M1b's share.)
+- **Two tallies, two shapes, and they must not be added together.** They have been merged once
+  already, in a fix pass's own report, which is why this entry exists:
+  - **Vacuous evidence** — an assertion that **passes against deliberately broken code**. Running
+    total **22**, of which **13 are M1b's**; the bullet above is that tally and nothing else.
+  - **A false fact** — a comment, report or label **asserting something untrue**, whatever the
+    tests do. Four in M1b: the `confirmed_count` doc comment, which described the opposite of what
+    the server compares and reached third-party clients through `openapi.json`; the
+    `worst-case-data.spec.ts` navigation comment; the `segments_compile.rs` "their negations match
+    everyone" comment; and the fix pass's own claim that nothing gates `openapi.json`, which CI
+    does.
+
+  The two are different defects with different cures. A vacuous assertion is found by mutating the
+  code and watching nothing go red; a false fact is found by reading the sentence against the code
+  it describes, and no mutation will ever surface it. **A tally that merges them stops meaning
+  anything** — it can neither be checked nor acted on, because the two numbers answer different
+  questions.
 - **Seven of them were one single shape: a negative assertion with nothing to wait on.** An absence
   checked before the thing could appear, an absence racing an alert, an absence on a grid that had
   not drawn, an absence of a page-wide element, and an accessible description asserted empty against
@@ -326,17 +358,49 @@ This is the part worth more than any line of the diff.
   runs** — mutate each negative twice, once with its positive neighbour present and once with the
   neighbours stripped. That is the specific thing to grep for; it is not a general exhortation to
   check negatives.
-- **"Untestable" and "unreachable" are hypotheses, not findings.** Five such claims were written
-  this milestone and every one fell to somebody who tried anyway: a per-worker plan node to three
-  zeroed parallel GUCs, a history rewrite to `migrations = false` plus `run_to(1)`, an unreachable
-  `409` to a held route, an untestable client guard to holding the real lazy chunk in a fresh
-  browser context, and a "cannot be measured" page alert to a twelve-line test. **The tell is the
-  wording.** All of them were written at the end of a task, about a precondition the writer had not
-  attacked, and all said *"I cannot see how"* rather than *"I tried X, Y and Z."* The one claim that
-  held was the one that came in the second form: four named attacks against a stream abort, each
-  printing what the page actually saw, which narrowed the answer to "only a socket closing mid-body
-  does this". Attack it for ten minutes before you write it down, and a reviewer who accepts such a
-  claim without trying has not reviewed it.
+- **"Untestable" and "unreachable" are hypotheses, not findings — and this milestone went six for
+  six.** Six such claims were written and **every one of them was wrong. None was upheld.** Listed
+  by the task that wrote them, so the number is checkable rather than quoted:
+
+  1. Task 4's per-worker plan node — fell to three zeroed parallel GUCs.
+  2. Task 7's history rewrite — fell to `migrations = false` plus `run_to(1)`.
+  3. Task 11's unreachable `409` — fell to a held route.
+  4. Task 11's L4 untestable client guard — fell to holding the real lazy chunk in a fresh browser
+     context.
+  5. Task 13's "cannot be measured" page alert — fell to a twelve-line test.
+  6. Task 12's F2 stream abort, the one that had held — fell to D5's fifth attack:
+     `pg_terminate_backend` on the export's own backend, whose pid the test knows because it
+     acquired the connection itself. 35 chunks, then `Err("export failed")`, audit row
+     `{"complete":false,"rows":7627}`.
+
+  **The tell is the wording.** The first five were written at the end of a task, about a
+  precondition the writer had not attacked, and all five said *"I cannot see how"* rather than
+  *"I tried X, Y and Z."* The sixth is the sharper lesson, because it was written in the **good**
+  form — four named attacks against a stream abort, each printing what the page actually saw — and
+  it was still wrong. Four named attacks is not a proof of impossibility; it is four attacks. D5
+  tried four of its own, all rejected for stated reasons (a session `statement_timeout` the test
+  cannot aim at a pooled connection, `ALTER DATABASE` that binds only later sessions, DDL that the
+  open cursor's lock blocks, and dropping a pool the stream no longer needs), and the fifth worked.
+  Attack it for ten minutes before you write it down; a reviewer who accepts such a claim without
+  trying has not reviewed it; and a claim in the good form buys scrutiny, never exemption.
+
+  The count moved twice before it settled, which is its own warning. The ledger wrote "four for
+  four" at Task 11, then "FIFTH such claim, FOURTH DISPROVEN", which does not reconcile with it;
+  Task 14 corrected it to five disproven with Task 12's upheld; D5's report counts the survivor as
+  the fifth of five, so a reader of D5 alone gets five. **Six is the enumeration above.** Count the
+  list, do not quote the sentence.
+- **A green consistency gate is evidence of propagation, not of correctness.** This is how one of
+  the four false facts above reached third-party clients with every gate green at every step, and
+  it was itself recorded wrongly once: the fix pass wrote that nothing gates `openapi.json`, and CI
+  does. `.github/workflows/ci.yml:42` diffs the committed spec against the live server, and
+  `:62-63` regenerates `schema.d.ts` and fails on any diff. The chain is tight and it held. What it
+  gates is **consistency, not truth**: one wrong doc comment on `confirmed_count` propagated
+  faithfully into `openapi.json` and then into `schema.d.ts`, because each step only ever asks
+  *"does the generated artefact match its source?"* **None of them can ask "is the source true?"**
+  So a generator chain multiplies whatever it is given, and a green run of it says the lie is
+  consistent — which is worse than no gate would have been, because it reads as a check. The source
+  comment is the only place that question can be asked, and only by a person reading it against the
+  code beneath it.
 - **The sharpest thing anyone said this milestone was said about themselves.** Task 13's implementer
   closed its report:
 
@@ -363,9 +427,11 @@ This is the part worth more than any line of the diff.
 
 ## Known gaps at the end of M1b
 
-Twelve issues are filed under `.scratch/email-platform/issues/`. `03`, `04` and `08` are resolved
-by this milestone, with the evidence in their own `## Comments`. The rest are open, and these are
-the ones that shape what comes next:
+**Eighteen** issues are filed under `.scratch/email-platform/issues/` — twelve at Task 14, plus
+`13`–`18`, which the whole-branch pass filed afterwards and which this sentence said "twelve" about
+for three commits. `03`, `04` and `08` are resolved by this milestone, with the evidence in their
+own `## Comments`; `14` is `ready-for-agent`, its two plans confirmed by `EXPLAIN`. The rest are
+open, and these are the ones that shape what comes next:
 
 - **`09` — query-string params ignore unknown keys** has grown teeth. `GET /contacts` now takes
   `snapshot_id`, so a client that misspells it is served the **live filter** instead of the frozen
@@ -378,15 +444,24 @@ the ones that shape what comes next:
   five bulk bodies and the signed token payload. `ChangeRole` is still the one to look at first.
 - **`12` — M0 PATCH bodies ignore an explicit null**, filed during this milestone. The real work is
   one extraction: `present` is copy-pasted in four places.
-- **One reserved finding for the whole-branch pass, with the fix already derived.**
-  `web/src/routes/contacts.tsx:325`'s effect still clears hand-ticked rows on `filterKey`, so
-  ticking three rows and then sorting the grid throws the ticks away — the same mistake as the
-  export dialog's key, one layer along. Changing its dependency to `[coveredKey]` is the fix. Not
-  critical: sorting is a deliberate act and the clearing is announced.
+- **The reserved finding is closed, not reserved.** `web/src/routes/contacts.tsx`'s effect now
+  depends on `[coveredKey]` and not `filterKey` (whole-branch MUST 5/7, `1e29091`), so ticking
+  three rows and then sorting the grid keeps the ticks: which contacts a view reaches is what a
+  tick belongs to, and sorting moves no contact in or out. D5 then found that the *announcement*
+  half of the repair had no test — removing `silentClear.current = true` left all 127 committed
+  e2e tests green — and added one.
 - **The one-hour TTL is still a guess.** Nobody has watched a real operator work a bulk action.
-- **Still no load testing.** The snapshot numbers in ADR 0004 are measured; nothing else in this
-  milestone is. The segment compiler has never run against 10M rows, `estimate()`'s fallback has
-  never been watched on a real table, and issues `01` and `02` remain open and untriaged.
+- **Still almost no load testing.** Three things are measured now and nothing else is: the snapshot
+  numbers in ADR 0004, the index plans in issue `14`, and the export pool-saturation figure — four
+  workspaces × five exports held all twenty connections, a twenty-first request still waiting at
+  8.00 s, `/readyz` at `503` after 2.00 s, which is what `MAX_CONCURRENT_EXPORTS` now bounds. Two
+  of the three changed a conclusion the reasoning had reached: ADR 0004's timestamp variant died of
+  its measurement, and the supersede delete turned out to spend 96% of its time in the members FK
+  cascade and not in the index everyone was looking at. The third, issue `14`'s two plans, merely
+  confirmed what reading had predicted — which is the outcome you cannot know in advance, and is
+  the reason to run it. The segment compiler has never run against 10M rows,
+  `estimate()`'s fallback has never been watched on a real table, and issues `01` and `02` remain
+  open and untriaged.
 - **A merge feature breaks the frozen set.** Identity is the only thing a snapshot records, so an
   importer that replaced one contact with another would make a frozen set stop meaning what it
   says. §15.3 carries it: an importer may **update** a contact, never replace one, and a merge must
