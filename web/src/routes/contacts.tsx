@@ -540,7 +540,7 @@ function ContactsPage({
                 }));
       // The confirmation closes **here**, not when it was agreed to, so a long bulk delete shows
       // its `busy` button for the wait instead of looking exactly like `chosen === 0` — the
-      // export dialog eleven lines down already works this way, and like that one it closes
+      // export dialog above already works this way, and like that one it closes
       // whatever the outcome and lets the refusal land in the page's own alert, where the person
       // is still looking. Before the outcome below, not after: a modal `<dialog>` is a focus
       // trap, and a delete hands focus to the result paragraph outside it. A no-op for the three

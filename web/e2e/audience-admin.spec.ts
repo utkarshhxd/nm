@@ -449,7 +449,7 @@ test("bulk_delete_requires_confirmation_naming_the_count", async () => {
 
   // Held, so the wait is observable: the dialog stays up with its button `aria-busy` instead of
   // closing on the click and leaving five bar buttons `disabled`, which looks exactly like
-  // `chosen === 0`. The export dialog eleven lines down the source has always worked this way.
+  // `chosen === 0`. The export dialog on this screen has always worked this way.
   let release = () => {};
   const held = new Promise<void>((done) => {
     release = done;
