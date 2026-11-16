@@ -724,7 +724,7 @@ pg_total_relation_size('snap_members')  ->  158 MB
 delete from snap_members where snapshot_id = $snap;   Time: 850.401 ms
 ```
 
-- **4.9 seconds**, against `spec.md:457`'s p95 < 150 ms for UI API responses. A real segment adds
+- **4.9 seconds**, against `spec.md:458`'s p95 < 150 ms for UI API responses. A real segment adds
   its own predicate cost on top, and §5 exists precisely because the *count* alone may exceed
   1.5 s at scale. The selection endpoint does the count **and** a 158 MB write, with no
   `statement_timeout`, no progress, and no stated budget. §16 records the 1M cap as a deviation but
@@ -899,7 +899,7 @@ Attack 3. §8.3 states the cost as one row per match plus a sweep. Measured, it 
 158 MB per 1M-contact selection**, in a request budgeted at p95 < 150 ms, with no timeout, no rate
 limit, no live-snapshot cap per workspace, and a sweep whose inline worst case is 850 ms in a
 stranger's request. The section is titled "The cost, stated"; state it. Add the latency to §16 as
-a fifth recorded deviation — `spec.md:457`'s 150 ms budget is one M1b endpoint cannot meet, and
+a fifth recorded deviation — `spec.md:458`'s 150 ms budget is one M1b endpoint cannot meet, and
 that is a defensible deviation but not a silent one.
 
 ### S24 — §6: an index per custom field definition is not shippable as written

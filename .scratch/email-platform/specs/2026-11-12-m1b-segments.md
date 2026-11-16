@@ -400,7 +400,7 @@ Measured on a 1M-row table, floor case, no predicate beyond `workspace_id`:
 | `delete … where snapshot_id = $1` | **850 ms** |
 
 So one selection can cost five seconds and hold 158 MB for an hour. That exceeds
-`spec.md:457`'s 150 ms server-time budget by two orders of magnitude and §16 records it as a
+`spec.md:458`'s 150 ms server-time budget by two orders of magnitude and §16 records it as a
 deviation rather than leaving it silent.
 
 Four consequences, each of which is a requirement:
@@ -709,7 +709,7 @@ SQL copy breaks the segment compiler, not merely the import.
 2. **Engagement rules return 422** (`spec.md:106` implies a complete builder). No events until M2.
 3. **Export is admin-only.** `spec.md` does not say; §10 gives the reason and its honest limits.
 4. **A bulk selection is capped at 1,000,000 contacts.** §8.4.
-5. **`POST /contacts/selection` cannot meet the 150 ms budget** (`spec.md:457`). It is measured at
+5. **`POST /contacts/selection` cannot meet the 150 ms budget** (`spec.md:458`). It is measured at
    ~4.9 s for 1M rows. Defensible — it is an explicit, rate-limited, once-per-task act — but it is
    the one endpoint in M1b that misses a stated budget, and it should not be silent.
 
