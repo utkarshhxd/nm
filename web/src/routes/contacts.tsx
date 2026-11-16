@@ -538,6 +538,14 @@ function ContactsPage({
                   params,
                   body,
                 }));
+      // The confirmation closes **here**, not when it was agreed to, so a long bulk delete shows
+      // its `busy` button for the wait instead of looking exactly like `chosen === 0` — the
+      // export dialog eleven lines down already works this way, and like that one it closes
+      // whatever the outcome and lets the refusal land in the page's own alert, where the person
+      // is still looking. Before the outcome below, not after: a modal `<dialog>` is a focus
+      // trap, and a delete hands focus to the result paragraph outside it. A no-op for the three
+      // actions that run without a confirmation.
+      setConfirming(null);
       if (error || !data) {
         setFailure(problemMessage(error, "The action failed and nothing was changed."));
         // These three all mean "this selection cannot be used again": it expired, its snapshot is
@@ -606,9 +614,12 @@ function ContactsPage({
       </div>
 
       <div className="mt-4">
-        {/* Hidden only while rows are ticked by hand, because changing a filter throws those
-            away. A frozen selection survives one, so its filters stay where they are. */}
-        <div hidden={selection.mode === "ids"} className="flex flex-wrap items-start gap-3">
+        {/* Always shown. It used to be `hidden` while rows were ticked by hand — the search box
+            and all three selects vanishing the moment anybody ticked a row, with nothing saying
+            why and no way back but "Clear selection". The frozen branch of this screen does the
+            opposite and explains itself in the sentence below the grid, so this one says its
+            piece beside the bar instead of disappearing. */}
+        <div className="flex flex-wrap items-start gap-3">
           <SearchBox
             initial={search.q ?? ""}
             onSearch={(q) => setSearch({ q })}
@@ -723,6 +734,15 @@ function ContactsPage({
             <Button variant="ghost" onClick={() => store.clear()}>
               Clear selection
             </Button>
+            {/* The counterpart to the frozen set's "Filtering changes what is shown here, not
+                what is selected": ticked rows are rows somebody saw in *this* view, so a filter
+                does throw them away. Said here rather than enforced by hiding the filters. */}
+            {selection.mode === "ids" ? (
+              <p className="basis-full text-fg-muted">
+                Changing a filter or the search clears these ticked rows, because they are rows of
+                this view. Sorting does not.
+              </p>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -856,9 +876,9 @@ function ContactsPage({
         // `bulk/tag` on the reporting side; red two controls from the bulk delete that really is
         // irreversible is how red stops meaning anything. §9.1's weight is in the copy.
         variant={confirming?.kind === "tag" ? "solid" : "danger-solid"}
+        busy={busy}
         onConfirm={() => {
           const go = confirming;
-          setConfirming(null);
           if (go) void bulk(go.kind, go.target, go.name, go.promised);
         }}
       >

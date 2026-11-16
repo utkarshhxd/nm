@@ -351,6 +351,15 @@ test("ticked_rows_survive_a_sort_and_still_go_on_a_filter", async () => {
   await expect(
     page.getByRole("checkbox", { name: "Select bulk-a@example.test", exact: true }),
   ).toBeChecked();
+
+  // And a change that does move contacts in and out still clears them, which is the half the key
+  // is there for. Reaching it at all is the other fix: the filter toolbar used to be `hidden` the
+  // moment anybody ticked a row, so there was no way to change a filter from here, and the
+  // sentence below the bar is what replaces the enforcement.
+  await expect(page.getByText("Changing a filter or the search clears these ticked rows")).toBeVisible();
+  await page.getByLabel("Search contacts", { exact: true }).fill("bulk-a");
+  await expect(page.locator("tbody tr[aria-rowindex]")).toHaveCount(1);
+  await expect(page.getByRole("region", { name: "Bulk actions" })).toHaveCount(0);
 });
 
 test("bulk_untag_over_a_selection", async () => {
@@ -437,7 +446,32 @@ test("bulk_delete_requires_confirmation_naming_the_count", async () => {
   // Deleting is not erasing: nothing is suppressed, so every address stays usable tomorrow.
   await expect(confirm).toContainText("not suppressed");
   await expect(confirm).toContainText("can be added again");
+
+  // Held, so the wait is observable: the dialog stays up with its button `aria-busy` instead of
+  // closing on the click and leaving five bar buttons `disabled`, which looks exactly like
+  // `chosen === 0`. The export dialog eleven lines down the source has always worked this way.
+  let release = () => {};
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  let holding = true;
+  await page.route("**/contacts/bulk/delete", async (route) => {
+    if (holding) {
+      holding = false;
+      await held;
+    }
+    await route.continue().catch(() => undefined);
+  });
   await confirm.getByRole("button", { name: "Delete 2 contacts", exact: true }).click();
+  await expect(confirm.getByRole("button", { name: "Delete 2 contacts", exact: true })).toHaveAttribute(
+    "aria-busy",
+    "true",
+  );
+  release();
+  await page.unroute("**/contacts/bulk/delete");
+  // And it closes when the request is answered, which is also what lets the outcome below take
+  // focus: a modal dialog is a focus trap.
+  await expect(confirm).toBeHidden();
 
   await expect(result()).toContainText("Deleted 2 contacts");
   // The bulk bar and its button are gone with the selection, so focus has nowhere to return to
