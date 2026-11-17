@@ -38,8 +38,38 @@ jobs:
       - run: cargo test
       - run: cargo sqlx prepare --check -- --all-targets
       # The committed spec is what web/src/api/schema.d.ts was generated from.
+      #
+      # This prints the drift rather than piping into `diff`, because a bare pipe says only that
+      # the two differ and GitHub expires a job's logs long before anyone asks why. This gate
+      # failed on a runner while passing locally, byte for byte, and there was no way left to see
+      # what it had found. The summary is for whoever opens the run; the artifact is for whoever
+      # has to diff it against their own machine.
       - name: Committed OpenAPI spec is current
-        run: cargo run -q -- openapi | diff - web/src/api/openapi.json
+        run: |
+          cargo run -q -- openapi > "$RUNNER_TEMP/openapi.generated.json"
+          if ! diff -u web/src/api/openapi.json "$RUNNER_TEMP/openapi.generated.json" \
+               > "$RUNNER_TEMP/openapi.diff"; then
+            {
+              echo '## The committed OpenAPI spec is not what the server generates'
+              echo
+              echo "committed:  $(wc -c < web/src/api/openapi.json) bytes"
+              echo "generated:  $(wc -c < "$RUNNER_TEMP/openapi.generated.json") bytes"
+              echo
+              echo '```diff'
+              head -c 60000 "$RUNNER_TEMP/openapi.diff"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::OpenAPI drift; see the job summary and the openapi-drift artifact"
+            exit 1
+          fi
+      - name: Keep the generated spec when it drifted
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-drift
+          path: ${{ runner.temp }}/openapi.*
+          if-no-files-found: ignore
+          retention-days: 7
 
   web:
     runs-on: ubuntu-latest
