@@ -640,29 +640,33 @@ async fn a_row_that_is_not_utf8_is_an_error_row_naming_its_line(pool: PgPool) {
 async fn a_lone_carriage_return_does_not_start_a_record(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let import = insert_import(&pool, ws).await;
+    // A `text` custom field, because this test is about the PARSER and needs a column that stores
+    // a control character rather than refusing it. It used to use `tags`, which now goes through
+    // `lists::validate_name` and would refuse a bare CR — and then this test would be asserting
+    // the tag validator instead of the record terminator it is named for.
     let mapping = vec![
         ColumnTarget::Field(ContactField::Email),
-        ColumnTarget::Field(ContactField::Tags),
+        ColumnTarget::Custom("note".to_owned()),
     ];
-    let j = job(import, ws, mapping, vec![]);
+    let j = job(import, ws, mapping, vec![field("note", FieldKind::Text)]);
     let mut tx = pool.begin().await.unwrap();
 
     // CRLF endings, and a quoted cell holding a bare CR: neither may end a record early or add an
     // empty one. A file read that way reports twice its rows and fails half of them.
-    let counts = copy(&mut tx, &j, b"email,tags\r\na@b.co,\"x\ry\"\r\nc@d.co,\r\n").await;
+    let counts = copy(&mut tx, &j, b"email,note\r\na@b.co,\"x\ry\"\r\nc@d.co,\r\n").await;
     assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 2, 0));
     assert_eq!(
         staged(&mut tx, import).await,
         [(2, "a@b.co".to_owned()), (3, "c@d.co".to_owned())]
     );
-    let tags: Value = sqlx::query_scalar(AssertSqlSafe(format!(
-        "select tags from {} where row_number = 2",
+    let attrs: Value = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select attributes from {} where row_number = 2",
         staging_table(import)
     )))
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(tags, json!(["x\ry"]));
+    assert_eq!(attrs, json!({"note": "x\ry"}));
 }
 
 #[sqlx::test]
@@ -814,9 +818,14 @@ async fn a_row_with_more_fields_than_the_column_cap_is_refused_and_the_rows_afte
 async fn a_cell_larger_than_the_parsers_buffer_stages_intact(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let import = insert_import(&pool, ws).await;
+    // `lists`, because this test needs a 20 KiB cell to reach staging whole and every other
+    // column now has a length rule that would refuse it first: `tags` is `lists::validate_name`
+    // (100 characters), a `text` custom field is `MAX_TEXT` (2000). A list NAME is not validated
+    // on the way in — it is matched against the workspace's lists later, and one that matches
+    // nothing writes nothing — so it is the column that still shows what the parser produced.
     let mapping = vec![
         ColumnTarget::Field(ContactField::Email),
-        ColumnTarget::Field(ContactField::Tags),
+        ColumnTarget::Field(ContactField::Lists),
     ];
     let j = job(import, ws, mapping, vec![]);
     let mut tx = pool.begin().await.unwrap();
@@ -824,18 +833,22 @@ async fn a_cell_larger_than_the_parsers_buffer_stages_intact(pool: PgPool) {
     // Over the 8 KiB the output buffer starts at, so the record only parses if the buffer grows
     // and the offsets carry across the grow. Under `MAX_RECORD_BYTES`, so it is a legitimate row.
     let big = "t".repeat(20_000);
-    let csv = format!("email,tags\na@b.co,{big}\nc@d.co,x\n");
+    let csv = format!("email,lists\na@b.co,{big}\nc@d.co,x\n");
     let counts = copy(&mut tx, &j, csv.as_bytes()).await;
     assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 2, 0));
 
-    let tags: Value = sqlx::query_scalar(AssertSqlSafe(format!(
-        "select tags from {} where row_number = 2",
+    let lists: Value = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select lists from {} where row_number = 2",
         staging_table(import)
     )))
     .fetch_one(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(tags, json!([big]), "the big cell survives the grow intact");
+    assert_eq!(
+        lists,
+        json!([{"name": big, "status": null}]),
+        "the big cell survives the grow intact"
+    );
 }
 
 #[sqlx::test]
@@ -1926,6 +1939,85 @@ async fn an_unsubscribed_entry_and_an_unknown_list_name_both_write_nothing(pool:
     assert_eq!(
         lists, 1,
         "an import creates tags, which only label; it never creates a list, which takes mail"
+    );
+}
+
+#[sqlx::test]
+async fn a_tag_name_the_api_would_refuse_is_an_error_row_naming_its_column(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
+
+    // `tags.name` has no constraint behind it, so the import is the only thing standing between a
+    // CSV and a tag row `PUT /tags/{id}` could never rewrite. One name too long and one holding a
+    // control character: both are what `POST /tags` refuses, and both must be refused here in the
+    // same words. The third row is the rest of the file, which carries on.
+    let long = "x".repeat(101);
+    let belled = "news\u{7}letter";
+    let csv = format!(
+        "email,tags,lists\n\
+         ada@example.com,vip;{long},\n\
+         bob@example.com,{belled},\n\
+         carol@example.com,vip,\n"
+    );
+    let staged = copy(&mut tx, &j, csv.as_bytes()).await;
+    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+
+    let refused = "must be 1-100 characters with no control characters".to_owned();
+    assert_eq!(
+        error_rows(&mut tx, import).await,
+        [
+            (2, Some("tags".to_owned()), refused.clone(), Some(long)),
+            (3, Some("tags".to_owned()), refused, Some(belled.to_owned())),
+        ],
+        "an operator whose tag is refused is told which row, which column and which value"
+    );
+    // One error row per failed ROW, as everything else this stage validates: the row is refused
+    // whole, so `failed` and `import_errors` still agree on what a row is.
+    assert_eq!((counts.imported, counts.failed), (1, 2), "{counts:?}");
+    assert!(contact(&mut tx, ws, "ada@example.com").await.is_none());
+    let names: Vec<String> =
+        sqlx::query_scalar("select name from tags where workspace_id = $1 order by name")
+            .bind(ws)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(
+        names,
+        ["vip"],
+        "a CSV may not put a name into `tags` that the API's own validator would reject"
+    );
+    assert_eq!(tags_of(&mut tx, ws, "carol@example.com").await, ["vip"]);
+}
+
+#[sqlx::test]
+async fn a_blank_entry_between_two_tags_is_dropped_and_does_not_refuse_the_row(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
+
+    // `vip;;founder` is the file saying nothing in the middle slot, the way a blank cell does.
+    // There is no tag in it to create, so it is dropped — refusing the row over a doubled
+    // separator would cost the operator a contact and protect nobody. Padding goes the same way
+    // as everywhere else in this stage.
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,tags,lists\nada@example.com,vip;; founder ;,\n",
+    )
+    .await;
+
+    assert_eq!(
+        counts.imported,
+        1,
+        "{:?}",
+        error_rows(&mut tx, import).await
+    );
+    assert_eq!(
+        tags_of(&mut tx, ws, "ada@example.com").await,
+        ["founder", "vip"]
     );
 }
 

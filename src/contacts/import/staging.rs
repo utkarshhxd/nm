@@ -53,7 +53,7 @@ use crate::{
     crypto::{secrets::Secrets, suppression_hmac},
     custom_fields::{Definition, FieldKind},
     error::{ApiError, ApiResult},
-    lists::MembershipSource,
+    lists::{MembershipSource, validate_name as validate_tag_name},
     users::normalize_email,
     workspaces::validate_timezone,
 };
@@ -511,8 +511,11 @@ pub async fn upsert_from_staging(
 /// `GET /tags` is `order by id desc` and its documented contract is "Newest first", so a `v4` id
 /// would scatter every imported tag through that list for ever. 48 bits of millisecond timestamp,
 /// the version nibble `7`, the variant nibble `8`, and 72 bits of randomness around them — the
-/// same layout `Uuid::now_v7()` writes, and `clock_timestamp()` so that tags made in one statement
-/// still order among themselves.
+/// same layout `Uuid::now_v7()` writes, and `clock_timestamp()` rather than `now()` so that tags
+/// made in one statement order by the millisecond they were made in. **Within one millisecond they
+/// order by their random bits, which is to say arbitrarily** — the ordering this buys is against
+/// everything created before and after the import, not among a handful of tags made together, and
+/// nothing asserts the finer claim because it is not true.
 ///
 /// A tag is the only row this module creates whose count is not known before the statement runs.
 /// Minting these ids in Rust would mean reading every distinct tag name in the file into memory
@@ -553,6 +556,13 @@ const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) *
 ///    writes nothing and declines nothing. Any other status is a subscription request, and the
 ///    LIST decides what is written — `pending` on a double-opt-in list, `subscribed` otherwise —
 ///    exactly as `lists::add_member` does. An import may not hand itself a status the UI could not.
+///
+///    **What rule 2 costs, written down rather than discovered.** Dropping the entry carries no
+///    record of the unsubscribe forward, so re-importing an export into a FRESH workspace leaves
+///    the address with no membership at all — and a LATER import of that address, from a file
+///    without the `:unsubscribed` marker, would then subscribe it, where a preserved
+///    `unsubscribed` row would have been protected by the `do nothing` above. Nobody becomes
+///    mailable by the import that drops the entry; what is lost is the protection on the next one.
 async fn write_memberships_and_tags(
     conn: &mut PgConnection,
     import: &ImportJob,
@@ -780,7 +790,27 @@ fn stage_row(
                     );
                 }
             }
-            ColumnTarget::Field(ContactField::Tags) => tags.extend(split_multi(&cell)),
+            // A CSV IS A TRUST BOUNDARY, AND THERE IS NO CONSTRAINT BEHIND THIS ONE:
+            // `migrations/0013_tags.sql` declares a bare `name text`, and the only rule a tag name
+            // has ever had is `lists::validate_name`, which `POST /tags` and `PUT /tags/{id}` both
+            // go through. Staging a name that rule would refuse creates a row the API can read and
+            // can never rewrite — `GET /tags` returns it and the UI renders it, and the first
+            // rename fails validation on a value the operator never typed. A megabyte-long tag, or
+            // one holding a newline, arrives this way and no other. So the import uses the API's
+            // own validator: one rule for a tag name, whichever door it came through.
+            //
+            // An entry that is blank once trimmed is dropped and not refused. A `;;` is the file
+            // saying nothing in that slot, the way a blank cell is (spec 7.3), and there is no tag
+            // in it to create. Anything else that fails refuses the row, like every other cell
+            // this function validates: one error row per failed row, naming the column.
+            ColumnTarget::Field(ContactField::Tags) => {
+                for tag in split_multi(&cell) {
+                    if tag.trim().is_empty() {
+                        continue;
+                    }
+                    tags.push(validate_tag_name(&tag).map_err(|e| bad(i, &e.message, &tag))?);
+                }
+            }
             ColumnTarget::Field(ContactField::Lists) => {
                 for entry in split_multi_raw(&cell) {
                     let (list, status) = split_list_entry(entry);
