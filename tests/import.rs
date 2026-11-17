@@ -2450,14 +2450,21 @@ async fn another_workspaces_import_report_is_404_not_403(pool: PgPool) {
 async fn the_audit_row_names_the_import_and_never_the_file_contents(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
-    let body = uploaded(
+    let import = upload_kept(
         &app,
         ws,
         "book.csv",
         "email,notes\nada@example.com,SECRET-CELL\n",
     )
     .await;
-    let import: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    // AND THE RUN. Without it `import.started` and `import.finished` are structurally outside this
+    // guard — the only test that reads every audit row of a workspace for the file's own cells —
+    // and the next field added to either one goes unwatched.
+    app.post(&start_uri(ws, import))
+        .json(&json!({"mapping": [field_target("email"), {"kind": "ignore"}]}))
+        .await
+        .assert_status_ok();
 
     // Reading the report and the rejected rows is a read: it writes no audit row of its own.
     app.get(&report_uri(ws, import)).await.assert_status_ok();
@@ -2478,9 +2485,12 @@ async fn the_audit_row_names_the_import_and_never_the_file_contents(pool: PgPool
         .filter(|r| r.1.as_deref() == Some("import"))
         .collect();
     assert_eq!(
-        about_the_import.len(),
-        1,
-        "the upload is logged and the two reads are not: {rows:?}"
+        about_the_import
+            .iter()
+            .map(|r| r.0.as_str())
+            .collect::<Vec<_>>(),
+        ["import.uploaded", "import.started", "import.finished"],
+        "the upload and the run are logged; the two reads are not: {rows:?}"
     );
     let logged_import = about_the_import[0];
     assert_eq!(
@@ -2559,6 +2569,9 @@ async fn a_run_writes_every_count_it_computed_to_the_report(pool: PgPool) {
     insert_contact(&mut conn, ws, "bob@example.com", "Bob", "Barker").await;
     unsubscribe(&mut conn, ws, list, "bob@example.com").await;
     suppress_address(&mut conn, Some(ws), "sue@example.com").await;
+    // The list the REQUEST names, which no cell in the file does. The file's own `lists` column
+    // names `news`, so a run that ignored `list_id` would still fill `news` and look right.
+    let everyone = insert_list(&mut conn, ws, "everyone", false).await;
     drop(conn);
 
     // Six data rows, one of each kind `update existing` can produce, and two of them are also the
@@ -2583,6 +2596,7 @@ async fn a_run_writes_every_count_it_computed_to_the_report(pool: PgPool) {
         .json(&json!({
             "mapping": [field_target("email"), field_target("tags"), field_target("lists")],
             "dedup": "update_existing",
+            "list_id": everyone.to_string(),
         }))
         .await;
     r.assert_status_ok();
@@ -2646,6 +2660,112 @@ async fn a_run_writes_every_count_it_computed_to_the_report(pool: PgPool) {
         !upload_path(import).exists(),
         "the uploaded file is gone once it has been imported"
     );
+
+    // AND THE LIST THE REQUEST NAMED. `list_id` is how an import subscribes contacts to a list,
+    // and a run that dropped it reports every count above correctly while subscribing nobody.
+    // Every contact the run touched is on it, suppressed and updated ones included: suppression
+    // is about mailing and not existence, and `update existing` reaches a contact that was
+    // already here.
+    let mut conn = pool.acquire().await.unwrap();
+    for email in [
+        "ada@example.com",
+        "bob@example.com",
+        "carol@example.com",
+        "sue@example.com",
+    ] {
+        assert_eq!(
+            membership(&mut conn, ws, everyone, email).await,
+            Some((
+                MembershipStatus::Subscribed,
+                Some(MembershipSource::Import),
+                None
+            )),
+            "{email} was not subscribed to the list the request named"
+        );
+    }
+    // And the row records the list it was asked for, which is the other place `list_id` is used.
+    let stored: Option<Uuid> = sqlx::query_scalar("select list_id from imports where id = $1")
+        .bind(import)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, Some(everyone));
+}
+
+#[sqlx::test]
+async fn start_naming_another_workspaces_list_is_404(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let app = member(&pool, a, "ed@example.com", Role::Editor).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let theirs = insert_list(&mut conn, b, "news", false).await;
+    let ours = insert_list(&mut conn, a, "news", false).await;
+    drop(conn);
+    let import = upload_kept(&app, a, "book.csv", "email\nada@example.com\n").await;
+
+    let r = app
+        .post(&start_uri(a, import))
+        .json(&json!({
+            "mapping": [field_target("email")],
+            "list_id": theirs.to_string(),
+        }))
+        .await;
+    r.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(r.json::<Value>()["type"], "urn:nm:problem:not-found");
+    // Nothing ran, and the import is still startable with a list that is ours.
+    assert_eq!(count(&pool, "contacts").await, 0);
+    assert_eq!(import_row(&pool, import).await.0, "pending");
+
+    // Control: the same request with our own list runs, so the 404 is the tenancy's doing and
+    // not the field's.
+    app.post(&start_uri(a, import))
+        .json(&json!({
+            "mapping": [field_target("email")],
+            "list_id": ours.to_string(),
+        }))
+        .await
+        .assert_status_ok();
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        membership(&mut conn, a, ours, "ada@example.com")
+            .await
+            .is_some()
+    );
+}
+
+#[sqlx::test]
+async fn a_start_whose_uploaded_file_is_gone_is_422_and_ends_the_import(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let import = upload_kept(&app, ws, "book.csv", "email\nada@example.com\n").await;
+    // The temp directory was swept, or this process is not the one that took the upload. Either
+    // way the file is not coming back.
+    std::fs::remove_file(upload_path(import)).unwrap();
+
+    let body = json!({"mapping": [field_target("email")]});
+    let r = app.post(&start_uri(ws, import)).json(&body).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json::<Value>()["type"], "urn:nm:problem:import-file-gone");
+
+    // THE IMPORT IS OVER, not back where it started: no retry can bring the file back, and a row
+    // left `pending` sits in `GET /imports` for ever with nothing that can clear it.
+    let b: Value = app.get(&report_uri(ws, import)).await.json();
+    assert_eq!(b["status"], "failed");
+    assert_eq!(
+        b["error_reason"],
+        "the uploaded file is no longer on this server; upload it again"
+    );
+    assert_eq!(
+        b["total_rows"],
+        Value::Null,
+        "the COPY never counted the file, and `0` would report an empty one"
+    );
+    assert_eq!(b["failed"], 0);
+    assert!(b["finished_at"].is_string(), "{b}");
+
+    // So a second start is the 409 an import that has run gets, not the same 422 again.
+    let r = app.post(&start_uri(ws, import)).json(&body).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(count(&pool, "contacts").await, 0);
 }
 
 #[sqlx::test]

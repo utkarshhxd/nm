@@ -23,7 +23,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Acquire, PgConnection};
+use sqlx::{Acquire, PgConnection, Postgres, Transaction};
 use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -582,6 +582,59 @@ pub struct StartImport {
     pub has_header: Option<bool>,
 }
 
+/// What a start says when the upload is not on this server any more. A constant because it is both
+/// the problem's detail and the import's `error_reason`, and the two have to be the same sentence.
+const FILE_GONE: &str = "the uploaded file is no longer on this server; upload it again";
+
+/// Removes an import's uploaded file once that import is over, on every path that ends one.
+///
+/// A failure is logged and nothing else: the import has already committed, so there is nothing
+/// left to refuse, and the operator cannot act on it anyway. But it is **logged**, because the
+/// thing this call exists to prevent — half a gigabyte of someone's contacts left on disk for
+/// ever — otherwise happens in silence. The path is [`upload_path`]'s, derived from the import id,
+/// so it carries nothing secret. "Already gone" is not a failure: that is the `import-file-gone`
+/// path, which ends an import whose file was the thing that was missing.
+async fn remove_upload(path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "could not remove an import's uploaded file",
+        );
+    }
+}
+
+/// Ends a run that was refused: the row says `failed` and why, the `import_errors` rows the `COPY`
+/// had already written are **kept** (that is the whole point — see the savepoint in
+/// [`start_import`]), and the file goes.
+///
+/// `total_rows` is `None` where the `COPY` never counted the file. Null is "still unknown", which
+/// a `0` would report as an empty file.
+async fn record_refusal(
+    mut tx: Transaction<'_, Postgres>,
+    job: &ImportJob,
+    reason: &str,
+    total_rows: Option<i64>,
+    failed: i64,
+) -> ApiResult<()> {
+    sqlx::query!(
+        "update imports set status = 'failed', error_reason = $3, total_rows = $4, failed = $5, \
+         finished_at = now() where workspace_id = $1 and id = $2",
+        job.workspace_id,
+        job.id,
+        reason,
+        total_rows,
+        failed,
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    remove_upload(&job.path).await;
+    Ok(())
+}
+
 /// The detail a refusal carries, for `imports.error_reason`. `None` for anything else: an internal
 /// error's cause is never shown to a client, and it must not be stored where admins read it
 /// either. Such an error also leaves a transaction that may not be used.
@@ -800,13 +853,21 @@ pub async fn start_import(
     )
     .await?;
 
-    let file =
-        tokio::fs::File::open(&job.path)
-            .await
-            .map_err(|_| ApiError::UnprocessableDetail {
+    let file = match tokio::fs::File::open(&job.path).await {
+        Ok(file) => file,
+        // THE IMPORT IS OVER, not back where it started. No retry can bring the file back, so a
+        // `?` here — which would roll `running` back to `pending` — leaves a row in `GET /imports`
+        // that answers 422 for ever with nothing that can ever clear it.
+        Err(_) => {
+            // `total_rows` stays null: the `COPY` never counted the file, and null is "still
+            // unknown", which a `0` would report as an empty file.
+            record_refusal(tx, &job, FILE_GONE, None, 0).await?;
+            return Err(ApiError::UnprocessableDetail {
                 code: "import-file-gone",
-                detail: "the uploaded file is no longer on this server; upload it again".to_owned(),
-            })?;
+                detail: FILE_GONE.to_owned(),
+            });
+        }
+    };
     let staged = copy_into_staging(&mut tx, &state.secrets, &job, file).await?;
 
     // A SAVEPOINT, so that a refusal can take the upsert's writes back WITHOUT taking back the
@@ -834,19 +895,7 @@ pub async fn start_import(
             run.rollback().await?;
             // `total_rows` and `failed` too, so the kept rows and the counts agree: a report
             // saying `failed = 0` beside a page of rejected rows is a report nobody believes.
-            sqlx::query!(
-                "update imports set status = 'failed', error_reason = $3, total_rows = $4, \
-                 failed = $5, finished_at = now() where workspace_id = $1 and id = $2",
-                workspace_id,
-                id,
-                reason,
-                staged.total_rows,
-                staged.failed,
-            )
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            let _ = std::fs::remove_file(&job.path);
+            record_refusal(tx, &job, &reason, Some(staged.total_rows), staged.failed).await?;
             return Err(e);
         }
     };
@@ -899,7 +948,7 @@ pub async fn start_import(
     tx.commit().await?;
     // The file has been imported. Nothing reads it again — a second start is a 409 — and leaving
     // it is half a gigabyte of someone's contacts on disk for ever.
-    let _ = std::fs::remove_file(&job.path);
+    remove_upload(&job.path).await;
     Ok(Json(done))
 }
 
