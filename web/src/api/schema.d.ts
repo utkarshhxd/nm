@@ -802,7 +802,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * This workspace's imports, newest first, a page at a time. Each row is the same report
+         *     `GET /imports/{id}` answers with: a list screen shows a status and counts, and a second read
+         *     per row to get them would be the list all over again.
+         */
+        get: operations["list_imports"];
         put?: never;
         /**
          * Takes a CSV as `multipart/form-data` (one part, `file`), keeps it on disk under a name derived
@@ -859,6 +864,37 @@ export interface paths {
         get: operations["list_import_errors"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/imports/{id}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirms the mapping and runs the import: `COPY` the file into a staging table, upsert out of
+         *     it, and write what that came to onto the import's row.
+         * @description **One transaction for the whole run.** The staging table is `create temporary table … on commit
+         *     drop`, so it exists only inside it, and that `COMMIT` is what makes the contacts durable.
+         *
+         *     **The delimiter and the header come from the stored values, never from a second sniff** — the
+         *     operator confirmed a mapping against those columns, and a sniff that disagreed at this point
+         *     would silently re-point every column. The request may carry `delimiter` and `has_header`
+         *     OVERRIDES, which replace them: a headerless file read as headed silently drops its first row,
+         *     and a misdetected delimiter misparses every row, and the operator who was shown the guess is
+         *     the one who can correct it. A request carrying neither uses what is stored.
+         *
+         *     **A refusal keeps the per-row report.** See the savepoint below.
+         */
+        post: operations["start_import"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1386,6 +1422,11 @@ export interface components {
             id: string;
             name: string;
         };
+        /**
+         * @description What to do with a row whose address is already a contact in the workspace (spec 7.3).
+         * @enum {string}
+         */
+        Dedup: "update_existing" | "skip_existing" | "fail_on_duplicate";
         Definition: {
             /**
              * Format: date-time
@@ -1855,6 +1896,81 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_ImportReport: {
+            data: {
+                /**
+                 * Format: int64
+                 * @description Rows a later row of the same file names the same address as. Not `skipped`: the file
+                 *     de-duplicated itself, and the database never had these rows.
+                 */
+                collapsed: number;
+                /** Format: date-time */
+                created_at: string;
+                /**
+                 * @description Why the import as a whole failed, and `null` otherwise. Never one row's reason: those are
+                 *     in `GET /imports/{id}/errors`.
+                 */
+                error_reason?: string | null;
+                /**
+                 * Format: int64
+                 * @description How many rejected rows `GET /imports/{id}/errors` can show. An import keeps at most
+                 *     [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) of them while `failed` counts
+                 *     every one, so **when this is less than `failed`, that list is the first `errors_recorded`
+                 *     rejected rows in file order and not all of them** — an operator who pages to the end of it
+                 *     has not seen everything wrong with the file, and has to be told so.
+                 */
+                errors_recorded: number;
+                /**
+                 * Format: int64
+                 * @description Every rejected row. [`ImportReport::errors_recorded`] is how many of them were kept.
+                 */
+                failed: number;
+                /** @description What the file was called when it was uploaded. A label; nothing opens it. */
+                filename: string;
+                /** Format: date-time */
+                finished_at?: string | null;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * Format: int64
+                 * @description Rows that became a new contact.
+                 */
+                imported: number;
+                /**
+                 * Format: int64
+                 * @description Subscriptions this import asked for and did not get, because the address is already
+                 *     `unsubscribed` on that list. The contact itself was still imported or updated.
+                 */
+                memberships_declined: number;
+                /**
+                 * Format: int64
+                 * @description Rows left alone because the contact already existed (`skip existing`).
+                 */
+                skipped: number;
+                /** Format: date-time */
+                started_at?: string | null;
+                /** @description `pending`, `running`, `complete` or `failed`. */
+                status: string;
+                /**
+                 * Format: int64
+                 * @description Imported or updated contacts whose address or domain is suppressed. They exist and they
+                 *     are not mailable — said here rather than discovered at send time.
+                 */
+                suppressed: number;
+                /**
+                 * Format: int64
+                 * @description `null` while the `COPY` is still counting the file. Not `0`, which would report an empty
+                 *     file for an import that has not read its first row.
+                 */
+                total_rows?: number | null;
+                /**
+                 * Format: int64
+                 * @description Rows applied to a contact that already existed.
+                 */
+                updated: number;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_InviteSummary: {
             data: {
                 /** Format: date-time */
@@ -2124,6 +2240,32 @@ export interface components {
             otpauth_url: string;
             /** @description Base32 secret, shown only here. */
             secret: string;
+        };
+        /** @description The confirmed mapping, and the run. */
+        StartImport: {
+            /**
+             * @description What to do with a row whose address is already a contact here. `update_existing` by
+             *     default, which is spec 7.3's blank-cell rule: a blank leaves the stored value alone.
+             */
+            dedup?: components["schemas"]["Dedup"];
+            /**
+             * @description Replaces the delimiter the upload sniffed: one of `,`, `;`, a tab or `|`. Left out, the
+             *     stored one is used — the file is never sniffed a second time.
+             */
+            delimiter?: string | null;
+            /** @description Replaces the header guess the upload made. Left out, the stored one is used. */
+            has_header?: boolean | null;
+            /**
+             * Format: uuid
+             * @description A list in this workspace to subscribe every imported contact to. The file's own `lists`
+             *     column, where it has one, is added to this rather than replacing it.
+             */
+            list_id?: string | null;
+            /**
+             * @description One target per CSV column, in the file's column order. One column must be `email`, and no
+             *     two columns may name the same single-write target.
+             */
+            mapping: components["schemas"]["ColumnTarget"][];
         };
         /** @description A suppression as the API shows it. There is deliberately no hash field here. */
         Suppression: {
@@ -4754,6 +4896,48 @@ export interface operations {
             };
         };
     };
+    list_imports: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ImportReport"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     create_import: {
         parameters: {
             query?: never;
@@ -4875,6 +5059,63 @@ export interface operations {
                 content?: never;
             };
             /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    start_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Import id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StartImport"];
+            };
+        };
+        responses: {
+            /** @description The import ran; every count is on the report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportReport"];
+                };
+            };
+            /** @description insufficient-role: running an import takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such import in this workspace, or no such list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description import-already-started: an import runs once; or import-duplicate-address, which writes no contact and keeps the rejected rows */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a mapping naming a custom field that no longer takes values, two columns aimed at one target, mapping-needs-email, a delimiter that is not one of the four, import-file-gone, or an unknown field */
             422: {
                 headers: {
                     [name: string]: unknown;
