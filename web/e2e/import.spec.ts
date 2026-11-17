@@ -194,6 +194,51 @@ test("a refusal from the server is shown as its own sentence", async () => {
   await expect(page.getByRole("heading", { name: "Map the columns", exact: true })).toHaveCount(0);
 });
 
+/** Answers a POST on `glob` with a problem document: a refusal the real server only gives under load. */
+async function refuse(glob: string, status: number, code: string): Promise<void> {
+  await page.route(glob, (route: Route) =>
+    route.request().method() === "POST"
+      ? route.fulfill({
+          status,
+          contentType: "application/problem+json",
+          body: JSON.stringify({ type: `urn:nm:problem:${code}`, title: code, status, detail: code.replaceAll("-", " ") }),
+        })
+      : route.fallback(),
+  );
+}
+
+test("an upload refused for size or rate says what to do, not just that it failed", async () => {
+  const glob = "**/api/v1/workspaces/*/imports";
+  for (const [status, code, text] of [
+    [422, "too-many-rows", "more than 1,000,000 rows"],
+    [429, "rate-limited", "wait a minute"],
+  ] as const) {
+    await refuse(glob, status, code);
+    try {
+      await page.goto(`/w/${SLUG}/imports`);
+      await page.getByLabel("CSV file", { exact: true }).setInputFiles(csv(PEOPLE));
+      await page.getByRole("button", { name: "Upload", exact: true }).click();
+      await expect(page.getByRole("alert")).toContainText(text);
+    } finally {
+      await page.unroute(glob);
+    }
+  }
+});
+
+test("starting an import while another runs says so, and says the file is fine", async () => {
+  await upload(csv(PEOPLE));
+  await review("Email Address");
+  const glob = "**/api/v1/workspaces/*/imports/*/start";
+  await refuse(glob, 409, "import-in-progress");
+  try {
+    await runButton().click();
+    await expect(page.getByRole("alert")).toContainText("Another import is already running");
+    await expect(page.getByRole("alert")).toContainText("Nothing is wrong with this file");
+  } finally {
+    await page.unroute(glob);
+  }
+});
+
 test("a reload of the mapping screen says the upload is gone rather than showing nothing", async () => {
   await upload(csv(PEOPLE));
   await page.reload();
@@ -400,7 +445,6 @@ test("the rejected rows page, and the CSV starts with the row the table starts w
   await expect(body).toHaveCount(4); // the header and three rejected rows, in file order
   const first = await body.nth(1).locator("th, td").allTextContents();
   // The line the row is on in the file, the header line counted: what a spreadsheet shows.
-  // (The API's schema comment says "data rows only"; `staging.rs` numbers lines. Reported.)
   expect(first[0]).toBe("3");
   expect(first).toContain("not-an-address");
 

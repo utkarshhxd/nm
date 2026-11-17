@@ -19,6 +19,11 @@ const KNOWN = {
   "import-too-large": "That file is over the size limit.",
   "empty-file": "That file has no rows.",
   "too-many-columns": "That file has more columns than an import can take.",
+  // 1,000,000 mirrors the server's MAX_IMPORT_ROWS; its own detail names the cap only as a bare number.
+  "too-many-rows":
+    "That file has more than 1,000,000 rows, the most an import takes. Split it into smaller files and upload them one at a time.",
+  "rate-limited":
+    "Too many uploads from this workspace in the last minute. Nothing is wrong with the file: wait a minute, then upload it again.",
 };
 
 export default function Imports() {

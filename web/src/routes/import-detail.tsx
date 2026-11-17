@@ -97,6 +97,8 @@ class Missing extends Error {}
 
 const KNOWN = {
   "insufficient-role": "Your role cannot run an import. It takes editor or above.",
+  "import-in-progress":
+    "Another import is already running in this workspace, perhaps in another tab or started by someone else. Imports run one at a time. Nothing is wrong with this file: wait for that one to finish, then run this import again.",
 };
 
 /**
