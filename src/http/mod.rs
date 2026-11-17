@@ -19,6 +19,7 @@ pub fn routes() -> Router<AppState> {
         .merge(crate::workspaces::routes())
         .merge(crate::custom_fields::routes::routes())
         .merge(crate::contacts::routes::routes())
+        .merge(crate::contacts::import::routes::routes())
         .merge(crate::lists::routes::routes())
         .merge(crate::segments::routes::routes())
         .merge(crate::tags::routes::routes())
