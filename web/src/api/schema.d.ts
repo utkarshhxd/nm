@@ -1473,7 +1473,14 @@ export interface components {
             reason: string;
             /**
              * Format: int64
-             * @description The row's place in the file, counting data rows only — a header row is not one.
+             * @description **The line the row is on in the file, as a spreadsheet numbers them**, which is what an
+             *     operator has to open the file at. The header row takes line 1 of a headed file and a blank
+             *     line takes a number of its own, so the first data row of a headed file is line 2 and the
+             *     second is line 3.
+             *
+             *     It is therefore **not** an index into the data rows and does not run alongside
+             *     `total_rows`, which counts data rows only: a headed file of 10 rows reports
+             *     `total_rows = 10` and may hold an error on line 11.
              */
             row_number: number;
             /** @description The offending cell as the file held it, cut short. Nothing else of the file is echoed. */
@@ -1888,7 +1895,14 @@ export interface components {
                 reason: string;
                 /**
                  * Format: int64
-                 * @description The row's place in the file, counting data rows only — a header row is not one.
+                 * @description **The line the row is on in the file, as a spreadsheet numbers them**, which is what an
+                 *     operator has to open the file at. The header row takes line 1 of a headed file and a blank
+                 *     line takes a number of its own, so the first data row of a headed file is line 2 and the
+                 *     second is line 3.
+                 *
+                 *     It is therefore **not** an index into the data rows and does not run alongside
+                 *     `total_rows`, which counts data rows only: a headed file of 10 rows reports
+                 *     `total_rows = 10` and may hold an error on line 11.
                  */
                 row_number: number;
                 /** @description The offending cell as the file held it, cut short. Nothing else of the file is echoed. */
@@ -4983,8 +4997,15 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, or too-many-columns */
+            /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, too-many-columns, or too-many-rows */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many uploads for this workspace */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5108,7 +5129,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description import-already-started: an import runs once; or import-duplicate-address, which writes no contact and keeps the rejected rows */
+            /** @description import-in-progress: this workspace is already running an import; import-already-started: an import runs once; or import-duplicate-address, which writes no contact and keeps the rejected rows */
             409: {
                 headers: {
                     [name: string]: unknown;
