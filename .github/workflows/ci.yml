@@ -46,10 +46,15 @@ jobs:
       # has to diff it against their own machine.
       - name: Committed OpenAPI spec is current
         run: |
-          # Not `cargo run … | diff -`: a pipeline's status is the LAST command's, so a generator
-          # that dies prints nothing, `diff` compares an empty stream against the committed file,
-          # and the step reports drift. That misreading cost three runs. Check the generator's own
-          # status first, and keep its stderr — it is the only place the reason appears.
+          # The generator dies on the runner intermittently, writing nothing. Run 44042256634
+          # failed here with a zero-byte stdout; the identical code passed on the very next run.
+          # The cause is still unknown, so the two halves of this gate are kept apart.
+          #
+          # Keeping them apart matters because a pipeline's status is only the LAST command's:
+          # the earlier `cargo run … | diff -` form reported every one of those deaths as drift,
+          # and four runs on main were read as a spec difference that did not exist. Check the
+          # generator's own status first and keep its stderr — when this returns, that file is
+          # the only place the reason will appear.
           if ! cargo run -q -- openapi \
                > "$RUNNER_TEMP/openapi.generated.json" 2> "$RUNNER_TEMP/openapi.stderr"; then
             status=$?
