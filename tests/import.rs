@@ -1235,34 +1235,110 @@ async fn another_workspaces_contact_is_never_updated_by_an_import(pool: PgPool) 
 }
 
 #[sqlx::test]
-async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: PgPool) {
+async fn a_row_the_copy_refused_is_still_one_of_the_five_counts(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let import = insert_import(&pool, ws).await;
     let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
     let mut tx = pool.begin().await.unwrap();
 
-    // The residual window, as close as one transaction can stage it: the contact is inserted, the
-    // tombstone lands afterwards, and the last statement before COMMIT has to take it back out.
-    // Running the upsert twice is what puts the erasure after the insert; the second run therefore
-    // counts the row both in the anti-join and in the delete, which a real race would not, so the
-    // counts are not what this asserts.
+    // Three of the five terms in one file: a row the `COPY` refused (`failed`), a row a later row
+    // of the same file repeats (`collapsed`), and two new contacts (`imported`). The whole reason
+    // `upsert_from_staging` takes `StagingCounts` is that the five come out apportioned here, so
+    // the `COPY`'s own refusals have to be carried into them.
     let staged = copy(
         &mut tx,
         &j,
-        b"email,first_name,last_name,timezone\nada@example.com,Ada,Lovelace,UTC\n",
+        b"email,first_name,last_name,timezone\n\
+          not-an-email,No,Address,UTC\n\
+          ada@example.com,First,Draft,UTC\n\
+          ada@example.com,Last,Word,UTC\n\
+          bob@example.com,Bob,Barker,UTC\n",
     )
     .await;
-    let first = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
-    assert_eq!(first.imported, 1);
-    assert!(contact(&mut tx, ws, "ada@example.com").await.is_some());
+    assert_eq!((staged.total_rows, staged.staged, staged.failed), (4, 3, 1));
+
+    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 2,
+            updated: 0,
+            skipped: 0,
+            collapsed: 1,
+            failed: 1
+        }
+    );
+    assert_eq!(
+        counts.imported + counts.updated + counts.skipped + counts.collapsed + counts.failed,
+        staged.total_rows,
+        "the five are mutually exclusive and are the whole file: {counts:?}"
+    );
+}
+
+#[sqlx::test]
+async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: PgPool) {
+    let (ws, other) = (
+        workspace(&pool, "acme").await,
+        workspace(&pool, "other").await,
+    );
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+
+    // The residual window, as close as one transaction can stage it. The first three rows are
+    // already contacts under the ids THIS import minted for them, which is exactly the state the
+    // insert leaves behind, and the tombstones land after that — where the anti-join in the insert
+    // can no longer see them and only the last statement before COMMIT can.
+    //
+    // The last three rows are new, and they are here to keep the call honest: the delete may only
+    // take back rows this import inserted, so `inserted >= gone` is an invariant of the real path
+    // and `upsert_from_staging` asserts it. Two expected deletions need two insertions, and the
+    // third insertion is the slack that lets a THIRD, wrong deletion reach the assertion below
+    // that names it, instead of tripping the invariant first.
+    let staged = copy(
+        &mut tx,
+        &j,
+        b"email,first_name,last_name,timezone\n\
+          ada@example.com,Ada,Lovelace,UTC\n\
+          ins@example.com,Ins,Tance,UTC\n\
+          theirs@example.com,Their,Erasure,UTC\n\
+          bob@example.com,Bob,Barker,UTC\n\
+          carol@example.com,Carol,Shaw,UTC\n\
+          dave@example.com,Dave,Theurer,UTC\n",
+    )
+    .await;
+    sqlx::query(AssertSqlSafe(format!(
+        "insert into contacts (id, workspace_id, email) \
+         select id, $1, email from {} where row_number between 2 and 4",
+        staging_table(import)
+    )))
+    .bind(ws)
+    .execute(&mut *tx)
+    .await
+    .expect("the state the insert leaves behind");
 
     erase(&mut tx, Some(ws), "ada@example.com").await;
-    let second = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    erase(&mut tx, None, "ins@example.com").await;
+    // Another workspace's erasure reaches nothing here, and the sweep deleting this contact would
+    // be a cross-workspace deletion of a row this import had just created.
+    erase(&mut tx, Some(other), "theirs@example.com").await;
+
+    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
     assert!(
         contact(&mut tx, ws, "ada@example.com").await.is_none(),
-        "the contact this import inserted is gone once the erasure lands"
+        "this workspace's tombstone takes the contact back out"
     );
-    assert!(second.failed >= 1, "{second:?}");
+    assert!(
+        contact(&mut tx, ws, "ins@example.com").await.is_none(),
+        "an instance-wide tombstone takes it out too"
+    );
+    assert!(
+        contact(&mut tx, ws, "theirs@example.com").await.is_some(),
+        "another workspace's tombstone may not delete this workspace's contact"
+    );
+    // The counts double-count here — this one call sees both the anti-join and the delete match
+    // the same two rows, which a real race never would — so only the floor is asserted.
+    assert!(counts.failed >= 2, "{counts:?}");
 }
 
 // ---- Task 5: the staging defects this task was handed -----------------------------------------

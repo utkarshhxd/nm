@@ -467,6 +467,14 @@ pub async fn upsert_from_staging(
     .fetch_one(&mut *conn)
     .await?;
 
+    // `gone` can only name contacts this call's insert created: its ids come from the staging
+    // table, and those are v7s minted row by row in `stage_row` that exist nowhere else. If that
+    // ever stops holding, `imported` goes negative and the operator's report is nonsense — so say
+    // so here rather than clamping, which would hide the break that caused it.
+    debug_assert!(
+        inserted >= gone,
+        "the erasure sweep deleted {gone} contacts, but this import inserted {inserted}"
+    );
     Ok(UpsertCounts {
         imported: inserted - gone,
         updated,
