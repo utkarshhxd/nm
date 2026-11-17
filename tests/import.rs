@@ -16,7 +16,7 @@ async fn workspace(pool: &PgPool, slug: &str) -> Uuid {
 
 async fn insert_import(pool: &PgPool, ws: Uuid) -> Uuid {
     let id = Uuid::now_v7();
-    sqlx::query("insert into imports (id, workspace_id, status, filename) values ($1, $2, 'pending', 'a.csv')")
+    sqlx::query("insert into imports (id, workspace_id, status, filename, delimiter, has_header) values ($1, $2, 'pending', 'a.csv', 44, true)")
         .bind(id)
         .bind(ws)
         .execute(pool)
@@ -120,8 +120,8 @@ async fn an_import_cannot_name_another_workspaces_list(pool: PgPool) {
         let pool = pool.clone();
         async move {
             sqlx::query(
-                "insert into imports (id, workspace_id, status, filename, list_id) \
-                 values ($1, $2, 'pending', 'a.csv', $3)",
+                "insert into imports (id, workspace_id, status, filename, delimiter, has_header, list_id) \
+                 values ($1, $2, 'pending', 'a.csv', 44, true, $3)",
             )
             .bind(Uuid::now_v7())
             .bind(ws)
@@ -277,6 +277,14 @@ async fn a_tab_separated_file_is_detected(pool: PgPool) {
     assert_eq!(body["delimiter"], "\t");
     assert_eq!(body["columns"].as_array().unwrap().len(), 3);
     assert_eq!(body["columns"][2]["samples"], json!(["Lovelace, Countess"]));
+    // What the operator was shown is what is stored, so the run cannot sniff differently.
+    let (delimiter, has_header): (i16, bool) =
+        sqlx::query_as("select delimiter, has_header from imports where id = $1")
+            .bind(body["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((delimiter, has_header), (9, true));
 }
 
 #[sqlx::test]

@@ -25,6 +25,13 @@
 -- row count is unknown until that finishes. NULL means "still counting", which is true; a `not
 -- null default 0` would report an empty file for an import that has not read its first row.
 --
+-- `delimiter` and `has_header` are what the sniff reported at upload, stored because the operator
+-- confirms a mapping against THOSE columns: a second sniff at start could disagree and silently
+-- re-point every column. The start request does not carry them. `delimiter` is the delimiter byte
+-- as a `smallint` (0..=255), not `"char"`: `"char"` is Postgres's internal one-byte type and
+-- sqlx has no friendly mapping for a byte in it, while `smallint` reads back as `i16` and the
+-- check keeps it a byte. Both are not null: an import row exists only because an upload was sniffed.
+--
 -- `unique (workspace_id, id)` is not redundant with the primary key: `import_errors` takes a
 -- composite foreign key onto it, so an error row cannot name another workspace's import. The
 -- database refuses it, not a handler.
@@ -32,6 +39,7 @@ create table imports (id uuid primary key,
   workspace_id uuid not null references workspaces(id) on delete cascade,
   status text not null check (status in ('pending','running','complete','failed')),
   filename text not null,
+  delimiter smallint not null check (delimiter between 0 and 255), has_header boolean not null,
   mapping jsonb, dedup text, list_id uuid,
   imported bigint not null default 0, updated bigint not null default 0,
   skipped bigint not null default 0, failed bigint not null default 0,

@@ -247,11 +247,13 @@ pub async fn create_import(
         Principal::ApiKey { .. } => None,
     };
     sqlx::query!(
-        "insert into imports (id, workspace_id, status, filename, created_by) \
-         values ($1, $2, 'pending', $3, $4)",
+        "insert into imports (id, workspace_id, status, filename, delimiter, has_header, created_by) \
+         values ($1, $2, 'pending', $3, $4, $5, $6)",
         id,
         workspace_id,
         filename,
+        i16::from(sniffed.delimiter),
+        sniffed.has_header,
         created_by,
     )
     .execute(&mut *tx)
