@@ -3,8 +3,9 @@
 -- One row per CSV upload, and one row per CSV row it rejected (spec M1c section 7).
 --
 -- THE FIVE ROW-LEVEL COUNTS ARE MUTUALLY EXCLUSIVE: every row of the file lands in exactly one of
--- `imported`, `updated`, `skipped`, `collapsed`, `failed`, so those five sum to `total_rows`. The
--- report test asserts exactly that. `suppressed` and `memberships_declined` are NOT row-level: they
+-- `imported`, `updated`, `skipped`, `collapsed`, `failed`, so on a `complete` import those five sum to
+-- `total_rows` (a `failed` one died part-way: they may not sum, and `total_rows` may be NULL). The
+-- report test asserts exactly that for `complete`. `suppressed` and `memberships_declined` are NOT row-level: they
 -- describe rows already counted in one of the five (a suppressed address is still an `imported` or
 -- `updated` contact, whose membership is simply not mailable; a declined membership is a contact
 -- that was imported or updated while its subscription was refused). Adding all seven counts rows
