@@ -820,6 +820,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/imports/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The import's report. Every count is named separately, and the five row-level ones sum to
+         *     `total_rows` on a `complete` import — see [`ImportReport`] for which five and why the other
+         *     two are not among them.
+         */
+        get: operations["get_import"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/imports/{id}/errors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The rows this import rejected, in file order, a page at a time.
+         * @description **This is the first `errors_recorded` rejected rows, not necessarily all of them.** An import
+         *     keeps at most [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) error rows while its
+         *     `failed` count counts every rejected row, so on a worse file the end of this list is the end
+         *     of what was kept and not the end of the damage. `GET /imports/{id}` reports both numbers, and
+         *     a client that shows this list shows them together.
+         */
+        get: operations["list_import_errors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/lists": {
         parameters: {
             query?: never;
@@ -1377,6 +1422,107 @@ export interface components {
             /** @description The browser's `PublicKeyCredential`, in WebAuthn JSON form. */
             credential: Record<string, never>;
         };
+        /**
+         * @description One rejected row, as the operator has to read it: which row, which column, why, and the cell
+         *     that did it.
+         */
+        ImportErrorRow: {
+            /** @description The column to blame, where one column is to blame. */
+            column_name?: string | null;
+            reason: string;
+            /**
+             * Format: int64
+             * @description The row's place in the file, counting data rows only — a header row is not one.
+             */
+            row_number: number;
+            /** @description The offending cell as the file held it, cut short. Nothing else of the file is echoed. */
+            value?: string | null;
+        };
+        /**
+         * @description What an import did, count by count (spec 7.5): *"'Imported 940,000 of 1,000,000' with no
+         *     breakdown is not a report."*
+         *
+         *     **`imported`, `updated`, `skipped`, `collapsed` and `failed` are the five row-level counts**,
+         *     and they are mutually exclusive: every row of the file lands in exactly one of them, so on a
+         *     `complete` import they sum to `total_rows`. (A `failed` import died part-way: its counts are
+         *     what it got to, and `total_rows` may still be `null`.)
+         *
+         *     **`suppressed` and `memberships_declined` are not row-level.** They describe rows already
+         *     counted among the five — a suppressed address is still an imported or updated contact, and a
+         *     declined subscription belongs to one — so adding all seven counts those rows twice.
+         */
+        ImportReport: {
+            /**
+             * Format: int64
+             * @description Rows a later row of the same file names the same address as. Not `skipped`: the file
+             *     de-duplicated itself, and the database never had these rows.
+             */
+            collapsed: number;
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * @description Why the import as a whole failed, and `null` otherwise. Never one row's reason: those are
+             *     in `GET /imports/{id}/errors`.
+             */
+            error_reason?: string | null;
+            /**
+             * Format: int64
+             * @description How many rejected rows `GET /imports/{id}/errors` can show. An import keeps at most
+             *     [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) of them while `failed` counts
+             *     every one, so **when this is less than `failed`, that list is the first `errors_recorded`
+             *     rejected rows in file order and not all of them** — an operator who pages to the end of it
+             *     has not seen everything wrong with the file, and has to be told so.
+             */
+            errors_recorded: number;
+            /**
+             * Format: int64
+             * @description Every rejected row. [`ImportReport::errors_recorded`] is how many of them were kept.
+             */
+            failed: number;
+            /** @description What the file was called when it was uploaded. A label; nothing opens it. */
+            filename: string;
+            /** Format: date-time */
+            finished_at?: string | null;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: int64
+             * @description Rows that became a new contact.
+             */
+            imported: number;
+            /**
+             * Format: int64
+             * @description Subscriptions this import asked for and did not get, because the address is already
+             *     `unsubscribed` on that list. The contact itself was still imported or updated.
+             */
+            memberships_declined: number;
+            /**
+             * Format: int64
+             * @description Rows left alone because the contact already existed (`skip existing`).
+             */
+            skipped: number;
+            /** Format: date-time */
+            started_at?: string | null;
+            /** @description `pending`, `running`, `complete` or `failed`. */
+            status: string;
+            /**
+             * Format: int64
+             * @description Imported or updated contacts whose address or domain is suppressed. They exist and they
+             *     are not mailable — said here rather than discovered at send time.
+             */
+            suppressed: number;
+            /**
+             * Format: int64
+             * @description `null` while the `COPY` is still counting the file. Not `0`, which would report an empty
+             *     file for an import that has not read its first row.
+             */
+            total_rows?: number | null;
+            /**
+             * Format: int64
+             * @description Rows applied to a contact that already existed.
+             */
+            updated: number;
+        };
         /** @description What the invitee sees before accepting. */
         InvitePreview: {
             /** @description Whether to show a sign-in or a set-a-password form. */
@@ -1691,6 +1837,21 @@ export interface components {
                 label: string;
                 /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
                 options: string[];
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_ImportErrorRow: {
+            data: {
+                /** @description The column to blame, where one column is to blame. */
+                column_name?: string | null;
+                reason: string;
+                /**
+                 * Format: int64
+                 * @description The row's place in the file, counting data rows only — a header row is not one.
+                 */
+                row_number: number;
+                /** @description The offending cell as the file held it, cut short. Nothing else of the file is echoed. */
+                value?: string | null;
             }[];
             next_cursor?: string | null;
         };
@@ -4639,6 +4800,81 @@ export interface operations {
                 content?: never;
             };
             /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, or too-many-columns */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Import id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportReport"];
+                };
+            };
+            /** @description not a member, or no such import in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_import_errors: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Import id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description File order, oldest row first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ImportErrorRow"];
+                };
+            };
+            /** @description not a member, or no such import in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
             422: {
                 headers: {
                     [name: string]: unknown;

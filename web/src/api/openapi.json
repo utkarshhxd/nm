@@ -2821,6 +2821,121 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/imports/{id}": {
+      "get": {
+        "tags": [
+          "crate::contacts::import::routes"
+        ],
+        "summary": "The import's report. Every count is named separately, and the five row-level ones sum to\n`total_rows` on a `complete` import — see [`ImportReport`] for which five and why the other\ntwo are not among them.",
+        "operationId": "get_import",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Import id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such import in this workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/imports/{id}/errors": {
+      "get": {
+        "tags": [
+          "crate::contacts::import::routes"
+        ],
+        "summary": "The rows this import rejected, in file order, a page at a time.",
+        "description": "**This is the first `errors_recorded` rejected rows, not necessarily all of them.** An import\nkeeps at most [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) error rows while its\n`failed` count counts every rejected row, so on a worse file the end of this list is the end\nof what was kept and not the end of the damage. `GET /imports/{id}` reports both numbers, and\na client that shows this list shows them together.",
+        "operationId": "list_import_errors",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Import id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File order, oldest row first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ImportErrorRow"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such import in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/lists": {
       "get": {
         "tags": [
@@ -4837,6 +4952,143 @@
           }
         }
       },
+      "ImportErrorRow": {
+        "type": "object",
+        "description": "One rejected row, as the operator has to read it: which row, which column, why, and the cell\nthat did it.",
+        "required": [
+          "row_number",
+          "reason"
+        ],
+        "properties": {
+          "column_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The column to blame, where one column is to blame."
+          },
+          "reason": {
+            "type": "string"
+          },
+          "row_number": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row's place in the file, counting data rows only — a header row is not one."
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The offending cell as the file held it, cut short. Nothing else of the file is echoed."
+          }
+        }
+      },
+      "ImportReport": {
+        "type": "object",
+        "description": "What an import did, count by count (spec 7.5): *\"'Imported 940,000 of 1,000,000' with no\nbreakdown is not a report.\"*\n\n**`imported`, `updated`, `skipped`, `collapsed` and `failed` are the five row-level counts**,\nand they are mutually exclusive: every row of the file lands in exactly one of them, so on a\n`complete` import they sum to `total_rows`. (A `failed` import died part-way: its counts are\nwhat it got to, and `total_rows` may still be `null`.)\n\n**`suppressed` and `memberships_declined` are not row-level.** They describe rows already\ncounted among the five — a suppressed address is still an imported or updated contact, and a\ndeclined subscription belongs to one — so adding all seven counts those rows twice.",
+        "required": [
+          "id",
+          "status",
+          "filename",
+          "imported",
+          "updated",
+          "skipped",
+          "collapsed",
+          "failed",
+          "suppressed",
+          "memberships_declined",
+          "errors_recorded",
+          "created_at"
+        ],
+        "properties": {
+          "collapsed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows a later row of the same file names the same address as. Not `skipped`: the file\nde-duplicated itself, and the database never had these rows."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the import as a whole failed, and `null` otherwise. Never one row's reason: those are\nin `GET /imports/{id}/errors`."
+          },
+          "errors_recorded": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many rejected rows `GET /imports/{id}/errors` can show. An import keeps at most\n[`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) of them while `failed` counts\nevery one, so **when this is less than `failed`, that list is the first `errors_recorded`\nrejected rows in file order and not all of them** — an operator who pages to the end of it\nhas not seen everything wrong with the file, and has to be told so."
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Every rejected row. [`ImportReport::errors_recorded`] is how many of them were kept."
+          },
+          "filename": {
+            "type": "string",
+            "description": "What the file was called when it was uploaded. A label; nothing opens it."
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "imported": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows that became a new contact."
+          },
+          "memberships_declined": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Subscriptions this import asked for and did not get, because the address is already\n`unsubscribed` on that list. The contact itself was still imported or updated."
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows left alone because the contact already existed (`skip existing`)."
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending`, `running`, `complete` or `failed`."
+          },
+          "suppressed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Imported or updated contacts whose address or domain is suppressed. They exist and they\nare not mailable — said here rather than discovered at send time."
+          },
+          "total_rows": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`null` while the `COPY` is still counting the file. Not `0`, which would report an empty\nfile for an import that has not read its first row."
+          },
+          "updated": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Rows applied to a contact that already existed."
+          }
+        }
+      },
       "InvitePreview": {
         "type": "object",
         "description": "What the invitee sees before accepting.",
@@ -5790,6 +6042,55 @@
                     "type": "string"
                   },
                   "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_ImportErrorRow": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One rejected row, as the operator has to read it: which row, which column, why, and the cell\nthat did it.",
+              "required": [
+                "row_number",
+                "reason"
+              ],
+              "properties": {
+                "column_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The column to blame, where one column is to blame."
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "row_number": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "The row's place in the file, counting data rows only — a header row is not one."
+                },
+                "value": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The offending cell as the file held it, cut short. Nothing else of the file is echoed."
                 }
               }
             }
