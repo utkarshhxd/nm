@@ -768,3 +768,97 @@ async fn a_row_wider_than_its_header_is_an_error_row_but_a_trailing_delimiter_is
     assert_eq!(errors[0].0, 2);
     assert!(errors[0].2.contains("3 fields"), "{}", errors[0].2);
 }
+
+// ---- Task 4, fix round 1: the parser's two growth paths, and their caps ------------------------
+
+use nm::contacts::import::{routes::MAX_IMPORT_COLUMNS, staging::MAX_RECORD_BYTES};
+
+#[sqlx::test]
+async fn a_row_with_more_fields_than_the_column_cap_is_refused_and_the_rows_after_it_stage(
+    pool: PgPool,
+) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job(import, ws, email_column(), vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Past the cap the parser throws the record away as it reads it, so the offsets it would have
+    // needed are never allocated. The rows after it must still be read out of the same stream.
+    let wide = "x,".repeat(MAX_IMPORT_COLUMNS + 100);
+    let csv = format!("email\na@b.co\n{wide}\nc@d.co\n");
+    let counts = copy(&mut tx, &j, csv.as_bytes()).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (3, 2, 1));
+    assert_eq!(
+        staged(&mut tx, import).await,
+        [(2, "a@b.co".to_owned()), (4, "c@d.co".to_owned())]
+    );
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 3);
+    assert!(
+        errors[0].2.contains(&format!("more than {MAX_IMPORT_COLUMNS} fields")),
+        "{}",
+        errors[0].2
+    );
+}
+
+#[sqlx::test]
+async fn a_cell_larger_than_the_parsers_buffer_stages_intact(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::Tags),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Over the 8 KiB the output buffer starts at, so the record only parses if the buffer grows
+    // and the offsets carry across the grow. Under `MAX_RECORD_BYTES`, so it is a legitimate row.
+    let big = "t".repeat(20_000);
+    let csv = format!("email,tags\na@b.co,{big}\nc@d.co,x\n");
+    let counts = copy(&mut tx, &j, csv.as_bytes()).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 2, 0));
+
+    let tags: Value = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select tags from {} where row_number = 2",
+        staging_table(import)
+    )))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(tags, json!([big]), "the big cell survives the grow intact");
+}
+
+#[sqlx::test]
+async fn a_row_over_the_record_byte_cap_is_refused_for_its_length_not_its_width(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::Tags),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // One record over the cap: without it the buffer would double until it held the rest of the
+    // file, which an unclosed quote makes as big as the upload. The row is refused for its
+    // LENGTH — a row that is too long and a row that is too wide send the operator to different
+    // places in their file — and the row after it still stages, from the same stream.
+    let huge = "z".repeat(MAX_RECORD_BYTES + 1024);
+    let csv = format!("email,tags\na@b.co,{huge}\nc@d.co,x\n");
+    let counts = copy(&mut tx, &j, csv.as_bytes()).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
+    assert_eq!(staged(&mut tx, import).await, [(3, "c@d.co".to_owned())]);
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 2);
+    let reason = &errors[0].2;
+    assert!(reason.contains("longer than"), "{reason}");
+    assert!(
+        !reason.contains("columns"),
+        "a long row must not be reported as a wide one: {reason}"
+    );
+}

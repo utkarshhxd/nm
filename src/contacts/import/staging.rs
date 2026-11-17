@@ -12,6 +12,13 @@
 //! without either holding the whole file in memory or bridging to a blocking thread (the
 //! connection is borrowed by the `COPY` for the whole stream, so nothing else may touch it).
 //!
+//! **What "without holding the whole file" costs is a cap on one record**, because a CSV record is
+//! only over when the file says so: an unterminated `"` makes the rest of the upload one record,
+//! and a file of nothing but delimiters one row of millions of fields. So the parser's two buffers
+//! are bounded by [`MAX_RECORD_BYTES`] and [`MAX_IMPORT_COLUMNS`], and a record past either is
+//! consumed and refused at constant memory while the rows after it are still read. An import's
+//! memory is therefore a row's worth, whatever is in the file.
+//!
 //! Three decisions this module implements rather than revisits:
 //!
 //! 1. **Ids are `Uuid::now_v7()`, minted in Rust.** Never `gen_random_uuid()`: a selection's
@@ -61,6 +68,18 @@ pub const MAX_IMPORT_ERRORS: usize = 10_000;
 /// `import_errors.value` exists to show the operator what failed, not to keep a copy of the file.
 const MAX_ERROR_VALUE_CHARS: usize = 200;
 
+/// The most field data one record may hold before it is refused unread.
+///
+/// It bounds the parser's output buffer, which is the only thing in this module that grows with
+/// the file rather than with a row. Without it one unterminated `"` makes the rest of the upload a
+/// single record, and `MAX_IMPORT_BYTES` (512 MiB) becomes the bound: the final doubling would
+/// hold the old 512 MiB and the new 1 GiB at once, per import running. A megabyte is some five
+/// hundred times a fat contact row with a dozen attributes, so nothing an operator meant to import
+/// reaches it — and a record that does is refused **by its size**, in those words, because telling
+/// someone their row is too wide when their cell is too long sends them looking in the wrong
+/// place.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+
 /// The staging columns, in the order every statement here writes them.
 const COLUMNS: &str =
     "row_number, id, email, email_hmac, first_name, last_name, timezone, attributes, tags, lists";
@@ -81,6 +100,18 @@ pub struct StagingCounts {
 /// injectable.
 pub fn staging_table(import_id: Uuid) -> String {
     format!("import_staging_{}", import_id.simple())
+}
+
+/// A record the parser threw away as it read it, rather than hand over: it was past one of the
+/// two caps that keep a row's memory a row's worth. Such a record comes back with no fields at
+/// all, so nothing downstream reads the buffers it was rewound out of. Each is its own
+/// `import_errors` reason: too long and too wide send the operator to different places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Oversize {
+    /// More than [`MAX_IMPORT_COLUMNS`] fields.
+    Fields,
+    /// More than [`MAX_RECORD_BYTES`] of field data.
+    Bytes,
 }
 
 /// One rejected row, held until the `COPY` gives the connection back.
@@ -148,7 +179,7 @@ pub async fn copy_into_staging(
     // `let … else` and not `while let`: a `while let` scrutinee's temporaries live for the whole
     // body, and the `&mut out` among them would collide with reading the record out of `out`.
     loop {
-        let Some((nend, wide)) = csv
+        let Some((nend, oversize)) = csv
             .next(&mut out, &mut ends)
             .await
             .map_err(|e| ApiError::Internal(e.into()))?
@@ -159,7 +190,7 @@ pub async fn copy_into_staging(
         let cells = fields(&out, &ends[..nend]);
         // A blank line is not a row, the way the `csv` crate also reads it. It still advances the
         // row number, so an error row points at the line the operator's spreadsheet shows.
-        if !wide && cells.len() <= 1 && cells.first().is_none_or(|f| f.is_empty()) {
+        if oversize.is_none() && cells.len() <= 1 && cells.first().is_none_or(|f| f.is_empty()) {
             continue;
         }
         // Lossily, unlike every data cell below: a header here is only the label an error row
@@ -173,7 +204,7 @@ pub async fn copy_into_staging(
             continue;
         }
         counts.total_rows += 1;
-        match stage_row(secrets, import, &headers, row, &cells, wide) {
+        match stage_row(secrets, import, &headers, row, &cells, oversize) {
             Ok(line) => {
                 counts.staged += 1;
                 buf.push_str(&line);
@@ -241,7 +272,7 @@ fn stage_row(
     headers: &[String],
     row: i64,
     cells: &[&[u8]],
-    wide: bool,
+    oversize: Option<Oversize>,
 ) -> Result<String, RowError> {
     let name = |i: usize| {
         headers
@@ -263,22 +294,32 @@ fn stage_row(
     // truncating writes that plausible-looking wrong data into the right-looking columns with
     // nothing saying so. Extra fields that are all empty are a trailing delimiter, which is
     // common, harmless, and dropped in silence.
-    if wide
-        || (cells.len() > job.mapping.len()
-            && cells[job.mapping.len()..].iter().any(|f| !f.is_empty()))
-    {
-        let found = if wide {
-            format!("more than {MAX_IMPORT_COLUMNS}")
-        } else {
-            cells.len().to_string()
+    //
+    // A record the parser threw away unread is refused here too, in its own words: a row over
+    // `MAX_RECORD_BYTES` is told it is too long, not too wide, because the two faults send the
+    // operator to different places in their file.
+    let too_wide = cells.len() > job.mapping.len()
+        && cells[job.mapping.len()..].iter().any(|f| !f.is_empty());
+    if oversize.is_some() || too_wide {
+        let reason = match oversize {
+            Some(Oversize::Bytes) => format!(
+                "the row is longer than the {MAX_RECORD_BYTES} bytes one row may hold; \
+                 an unclosed quote earlier in the file can do this"
+            ),
+            Some(Oversize::Fields) => format!(
+                "the row has more than {MAX_IMPORT_COLUMNS} fields and the file has {} columns",
+                job.mapping.len()
+            ),
+            None => format!(
+                "the row has {} fields and the file has {} columns",
+                cells.len(),
+                job.mapping.len()
+            ),
         };
         return Err(RowError {
             row,
             column: None,
-            reason: format!(
-                "the row has {found} fields and the file has {} columns",
-                job.mapping.len()
-            ),
+            reason,
             value: None,
         });
     }
@@ -470,22 +511,28 @@ impl<R: AsyncRead + Unpin> Csv<R> {
         }
     }
 
-    /// The next record, as the number of fields written into `ends` and whether it was too wide.
-    /// `None` at the end of the file.
+    /// The next record, as the number of fields written into `ends` and, when the parser threw it
+    /// away instead, why. `None` at the end of the file.
     ///
-    /// `ends` grows to at most [`MAX_IMPORT_COLUMNS`] + 1: past that the record is consumed and
-    /// thrown away, so a file of nothing but delimiters cannot make one row's offsets outgrow
-    /// memory. `out` grows to whatever one record needs, which the upload's byte cap bounds.
+    /// **Both buffers are capped, and a record past either cap is consumed at constant memory**:
+    /// the offsets rewind, the parser keeps running to the record's end so the rows after it are
+    /// still read, and the caller gets the reason to put in an `import_errors` row. `ends` stops
+    /// at [`MAX_IMPORT_COLUMNS`] + 1 and `out` at [`MAX_RECORD_BYTES`], so neither the file's size
+    /// nor a stray quote in it decides how much memory one import holds.
     async fn next(
         &mut self,
         out: &mut Vec<u8>,
         ends: &mut Vec<usize>,
-    ) -> std::io::Result<Option<(usize, bool)>> {
-        let (mut nout, mut nend, mut wide) = (0, 0, false);
+    ) -> std::io::Result<Option<(usize, Option<Oversize>)>> {
+        let (mut nout, mut nend) = (0, 0);
+        let mut oversize: Option<Oversize> = None;
         loop {
-            if wide {
+            if oversize.is_some() {
                 // The record is already refused; keep the parser moving over the rest of it with
-                // the buffers rewound, so neither one grows for it.
+                // the buffers rewound, so neither one grows for it. What is in them is then
+                // nonsense — `read_record` writes each end as a position in the whole record, so
+                // after a rewind they no longer index `out` at all — which is why a refused
+                // record is handed back with no fields rather than with these.
                 nout = 0;
                 nend = 0;
             }
@@ -505,18 +552,22 @@ impl<R: AsyncRead + Unpin> Csv<R> {
             match result {
                 csv_core::ReadRecordResult::InputEmpty => {}
                 csv_core::ReadRecordResult::OutputFull => {
-                    if !wide {
-                        out.resize(out.len() * 2, 0);
+                    if out.len() >= MAX_RECORD_BYTES {
+                        oversize = oversize.or(Some(Oversize::Bytes));
+                    } else {
+                        out.resize((out.len() * 2).min(MAX_RECORD_BYTES), 0);
                     }
                 }
                 csv_core::ReadRecordResult::OutputEndsFull => {
                     if ends.len() > MAX_IMPORT_COLUMNS {
-                        wide = true;
+                        oversize = oversize.or(Some(Oversize::Fields));
                     } else {
                         ends.resize((ends.len() * 2).min(MAX_IMPORT_COLUMNS + 1), 0);
                     }
                 }
-                csv_core::ReadRecordResult::Record => return Ok(Some((nend, wide))),
+                csv_core::ReadRecordResult::Record => {
+                    return Ok(Some((if oversize.is_some() { 0 } else { nend }, oversize)));
+                }
                 csv_core::ReadRecordResult::End => return Ok(None),
             }
         }
