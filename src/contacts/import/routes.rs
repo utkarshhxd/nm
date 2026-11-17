@@ -325,6 +325,16 @@ pub async fn create_import(
 
 /// The body length the client declared, where it declared one. A chunked upload declares none and
 /// is counted as it streams instead, by [`receive`].
+///
+/// **What answering early buys, and where it stops.** The refusal goes out before a byte of the
+/// body is read, which is what gets a problem body to a client that is still uploading rather than
+/// a dead connection. The server then closes with that body unread, and a close over unread data
+/// is a TCP reset — `an_upload_declaring_more_than_the_cap_is_413_with_a_problem_body` shows the
+/// answer surviving one, with 8 MB in flight, reading concurrently and not — **but that is Linux
+/// over loopback, which is the only stack this repo can test**. Another TCP stack, or a middlebox
+/// between, may drop a receive buffer on a reset and take the answer with it. The only cure that
+/// does not depend on the client's stack is reading and discarding the whole body before
+/// answering, which is the half-gigabyte of work this refusal exists to avoid.
 fn declared_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_LENGTH)?
@@ -679,6 +689,7 @@ const FILE_GONE: &str = "the uploaded file is no longer on this server; upload i
 /// ever — otherwise happens in silence. The path is [`upload_path`]'s, derived from the import id,
 /// so it carries nothing secret. "Already gone" is not a failure: that is the `import-file-gone`
 /// path, which ends an import whose file was the thing that was missing.
+///
 /// Answers whether THIS call removed the file, which is what [`sweep_orphaned_uploads`] counts: a
 /// sweep that reported the files it meant to take rather than the ones it took would log work it
 /// had not done.

@@ -3558,11 +3558,23 @@ async fn an_upload_declaring_more_than_the_cap_is_413_with_a_problem_body(pool: 
          Connection: close\r\n\r\n"
     );
     writer.write_all(head.as_bytes()).await.expect("send");
+    // THE SENDER OWNS THE WRITE HALF, AND DROPPING IT IS WHAT CLOSES IT. That matters for more
+    // than tidiness: it is the whole mechanism of this test's mutation. With the precheck removed
+    // the server reads the body instead of refusing it, this task writes its 8 MB and ends, the
+    // write half drops and sends FIN, the multipart parser hits the end of a body that promised a
+    // gigabyte, and only then does the server answer. The `refused` assertion below is what
+    // notices.
     let sending = tokio::spawn(async move {
         let chunk = vec![b'x'; 64 * 1024];
         // 8 MB of a declared 1 GB, which is more than the socket's buffers hold, so the server is
         // refusing a body that is genuinely in flight. The server stops reading, so these writes
         // fail partway: that failure is the condition being tested, not an error.
+        //
+        // THIS DEPENDS ON THE HOST'S SOCKET BUFFERS BEING SMALLER THAN 8 MiB with a receiver that
+        // never reads, which is true of every Linux default and of the CI container. A host that
+        // auto-tunes past that would take the whole body, and the assertion below would red
+        // saying so rather than passing quietly: read that red as "this premise no longer holds
+        // here, raise the figure", not as a flake and not as a defect in the route.
         for sent in 0..128u64 {
             if writer.write_all(&chunk).await.is_err() {
                 return (sent * 64 * 1024, true);

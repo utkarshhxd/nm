@@ -80,11 +80,13 @@ pub const EXPORT_PER_MINUTE: u32 = 5;
 /// between a client and a hammer, and it has to sit **above the fastest legitimate client there
 /// is**, which is the e2e harness driving the real screen: `web/e2e/import.spec.ts` makes about 25
 /// uploads into one workspace, serially, as fast as a browser will go, and
-/// `web/e2e/worst-case-data.spec.ts` makes up to 8 per `everyScreen` pass over four passes, about
-/// 32 into its own. One a second is past what either can reach — each of those uploads costs a
-/// navigation, a file chooser and a round trip — and past what a person at the mapping screen
-/// could ever want, and it still stops the thousands a minute a loop would otherwise get.
-/// **The margin over the harness is about 2×**, so a change to either file that batches uploads
+/// `web/e2e/worst-case-data.spec.ts` makes 8 per full `everyScreen` pass — four upload-bearing
+/// screens in both themes — over the three passes that take the whole `SCREENS` list, so **24**
+/// into its own workspace. (Its fourth call site passes a filtered list with no import screen in
+/// it, and uploads nothing.) One a second is past what either can reach — each of those uploads
+/// costs a navigation, a file chooser and a round trip — and past what a person at the mapping
+/// screen could ever want, and it still stops the thousands a minute a loop would otherwise get.
+/// **The margin over the harness is about 2.5×**, so a change to either file that batches uploads
 /// more tightly is a change that has to be measured against this number.
 ///
 /// This counts uploads, not runs. What bounds the runs is the advisory lock in `start_import`:
