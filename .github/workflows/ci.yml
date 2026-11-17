@@ -24,6 +24,18 @@ jobs:
     env:
       DATABASE_URL: postgres://nm:nm@localhost:5432/nm
       SQLX_OFFLINE: "true"
+      # `cargo test` here linked 32 binaries and died with
+      # `collect2: fatal error: ld terminated with signal 7 [Bus error], core dumped`.
+      # SIGBUS out of `ld` is the shape of a failed mmap on the output file: the runner's disk
+      # filled. Debug info is almost all of it — a hosted runner has ~14 GB free and this tree's
+      # test binaries carry full DWARF.
+      #
+      # This is set in CI only, as environment rather than in Cargo.toml, so a developer keeps
+      # debuggable local builds. It almost certainly also explains the OpenAPI generator that died
+      # on three earlier runs writing nothing: a link killed this way exits non-zero with an empty
+      # stdout, which is exactly what that step's artifact showed.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
