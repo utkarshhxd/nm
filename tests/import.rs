@@ -3367,10 +3367,21 @@ async fn a_file_over_the_row_cap_is_refused_naming_the_cap(pool: PgPool) {
     // and not the request.
     uploaded(&app, ws, "small.csv", &big_csv(999)).await;
 
-    // Counted on line feeds as the file streams, before anything parses it, so the content of the
-    // rows is not what is being tested here: the number of them is.
-    let over = "\n".repeat(MAX_IMPORT_ROWS as usize + 2);
-    let r = upload(&app, ws, "huge.csv", &over).await;
+    // THE EDGE, FROM THE ACCEPTING SIDE. A header and exactly the cap in data rows is the largest
+    // file that passes: the count is line feeds, with one discounted for a header the sniff has
+    // not read yet. The refusal below is this file plus one row and nothing else, so the two
+    // together pin the boundary rather than straddling it.
+    let row = "a\n";
+    uploaded(
+        &app,
+        ws,
+        "at-the-cap.csv",
+        &format!("email\n{}", row.repeat(MAX_IMPORT_ROWS as usize)),
+    )
+    .await;
+
+    let over = format!("email\n{}", row.repeat(MAX_IMPORT_ROWS as usize + 1));
+    let r = upload(&app, ws, "one-row-over.csv", &over).await;
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     let p: Value = r.json();
     assert_eq!(p["type"], "urn:nm:problem:too-many-rows");
@@ -3383,8 +3394,8 @@ async fn a_file_over_the_row_cap_is_refused_naming_the_cap(pool: PgPool) {
     );
     assert_eq!(
         count(&pool, "imports").await,
-        1,
-        "only the control was recorded"
+        2,
+        "the two accepted files were recorded and the refused one was not"
     );
 }
 
@@ -3434,17 +3445,31 @@ async fn a_running_import_is_swept_to_failed_at_boot(pool: PgPool) {
 #[sqlx::test]
 async fn the_upload_of_an_import_that_is_over_is_swept_and_the_others_are_kept(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
-    let (over, pending, stranger) = (
+    let (over, pending, stranger, unremovable) = (
         insert_import(&pool, ws).await,
         insert_import(&pool, ws).await,
         Uuid::now_v7(),
+        insert_import(&pool, ws).await,
     );
     set_status(&pool, over, "complete").await;
+    set_status(&pool, unremovable, "failed").await;
     for id in [over, pending, stranger] {
         std::fs::write(upload_path(id), b"email\n").unwrap();
     }
+    // A path the unlink cannot take, so the sweep has one more target than it can remove. The
+    // count it answers with is what the boot logs, and a log that reports work it did not do is
+    // how a failed unlink becomes invisible.
+    std::fs::create_dir(upload_path(unremovable)).unwrap();
 
-    assert_eq!(sweep_orphaned_uploads(&pool).await.expect("sweep"), 1);
+    assert_eq!(
+        sweep_orphaned_uploads(&pool).await.expect("sweep"),
+        1,
+        "the file it removed, not the two it meant to"
+    );
+    assert!(
+        upload_path(unremovable).exists(),
+        "the one it could not take is still there, and was not counted"
+    );
     assert!(
         !upload_path(over).exists(),
         "the import is over; nothing will read its file again"
@@ -3459,6 +3484,7 @@ async fn the_upload_of_an_import_that_is_over_is_swept_and_the_others_are_kept(p
     );
     std::fs::remove_file(upload_path(pending)).unwrap();
     std::fs::remove_file(upload_path(stranger)).unwrap();
+    std::fs::remove_dir(upload_path(unremovable)).unwrap();
 }
 
 /// AN OPEN THAT FAILS FOR ANY OTHER REASON LEAVES THE IMPORT RETRYABLE. `import-file-gone` is
@@ -3496,7 +3522,15 @@ async fn a_start_whose_upload_cannot_be_opened_leaves_the_import_pending(pool: P
 /// THE 413 HAS TO REACH THE BROWSER AS A PROBLEM BODY. A refusal taken only once the body has been
 /// read answers an upload that is still being sent, and what the browser gets then is a network
 /// error, where the UI's `problemText` never runs. So this test speaks HTTP itself: it declares a
-/// body over the cap, sends none of it, and reads what comes back off the socket.
+/// body over the cap and reads what comes back off the socket.
+///
+/// **And it puts the body in flight**, which is the half that matters. With no body sent, the
+/// handler returns without consuming the request and the close is a clean FIN — every client reads
+/// the answer, and the test would pass against a server that could never answer a real browser. A
+/// browser sending half a gigabyte leaves bytes in the server's receive buffer when it gives up on
+/// them, and a close with unread data is an RST, which can take a response the client has received
+/// but not yet read. So this writes megabytes of the declared body and reads at the same time, as
+/// a browser's socket does.
 #[sqlx::test]
 async fn an_upload_declaring_more_than_the_cap_is_413_with_a_problem_body(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
@@ -3510,9 +3544,10 @@ async fn an_upload_declaring_more_than_the_cap_is_413_with_a_problem_body(pool: 
         url.port().expect("port")
     );
 
-    let mut socket = tokio::net::TcpStream::connect(&host)
+    let socket = tokio::net::TcpStream::connect(&host)
         .await
         .expect("connect");
+    let (mut reader, mut writer) = socket.into_split();
     let declared = MAX_IMPORT_BYTES * 2;
     let head = format!(
         "POST /api/v1/workspaces/{ws}/imports HTTP/1.1\r\n\
@@ -3522,15 +3557,47 @@ async fn an_upload_declaring_more_than_the_cap_is_413_with_a_problem_body(pool: 
          Content-Length: {declared}\r\n\
          Connection: close\r\n\r\n"
     );
-    socket.write_all(head.as_bytes()).await.expect("send");
-    // Bounded: a server that answers only once it has read the body answers this request never,
-    // because not a byte of the body is coming. That is the failure this test is here to catch,
-    // and it has to be a failure and not a hang.
-    let mut answer = String::new();
-    tokio::time::timeout(Duration::from_secs(20), socket.read_to_string(&mut answer))
-        .await
-        .expect("the refusal came before the body, not after it")
-        .expect("read");
+    writer.write_all(head.as_bytes()).await.expect("send");
+    let sending = tokio::spawn(async move {
+        let chunk = vec![b'x'; 64 * 1024];
+        // 8 MB of a declared 1 GB, which is more than the socket's buffers hold, so the server is
+        // refusing a body that is genuinely in flight. The server stops reading, so these writes
+        // fail partway: that failure is the condition being tested, not an error.
+        for sent in 0..128u64 {
+            if writer.write_all(&chunk).await.is_err() {
+                return (sent * 64 * 1024, true);
+            }
+        }
+        (128 * 64 * 1024, false)
+    });
+    // Read as it arrives, as a browser does, and keep whatever arrived: a reset after the answer
+    // is still an answer, and a reset that takes the answer leaves nothing to assert on - which is
+    // the failure this test exists to catch.
+    //
+    // Bounded, because the other failure is silence: a server that answers only once it has read
+    // the body never answers this request at all, and that has to be a failure and not a hang.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .expect("the refusal came before the body, not after it");
+    let (sent, refused) = sending.await.expect("the sending task");
+    // The test's own configuration, pinned: the body really was in flight and the server really
+    // did close under it. Without this the test could quietly become the easy case - a body the
+    // kernel swallowed whole, closed with a clean FIN, which any client reads.
+    assert!(
+        refused,
+        "the server took all {sent} bytes of the body, so this did not test a close over an \
+         unread one"
+    );
+    let answer = String::from_utf8_lossy(&raw).into_owned();
 
     assert!(
         answer.starts_with("HTTP/1.1 413 "),

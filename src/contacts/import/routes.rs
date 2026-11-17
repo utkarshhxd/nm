@@ -679,15 +679,22 @@ const FILE_GONE: &str = "the uploaded file is no longer on this server; upload i
 /// ever — otherwise happens in silence. The path is [`upload_path`]'s, derived from the import id,
 /// so it carries nothing secret. "Already gone" is not a failure: that is the `import-file-gone`
 /// path, which ends an import whose file was the thing that was missing.
-async fn remove_upload(path: &Path) {
-    if let Err(e) = tokio::fs::remove_file(path).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            "could not remove an import's uploaded file",
-        );
+/// Answers whether THIS call removed the file, which is what [`sweep_orphaned_uploads`] counts: a
+/// sweep that reported the files it meant to take rather than the ones it took would log work it
+/// had not done.
+async fn remove_upload(path: &Path) -> bool {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => true,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not remove an import's uploaded file",
+                );
+            }
+            false
+        }
     }
 }
 
@@ -872,9 +879,21 @@ pub async fn start_import(
     // `for update` below is neither half and does not stand in for them. It locks THIS import's
     // row, so two starts of the same import cannot both read `pending`; one import per WORKSPACE
     // is a different claim over rows that statement never sees.
+    //
+    // THE ORDERING HAS A CONSEQUENCE WORTH NAMING. Because this runs before the import is read, a
+    // start naming an id that does not exist — or one belonging to another workspace — answers
+    // `409 import-in-progress` rather than 404 while this workspace has a committed `running`
+    // import. That is not a tenancy leak: the 409 is decided entirely by the caller's OWN
+    // workspace, and says nothing about whether the id exists anywhere. Reading the import first
+    // would give the 404 priority, and would cost the thing the comment above argues for — the
+    // lock has to be held before this request can see another request's state.
     let guard = sqlx::query!(
-        // The seed is this lock's own, so its key space is its own: a later advisory lock keyed on
-        // a workspace id would otherwise take the same key and the two would block each other.
+        // The seed does not create a namespace. `pg_advisory_xact_lock(bigint)` has ONE 64-bit key
+        // space for the whole cluster, and `suppressions::lock_address` is already in it. What the
+        // seed does is keep this key off the plain `hashtextextended(workspace_id::text, 0)` that
+        // another feature locking a workspace would reach for first, so the two cannot become the
+        // same key by having had the same idea. A collision with an unrelated key is a 1-in-2^64
+        // event; this side would answer a spurious 409 and never hang, because it is `try`.
         r#"select pg_try_advisory_xact_lock(hashtextextended($1::uuid::text, 7711)) as "held!",
                   (select id from imports
                     where workspace_id = $1 and status = 'running' limit 1) as "running?""#,
@@ -1102,6 +1121,12 @@ const SWEPT: &str = "the server restarted while this import was running; its fil
 /// `UPDATE`, a restore of a dump taken mid-transaction on another system, or the background runner
 /// this route becomes when a million rows stop fitting in one request. It is cheap, and the state
 /// it clears is one nothing else can clear.
+///
+/// **And on that day this predicate is not enough.** It has no age and no owner: every `running`
+/// row goes, whoever wrote it and however recently. That is harmless while no live import can be
+/// in that state, and wrong the moment one can — a second instance booting would fail the first
+/// instance's import mid-run. Whatever makes `running` reachable has to bring a predicate with it:
+/// an instance id on the row, or an age past which a run cannot still be alive.
 pub async fn sweep_running_imports(pool: &PgPool) -> sqlx::Result<u64> {
     let swept = sqlx::query!(
         "update imports set status = 'failed', error_reason = $1, finished_at = now() \
@@ -1174,10 +1199,11 @@ pub async fn sweep_orphaned_uploads(pool: &PgPool) -> sqlx::Result<u64> {
     )
     .fetch_all(pool)
     .await?;
+    let mut removed = 0;
     for id in &over {
-        remove_upload(&upload_path(*id)).await;
+        removed += u64::from(remove_upload(&upload_path(*id)).await);
     }
-    Ok(over.len() as u64)
+    Ok(removed)
 }
 
 #[cfg(test)]
