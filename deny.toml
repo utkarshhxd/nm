@@ -10,7 +10,24 @@ yanked = "deny"
 # RE-VERIFY ON EVERY `webauthn-rs` OR `crypto-glue` BUMP: crypto-glue already ships private-key
 # operations (`new_key`, `oaep_sha256_decrypt`) that a future version could start using, and this
 # ignore would silently cover that. If either is reached by a new caller, drop the ignore.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0555 (`chrono-tz`), both `unmaintained`: no
+# vulnerability, no exploit, and no patched version can exist, because the finding IS the
+# maintenance status. They arrived from an advisory-database refresh, not from anything this
+# repository changed — `cargo deny` was green on these same versions earlier in this branch.
+#
+# Dropping our direct use would not remove either crate: `sqlx` is built with its `chrono` feature
+# and `utoipa` with its own, so `chrono` arrives transitively whatever we do. Removing it means
+# moving both to the `time` crate and rewriting every timestamp in the tree — a project-wide
+# migration, deliberately not smuggled into an unrelated milestone.
+#
+# RE-VERIFY WHEN EITHER IS TRUE, AND DROP THE IGNORE RATHER THAN EXTEND IT:
+#  - either advisory is reclassified from `unmaintained` to a vulnerability or an unsoundness, or
+#  - `sqlx` and `utoipa` both offer a `time` backend we can take, at which point the migration is
+#    a day's work and this ignore stops being the cheaper answer.
+#
+# An `unmaintained` crate is not harmless over time: the risk is that the next CVE in it never gets
+# a fix. This ignore buys schedule, not safety, and it is reviewed on the triggers above.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0543", "RUSTSEC-2026-0555"]
 
 [licenses]
 version = 2
