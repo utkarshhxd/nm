@@ -3197,3 +3197,400 @@ async fn the_list_is_cursor_paginated_and_ordered_newest_first(pool: PgPool) {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 }
+
+// ---- Task 8: one import per workspace, the row cap, and the boot sweep -------------------------
+
+use std::time::Duration;
+
+use common::api_key;
+use nm::{
+    contacts::import::routes::{
+        MAX_IMPORT_BYTES, MAX_IMPORT_ROWS, sweep_orphaned_uploads, sweep_running_imports,
+    },
+    http::rate_limit::IMPORT_PER_MINUTE,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn set_status(pool: &PgPool, import: Uuid, status: &str) {
+    sqlx::query("update imports set status = $2 where id = $1")
+        .bind(import)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("set status");
+}
+
+async fn error_reason(pool: &PgPool, import: Uuid) -> (Option<String>, bool) {
+    sqlx::query_as("select error_reason, finished_at is not null from imports where id = $1")
+        .bind(import)
+        .fetch_one(pool)
+        .await
+        .expect("read import")
+}
+
+/// A file of `rows` addresses: a run long enough that it is still inside its transaction while the
+/// second request below is made.
+fn big_csv(rows: usize) -> String {
+    let mut csv = String::from("email\n");
+    for i in 0..rows {
+        csv.push_str(&format!("c{i}@example.com\n"));
+    }
+    csv
+}
+
+/// Waits until a session holds an advisory lock in this test's database.
+///
+/// This is what makes the two tests below races rather than hopes: the second start is made while
+/// the first is holding the workspace, not merely soon after it began. Bounded, and silent when it
+/// gives up - with the lock replaced by a status check no lock ever appears, and a test that hung
+/// there would be a worse red than the assertions that follow.
+///
+/// `#[sqlx::test]` gives each test its own database and `pg_locks.database` scopes an advisory
+/// lock to one, so another test's lock is never this one's.
+async fn wait_for_the_workspace_lock(pool: &PgPool) {
+    for _ in 0..200 {
+        let held: i64 = sqlx::query_scalar(
+            "select count(*) from pg_locks where locktype = 'advisory' \
+             and database = (select oid from pg_database where datname = current_database())",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if held > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// An import that is `running` holds its workspace, and the refusal says which one it is: "an
+/// import is already running" with no id sends an operator to look through the list for it.
+#[sqlx::test]
+async fn a_second_import_in_the_same_workspace_is_409(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let mine = upload_kept(&app, ws, "mine.csv", "email\nada@example.com\n").await;
+    let body = json!({"mapping": [field_target("email")]});
+    let theirs = insert_import(&pool, ws).await;
+    set_status(&pool, theirs, "running").await;
+
+    let r = app.post(&start_uri(ws, mine)).json(&body).await;
+    r.assert_status(StatusCode::CONFLICT);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:import-in-progress");
+    assert!(
+        p["detail"].as_str().unwrap().contains(&theirs.to_string()),
+        "the refusal names the import that is holding the workspace: {p}"
+    );
+    // Refused, not ruined: the import is still `pending`, so the operator may start it when the
+    // other one is over, and nothing of its file was written.
+    assert_eq!(import_row(&pool, mine).await.0, "pending");
+    assert_eq!(count(&pool, "contacts").await, 0);
+
+    // Control: with that import over, the same request runs. The refusal above was the running
+    // import and not the route, the mapping or the file.
+    set_status(&pool, theirs, "failed").await;
+    app.post(&start_uri(ws, mine))
+        .json(&body)
+        .await
+        .assert_status_ok();
+    assert_eq!(emails(&pool, ws).await, ["ada@example.com"]);
+}
+
+/// TWO TASKS, TWO CONNECTIONS, BOTH INSIDE THE HANDLER. Called one after the other this proves
+/// nothing: the first start would be over before the second began, and a `select status` check
+/// would pass them both - neither request can see the other's `running`, because the run holds it
+/// inside its own transaction until the COMMIT. That is why the guard is a lock.
+#[sqlx::test]
+async fn two_concurrent_starts_do_not_both_pass_the_check(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let first_app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let second_app = member(&pool, ws, "ed2@example.com", Role::Editor).await;
+    let first = upload_kept(&first_app, ws, "a.csv", &big_csv(5_000)).await;
+    let second = upload_kept(&second_app, ws, "b.csv", "email\nbea@example.com\n").await;
+    let body = json!({"mapping": [field_target("email")]});
+
+    let (ran, refused) = tokio::join!(
+        async { first_app.post(&start_uri(ws, first)).json(&body).await },
+        async {
+            wait_for_the_workspace_lock(&pool).await;
+            second_app.post(&start_uri(ws, second)).json(&body).await
+        },
+    );
+
+    ran.assert_status_ok();
+    refused.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        refused.json::<Value>()["type"],
+        "urn:nm:problem:import-in-progress"
+    );
+    assert_eq!(count(&pool, "contacts").await, 5_000, "one of them ran");
+    // The refused one kept everything it needs to be started again.
+    assert_eq!(import_row(&pool, second).await.0, "pending");
+    assert!(upload_path(second).exists());
+    std::fs::remove_file(upload_path(second)).unwrap();
+}
+
+/// The lock is keyed on the workspace, not on the instance: one tenant's million rows do not stop
+/// another tenant importing. The positive control for the two refusals above.
+#[sqlx::test]
+async fn another_workspace_may_import_at_the_same_time(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let app_a = member(&pool, a, "ed-a@example.com", Role::Editor).await;
+    let app_b = member(&pool, b, "ed-b@example.com", Role::Editor).await;
+    let theirs = upload_kept(&app_a, a, "a.csv", &big_csv(5_000)).await;
+    let ours = upload_kept(&app_b, b, "b.csv", "email\nbea@example.com\n").await;
+    let body = json!({"mapping": [field_target("email")]});
+
+    let (first, second) = tokio::join!(
+        async { app_a.post(&start_uri(a, theirs)).json(&body).await },
+        async {
+            wait_for_the_workspace_lock(&pool).await;
+            app_b.post(&start_uri(b, ours)).json(&body).await
+        },
+    );
+
+    first.assert_status_ok();
+    second.assert_status_ok();
+    assert_eq!(emails(&pool, b).await, ["bea@example.com"]);
+    assert_eq!(import_row(&pool, ours).await.0, "complete");
+}
+
+/// A file over the cap is refused at the upload, naming the cap - not accepted and timed out two
+/// minutes into a run nobody can stop.
+#[sqlx::test]
+async fn a_file_over_the_row_cap_is_refused_naming_the_cap(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+
+    // Control: a file of the same shape under the cap is accepted, so the refusal below is the cap
+    // and not the request.
+    uploaded(&app, ws, "small.csv", &big_csv(999)).await;
+
+    // Counted on line feeds as the file streams, before anything parses it, so the content of the
+    // rows is not what is being tested here: the number of them is.
+    let over = "\n".repeat(MAX_IMPORT_ROWS as usize + 2);
+    let r = upload(&app, ws, "huge.csv", &over).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:too-many-rows");
+    assert!(
+        p["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&MAX_IMPORT_ROWS.to_string()),
+        "the refusal names the cap: {p}"
+    );
+    assert_eq!(
+        count(&pool, "imports").await,
+        1,
+        "only the control was recorded"
+    );
+}
+
+/// A row stuck in `running` for ever is worse than a clear failure: `GET /imports` shows it as in
+/// progress, and the workspace's guard has to be argued with to start anything else.
+#[sqlx::test]
+async fn a_running_import_is_swept_to_failed_at_boot(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let stuck = insert_import(&pool, a).await;
+    let stuck_elsewhere = insert_import(&pool, b).await;
+    let pending = insert_import(&pool, a).await;
+    let complete = insert_import(&pool, a).await;
+    set_status(&pool, stuck, "running").await;
+    set_status(&pool, stuck_elsewhere, "running").await;
+    set_status(&pool, complete, "complete").await;
+
+    assert_eq!(
+        sweep_running_imports(&pool).await.expect("sweep"),
+        2,
+        "every workspace's, because a boot has no tenant"
+    );
+    for id in [stuck, stuck_elsewhere] {
+        assert_eq!(import_row(&pool, id).await.0, "failed");
+        let (reason, finished) = error_reason(&pool, id).await;
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("restart")),
+            "the failure says why: {reason:?}"
+        );
+        assert!(finished, "a swept import is over, and the report says when");
+    }
+    // Nothing else was touched: a pending import is still startable and a finished one keeps its
+    // report.
+    assert_eq!(import_row(&pool, pending).await.0, "pending");
+    assert_eq!(import_row(&pool, complete).await.0, "complete");
+    assert_eq!(error_reason(&pool, pending).await.0, None);
+
+    assert_eq!(
+        sweep_running_imports(&pool).await.expect("second boot"),
+        0,
+        "the second boot has nothing left to sweep"
+    );
+}
+
+/// The other half of the boot pass: the uploaded files of imports that are over. Half a gigabyte
+/// of someone's contacts is not left on disk because a process died between the COMMIT and the
+/// unlink.
+#[sqlx::test]
+async fn the_upload_of_an_import_that_is_over_is_swept_and_the_others_are_kept(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let (over, pending, stranger) = (
+        insert_import(&pool, ws).await,
+        insert_import(&pool, ws).await,
+        Uuid::now_v7(),
+    );
+    set_status(&pool, over, "complete").await;
+    for id in [over, pending, stranger] {
+        std::fs::write(upload_path(id), b"email\n").unwrap();
+    }
+
+    assert_eq!(sweep_orphaned_uploads(&pool).await.expect("sweep"), 1);
+    assert!(
+        !upload_path(over).exists(),
+        "the import is over; nothing will read its file again"
+    );
+    assert!(
+        upload_path(pending).exists(),
+        "a pending import's file is exactly what its start reads"
+    );
+    assert!(
+        upload_path(stranger).exists(),
+        "a file this database cannot account for is not ours to delete"
+    );
+    std::fs::remove_file(upload_path(pending)).unwrap();
+    std::fs::remove_file(upload_path(stranger)).unwrap();
+}
+
+/// AN OPEN THAT FAILS FOR ANY OTHER REASON LEAVES THE IMPORT RETRYABLE. `import-file-gone` is
+/// permanent and must be: no retry brings a deleted upload back. A descriptor blip or a
+/// permissions change is not that, and failing a 512 MB upload for one is unrecoverable damage
+/// done by the error path.
+#[cfg(unix)]
+#[sqlx::test]
+async fn a_start_whose_upload_cannot_be_opened_leaves_the_import_pending(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let import = upload_kept(&app, ws, "book.csv", "email\nada@example.com\n").await;
+    // A symbolic link to itself where the upload was: `open` fails with ELOOP, which is not
+    // `NotFound` and is not the file being gone.
+    let path = upload_path(import);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&path, &path).unwrap();
+
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({"mapping": [field_target("email")]}))
+        .await;
+    r.assert_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:internal");
+    assert_eq!(
+        import_row(&pool, import).await.0,
+        "pending",
+        "still startable: the file may well open on the next request"
+    );
+    assert_eq!(error_reason(&pool, import).await.0, None);
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// THE 413 HAS TO REACH THE BROWSER AS A PROBLEM BODY. A refusal taken only once the body has been
+/// read answers an upload that is still being sent, and what the browser gets then is a network
+/// error, where the UI's `problemText` never runs. So this test speaks HTTP itself: it declares a
+/// body over the cap, sends none of it, and reads what comes back off the socket.
+#[sqlx::test]
+async fn an_upload_declaring_more_than_the_cap_is_413_with_a_problem_body(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let mut owner = TestApp::new(pool.clone()).await;
+    owner.login("owner-acme@example.com", PW).await;
+    let key = api_key(&owner, ws, "editor").await;
+    let url = owner.server.server_address().expect("a real HTTP server");
+    let host = format!(
+        "{}:{}",
+        url.host_str().expect("host"),
+        url.port().expect("port")
+    );
+
+    let mut socket = tokio::net::TcpStream::connect(&host)
+        .await
+        .expect("connect");
+    let declared = MAX_IMPORT_BYTES * 2;
+    let head = format!(
+        "POST /api/v1/workspaces/{ws}/imports HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Authorization: Bearer {key}\r\n\
+         Content-Type: multipart/form-data; boundary=b\r\n\
+         Content-Length: {declared}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    socket.write_all(head.as_bytes()).await.expect("send");
+    // Bounded: a server that answers only once it has read the body answers this request never,
+    // because not a byte of the body is coming. That is the failure this test is here to catch,
+    // and it has to be a failure and not a hang.
+    let mut answer = String::new();
+    tokio::time::timeout(Duration::from_secs(20), socket.read_to_string(&mut answer))
+        .await
+        .expect("the refusal came before the body, not after it")
+        .expect("read");
+
+    assert!(
+        answer.starts_with("HTTP/1.1 413 "),
+        "the refusal comes before the body: {answer}"
+    );
+    assert!(
+        answer
+            .to_ascii_lowercase()
+            .contains("content-type: application/problem+json"),
+        "{answer}"
+    );
+    let body = answer.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let p: Value = serde_json::from_str(body.trim()).expect("a problem body reached the client");
+    assert_eq!(p["type"], "urn:nm:problem:import-too-large");
+    assert!(
+        p["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&MAX_IMPORT_BYTES.to_string()),
+        "the refusal names the limit: {p}"
+    );
+    assert_eq!(count(&pool, "imports").await, 0);
+}
+
+/// Nothing counted uploads before, and an upload writes up to half a gigabyte to disk.
+#[sqlx::test]
+async fn an_upload_past_the_per_minute_limit_is_429(pool: PgPool) {
+    let (ws, other) = (
+        workspace(&pool, "acme").await,
+        workspace(&pool, "other").await,
+    );
+    let ed = create_user(&pool, "ed@example.com", PW, false).await;
+    add_member(&pool, ws, ed, Role::Editor).await;
+    add_member(&pool, other, ed, Role::Editor).await;
+    let mut app = TestApp::new(pool.clone()).await;
+    app.login("ed@example.com", PW).await;
+
+    // The window is spent through the limiter the route consults, rather than by sending sixty
+    // files: what is being tested here is that the route is behind it, and at a file each that
+    // would be a minute of the suite spent proving arithmetic `rate_limit.rs` already tests.
+    for _ in 0..IMPORT_PER_MINUTE {
+        app.state.import_limit.check(ws);
+    }
+
+    let r = upload(&app, ws, "over.csv", "email\nbea@example.com\n").await;
+    r.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.json::<Value>()["type"], "urn:nm:problem:rate-limited");
+    assert_eq!(
+        r.headers()["ratelimit-remaining"],
+        "0",
+        "the refusal carries the headers that say when to come back"
+    );
+    assert_eq!(
+        count(&pool, "imports").await,
+        0,
+        "the refused upload recorded nothing"
+    );
+
+    // Control, and the shape of the limit: the window is one workspace's, so another workspace is
+    // not refused - and the same caller, the same app and the same limiter are what prove it.
+    uploaded(&app, other, "fine.csv", "email\nada@example.com\n").await;
+    assert_eq!(count(&pool, "imports").await, 1);
+}

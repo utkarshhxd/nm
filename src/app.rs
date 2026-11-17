@@ -17,7 +17,9 @@ use crate::{
     error::ApiError,
     http,
     http::csrf,
-    http::rate_limit::{EXPORT_PER_MINUTE, PREVIEW_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE},
+    http::rate_limit::{
+        EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE,
+    },
     http::security_headers::security_headers,
     telemetry,
 };
@@ -44,6 +46,9 @@ pub struct AppState {
     /// each inside their own five-a-minute hold all twenty pooled connections between them, and
     /// `/readyz` waits on the same pool. See `contacts::export::MAX_CONCURRENT_EXPORTS`.
     pub export_slots: Arc<Semaphore>,
+    /// Per-workspace cap on `POST /imports`, the heaviest write the product takes: up to 512 MB
+    /// streamed to disk per call, kept there until the import is run or swept.
+    pub import_limit: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -59,6 +64,7 @@ impl AppState {
             selection_limit: Arc::new(RateLimiter::per_minute(SELECTION_PER_MINUTE)),
             export_limit: Arc::new(RateLimiter::per_minute(EXPORT_PER_MINUTE)),
             export_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
+            import_limit: Arc::new(RateLimiter::per_minute(IMPORT_PER_MINUTE)),
         })
     }
 
@@ -95,6 +101,24 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     let pool = db::connect(&cfg).await?;
     if cfg.auto_migrate {
         db::MIGRATOR.run(&pool).await?;
+    }
+    // THE BOOT SWEEP. An import left `running` is failed with a reason, and then the uploads of
+    // the imports that are over are removed. A row stuck in `running` for ever is worse than a
+    // clear failure: nothing will finish it, `GET /imports` reports it as in progress, and the
+    // workspace's guard in `start_import` holds against it.
+    //
+    // Awaited here rather than spawned: it is two statements and a directory walk, and a request
+    // served before it has run would read the state it exists to clear. Best effort, like the
+    // other sweeps — one that cannot run is not a reason to refuse to serve.
+    match crate::contacts::import::routes::sweep_running_imports(&pool).await {
+        Ok(0) => {}
+        Ok(swept) => tracing::warn!(swept, "imports left running by a restart were failed"),
+        Err(e) => tracing::warn!(error = ?e, "the running-import sweep failed"),
+    }
+    match crate::contacts::import::routes::sweep_orphaned_uploads(&pool).await {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed the uploads of imports that are over"),
+        Err(e) => tracing::warn!(error = ?e, "the orphaned-upload sweep failed"),
     }
     if let Some(addr) = cfg.metrics_listen {
         PrometheusBuilder::new()

@@ -18,12 +18,13 @@ use axum::{
         DefaultBodyLimit, Multipart,
         multipart::{MultipartError, MultipartRejection},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{Acquire, PgConnection, Postgres, Transaction};
+use sqlx::{Acquire, PgConnection, PgPool, Postgres, Transaction};
 use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -53,6 +54,18 @@ use axum::extract::State;
 /// configuration, as `MAX_RULES` and `CHUNK_BYTES` are: it is a bound on what one request may make
 /// the disk hold, and an operator who raises it should have to read this comment.
 pub const MAX_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The most rows an import may carry. `spec.md` budgets **a 1M-row CSV at under two minutes**,
+/// which is what the staging `COPY` and the set-based upsert were shaped against; a file past it
+/// is one an operator watches until the request times out, and a run killed part-way is the worst
+/// of both. So it is refused at the upload, naming the cap. A named limit and not configuration,
+/// as `MAX_IMPORT_BYTES`, `MAX_RULES` and `CHUNK_BYTES` are.
+///
+/// Counted on LINE FEEDS as the file streams, which is not a count of records: a quoted cell
+/// holding a line feed counts twice, and one line is discounted for a header the sniff has not
+/// read yet, so a headed file at the cap is not refused for its header. Counting records exactly
+/// means parsing the file, which is the work this cap exists to refuse to start.
+pub const MAX_IMPORT_ROWS: u64 = 1_000_000;
 
 /// The most columns a file may have. The run copies each file into a staging table with one column
 /// per CSV column, and Postgres refuses a table over 1600 columns (and one near it fails with an
@@ -155,6 +168,15 @@ fn too_large(limit: u64) -> ApiError {
     }
 }
 
+/// What a file past [`MAX_IMPORT_ROWS`] is refused with. 422 and not 413: this is a file whose
+/// shape this server will not run, not a body too large to hold.
+fn too_many_rows() -> ApiError {
+    ApiError::UnprocessableDetail {
+        code: "too-many-rows",
+        detail: format!("the file has more than {MAX_IMPORT_ROWS} rows"),
+    }
+}
+
 /// A body that hit the framework's own limit is the same refusal as one that hit ours.
 fn upload_err(e: MultipartError) -> ApiError {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -183,7 +205,7 @@ async fn receive(
     path: &Path,
     limit: u64,
 ) -> ApiResult<(String, u64, Vec<u8>)> {
-    let (mut found, mut total, mut head) = (None, 0u64, Vec::new());
+    let (mut found, mut total, mut head, mut lines) = (None, 0u64, Vec::new(), 0u64);
     while let Some(mut field) = multipart.next_field().await.map_err(upload_err)? {
         if field.name() != Some("file") {
             return Err(ApiError::Validation(vec![FieldError::new(
@@ -208,6 +230,14 @@ async fn receive(
             total += chunk.len() as u64;
             if total > limit {
                 return Err(too_large(limit));
+            }
+            // The row cap, counted as the file streams and refused in the same breath as the byte
+            // cap: a file this server will not run is not written to its end first. One line is
+            // discounted for a header the sniff has not read yet, so a headed file carrying the
+            // cap exactly is not refused for its header.
+            lines += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
+            if lines.saturating_sub(1) > MAX_IMPORT_ROWS {
+                return Err(too_many_rows());
             }
             head.extend_from_slice(
                 &chunk[..chunk.len().min(HEAD_BYTES.saturating_sub(head.len()))],
@@ -249,7 +279,8 @@ async fn receive(
         (status = 403, description = "insufficient-role: importing takes editor"),
         (status = 404, description = "not a member, or no such workspace"),
         (status = 413, description = "import-too-large: the file is over the size limit"),
-        (status = 422, description = "not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, or too-many-columns"),
+        (status = 422, description = "not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, too-many-columns, or too-many-rows"),
+        (status = 429, description = "rate-limited: too many uploads for this workspace"),
     ),
 )]
 pub async fn create_import(
@@ -257,11 +288,61 @@ pub async fn create_import(
     meta: RequestMeta,
     principal: Principal,
     ApiPath(workspace_id): ApiPath<Uuid>,
+    headers: HeaderMap,
     multipart: Result<Multipart, MultipartRejection>,
-) -> ApiResult<(StatusCode, Json<Upload>)> {
+) -> ApiResult<Response> {
     // Before the body is read, so a stranger's gigabyte is never written and the answer is the
     // 404 or 403 it would be for any other route. The rejection is taken after for the same reason.
     authorize(&state.pool, &principal, workspace_id, Role::Editor).await?;
+    // Also after `authorize`, so a stranger cannot spend the workspace's quota.
+    let quota = state.import_limit.check(workspace_id);
+    if let Some(retry_after_secs) = quota.over {
+        return Ok((
+            quota.headers,
+            ApiError::TooManyRequests { retry_after_secs },
+        )
+            .into_response());
+    }
+    // THE REFUSAL AN OVERSIZE UPLOAD HAS TO GET, AND WHERE IT HAS TO GET IT. A browser sends the
+    // whole body before it reads the answer, so a 413 raised while the body streams is one the
+    // client may never read: the connection goes down under it and the UI gets a network error
+    // where it expected a problem body. The declared length is on the headers, which are already
+    // here, so the refusal is taken before a byte of the body is read. The multipart framing is
+    // counted in, so a body inside this cannot hold a file over the cap.
+    if declared_length(&headers).is_some_and(|n| n > MAX_IMPORT_BYTES + MULTIPART_OVERHEAD) {
+        return Ok((quota.headers, too_large(MAX_IMPORT_BYTES)).into_response());
+    }
+    // Every answer from here carries the `RateLimit` headers, refusals included, as
+    // `preview_segment`'s do: the quota was spent whatever the outcome, and the client whose file
+    // was refused is exactly the one about to send another.
+    Ok(
+        match record_upload(&state, meta, &principal, workspace_id, multipart).await {
+            Ok(upload) => (StatusCode::CREATED, quota.headers, Json(upload)).into_response(),
+            Err(e) => (quota.headers, e).into_response(),
+        },
+    )
+}
+
+/// The body length the client declared, where it declared one. A chunked upload declares none and
+/// is counted as it streams instead, by [`receive`].
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// `create_import` past the role check, the quota and the declared length: take the file, sniff
+/// it, and record the import.
+async fn record_upload(
+    state: &AppState,
+    meta: RequestMeta,
+    principal: &Principal,
+    workspace_id: Uuid,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> ApiResult<Upload> {
     let multipart = multipart.map_err(|_| bad_body("expected multipart/form-data"))?;
 
     let id = Uuid::now_v7();
@@ -285,8 +366,8 @@ pub async fn create_import(
 
     // The upload took as long as it took: the role is checked again before anything is recorded.
     let mut tx = state.pool.begin().await?;
-    authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
-    let created_by = match &principal {
+    authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
+    let created_by = match principal {
         Principal::User { user_id, .. } => Some(*user_id),
         Principal::ApiKey { .. } => None,
     };
@@ -318,24 +399,21 @@ pub async fn create_import(
     tx.commit().await?;
     file.keep = true;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(Upload {
-            id,
-            delimiter: char::from(sniffed.delimiter).to_string(),
-            has_header: sniffed.has_header,
-            columns: sniffed
-                .columns
-                .into_iter()
-                .map(|c| UploadColumn {
-                    name: c.name,
-                    samples: c.samples,
-                    proposed: c.proposed,
-                })
-                .collect(),
-            total_bytes,
-        }),
-    ))
+    Ok(Upload {
+        id,
+        delimiter: char::from(sniffed.delimiter).to_string(),
+        has_header: sniffed.has_header,
+        columns: sniffed
+            .columns
+            .into_iter()
+            .map(|c| UploadColumn {
+                name: c.name,
+                samples: c.samples,
+                proposed: c.proposed,
+            })
+            .collect(),
+        total_bytes,
+    })
 }
 
 /// What an import did, count by count (spec 7.5): *"'Imported 940,000 of 1,000,000' with no
@@ -394,7 +472,14 @@ pub struct ImportReport {
 /// that did it.
 #[derive(Serialize, ToSchema)]
 pub struct ImportErrorRow {
-    /// The row's place in the file, counting data rows only — a header row is not one.
+    /// **The line the row is on in the file, as a spreadsheet numbers them**, which is what an
+    /// operator has to open the file at. The header row takes line 1 of a headed file and a blank
+    /// line takes a number of its own, so the first data row of a headed file is line 2 and the
+    /// second is line 3.
+    ///
+    /// It is therefore **not** an index into the data rows and does not run alongside
+    /// `total_rows`, which counts data rows only: a headed file of 10 rows reports
+    /// `total_rows = 10` and may hold an error on line 11.
     pub row_number: i64,
     /// The column to blame, where one column is to blame.
     pub column_name: Option<String>,
@@ -750,8 +835,9 @@ fn check_mapping(mapping: &[ColumnTarget], defs: &[Definition]) -> ApiResult<()>
         (status = 200, description = "The import ran; every count is on the report", body = ImportReport),
         (status = 403, description = "insufficient-role: running an import takes editor"),
         (status = 404, description = "not a member, no such import in this workspace, or no such list"),
-        (status = 409, description = "import-already-started: an import runs once; or \
-            import-duplicate-address, which writes no contact and keeps the rejected rows"),
+        (status = 409, description = "import-in-progress: this workspace is already running an \
+            import; import-already-started: an import runs once; or import-duplicate-address, \
+            which writes no contact and keeps the rejected rows"),
         (status = 422, description = "a mapping naming a custom field that no longer takes values, \
             two columns aimed at one target, mapping-needs-email, a delimiter that is not one of \
             the four, import-file-gone, or an unknown field"),
@@ -766,13 +852,51 @@ pub async fn start_import(
 ) -> ApiResult<Json<ImportReport>> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
-    // TASK 8'S ADVISORY LOCK BELONGS HERE, keyed on `workspace_id` and taken before the row below
-    // is read: it has to be held before this request can see another request's status, and it has
-    // to outlive the whole run, which `pg_advisory_xact_lock` does by living on this transaction.
+    // ONE IMPORT AT A TIME PER WORKSPACE (section 7.4), as an advisory lock keyed on the
+    // workspace and NOT a status check. This run writes `running` inside this transaction and
+    // commits once, at the end, so a concurrent start cannot see it: two requests would both read
+    // `pending` and both pass. The lock is taken before the row below is read, because it has to
+    // be held before this request can see another request's status, and it lives on this
+    // transaction, so it covers the whole run and is released by the COMMIT or the rollback,
+    // whichever comes.
     //
-    // `for update` is not that lock and does not stand in for it. It locks THIS import's row, so
-    // two starts of the same import cannot both read `pending`; one import per WORKSPACE is a
-    // different claim over rows this statement never sees.
+    // `try`, not a wait: a second start is answered now, and says what is holding the workspace,
+    // rather than queueing behind a million rows while holding a pooled connection.
+    //
+    // The `running` row read beside it is the other half of the guard. A lock is held by a live
+    // transaction and so says nothing about an import whose process died; such a row is swept to
+    // `failed` at the next boot by [`sweep_running_imports`], and until that boot it holds the
+    // workspace. It is also the one case where the refusal can name the import, because it is the
+    // only case where the `running` row has been committed.
+    //
+    // `for update` below is neither half and does not stand in for them. It locks THIS import's
+    // row, so two starts of the same import cannot both read `pending`; one import per WORKSPACE
+    // is a different claim over rows that statement never sees.
+    let guard = sqlx::query!(
+        // The seed is this lock's own, so its key space is its own: a later advisory lock keyed on
+        // a workspace id would otherwise take the same key and the two would block each other.
+        r#"select pg_try_advisory_xact_lock(hashtextextended($1::uuid::text, 7711)) as "held!",
+                  (select id from imports
+                    where workspace_id = $1 and status = 'running' limit 1) as "running?""#,
+        workspace_id,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !guard.held || guard.running.is_some() {
+        return Err(ApiError::ConflictDetail {
+            code: "import-in-progress",
+            detail: match guard.running {
+                Some(other) => format!(
+                    "import {other} is already running in this workspace; one import runs at a \
+                     time, and this one can be started when that one is over"
+                ),
+                // The holder's `running` is inside its own transaction, so there is no id to name.
+                None => "another import is already running in this workspace; one import runs at \
+                         a time, and this one can be started when that one is over"
+                    .to_owned(),
+            },
+        });
+    }
     let row = sqlx::query!(
         "select status, delimiter, has_header from imports \
          where workspace_id = $1 and id = $2 for update",
@@ -858,7 +982,7 @@ pub async fn start_import(
         // THE IMPORT IS OVER, not back where it started. No retry can bring the file back, so a
         // `?` here — which would roll `running` back to `pending` — leaves a row in `GET /imports`
         // that answers 422 for ever with nothing that can ever clear it.
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // `total_rows` stays null: the `COPY` never counted the file, and null is "still
             // unknown", which a `0` would report as an empty file.
             record_refusal(tx, &job, FILE_GONE, None, 0).await?;
@@ -867,6 +991,12 @@ pub async fn start_import(
                 detail: FILE_GONE.to_owned(),
             });
         }
+        // AND ONLY THAT ERROR ENDS THE IMPORT. Every other one — a descriptor the rest of the
+        // process has exhausted, a permission that changed under it — is a request that can be
+        // made again, and `?` is the retry: it rolls `running` back to `pending`, where the
+        // operator left it. Ending the import on one of those throws away a 512 MB upload, and no
+        // retry brings it back.
+        Err(e) => return Err(io(e)),
     };
     let staged = copy_into_staging(&mut tx, &state.secrets, &job, file).await?;
 
@@ -950,6 +1080,104 @@ pub async fn start_import(
     // it is half a gigabyte of someone's contacts on disk for ever.
     remove_upload(&job.path).await;
     Ok(Json(done))
+}
+
+/// What a swept import's `error_reason` says. A constant because the sweep writes it and the
+/// operator reads it on the report, and the two are the same sentence.
+const SWEPT: &str = "the server restarted while this import was running; its file was not fully \
+                     imported, so upload it again and start it";
+
+/// Fails every import left `running`, and answers how many. **Called once at boot, before the
+/// first request.**
+///
+/// A row stuck in `running` for ever is worse than a clear failure: `GET /imports` reports it as
+/// in progress, nothing will ever finish it, and the workspace's guard in [`start_import`] holds
+/// against it until someone edits the database.
+///
+/// Instance-wide and not scoped to a workspace: a boot has no request and no tenant.
+///
+/// **What it can sweep today is narrower than it looks.** A run is one transaction that commits
+/// `complete` or `failed`, so an instance killed mid-import rolls back to `pending` and leaves
+/// nothing here. What this catches is a row committed `running` by anything else — a hand-run
+/// `UPDATE`, a restore of a dump taken mid-transaction on another system, or the background runner
+/// this route becomes when a million rows stop fitting in one request. It is cheap, and the state
+/// it clears is one nothing else can clear.
+pub async fn sweep_running_imports(pool: &PgPool) -> sqlx::Result<u64> {
+    let swept = sqlx::query!(
+        "update imports set status = 'failed', error_reason = $1, finished_at = now() \
+         where status = 'running'",
+        SWEPT,
+    )
+    .execute(pool)
+    .await?;
+    Ok(swept.rows_affected())
+}
+
+/// Removes the uploaded file of every import that is over, and answers how many it took. **Called
+/// once at boot, after [`sweep_running_imports`], whose newly failed imports are part of its
+/// work.**
+///
+/// Its own pass and not part of the sweep above: one is a transactional count of rows and the
+/// other is a best-effort walk of a directory, they fail in different ways, and an upload is not
+/// deleted on the strength of a row the same statement has just changed. [`remove_upload`] already
+/// runs on every path that ends an import, so what is left here is what never reached one — a
+/// process killed between the COMMIT and the unlink, or an unlink that failed.
+///
+/// **A `pending` import's file is kept**, because that file is exactly what its start will read:
+/// an upload sitting unstarted is someone's mapping screen, not litter. So an upload that is never
+/// started is still on disk until its import ends; the cure for that is an expiry on pending
+/// imports, which is a policy decision and not a sweep's to take.
+///
+/// **A file with no import row is kept too.** This is the system temp directory, and a file this
+/// database cannot account for is not ours to delete — the same reason the upload opens with
+/// `create_new`.
+///
+/// shortcut: it attributes a file by its id alone, so two instances sharing a temp directory and
+/// one database sweep each other's correctly, and the file of an import deleted from the database
+/// is left behind. Give the uploads a configured directory of their own if either ever matters.
+pub async fn sweep_orphaned_uploads(pool: &PgPool) -> sqlx::Result<u64> {
+    let mut found = Vec::new();
+    let dir = std::env::temp_dir();
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %dir.display(), "could not read the upload directory");
+            return Ok(0);
+        }
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                if let Some(id) = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("nm-import-")
+                    .and_then(|rest| rest.strip_suffix(".csv"))
+                    .and_then(|id| id.parse::<Uuid>().ok())
+                {
+                    found.push(id);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %dir.display(), "the upload directory ended early");
+                break;
+            }
+        }
+    }
+    if found.is_empty() {
+        return Ok(0);
+    }
+    let over = sqlx::query_scalar!(
+        "select id from imports where id = any($1) and status <> 'pending'",
+        &found,
+    )
+    .fetch_all(pool)
+    .await?;
+    for id in &over {
+        remove_upload(&upload_path(*id)).await;
+    }
+    Ok(over.len() as u64)
 }
 
 #[cfg(test)]
