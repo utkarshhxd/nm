@@ -2507,3 +2507,573 @@ async fn the_audit_row_names_the_import_and_never_the_file_contents(pool: PgPool
         );
     }
 }
+
+// ---- Task 9: the run, and the list of a workspace's imports ------------------------------------
+
+fn start_uri(ws: Uuid, import: Uuid) -> String {
+    format!("{}/start", report_uri(ws, import))
+}
+
+fn field_target(name: &str) -> Value {
+    json!({"kind": "field", "value": name})
+}
+
+/// Uploads `body` and LEAVES the file on disk: that file is what the run reads, and `uploaded`'s
+/// cleanup would take it away.
+async fn upload_kept(app: &TestApp, ws: Uuid, name: &str, body: &str) -> Uuid {
+    let r = upload(app, ws, name, body).await;
+    r.assert_status(StatusCode::CREATED);
+    r.json::<Value>()["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// `status`, `delimiter` and `has_header` as the row holds them. The last two are what the run
+/// used, which a start may override.
+async fn import_row(pool: &PgPool, import: Uuid) -> (String, i16, bool) {
+    sqlx::query_as("select status, delimiter, has_header from imports where id = $1")
+        .bind(import)
+        .fetch_one(pool)
+        .await
+        .expect("read import")
+}
+
+/// Every address in the workspace, alphabetically.
+async fn emails(pool: &PgPool, ws: Uuid) -> Vec<String> {
+    sqlx::query_scalar("select email from contacts where workspace_id = $1 order by email")
+        .bind(ws)
+        .fetch_all(pool)
+        .await
+        .expect("read contacts")
+}
+
+/// THE TEST THIS TASK EXISTS FOR. Nothing in `src/` wrote an import's counts before this route:
+/// Task 7's report reads seven columns and a `total_rows` that only a test's hand-written `UPDATE`
+/// had ever set. So this one runs a real file through the real handler and reads the real report
+/// back - delete the handler's `update imports set …` and every number below goes to zero while
+/// every other test on this branch still passes.
+#[sqlx::test]
+async fn a_run_writes_every_count_it_computed_to_the_report(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let list = insert_list(&mut conn, ws, "news", false).await;
+    insert_contact(&mut conn, ws, "bob@example.com", "Bob", "Barker").await;
+    unsubscribe(&mut conn, ws, list, "bob@example.com").await;
+    suppress_address(&mut conn, Some(ws), "sue@example.com").await;
+    drop(conn);
+
+    // Six data rows, one of each kind `update existing` can produce, and two of them are also the
+    // overlap the two non-row-level counts describe: sue is suppressed, bob's subscription is
+    // declined. Seven counts and a total, no two of them equal by accident.
+    let import = upload_kept(
+        &app,
+        ws,
+        "book.csv",
+        "email,tags,lists\n\
+         not-an-email,vip,news\n\
+         ada@example.com,vip,news\n\
+         ada@example.com,vip,news\n\
+         bob@example.com,vip,news\n\
+         sue@example.com,vip,news\n\
+         carol@example.com,vip,news\n",
+    )
+    .await;
+
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({
+            "mapping": [field_target("email"), field_target("tags"), field_target("lists")],
+            "dedup": "update_existing",
+        }))
+        .await;
+    r.assert_status_ok();
+    let run: Value = r.json();
+
+    // Read back through `GET /imports/{id}`, which is the route an operator reads, not the run's
+    // own answer.
+    let b: Value = app.get(&report_uri(ws, import)).await.json();
+    assert_eq!(
+        b, run,
+        "the run answers with the report the read answers with"
+    );
+    assert_eq!(b["status"], "complete");
+    assert_eq!(
+        (
+            &b["total_rows"],
+            &b["imported"],
+            &b["updated"],
+            &b["skipped"],
+            &b["collapsed"],
+            &b["failed"],
+            &b["suppressed"],
+            &b["memberships_declined"],
+        ),
+        (
+            &json!(6),
+            &json!(3),
+            &json!(1),
+            &json!(0),
+            &json!(1),
+            &json!(1),
+            &json!(1),
+            &json!(1),
+        ),
+        "the eight numbers the pipeline computed, on the row the report reads: {b}"
+    );
+    assert_eq!(b["errors_recorded"], 1);
+    assert_eq!(b["error_reason"], Value::Null);
+    assert!(
+        b["started_at"].is_string() && b["finished_at"].is_string(),
+        "{b}"
+    );
+
+    // And the contacts themselves, so the counts are a report of work done and not of arithmetic.
+    assert_eq!(
+        emails(&pool, ws).await,
+        [
+            "ada@example.com",
+            "bob@example.com",
+            "carol@example.com",
+            "sue@example.com"
+        ]
+    );
+    let page: Value = app
+        .get(&format!("{}/errors", report_uri(ws, import)))
+        .await
+        .json();
+    assert_eq!(page["data"][0]["row_number"], 2, "the header is row 1");
+    assert_eq!(page["data"][0]["value"], "not-an-email");
+    assert!(
+        !upload_path(import).exists(),
+        "the uploaded file is gone once it has been imported"
+    );
+}
+
+#[sqlx::test]
+async fn start_with_a_mapping_naming_a_deleted_field_is_422_naming_it(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ad@example.com", Role::Admin).await;
+    let r = app
+        .post(&format!("/api/v1/workspaces/{ws}/custom-fields"))
+        .json(&json!({"key": "colour", "label": "Colour", "kind": "text"}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let field = r.json::<Value>()["id"].as_str().unwrap().to_owned();
+
+    let csv = "email,attr:colour\nada@example.com,red\n";
+    let import = upload_kept(&app, ws, "book.csv", csv).await;
+
+    // Deleted between the sniff and the start, which is the whole of this case: the mapping the
+    // operator confirmed names a field that is no longer anywhere to put data. Archive and purge
+    // is as deleted as a custom field gets — `purge_custom_field` removes every contact's value
+    // and KEEPS the definition, so no API path ever leaves the row gone.
+    app.delete(&format!("/api/v1/workspaces/{ws}/custom-fields/{field}"))
+        .await
+        .assert_status_ok();
+    app.post(&format!(
+        "/api/v1/workspaces/{ws}/custom-fields/{field}/purge"
+    ))
+    .await
+    .assert_status_ok();
+
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({
+            "mapping": [field_target("email"), {"kind": "custom", "value": "colour"}],
+        }))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:validation");
+    assert_eq!(
+        (&p["errors"][0]["field"], &p["errors"][0]["message"]),
+        (
+            &json!("mapping[1]"),
+            &json!("this custom field is archived and takes no new values")
+        ),
+        "the 422 names the column, and does not run a file whose every row would fail: {p}"
+    );
+
+    // And a key that was never a field at all. The wizard offers only live fields, but the API
+    // takes a mapping directly and a client-side list is not a guard.
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({
+            "mapping": [field_target("email"), {"kind": "custom", "value": "ghost"}],
+        }))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let p: Value = r.json();
+    assert_eq!(
+        (&p["errors"][0]["field"], &p["errors"][0]["message"]),
+        (&json!("mapping[1]"), &json!("no such custom field")),
+        "{p}"
+    );
+
+    // Nothing ran, and the import is still startable with a mapping that is not stale.
+    assert_eq!(count(&pool, "contacts").await, 0);
+    assert_eq!(import_row(&pool, import).await.0, "pending");
+    std::fs::remove_file(upload_path(import)).unwrap();
+}
+
+#[sqlx::test]
+async fn two_columns_aimed_at_one_field_is_422_naming_both(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let csv = "email,work_email,tags,more_tags\nada@example.com,ada@work.com,vip,eu\n";
+    let import = upload_kept(&app, ws, "book.csv", csv).await;
+
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({
+            "mapping": [
+                field_target("email"), field_target("email"),
+                field_target("tags"), field_target("tags"),
+            ],
+        }))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:duplicate-mapping-target");
+    let detail = p["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("columns 1 and 2") && detail.contains("email"),
+        "the refusal names both columns and the target they share: {detail}"
+    );
+    assert_eq!(count(&pool, "contacts").await, 0);
+
+    // Tags and lists accumulate, so two columns of them are not a collision. The same request
+    // without the duplicated `email` runs, which is what makes the refusal above specific.
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({
+            "mapping": [
+                field_target("email"), {"kind": "ignore"},
+                field_target("tags"), field_target("tags"),
+            ],
+        }))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["imported"], 1);
+    assert_eq!(
+        tags_of(&mut pool.acquire().await.unwrap(), ws, "ada@example.com").await,
+        ["eu", "vip"],
+        "both tag columns were read"
+    );
+}
+
+#[sqlx::test]
+async fn start_on_another_workspaces_import_is_404(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let app = member(&pool, a, "ed@example.com", Role::Editor).await;
+    let viewer = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let theirs = {
+        let b_app = member(&pool, b, "ed-b@example.com", Role::Editor).await;
+        upload_kept(&b_app, b, "THEIR-BOOK.csv", "email\nbea@example.com\n").await
+    };
+
+    let body = json!({"mapping": [field_target("email")]});
+
+    // Control: our own import in our own workspace runs, so the refusals below are the tenancy's
+    // and not an absent route answering 404 for everything.
+    let ours = upload_kept(&app, a, "ours.csv", "email\nada@example.com\n").await;
+    app.post(&start_uri(a, ours))
+        .json(&body)
+        .await
+        .assert_status_ok();
+
+    for uri in [start_uri(a, theirs), start_uri(b, theirs)] {
+        let r = app.post(&uri).json(&body).await;
+        r.assert_status(StatusCode::NOT_FOUND);
+        let p: Value = r.json();
+        assert_eq!(p["type"], "urn:nm:problem:not-found");
+        assert!(
+            !p.to_string().contains("THEIR-BOOK"),
+            "a 404 carries none of the resource it refused: {p}"
+        );
+    }
+    // 404 BEFORE THE ROLE CHECK: a viewer asking under the workspace they are not in learns
+    // nothing more than a stranger would, and nothing less either.
+    viewer
+        .post(&start_uri(b, theirs))
+        .json(&body)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        emails(&pool, a).await,
+        ["ada@example.com"],
+        "only the control ran; nothing of theirs did"
+    );
+    assert_eq!(emails(&pool, b).await, Vec::<String>::new());
+    assert_eq!(import_row(&pool, theirs).await.0, "pending");
+    std::fs::remove_file(upload_path(theirs)).unwrap();
+}
+
+#[sqlx::test]
+async fn start_twice_on_the_same_import_is_409(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let import = upload_kept(&app, ws, "book.csv", "email\nada@example.com\n").await;
+    let body = json!({"mapping": [field_target("email")]});
+
+    let r = app.post(&start_uri(ws, import)).json(&body).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["imported"], 1);
+
+    let r = app.post(&start_uri(ws, import)).json(&body).await;
+    r.assert_status(StatusCode::CONFLICT);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:import-already-started");
+    assert!(
+        p["detail"].as_str().unwrap().contains("complete"),
+        "the refusal says what the import already is: {p}"
+    );
+
+    // The first run's report is untouched, and the file was imported once.
+    let b: Value = app.get(&report_uri(ws, import)).await.json();
+    assert_eq!(
+        (&b["status"], &b["imported"], &b["total_rows"]),
+        (&json!("complete"), &json!(1), &json!(1)),
+    );
+    assert_eq!(count(&pool, "contacts").await, 1);
+}
+
+/// The decision this task had to make and could not duck: a `fail on duplicate` refusal is a
+/// `SELECT`, so the transaction is still good - and the rows the `COPY` already rejected are the
+/// report an operator fixing a bad file actually needs. They are committed; the contacts are not.
+#[sqlx::test]
+async fn a_refused_fail_on_duplicate_keeps_the_rows_the_copy_rejected(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let mut conn = pool.acquire().await.unwrap();
+    insert_contact(&mut conn, ws, "bob@example.com", "Bob", "Barker").await;
+    drop(conn);
+
+    let import = upload_kept(
+        &app,
+        ws,
+        "book.csv",
+        "email\nnot-an-email\nbob@example.com\nada@example.com\n",
+    )
+    .await;
+    let r = app
+        .post(&start_uri(ws, import))
+        .json(&json!({
+            "mapping": [field_target("email")],
+            "dedup": "fail_on_duplicate",
+        }))
+        .await;
+    r.assert_status(StatusCode::CONFLICT);
+    let p: Value = r.json();
+    assert_eq!(p["type"], "urn:nm:problem:import-duplicate-address");
+    assert!(
+        p["detail"].as_str().unwrap().contains("bob@example.com"),
+        "{p}"
+    );
+
+    // The file was refused, so nothing it named was written.
+    assert_eq!(emails(&pool, ws).await, ["bob@example.com"]);
+
+    // But the per-row report survives the refusal: without it the operator is told one address is
+    // a duplicate and never learns that row 2 is not an address at all.
+    let b: Value = app.get(&report_uri(ws, import)).await.json();
+    assert_eq!(b["status"], "failed");
+    assert!(
+        b["error_reason"]
+            .as_str()
+            .unwrap()
+            .contains("bob@example.com"),
+        "the report says why the import as a whole was refused: {b}"
+    );
+    assert_eq!(
+        (
+            &b["total_rows"],
+            &b["failed"],
+            &b["errors_recorded"],
+            &b["imported"]
+        ),
+        (&json!(3), &json!(1), &json!(1), &json!(0)),
+        "{b}"
+    );
+    let page: Value = app
+        .get(&format!("{}/errors", report_uri(ws, import)))
+        .await
+        .json();
+    assert_eq!(page["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (&page["data"][0]["row_number"], &page["data"][0]["value"]),
+        (&json!(2), &json!("not-an-email")),
+    );
+}
+
+#[sqlx::test]
+async fn the_start_may_override_the_stored_delimiter_and_header(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let mapping = json!([field_target("email")]);
+
+    // A headed file the operator says has no header. The header row is then a data row, and a data
+    // row reading `email` is not an address - which is exactly what the operator sees when the
+    // guess goes the other way and their first contact silently vanishes.
+    let headed = upload_kept(&app, ws, "a.csv", "email\nada@example.com\n").await;
+    let r = app
+        .post(&start_uri(ws, headed))
+        .json(&json!({"mapping": mapping, "has_header": false}))
+        .await;
+    r.assert_status_ok();
+    let b: Value = r.json();
+    assert_eq!(
+        (&b["total_rows"], &b["imported"], &b["failed"]),
+        (&json!(2), &json!(1), &json!(1)),
+        "the header row was read as data, because the request said so: {b}"
+    );
+    assert_eq!(
+        import_row(&pool, headed).await,
+        ("complete".to_owned(), 44, false)
+    );
+
+    // A comma file read as semicolons: one field per row, so the whole line lands in `email` and
+    // the name is swallowed into the address. A misdetected delimiter misparses every row, which
+    // is why the operator who was shown the guess has to be able to correct it.
+    let commas = upload_kept(&app, ws, "b.csv", "email,first_name\nbea@example.com,Bea\n").await;
+    let r = app
+        .post(&start_uri(ws, commas))
+        .json(&json!({
+            "mapping": [field_target("email"), field_target("first_name")],
+            "delimiter": ";",
+        }))
+        .await;
+    r.assert_status_ok();
+    let b: Value = r.json();
+    assert_eq!(
+        (&b["total_rows"], &b["imported"]),
+        (&json!(1), &json!(1)),
+        "{b}"
+    );
+    assert!(
+        emails(&pool, ws)
+            .await
+            .contains(&"bea@example.com,bea".to_owned()),
+        "the whole line was one field, because the request said the delimiter was `;`"
+    );
+    assert_eq!(
+        import_row(&pool, commas).await,
+        ("complete".to_owned(), 59, true)
+    );
+
+    // A request carrying neither uses what the sniff stored, and nothing is sniffed again.
+    let stored = upload_kept(&app, ws, "c.csv", "email;first_name\ncaz@example.com;Caz\n").await;
+    assert_eq!(
+        import_row(&pool, stored).await,
+        ("pending".to_owned(), 59, true)
+    );
+    let r = app
+        .post(&start_uri(ws, stored))
+        .json(&json!({"mapping": [field_target("email"), field_target("first_name")]}))
+        .await;
+    r.assert_status_ok();
+    let b: Value = r.json();
+    assert_eq!(
+        (&b["total_rows"], &b["imported"]),
+        (&json!(1), &json!(1)),
+        "{b}"
+    );
+    assert_eq!(
+        import_row(&pool, stored).await,
+        ("complete".to_owned(), 59, true)
+    );
+
+    // A delimiter the sniff would never have chosen is refused, not guessed at: a `"` or a newline
+    // parses the file in a way nobody was shown.
+    let bad = upload_kept(&app, ws, "d.csv", "email\ndee@example.com\n").await;
+    let r = app
+        .post(&start_uri(ws, bad))
+        .json(&json!({"mapping": mapping, "delimiter": "\""}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json::<Value>()["errors"][0]["field"], "delimiter");
+    assert_eq!(import_row(&pool, bad).await.0, "pending");
+    std::fs::remove_file(upload_path(bad)).unwrap();
+}
+
+#[sqlx::test]
+async fn an_editor_may_import_and_a_viewer_may_not(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let editor = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let viewer = member(&pool, ws, "v@example.com", Role::Viewer).await;
+    let import = upload_kept(&editor, ws, "book.csv", "email\nada@example.com\n").await;
+    let body = json!({"mapping": [field_target("email")]});
+
+    // The same workspace and the same import, so the only difference is the role.
+    let r = viewer.post(&start_uri(ws, import)).json(&body).await;
+    r.assert_status(StatusCode::FORBIDDEN);
+    assert_eq!(
+        r.json::<Value>()["type"],
+        "urn:nm:problem:insufficient-role"
+    );
+    assert_eq!(count(&pool, "contacts").await, 0);
+    assert_eq!(import_row(&pool, import).await.0, "pending");
+
+    // A viewer may still read: refusing the run is not refusing the report.
+    viewer.get(&report_uri(ws, import)).await.assert_status_ok();
+    viewer.get(&imports_uri(ws)).await.assert_status_ok();
+
+    let r = editor.post(&start_uri(ws, import)).json(&body).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["imported"], 1);
+    assert_eq!(emails(&pool, ws).await, ["ada@example.com"]);
+}
+
+#[sqlx::test]
+async fn the_list_is_cursor_paginated_and_ordered_newest_first(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let app = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let mut ours = Vec::new();
+    for _ in 0..5 {
+        ours.push(insert_import(&pool, a).await);
+    }
+    let theirs = insert_import(&pool, b).await;
+
+    let (mut rows, mut uri, mut pages) = (Vec::new(), format!("{}?limit=2", imports_uri(a)), 0);
+    loop {
+        let page: Value = app.get(&uri).await.json();
+        pages += 1;
+        assert!(pages <= 4, "the cursor is not advancing");
+        rows.extend(page["data"].as_array().expect("data").clone());
+        match page["next_cursor"].as_str() {
+            Some(cursor) => uri = format!("{}?limit=2&cursor={cursor}", imports_uri(a)),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3, "five imports, two at a time");
+    ours.reverse();
+    assert_eq!(
+        rows.iter().map(|r| r["id"].clone()).collect::<Vec<_>>(),
+        ours.iter()
+            .map(|id| json!(id.to_string()))
+            .collect::<Vec<_>>(),
+        "newest first, which is the order an operator looks for the import they just ran"
+    );
+    assert!(
+        !rows.iter().any(|r| r["id"] == json!(theirs.to_string())),
+        "another workspace's imports are not in this list"
+    );
+    // The rows are reports, not stubs: the list screen shows a status and a filename.
+    assert_eq!(
+        (
+            &rows[0]["status"],
+            &rows[0]["filename"],
+            &rows[0]["errors_recorded"]
+        ),
+        (&json!("pending"), &json!("a.csv"), &json!(0)),
+    );
+
+    // A cursor that is not one is a 422, not a silent first page.
+    app.get(&format!("{}?cursor=%25%25%25", imports_uri(a)))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    // And a workspace this caller is not in is a 404, not an empty page.
+    app.get(&imports_uri(b))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+}

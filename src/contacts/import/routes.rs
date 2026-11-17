@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `POST /imports`: the upload, and the server's reading of its head. Nothing here writes to
+//! `POST /imports`: the upload, and the server's reading of its head. Nothing there writes to
 //! `contacts`; the run is a later request.
 //!
-//! And the two reads an operator is left with afterwards: `GET /imports/{id}`, the report, and
-//! `GET /imports/{id}/errors`, the rows it rejected.
+//! That request is `POST /imports/{id}/start`, which is where the whole pipeline is finally wired
+//! together and is **the only thing in `src/` that writes an import's counts**. Everything before
+//! it computes numbers; this is what puts them on the row the report reads.
+//!
+//! And the reads an operator is left with: `GET /imports`, the workspace's imports newest first,
+//! `GET /imports/{id}`, the report, and `GET /imports/{id}/errors`, the rows it rejected.
 
 use std::path::{Path, PathBuf};
 
@@ -17,20 +21,27 @@ use axum::{
     http::StatusCode,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::{Acquire, PgConnection};
 use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{ColumnTarget, sniff::sniff, upload_path};
+use super::{
+    ColumnTarget, ContactField, Dedup, ImportJob,
+    sniff::{DELIMITERS, sniff},
+    staging::{copy_into_staging, upsert_from_staging},
+    upload_path,
+};
 use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
-    custom_fields::definitions_for,
-    error::{ApiError, ApiPath, ApiQuery, ApiResult, FieldError},
+    custom_fields::{Definition, definitions_for},
+    error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
+    lists,
     pagination::{Page, PageParams},
     workspaces::roles::Role,
 };
@@ -62,13 +73,19 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/v1/workspaces/{workspace_id}/imports",
-            axum::routing::post(create_import).layer(DefaultBodyLimit::max(
-                (MAX_IMPORT_BYTES + MULTIPART_OVERHEAD) as usize,
-            )),
+            axum::routing::get(list_imports)
+                .post(create_import)
+                .layer(DefaultBodyLimit::max(
+                    (MAX_IMPORT_BYTES + MULTIPART_OVERHEAD) as usize,
+                )),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/imports/{id}",
             axum::routing::get(get_import),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/imports/{id}/start",
+            axum::routing::post(start_import),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/imports/{id}/errors",
@@ -409,8 +426,14 @@ pub async fn get_import(
 ) -> ApiResult<Json<ImportReport>> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
-    // `fetch_one` scoped by `workspace_id`: another workspace's import is `RowNotFound`, which is
-    // the 404 every other tenant-scoped read answers with.
+    report(&mut conn, workspace_id, id).await.map(Json)
+}
+
+/// One import's report, which is also what the run answers with once it has written the counts.
+///
+/// `fetch_one` scoped by `workspace_id`: another workspace's import is `RowNotFound`, which is
+/// the 404 every other tenant-scoped read answers with.
+async fn report(conn: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResult<ImportReport> {
     sqlx::query_as!(
         ImportReport,
         r#"select i.id, i.status, i.filename, i.total_rows, i.imported, i.updated, i.skipped,
@@ -423,10 +446,54 @@ pub async fn get_import(
         workspace_id,
         id,
     )
-    .fetch_one(&mut *conn)
+    .fetch_one(conn)
     .await
-    .map(Json)
     .map_err(Into::into)
+}
+
+/// This workspace's imports, newest first, a page at a time. Each row is the same report
+/// `GET /imports/{id}` answers with: a list screen shows a status and counts, and a second read
+/// per row to get them would be the list all over again.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/imports",
+    operation_id = "list_imports",
+    params(("workspace_id" = Uuid, Path, description = "Workspace id"), PageParams),
+    responses(
+        (status = 200, description = "Newest first", body = Page<ImportReport>),
+        (status = 404, description = "not a member, or no such workspace"),
+        (status = 422, description = "a malformed cursor"),
+    ),
+)]
+pub async fn list_imports(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath(workspace_id): ApiPath<Uuid>,
+    ApiQuery(page): ApiQuery<PageParams>,
+) -> ApiResult<Json<Page<ImportReport>>> {
+    let mut conn = state.pool.acquire().await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    let limit = page.limit();
+    // Keyset on `id`, which is a UUIDv7, so `id desc` is newest first. `unique (workspace_id, id)`
+    // is the index that answers it; no second index is needed for this list.
+    let rows = sqlx::query_as!(
+        ImportReport,
+        r#"select i.id, i.status, i.filename, i.total_rows, i.imported, i.updated, i.skipped,
+                  i.collapsed, i.failed, i.suppressed, i.memberships_declined,
+                  (select count(*) from import_errors e
+                    where e.workspace_id = i.workspace_id and e.import_id = i.id)
+                      as "errors_recorded!",
+                  i.error_reason, i.created_at, i.started_at, i.finished_at
+             from imports i
+            where i.workspace_id = $1 and ($2::uuid is null or i.id < $2)
+            order by i.id desc limit $3"#,
+        workspace_id,
+        page.after()?,
+        limit + 1,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Json(Page::from_rows(rows, limit, |i| i.id)))
 }
 
 /// The rows this import rejected, in file order, a page at a time.
@@ -492,6 +559,348 @@ pub async fn list_import_errors(
     Ok(Json(Page::from_numbered_rows(rows, limit, |e| {
         e.row_number
     })))
+}
+
+/// The confirmed mapping, and the run.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StartImport {
+    /// One target per CSV column, in the file's column order. One column must be `email`, and no
+    /// two columns may name the same single-write target.
+    pub mapping: Vec<ColumnTarget>,
+    /// What to do with a row whose address is already a contact here. `update_existing` by
+    /// default, which is spec 7.3's blank-cell rule: a blank leaves the stored value alone.
+    #[serde(default)]
+    pub dedup: Dedup,
+    /// A list in this workspace to subscribe every imported contact to. The file's own `lists`
+    /// column, where it has one, is added to this rather than replacing it.
+    pub list_id: Option<Uuid>,
+    /// Replaces the delimiter the upload sniffed: one of `,`, `;`, a tab or `|`. Left out, the
+    /// stored one is used — the file is never sniffed a second time.
+    pub delimiter: Option<String>,
+    /// Replaces the header guess the upload made. Left out, the stored one is used.
+    pub has_header: Option<bool>,
+}
+
+/// The detail a refusal carries, for `imports.error_reason`. `None` for anything else: an internal
+/// error's cause is never shown to a client, and it must not be stored where admins read it
+/// either. Such an error also leaves a transaction that may not be used.
+fn refusal_detail(e: &ApiError) -> Option<&str> {
+    match e {
+        ApiError::ConflictDetail { detail, .. } | ApiError::UnprocessableDetail { detail, .. } => {
+            Some(detail)
+        }
+        _ => None,
+    }
+}
+
+/// What `imports.dedup` stores, which is serde's own name for the variant and so the wire name the
+/// request used. A unit test holds the two together.
+fn dedup_name(dedup: Dedup) -> &'static str {
+    match dedup {
+        Dedup::UpdateExisting => "update_existing",
+        Dedup::SkipExisting => "skip_existing",
+        Dedup::FailOnDuplicate => "fail_on_duplicate",
+    }
+}
+
+/// A delimiter override: one of the four [`DELIMITERS`] the sniff itself chooses between. A `"`, a
+/// newline or a letter would parse the file in a way the operator was never shown, so it is
+/// refused rather than obeyed.
+fn delimiter_byte(s: &str) -> ApiResult<u8> {
+    match s.as_bytes() {
+        [b] if DELIMITERS.contains(b) => Ok(*b),
+        _ => Err(ApiError::Validation(vec![FieldError::new(
+            "delimiter",
+            "must be one of `,`, `;`, a tab or `|`",
+        )])),
+    }
+}
+
+/// What a mapping has to be before a single row is read.
+///
+/// Both refusals exist because the alternative is found out one row at a time, after the run has
+/// written everything else. A mapping naming a custom field **deleted since the sniff** fails
+/// every row of the file with the same message — the proposal was made against the fields as they
+/// were at the upload, and the API takes a mapping directly, so a client-side guard is not one.
+/// Two columns aimed at one field quietly keep whichever the staged row wrote last, and nothing
+/// tells the operator which column was dropped. Tags and lists accumulate and are exempt.
+fn check_mapping(mapping: &[ColumnTarget], defs: &[Definition]) -> ApiResult<()> {
+    for (i, target) in mapping.iter().enumerate() {
+        let name = match target {
+            // `ignore` writes nothing, and tags and lists ACCUMULATE: a file with its tags in two
+            // columns is a file with two tag columns, not a collision.
+            ColumnTarget::Ignore
+            | ColumnTarget::Field(ContactField::Tags | ContactField::Lists) => {
+                continue;
+            }
+            ColumnTarget::Field(f) => f.header().to_owned(),
+            ColumnTarget::Custom(key) => {
+                let message = match defs.iter().find(|d| d.key == *key) {
+                    None => Some("no such custom field"),
+                    // The same sentence `validate_attributes` would have given, a million rows
+                    // later: `definitions_for` returns archived fields so old values stay
+                    // readable, and an archived field takes no new ones.
+                    Some(d) if d.archived_at.is_some() => {
+                        Some("this custom field is archived and takes no new values")
+                    }
+                    Some(_) => None,
+                };
+                if let Some(message) = message {
+                    return Err(ApiError::Validation(vec![FieldError::new(
+                        format!("mapping[{i}]"),
+                        message,
+                    )]));
+                }
+                format!("attr:{key}")
+            }
+        };
+        if let Some(j) = mapping[i + 1..].iter().position(|t| t == target) {
+            return Err(ApiError::UnprocessableDetail {
+                code: "duplicate-mapping-target",
+                detail: format!(
+                    "columns {} and {} are both mapped to `{name}`; only tags and lists take more \
+                     than one column",
+                    i + 1,
+                    i + 2 + j,
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Confirms the mapping and runs the import: `COPY` the file into a staging table, upsert out of
+/// it, and write what that came to onto the import's row.
+///
+/// **One transaction for the whole run.** The staging table is `create temporary table … on commit
+/// drop`, so it exists only inside it, and that `COMMIT` is what makes the contacts durable.
+///
+/// **The delimiter and the header come from the stored values, never from a second sniff** — the
+/// operator confirmed a mapping against those columns, and a sniff that disagreed at this point
+/// would silently re-point every column. The request may carry `delimiter` and `has_header`
+/// OVERRIDES, which replace them: a headerless file read as headed silently drops its first row,
+/// and a misdetected delimiter misparses every row, and the operator who was shown the guess is
+/// the one who can correct it. A request carrying neither uses what is stored.
+///
+/// **A refusal keeps the per-row report.** See the savepoint below.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/imports/{id}/start",
+    operation_id = "start_import",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Import id"),
+    ),
+    request_body = StartImport,
+    responses(
+        (status = 200, description = "The import ran; every count is on the report", body = ImportReport),
+        (status = 403, description = "insufficient-role: running an import takes editor"),
+        (status = 404, description = "not a member, no such import in this workspace, or no such list"),
+        (status = 409, description = "import-already-started: an import runs once; or \
+            import-duplicate-address, which writes no contact and keeps the rejected rows"),
+        (status = 422, description = "a mapping naming a custom field that no longer takes values, \
+            two columns aimed at one target, mapping-needs-email, a delimiter that is not one of \
+            the four, import-file-gone, or an unknown field"),
+    ),
+)]
+pub async fn start_import(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+    ApiJson(input): ApiJson<StartImport>,
+) -> ApiResult<Json<ImportReport>> {
+    let mut tx = state.pool.begin().await?;
+    authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
+    // TASK 8'S ADVISORY LOCK BELONGS HERE, keyed on `workspace_id` and taken before the row below
+    // is read: it has to be held before this request can see another request's status, and it has
+    // to outlive the whole run, which `pg_advisory_xact_lock` does by living on this transaction.
+    //
+    // `for update` is not that lock and does not stand in for it. It locks THIS import's row, so
+    // two starts of the same import cannot both read `pending`; one import per WORKSPACE is a
+    // different claim over rows this statement never sees.
+    let row = sqlx::query!(
+        "select status, delimiter, has_header from imports \
+         where workspace_id = $1 and id = $2 for update",
+        workspace_id,
+        id,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if row.status != "pending" {
+        return Err(ApiError::ConflictDetail {
+            code: "import-already-started",
+            detail: format!(
+                "this import is already `{}`; an import runs once, and a second file is a second \
+                 upload",
+                row.status
+            ),
+        });
+    }
+
+    let defs = definitions_for(&mut *tx, workspace_id).await?;
+    check_mapping(&input.mapping, &defs)?;
+    let delimiter = match &input.delimiter {
+        Some(d) => delimiter_byte(d)?,
+        // `check (delimiter between 0 and 255)` on the column, so this cannot narrow.
+        None => u8::try_from(row.delimiter).map_err(|e| ApiError::Internal(e.into()))?,
+    };
+    if let Some(list_id) = input.list_id {
+        // 404, as every other id in a body that names another workspace's row. Without it the
+        // composite foreign key refuses the update below and the operator reads `internal error`.
+        lists::get(&mut tx, workspace_id, list_id).await?;
+    }
+    let job = ImportJob {
+        id,
+        workspace_id,
+        path: upload_path(id),
+        delimiter,
+        has_header: input.has_header.unwrap_or(row.has_header),
+        mapping: input.mapping,
+        dedup: input.dedup,
+        list_id: input.list_id,
+        defs,
+    };
+
+    // What the run was asked to do, on the row, before it does any of it. The overrides are
+    // written back because they are what parsed the file: a row still claiming the sniff's guess
+    // would describe an import that did not happen.
+    let mapping = serde_json::to_value(&job.mapping).map_err(|e| ApiError::Internal(e.into()))?;
+    sqlx::query!(
+        "update imports set status = 'running', started_at = now(), mapping = $3, dedup = $4, \
+         list_id = $5, delimiter = $6, has_header = $7 where workspace_id = $1 and id = $2",
+        workspace_id,
+        id,
+        mapping,
+        dedup_name(job.dedup),
+        job.list_id,
+        i16::from(job.delimiter),
+        job.has_header,
+    )
+    .execute(&mut *tx)
+    .await?;
+    audit::record(
+        &mut *tx,
+        &meta,
+        AuditEvent {
+            workspace_id: Some(workspace_id),
+            actor: principal.actor(),
+            action: actions::IMPORT_STARTED,
+            target_type: Some("import"),
+            target_id: Some(id.to_string()),
+            // The import's own settings and nothing out of the file. A header, a cell and an
+            // address are the file's contents, and this log is stored in plaintext.
+            metadata: json!({
+                "dedup": dedup_name(job.dedup),
+                "columns": job.mapping.len(),
+                "list_id": job.list_id,
+            }),
+        },
+    )
+    .await?;
+
+    let file =
+        tokio::fs::File::open(&job.path)
+            .await
+            .map_err(|_| ApiError::UnprocessableDetail {
+                code: "import-file-gone",
+                detail: "the uploaded file is no longer on this server; upload it again".to_owned(),
+            })?;
+    let staged = copy_into_staging(&mut tx, &state.secrets, &job, file).await?;
+
+    // A SAVEPOINT, so that a refusal can take the upsert's writes back WITHOUT taking back the
+    // `import_errors` rows the `COPY` wrote above.
+    let mut run = tx.begin().await?;
+    let counts = match upsert_from_staging(&mut run, &job, staged.failed).await {
+        Ok(counts) => {
+            run.commit().await?;
+            counts
+        }
+        Err(e) => {
+            // THE DECISION A CALLER OF `copy_into_staging` HAS TO MAKE, AND NOTHING ENFORCES.
+            // `fail on duplicate` raises its 409 from a pre-flight `SELECT`, so the transaction is
+            // still usable — and a caller that rolled all of it back would tell an operator that
+            // `bob@example.com` is already a contact while never mentioning the twelve unreadable
+            // rows in the same file. The per-row report is the thing they fix the file with; the
+            // contacts are what they asked not to have, and the savepoint takes back only those.
+            //
+            // Anything that is not a refusal carries no detail that may be shown and leaves a
+            // transaction that may not be used: it is re-raised with nothing recorded, and the
+            // rollback puts the import back to `pending` for the operator to start again.
+            let Some(reason) = refusal_detail(&e).map(str::to_owned) else {
+                return Err(e);
+            };
+            run.rollback().await?;
+            // `total_rows` and `failed` too, so the kept rows and the counts agree: a report
+            // saying `failed = 0` beside a page of rejected rows is a report nobody believes.
+            sqlx::query!(
+                "update imports set status = 'failed', error_reason = $3, total_rows = $4, \
+                 failed = $5, finished_at = now() where workspace_id = $1 and id = $2",
+                workspace_id,
+                id,
+                reason,
+                staged.total_rows,
+                staged.failed,
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            let _ = std::fs::remove_file(&job.path);
+            return Err(e);
+        }
+    };
+
+    // THE EIGHT COLUMNS NOTHING ELSE IN `src/` WRITES. Seven come from `UpsertCounts`, which has
+    // already apportioned them — the caller has nothing to add up. `total_rows` is the `COPY`'s
+    // own count of the file and never a recount: a recount counts the rows that reached staging,
+    // and would report a file with twelve unreadable rows as twelve rows shorter than it is.
+    sqlx::query!(
+        "update imports set status = 'complete', finished_at = now(), total_rows = $3, \
+         imported = $4, updated = $5, skipped = $6, collapsed = $7, failed = $8, suppressed = $9, \
+         memberships_declined = $10 where workspace_id = $1 and id = $2",
+        workspace_id,
+        id,
+        staged.total_rows,
+        counts.imported,
+        counts.updated,
+        counts.skipped,
+        counts.collapsed,
+        counts.failed,
+        counts.suppressed,
+        counts.memberships_declined,
+    )
+    .execute(&mut *tx)
+    .await?;
+    audit::record(
+        &mut *tx,
+        &meta,
+        AuditEvent {
+            workspace_id: Some(workspace_id),
+            actor: principal.actor(),
+            action: actions::IMPORT_FINISHED,
+            target_type: Some("import"),
+            target_id: Some(id.to_string()),
+            // Numbers, which is all a count is. Still nothing out of the file.
+            metadata: json!({
+                "total_rows": staged.total_rows,
+                "imported": counts.imported,
+                "updated": counts.updated,
+                "skipped": counts.skipped,
+                "collapsed": counts.collapsed,
+                "failed": counts.failed,
+                "suppressed": counts.suppressed,
+                "memberships_declined": counts.memberships_declined,
+            }),
+        },
+    )
+    .await?;
+    let done = report(&mut tx, workspace_id, id).await?;
+    tx.commit().await?;
+    // The file has been imported. Nothing reads it again — a second start is a 409 — and leaving
+    // it is half a gigabyte of someone's contacts on disk for ever.
+    let _ = std::fs::remove_file(&job.path);
+    Ok(Json(done))
 }
 
 #[cfg(test)]
@@ -563,6 +972,18 @@ mod tests {
         });
         assert!(kept.exists());
         std::fs::remove_file(&kept).unwrap();
+    }
+
+    /// `imports.dedup` holds what the request said, so the two names cannot drift apart.
+    #[test]
+    fn the_stored_dedup_is_the_name_the_request_used() {
+        for dedup in [
+            Dedup::UpdateExisting,
+            Dedup::SkipExisting,
+            Dedup::FailOnDuplicate,
+        ] {
+            assert_eq!(json!(dedup), json!(dedup_name(dedup)));
+        }
     }
 
     #[test]

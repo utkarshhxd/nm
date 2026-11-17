@@ -22,8 +22,9 @@ const SAMPLES: usize = 5;
 /// A sample is cut to this many characters: a cell can be as large as the head.
 const SAMPLE_CHARS: usize = 100;
 
-/// In preference order: on a tie the earlier one wins.
-const DELIMITERS: [u8; 4] = [b',', b';', b'\t', b'|'];
+/// In preference order: on a tie the earlier one wins. Also the set a start request may override
+/// the stored delimiter with — the operator corrects the sniff's choice among the same four.
+pub const DELIMITERS: [u8; 4] = [b',', b';', b'\t', b'|'];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniffedColumn {

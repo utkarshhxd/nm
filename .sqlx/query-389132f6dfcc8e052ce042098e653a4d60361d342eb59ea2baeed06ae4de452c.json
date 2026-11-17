@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update imports set status = 'running', started_at = now(), mapping = $3, dedup = $4, list_id = $5, delimiter = $6, has_header = $7 where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Text",
+        "Uuid",
+        "Int2",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "389132f6dfcc8e052ce042098e653a4d60361d342eb59ea2baeed06ae4de452c"
+}
