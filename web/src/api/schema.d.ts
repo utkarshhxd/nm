@@ -795,6 +795,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Takes a CSV as `multipart/form-data` (one part, `file`), keeps it on disk under a name derived
+         *     from the import's id, records the import as `pending`, and answers with the delimiter, a header
+         *     guess, and a proposed mapping from each column to a contact field or custom field.
+         * @description The proposal names a column only when the match is certain: the whole header equals a field's
+         *     name, ignoring case, or the exporter's own `attr:<key>`, and no other column claims the same
+         *     target. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
+         */
+        post: operations["create_import"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/lists": {
         parameters: {
             query?: never;
@@ -1221,6 +1245,20 @@ export interface components {
         ChangeRole: {
             role: components["schemas"]["Role"];
         };
+        /** @description What one CSV column is written to. */
+        ColumnTarget: {
+            /** @enum {string} */
+            kind: "ignore";
+        } | {
+            /** @enum {string} */
+            kind: "field";
+            value: components["schemas"]["ContactField"];
+        } | {
+            /** @enum {string} */
+            kind: "custom";
+            /** @description A custom field, by its key. */
+            value: string;
+        };
         ConfirmRequest: {
             code: string;
         };
@@ -1242,6 +1280,13 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /**
+         * @description A built-in contact column an import may write: the exporter's own header for it. `id`,
+         *     `created_at`, `updated_at` and `suppressed` are not here on purpose: the first three are the
+         *     database's, and an import may not bypass or lift a suppression (spec 7.5).
+         * @enum {string}
+         */
+        ContactField: "email" | "first_name" | "last_name" | "timezone" | "tags" | "lists";
         /** @description One list a contact is on, as the contact's page shows it. */
         ContactList: {
             /** Format: uuid */
@@ -1478,6 +1523,14 @@ export interface components {
             label: string;
             /** @description Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind. */
             options?: string[] | null;
+        };
+        /** @description The request body, for the document: the one part, named `file`. */
+        NewImport: {
+            /**
+             * Format: binary
+             * @description The CSV file. Its name is kept as a label and is never used as a path.
+             */
+            file: string;
         };
         NewInvite: {
             email: string;
@@ -2018,6 +2071,28 @@ export interface components {
         UpdateWorkspace: {
             name?: string | null;
             timezone?: string | null;
+        };
+        Upload: {
+            columns: components["schemas"]["UploadColumn"][];
+            /** @description One character: `,`, `;`, a tab or `|`. */
+            delimiter: string;
+            /** @description A guess: the first row is a header unless it holds an email address. */
+            has_header: boolean;
+            /** Format: uuid */
+            id: string;
+            /** Format: int64 */
+            total_bytes: number;
+        };
+        UploadColumn: {
+            /** @description The header cell, or `Column N` when the file has no header row. */
+            name: string;
+            /**
+             * @description `ignore` when the server is not sure: a blank costs one dropdown, a wrong guess writes the
+             *     wrong column into the wrong field.
+             */
+            proposed: components["schemas"]["ColumnTarget"];
+            /** @description Up to five non-blank values from the first 100 rows, as a spreadsheet shows them. */
+            samples: string[];
         };
         /**
          * @description Stored as text under a `check` constraint, not a Postgres enum.
@@ -4510,6 +4585,60 @@ export interface operations {
             };
             /** @description field-not-archived, or field-in-use: a segment still names it, and the problem lists which */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["NewImport"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Upload"];
+                };
+            };
+            /** @description insufficient-role: importing takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description import-too-large: the file is over the size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, or empty-file: the file has no rows */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

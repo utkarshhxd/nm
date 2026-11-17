@@ -2766,6 +2766,61 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/imports": {
+      "post": {
+        "tags": [
+          "crate::contacts::import::routes"
+        ],
+        "summary": "Takes a CSV as `multipart/form-data` (one part, `file`), keeps it on disk under a name derived\nfrom the import's id, records the import as `pending`, and answers with the delimiter, a header\nguess, and a proposed mapping from each column to a contact field or custom field.",
+        "description": "The proposal names a column only when the match is certain: the whole header equals a field's\nname, ignoring case, or the exporter's own `attr:<key>`, and no other column claims the same\ntarget. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.",
+        "operationId": "create_import",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/NewImport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Upload"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: importing takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "413": {
+            "description": "import-too-large: the file is over the size limit"
+          },
+          "422": {
+            "description": "not multipart/form-data, no `file` part, an unknown part, more than one file, or empty-file: the file has no rows"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/lists": {
       "get": {
         "tags": [
@@ -4395,6 +4450,64 @@
           }
         }
       },
+      "ColumnTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The column is not imported. Also what a proposal says when it is unsure.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "ignore"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "value",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "field"
+                ]
+              },
+              "value": {
+                "$ref": "#/components/schemas/ContactField"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A custom field, by its key.",
+            "required": [
+              "value",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "custom"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "description": "A custom field, by its key."
+              }
+            }
+          }
+        ],
+        "description": "What one CSV column is written to."
+      },
       "ConfirmRequest": {
         "type": "object",
         "required": [
@@ -4464,6 +4577,18 @@
             "format": "date-time"
           }
         }
+      },
+      "ContactField": {
+        "type": "string",
+        "description": "A built-in contact column an import may write: the exporter's own header for it. `id`,\n`created_at`, `updated_at` and `suppressed` are not here on purpose: the first three are the\ndatabase's, and an import may not bypass or lift a suppression (spec 7.5).",
+        "enum": [
+          "email",
+          "first_name",
+          "last_name",
+          "timezone",
+          "tags",
+          "lists"
+        ]
       },
       "ContactList": {
         "type": "object",
@@ -5127,6 +5252,20 @@
           }
         },
         "additionalProperties": false
+      },
+      "NewImport": {
+        "type": "object",
+        "description": "The request body, for the document: the one part, named `file`.",
+        "required": [
+          "file"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "description": "The CSV file. Its name is kept as a label and is never used as a path."
+          }
+        }
       },
       "NewInvite": {
         "type": "object",
@@ -6647,6 +6786,66 @@
           }
         },
         "additionalProperties": false
+      },
+      "Upload": {
+        "type": "object",
+        "required": [
+          "id",
+          "delimiter",
+          "has_header",
+          "columns",
+          "total_bytes"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UploadColumn"
+            }
+          },
+          "delimiter": {
+            "type": "string",
+            "description": "One character: `,`, `;`, a tab or `|`."
+          },
+          "has_header": {
+            "type": "boolean",
+            "description": "A guess: the first row is a header unless it holds an email address."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "UploadColumn": {
+        "type": "object",
+        "required": [
+          "name",
+          "samples",
+          "proposed"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The header cell, or `Column N` when the file has no header row."
+          },
+          "proposed": {
+            "$ref": "#/components/schemas/ColumnTarget",
+            "description": "`ignore` when the server is not sure: a blank costs one dropdown, a wrong guess writes the\nwrong column into the wrong field."
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Up to five non-blank values from the first 100 rows, as a spreadsheet shows them."
+          }
+        }
       },
       "Visibility": {
         "type": "string",
