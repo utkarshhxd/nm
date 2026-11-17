@@ -83,7 +83,10 @@ pub struct Audit {
 ///
 /// **What M1c's importer must undo when it reads this file back, both of them lossless:** (1) a
 /// leading `'` on a cell, and (2) the backslash escapes in every multi-valued column — `lists`,
-/// `tags` and each `attr:<key>` of a multi_select: split on a `;` that no backslash precedes,
+/// `tags` and each `attr:<key>` of a multi_select: split on each `;` not consumed by a preceding
+/// backslash, reading left to right with one bit of state (a backslash consumes the character
+/// after it, so `\\;` is an escaped backslash followed by a real separator, never an escaped
+/// `;`),
 /// then turn `\\`, `\;` and `\:` back into `\`, `;` and `:`. One rule, one unescape function. For
 /// `lists` only, split each entry at its one unescaped `:` into name and status first.
 pub fn push_cell(out: &mut String, cell: &str) {

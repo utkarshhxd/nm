@@ -21,10 +21,12 @@ fn through_the_file(cell: &str) -> String {
     }
 }
 
-const AWKWARD: [&str; 12] = [
+const AWKWARD: [&str; 14] = [
     "a;b",
     "a:b",
     r"a\b",
+    r"a\",
+    r"\",
     r"a\;b",
     r"a\\;b",
     "'quoted",
