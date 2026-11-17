@@ -2219,6 +2219,7 @@ dependencies = [
  "clap",
  "cookie",
  "csv",
+ "csv-core",
  "figment",
  "futures-util",
  "hmac",
