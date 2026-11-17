@@ -152,6 +152,8 @@ test("a mapping with no email column cannot be reviewed, and says why", async ()
   await upload(csv(PEOPLE));
   await expect(page.getByRole("button", { name: "Review mapping", exact: true })).toBeDisabled();
   await expect(page.getByText("Map one column to Email.")).toBeVisible();
+  // Said in a live region, so a screen reader hears the list change when a select does.
+  await expect(page.getByRole("status").filter({ hasText: "Map one column to Email." })).toBeVisible();
 
   await target("Email Address").selectOption({ label: "Email" });
   await target("First Name").selectOption({ label: "Email" });
@@ -172,6 +174,7 @@ test("a changed mapping is what the confirmation step shows, and survives going 
   await expect(review.getByRole("row", { name: /Company.*Company/ })).toBeVisible();
   await expect(review.getByRole("row", { name: /Notes.*Tags/ })).toBeVisible();
   await expect(page.getByText("A blank cell leaves the existing value alone.")).toBeVisible();
+  await expect(page.getByText("Every column is imported.")).toBeVisible();
 
   // A keyboard user's focus must not fall to <body> when the button that was pressed unmounts.
   await expect(page.getByRole("heading", { name: "Review the mapping", exact: true })).toBeFocused();
@@ -313,6 +316,7 @@ async function downloadedCsv(): Promise<{ name: string; rows: string[][] }> {
 test("the confirmation names the de-duplication mode and the target list, and follows both choices", async () => {
   await upload(csv(PEOPLE));
   await review();
+  await expect(page.getByText("1 column is not imported.")).toBeVisible();
 
   // The default is named, not implied: an operator about to change a million contacts is told
   // which of the three modes will run.
@@ -463,9 +467,15 @@ test("a separator the sniff got wrong is corrected on the confirmation step", as
   await page.getByLabel("Separator", { exact: true }).selectOption({ label: "Semicolon" });
   await expect(will()).toContainText("separated by a semicolon");
   await run();
-  // Read with the comma, the addresses would be `sep1@example.com;A`, and both rows would fail.
   await expect(count("Imported")).toHaveText("2");
   await expect(count("Failed")).toHaveText("0");
+  // The counts alone do not tell the readings apart: the server takes `sep1@example.com;a` as an
+  // address too, so a run that ignored the correction would also report two imports. The contact
+  // that exists is what shows which separator the file was read with.
+  const found = await admin.request.get(`/api/v1/workspaces/${workspaceId}/contacts?q=sep1%40example.com`);
+  expect(found.ok()).toBe(true);
+  const emails = ((await found.json()) as { data: { email: string }[] }).data.map((c) => c.email);
+  expect(emails).toEqual(["sep1@example.com"]);
 });
 
 test("a header the sniff did not see is corrected on the confirmation step", async () => {
