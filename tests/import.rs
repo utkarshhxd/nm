@@ -478,3 +478,293 @@ async fn a_three_megabyte_upload_is_accepted(pool: PgPool) {
     assert_eq!(body["columns"].as_array().unwrap().len(), 2);
     assert_eq!(body["columns"][0]["samples"].as_array().unwrap().len(), 5);
 }
+
+// ---- Task 4: COPY into staging -----------------------------------------------------------------
+
+use nm::{
+    config::SecretKey,
+    contacts::import::{
+        Dedup, ImportJob,
+        staging::{StagingCounts, copy_into_staging, staging_table},
+    },
+    crypto::{secrets::Secrets, suppression_hmac},
+    custom_fields::FieldKind,
+    users::normalize_email,
+};
+use sqlx::{AssertSqlSafe, PgConnection};
+
+fn secrets() -> Secrets {
+    Secrets::new(&SecretKey([7u8; 32]))
+}
+
+fn field(key: &str, kind: FieldKind) -> Definition {
+    Definition {
+        id: Uuid::now_v7(),
+        key: key.to_owned(),
+        label: key.to_owned(),
+        kind,
+        options: vec![],
+        archived_at: None,
+    }
+}
+
+fn job(id: Uuid, ws: Uuid, mapping: Vec<ColumnTarget>, defs: Vec<Definition>) -> ImportJob {
+    ImportJob {
+        id,
+        workspace_id: ws,
+        path: upload_path(id),
+        delimiter: b',',
+        has_header: true,
+        mapping,
+        dedup: Dedup::default(),
+        list_id: None,
+        defs,
+    }
+}
+
+fn email_column() -> Vec<ColumnTarget> {
+    vec![ColumnTarget::Field(ContactField::Email)]
+}
+
+async fn copy(conn: &mut PgConnection, j: &ImportJob, csv: &[u8]) -> StagingCounts {
+    copy_into_staging(conn, &secrets(), j, csv)
+        .await
+        .expect("an unreadable row is an error row, never a failed call")
+}
+
+/// `row_number` and `email` of everything staged, in file order.
+async fn staged(conn: &mut PgConnection, import: Uuid) -> Vec<(i64, String)> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select row_number, email from {} order by row_number",
+        staging_table(import)
+    )))
+    .fetch_all(conn)
+    .await
+    .expect("read staging")
+}
+
+async fn error_rows(
+    conn: &mut PgConnection,
+    import: Uuid,
+) -> Vec<(i64, Option<String>, String, Option<String>)> {
+    sqlx::query_as(
+        "select row_number, column_name, reason, value from import_errors \
+         where import_id = $1 order by row_number",
+    )
+    .bind(import)
+    .fetch_all(conn)
+    .await
+    .expect("read import_errors")
+}
+
+#[sqlx::test]
+async fn every_staged_id_is_uuid_v7(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job(import, ws, email_column(), vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    let counts = copy(&mut tx, &j, b"email\na@b.co\nc@d.co\n").await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 2, 0));
+
+    let ids: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select id from {} order by row_number",
+        staging_table(import)
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(ids.len(), 2);
+    for id in &ids {
+        // A v4 parses, and `gen_random_uuid()` would too: the version nibble is the assertion. A
+        // selection snapshot is `id <= as_of`, so an id that is not time-ordered escapes it.
+        assert_eq!(id.get_version_num(), 7, "{id} is not a UUIDv7");
+    }
+    assert!(ids[0] < ids[1], "v7 ids rise with the rows that made them");
+}
+
+#[sqlx::test]
+async fn the_staged_address_is_what_normalize_email_returns(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job(import, ws, email_column(), vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Untrimmed, uppercase and decomposed: three spellings the application folds into one.
+    let raw = " JOSE\u{301}@Example.COM ";
+    copy(&mut tx, &j, format!("email\n{raw}\n").as_bytes()).await;
+
+    let (email, hmac): (String, Vec<u8>) = sqlx::query_as(AssertSqlSafe(format!(
+        "select email, email_hmac from {}",
+        staging_table(import)
+    )))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(email, normalize_email(raw).unwrap());
+    assert_eq!(email, "jos\u{e9}@example.com");
+    // The erasure anti-join is only an anti-join if this is the hash `suppressions` stores.
+    assert_eq!(hmac, suppression_hmac(&secrets(), &email).to_vec());
+}
+
+#[sqlx::test]
+async fn a_row_that_is_not_utf8_is_an_error_row_naming_its_line(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::FirstName),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Latin-1 out of someone's old system. The operator must learn that, not read "internal error".
+    let counts = copy(&mut tx, &j, b"email,first_name\na@b.co,Ada\nc@d.co,Jos\xe9\n").await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    let (row, column, reason, value) = &errors[0];
+    assert_eq!(*row, 3, "the header is row 1, so the second data row is 3");
+    assert_eq!(column.as_deref(), Some("first_name"));
+    assert!(reason.contains("UTF-8"), "{reason}");
+    assert_eq!(value.as_deref(), Some("Jos\u{fffd}"));
+}
+
+#[sqlx::test]
+async fn a_lone_carriage_return_does_not_start_a_record(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::Tags),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // CRLF endings, and a quoted cell holding a bare CR: neither may end a record early or add an
+    // empty one. A file read that way reports twice its rows and fails half of them.
+    let counts = copy(&mut tx, &j, b"email,tags\r\na@b.co,\"x\ry\"\r\nc@d.co,\r\n").await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 2, 0));
+    assert_eq!(
+        staged(&mut tx, import).await,
+        [(2, "a@b.co".to_owned()), (3, "c@d.co".to_owned())]
+    );
+    let tags: Value = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select tags from {} where row_number = 2",
+        staging_table(import)
+    )))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(tags, json!(["x\ry"]));
+}
+
+#[sqlx::test]
+async fn minus_five_minus_five_into_a_number_field_is_an_error_row(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let defs = vec![field("score", FieldKind::Number)];
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Custom("score".to_owned()),
+    ];
+    let j = job(import, ws, mapping, defs);
+    let mut tx = pool.begin().await.unwrap();
+
+    let counts = copy(&mut tx, &j, b"email,attr:score\na@b.co,-5-5\nc@d.co,7\n").await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
+    assert_eq!(staged(&mut tx, import).await, [(3, "c@d.co".to_owned())]);
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 2);
+    assert_eq!(errors[0].1.as_deref(), Some("attr:score"));
+    assert_eq!(errors[0].3.as_deref(), Some("-5-5"));
+}
+
+#[sqlx::test]
+async fn one_e_999_into_a_number_field_is_an_error_row(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let defs = vec![field("score", FieldKind::Number)];
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Custom("score".to_owned()),
+    ];
+    let j = job(import, ws, mapping, defs);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Parses as a float, to an infinity: not a JSON number, and not a quantity anyone meant.
+    let counts = copy(&mut tx, &j, b"email,attr:score\na@b.co,1e999\nc@d.co,1e3\n").await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
+
+    let attributes: Value = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select attributes from {} where row_number = 3",
+        staging_table(import)
+    )))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(attributes, json!({"score": 1000.0}));
+    assert_eq!(error_rows(&mut tx, import).await[0].0, 2);
+}
+
+#[sqlx::test]
+async fn a_bad_row_does_not_stop_the_good_rows_after_it(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job(import, ws, email_column(), vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    let counts = copy(&mut tx, &j, b"email\na@b.co\nnot-an-email\nc@d.co\n").await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (3, 2, 1));
+    assert_eq!(
+        staged(&mut tx, import).await,
+        [(2, "a@b.co".to_owned()), (4, "c@d.co".to_owned())],
+        "the row after the bad one is staged, and keeps its own line number"
+    );
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 3);
+    assert_eq!(errors[0].3.as_deref(), Some("not-an-email"));
+}
+
+#[sqlx::test]
+async fn a_row_wider_than_its_header_is_an_error_row_but_a_trailing_delimiter_is_not(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::FirstName),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Row 2 holds a value with an unquoted comma in it, so every cell after it may be the wrong
+    // cell; row 3 ends in a delimiter, which says nothing; row 4 is short, which is a blank cell.
+    let counts = copy(
+        &mut tx,
+        &j,
+        b"email,first_name\na@b.co,Lovelace,Countess\nb@b.co,Bo,\nc@d.co\n",
+    )
+    .await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (3, 2, 1));
+    assert_eq!(
+        staged(&mut tx, import).await,
+        [(3, "b@b.co".to_owned()), (4, "c@d.co".to_owned())]
+    );
+    let names: Vec<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "select first_name from {} order by row_number",
+        staging_table(import)
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    // A blank cell is not a null to write: it is the file saying nothing about the field.
+    assert_eq!(names, [Some("Bo".to_owned()), None]);
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 2);
+    assert!(errors[0].2.contains("3 fields"), "{}", errors[0].2);
+}

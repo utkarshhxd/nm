@@ -16,6 +16,7 @@ use crate::custom_fields::Definition;
 pub mod csv;
 pub mod routes;
 pub mod sniff;
+pub mod staging;
 
 /// A built-in contact column an import may write: the exporter's own header for it. `id`,
 /// `created_at`, `updated_at` and `suppressed` are not here on purpose: the first three are the
