@@ -2772,7 +2772,7 @@
           "crate::contacts::import::routes"
         ],
         "summary": "Takes a CSV as `multipart/form-data` (one part, `file`), keeps it on disk under a name derived\nfrom the import's id, records the import as `pending`, and answers with the delimiter, a header\nguess, and a proposed mapping from each column to a contact field or custom field.",
-        "description": "The proposal names a column only when the match is certain: the whole header equals a field's\nname, ignoring case, or the exporter's own `attr:<key>`, and no other column claims the same\ntarget. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.",
+        "description": "The proposal names a column only when the match is certain: the whole header, lowercased with\neverything but letters and digits removed, equals a field's name the same way (`First Name` is\n`first_name`; `Email Address` is nothing), or is the exporter's own `attr:<key>`, and no other\ncolumn or field also claims it. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.",
         "operationId": "create_import",
         "parameters": [
           {
@@ -2816,7 +2816,7 @@
             "description": "import-too-large: the file is over the size limit"
           },
           "422": {
-            "description": "not multipart/form-data, no `file` part, an unknown part, more than one file, or empty-file: the file has no rows"
+            "description": "not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, or too-many-columns"
           }
         }
       }

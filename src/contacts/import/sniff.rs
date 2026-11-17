@@ -5,8 +5,8 @@
 //!
 //! **A proposal that is not certain is blank.** A blank costs the operator one dropdown; a
 //! confident wrong one writes a column into the wrong field, and the mapping screen is the last
-//! place anyone would look for the cause. So a name is matched exactly (case aside) or not at all,
-//! and a target two columns would claim goes to neither.
+//! place anyone would look for the cause. So a name is matched after one normalisation (see
+//! [`normalise`]) or not at all, and a target two columns would claim goes to neither.
 
 use std::collections::HashMap;
 
@@ -88,19 +88,39 @@ fn looks_like_email(cell: &str) -> bool {
         .is_some_and(|(l, r)| !l.is_empty() && r.contains('.') && !cell.contains(' '))
 }
 
-/// The target a header names, or `Ignore` when it names none or more than one. Matching is on the
-/// whole header, ignoring case: a built-in's wire name, a live custom field's key or label, or the
-/// exporter's own `attr:<key>`. Archived fields take no new values, so they are never proposed.
+/// Lowercased with everything but letters and digits removed, so `First Name`, `FIRST_NAME` and
+/// `first name` are one token and `e-mail` is `email`. That is all it does: it canonicalises the
+/// same words and consults no synonym table, so `Email Address` stays `emailaddress` and matches
+/// nothing. Collisions it creates (a custom key `first_name` beside the built-in) are caught by
+/// [`propose`] seeing two candidates and answering `Ignore`.
+fn normalise(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The target a header names, or `Ignore` when it names none or more than one. A plain header is
+/// compared, after [`normalise`], with a built-in's wire name and a live custom field's key or
+/// label. The exporter's own `attr:<key>` is a custom field's key only; its prefix comes off
+/// BEFORE normalising, or `attr:colour` would read as `attrcolour`. Archived fields take no new
+/// values, so they are never proposed.
 fn propose(header: &str, defs: &[Definition]) -> ColumnTarget {
-    let h = header.trim().to_lowercase();
+    let lower = header.trim().to_lowercase();
+    let (attr, name) = match lower.strip_prefix("attr:") {
+        Some(key) => (true, normalise(key)),
+        None => (false, normalise(&lower)),
+    };
+    if name.is_empty() {
+        return ColumnTarget::Ignore;
+    }
     let mut hits: Vec<ColumnTarget> = ContactField::ALL
         .into_iter()
-        .filter(|f| f.header() == h)
+        .filter(|f| !attr && normalise(f.header()) == name)
         .map(ColumnTarget::Field)
         .collect();
-    let attr_key = h.strip_prefix("attr:");
     for d in defs.iter().filter(|d| d.archived_at.is_none()) {
-        if d.key == h || d.label.trim().to_lowercase() == h || attr_key == Some(d.key.as_str()) {
+        if normalise(&d.key) == name || (!attr && normalise(&d.label) == name) {
             hits.push(ColumnTarget::Custom(d.key.clone()));
         }
     }

@@ -313,7 +313,7 @@ async fn a_column_named_attr_colour_proposes_that_custom_field(pool: PgPool) {
 async fn an_unrecognised_column_proposes_nothing(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
-    let csv = "e-mail,Given Name,attr:ghost,id,suppressed\nada@example.com,Ada,x,1,true\n";
+    let csv = "Email Address,Given Name,attr:ghost,id,suppressed\nada@example.com,Ada,x,1,true\n";
     let body = uploaded(&app, ws, "u.csv", csv).await;
     assert!(
         proposals(&body)
@@ -419,4 +419,62 @@ fn only_the_first_hundred_rows_are_read_and_an_empty_head_has_no_columns() {
     let s = sniff(&csv, &[]);
     assert!(s.columns[1].samples.is_empty());
     assert_eq!(sniff("", &[]).columns.len(), 0);
+}
+
+#[test]
+fn a_header_is_matched_after_lowercasing_and_dropping_punctuation_and_nothing_more() {
+    let s = sniff(
+        "First Name,LAST_NAME,e-mail,Email Address,time zone\nAda,Lovelace,a@b.co,a@b.co,UTC\n",
+        &[],
+    );
+    assert_eq!(
+        proposed(&s),
+        [
+            ColumnTarget::Field(ContactField::FirstName),
+            ColumnTarget::Field(ContactField::LastName),
+            // `e-mail` is `email`; `Email Address` is a different word and must stay blank.
+            ColumnTarget::Field(ContactField::Email),
+            ColumnTarget::Ignore,
+            ColumnTarget::Field(ContactField::Timezone),
+        ]
+    );
+}
+
+#[test]
+fn a_custom_key_that_normalises_onto_a_built_in_blanks_both_and_attr_keeps_its_key() {
+    // The built-in and the custom field both read as `firstname`: unsure, so blank.
+    let defs = [
+        def("first_name", "First name", false),
+        def("colour", "Colour", false),
+    ];
+    let s = sniff("First Name,attr:colour,attr:first_name\nAda,red,x\n", &defs);
+    assert_eq!(
+        proposed(&s),
+        [
+            ColumnTarget::Ignore,
+            ColumnTarget::Custom("colour".to_owned()),
+            // `attr:` names a custom key only, so this one is certain even though the plain
+            // header above is not.
+            ColumnTarget::Custom("first_name".to_owned()),
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_three_megabyte_upload_is_accepted(pool: PgPool) {
+    // axum's own multipart limit is 2 MB; the route raises it. If that layer is lost every real
+    // upload is a 413 and nothing else here would notice.
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let mut csv = String::from("email,first_name\n");
+    let mut i = 0;
+    while csv.len() < 3 * 1024 * 1024 {
+        csv.push_str(&format!("user{i}@example.com,Ada\n"));
+        i += 1;
+    }
+    let body = uploaded(&app, ws, "big.csv", &csv).await;
+    assert_eq!(body["total_bytes"], csv.len());
+    // Sniffed from the head only, so the answer is the same as for a small file.
+    assert_eq!(body["columns"].as_array().unwrap().len(), 2);
+    assert_eq!(body["columns"][0]["samples"].as_array().unwrap().len(), 5);
 }

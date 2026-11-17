@@ -38,6 +38,12 @@ use axum::extract::State;
 /// the disk hold, and an operator who raises it should have to read this comment.
 pub const MAX_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The most columns a file may have. The run copies each file into a staging table with one column
+/// per CSV column, and Postgres refuses a table over 1600 columns (and one near it fails with an
+/// error nobody can read), so the cap sits well below that, leaving room for bookkeeping columns.
+/// Checked at upload so the operator hears it before the mapping screen renders a thousand rows.
+pub const MAX_IMPORT_COLUMNS: usize = 1000;
+
 /// What the multipart framing may add to the file. The body limit is the file's cap plus this, so a
 /// client cannot get past [`MAX_IMPORT_BYTES`] by padding the other parts; the file itself is
 /// counted exactly, as it streams.
@@ -197,9 +203,10 @@ async fn receive(
 /// from the import's id, records the import as `pending`, and answers with the delimiter, a header
 /// guess, and a proposed mapping from each column to a contact field or custom field.
 ///
-/// The proposal names a column only when the match is certain: the whole header equals a field's
-/// name, ignoring case, or the exporter's own `attr:<key>`, and no other column claims the same
-/// target. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
+/// The proposal names a column only when the match is certain: the whole header, lowercased with
+/// everything but letters and digits removed, equals a field's name the same way (`First Name` is
+/// `first_name`; `Email Address` is nothing), or is the exporter's own `attr:<key>`, and no other
+/// column or field also claims it. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/imports",
@@ -211,7 +218,7 @@ async fn receive(
         (status = 403, description = "insufficient-role: importing takes editor"),
         (status = 404, description = "not a member, or no such workspace"),
         (status = 413, description = "import-too-large: the file is over the size limit"),
-        (status = 422, description = "not multipart/form-data, no `file` part, an unknown part, more than one file, or empty-file: the file has no rows"),
+        (status = 422, description = "not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, or too-many-columns"),
     ),
 )]
 pub async fn create_import(
@@ -232,6 +239,12 @@ pub async fn create_import(
     let (filename, total_bytes, head) = receive(multipart, &file.path, MAX_IMPORT_BYTES).await?;
     let defs = definitions_for(&state.pool, workspace_id).await?;
     let sniffed = sniff(&String::from_utf8_lossy(&head), &defs);
+    if sniffed.columns.len() > MAX_IMPORT_COLUMNS {
+        return Err(ApiError::UnprocessableDetail {
+            code: "too-many-columns",
+            detail: format!("the file has more than {MAX_IMPORT_COLUMNS} columns"),
+        });
+    }
     if sniffed.columns.is_empty() {
         return Err(ApiError::UnprocessableDetail {
             code: "empty-file",
@@ -327,11 +340,42 @@ mod tests {
                 ..
             })
         ));
+        // `receive` itself leaves the partial file: removing it is the guard's job, tested below.
+        assert!(path.exists());
         std::fs::remove_file(&path).unwrap();
 
         let (_, bytes, _) = receive(part(20).await, &path, 20).await.unwrap();
         assert_eq!(bytes, 20);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_guard_removes_a_partial_file_when_dropped_and_keeps_a_recorded_one() {
+        let dir = std::env::temp_dir();
+        let (gone, kept) = (
+            dir.join(format!("nm-import-test-{}", Uuid::now_v7())),
+            dir.join(format!("nm-import-test-{}", Uuid::now_v7())),
+        );
+        {
+            let _guard = TempFile {
+                path: gone.clone(),
+                keep: false,
+            };
+            let over = receive(part(21).await, &gone, 20).await;
+            assert!(over.is_err() && gone.exists());
+        }
+        assert!(
+            !gone.exists(),
+            "dropping the guard removes what was written"
+        );
+
+        std::fs::write(&kept, b"x").unwrap();
+        drop(TempFile {
+            path: kept.clone(),
+            keep: true,
+        });
+        assert!(kept.exists());
+        std::fs::remove_file(&kept).unwrap();
     }
 
     #[test]

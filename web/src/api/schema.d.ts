@@ -808,9 +808,10 @@ export interface paths {
          * Takes a CSV as `multipart/form-data` (one part, `file`), keeps it on disk under a name derived
          *     from the import's id, records the import as `pending`, and answers with the delimiter, a header
          *     guess, and a proposed mapping from each column to a contact field or custom field.
-         * @description The proposal names a column only when the match is certain: the whole header equals a field's
-         *     name, ignoring case, or the exporter's own `attr:<key>`, and no other column claims the same
-         *     target. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
+         * @description The proposal names a column only when the match is certain: the whole header, lowercased with
+         *     everything but letters and digits removed, equals a field's name the same way (`First Name` is
+         *     `first_name`; `Email Address` is nothing), or is the exporter's own `attr:<key>`, and no other
+         *     column or field also claims it. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
          */
         post: operations["create_import"];
         delete?: never;
@@ -4637,7 +4638,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, or empty-file: the file has no rows */
+            /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, or too-many-columns */
             422: {
                 headers: {
                     [name: string]: unknown;

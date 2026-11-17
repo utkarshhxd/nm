@@ -27,7 +27,12 @@
 --
 -- `delimiter` and `has_header` are what the sniff reported at upload, stored because the operator
 -- confirms a mapping against THOSE columns: a second sniff at start could disagree and silently
--- re-point every column. The start request does not carry them. `delimiter` is the delimiter byte
+-- re-point every column. THE RULE FOR THE RUN: use these stored values, never sniff again. The
+-- start request may carry optional `delimiter` and `has_header` OVERRIDES, which replace the stored
+-- values: a wrong guess (a headerless file read as headed silently drops its first row; a
+-- misdetected delimiter misparses every row) is corrected by the operator who was shown it, which
+-- is not a silent disagreement. A request that carries neither uses what is stored here.
+-- `delimiter` is the delimiter byte
 -- as a `smallint` (0..=255), not `"char"`: `"char"` is Postgres's internal one-byte type and
 -- sqlx has no friendly mapping for a byte in it, while `smallint` reads back as `i16` and the
 -- check keeps it a byte. Both are not null: an import row exists only because an upload was sniffed.
