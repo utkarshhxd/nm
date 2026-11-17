@@ -154,7 +154,11 @@ test("a changed mapping is what the confirmation step shows, and survives going 
   await expect(review.getByRole("row", { name: /Notes.*Tags/ })).toBeVisible();
   await expect(page.getByText("A blank cell leaves the existing value alone.")).toBeVisible();
 
+  // A keyboard user's focus must not fall to <body> when the button that was pressed unmounts.
+  await expect(page.getByRole("heading", { name: "Review the mapping", exact: true })).toBeFocused();
+
   await page.getByRole("button", { name: "Back to mapping", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Map the columns", exact: true })).toBeFocused();
   await expect(target("Email Address")).toHaveValue("field:email");
   await expect(target("Notes")).toHaveValue("field:tags");
 });
@@ -194,8 +198,15 @@ test("worst-case names and samples keep the screens inside 320 px and axe-clean 
       for (const where of ["mapping", "review"]) {
         if (where === "review") {
           await target("Email").selectOption({ label: "Email" });
+          // Not left as `ignore`: the review table lists only mapped columns, so the long name and
+          // sample must be mapped to be rendered there at all.
+          await target(long).selectOption({ label: "Tags" });
           await page.getByRole("button", { name: "Review mapping", exact: true }).click();
           await expect(page.getByRole("heading", { name: "Review the mapping", exact: true })).toBeVisible();
+          const review = page.getByRole("table", { name: "Mapping to review" });
+          await expect(review.getByRole("rowheader", { name: long, exact: true })).toBeVisible();
+          // The server cuts a sample to 100 characters (`SAMPLE_CHARS`).
+          await expect(review.getByRole("cell", { name: "x".repeat(100), exact: true })).toBeVisible();
         }
         const widths = await page.evaluate(() => ({
           page: document.documentElement.scrollWidth,

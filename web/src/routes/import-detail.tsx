@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api, problemMessage } from "../api/client";
 import type { components } from "../api/schema";
@@ -89,6 +89,14 @@ export default function ImportDetail() {
 function Mapping({ ws, uploaded: { upload, filename } }: { ws: string; uploaded: Uploaded }) {
   const [mapping, setMapping] = useState<ColumnTarget[]>(() => upload.columns.map((c) => c.proposed));
   const [reviewing, setReviewing] = useState(false);
+  // The button that changes the step unmounts with it, so focus would fall to <body> and nothing
+  // would say the heading changed. Focusing the heading announces it and keeps the place.
+  const heading = useRef<HTMLHeadingElement>(null);
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) first.current = false;
+    else heading.current?.focus();
+  }, [reviewing]);
 
   const custom = useQuery({
     // Under the custom-fields screen's key as a prefix, never equal to it, as the lists do.
@@ -124,7 +132,7 @@ function Mapping({ ws, uploaded: { upload, filename } }: { ws: string; uploaded:
 
   return (
     <>
-      <h2 className="mt-4 text-xl font-semibold">{reviewing ? "Review the mapping" : "Map the columns"}</h2>
+      <h2 ref={heading} tabIndex={-1} className="mt-4 text-xl font-semibold">{reviewing ? "Review the mapping" : "Map the columns"}</h2>
       <p className="mt-2 text-fg-muted">
         <span className="wrap-anywhere">{filename}</span>: {upload.columns.length.toLocaleString()} columns,
         separated by a {DELIMITERS[upload.delimiter] ?? "custom separator"};{" "}
