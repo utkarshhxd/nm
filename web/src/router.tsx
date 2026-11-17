@@ -152,6 +152,18 @@ const auditLogRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/audit-log")),
 });
 
+const importsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "imports",
+  component: lazyRouteComponent(() => import("./routes/imports")),
+});
+
+const importRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "imports/$importId",
+  component: lazyRouteComponent(() => import("./routes/import-detail")),
+});
+
 export const router = createRouter({
   routeTree: rootRoute.addChildren([
     homeRoute,
@@ -172,6 +184,8 @@ export const router = createRouter({
       membersRoute,
       apiKeysRoute,
       auditLogRoute,
+      importsRoute,
+      importRoute,
     ]),
   ]),
 });
