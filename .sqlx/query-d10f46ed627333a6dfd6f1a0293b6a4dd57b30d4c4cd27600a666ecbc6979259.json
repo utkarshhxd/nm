@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select row_number, column_name, reason, value from import_errors where workspace_id = $1 and import_id = $2 and ($3::bigint is null or row_number > $3) order by row_number limit $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "row_number",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "import_errors",
+            "name": "row_number"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "column_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "import_errors",
+            "name": "column_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "import_errors",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "value",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "import_errors",
+            "name": "value"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "d10f46ed627333a6dfd6f1a0293b6a4dd57b30d4c4cd27600a666ecbc6979259"
+}

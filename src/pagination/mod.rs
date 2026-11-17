@@ -40,6 +40,21 @@ impl PageParams {
             .map(Some)
             .ok_or_else(|| ApiError::Validation(vec![FieldError::new("cursor", "invalid cursor")]))
     }
+
+    /// The decoded cursor for a list keyed by a row number rather than an id
+    /// ([`encode_row_cursor`]); a malformed one is a 422. An id cursor is 16 bytes and this one
+    /// is 8, so one minted for the other list kind is refused rather than silently restarting.
+    pub fn after_row(&self) -> ApiResult<Option<i64>> {
+        let Some(cursor) = &self.cursor else {
+            return Ok(None);
+        };
+        URL_SAFE_NO_PAD
+            .decode(cursor)
+            .ok()
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(|bytes| Some(i64::from_be_bytes(bytes)))
+            .ok_or_else(|| ApiError::Validation(vec![FieldError::new("cursor", "invalid cursor")]))
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -50,12 +65,22 @@ pub struct Page<T> {
 
 impl<T> Page<T> {
     /// `rows` is the `limit + 1` fetch: an extra row means another page exists.
-    pub fn from_rows(mut rows: Vec<T>, limit: i64, id: impl Fn(&T) -> Uuid) -> Page<T> {
+    pub fn from_rows(rows: Vec<T>, limit: i64, id: impl Fn(&T) -> Uuid) -> Page<T> {
+        Page::paged(rows, limit, |row| encode_cursor(id(row)))
+    }
+
+    /// [`Page::from_rows`] for a list keyed by a row number rather than an id: the errors of one
+    /// import, which are ordered by the CSV row they came from.
+    pub fn from_numbered_rows(rows: Vec<T>, limit: i64, row_number: impl Fn(&T) -> i64) -> Page<T> {
+        Page::paged(rows, limit, |row| encode_row_cursor(row_number(row)))
+    }
+
+    fn paged(mut rows: Vec<T>, limit: i64, cursor: impl Fn(&T) -> String) -> Page<T> {
         let limit = usize::try_from(limit).unwrap_or(0);
         let mut next_cursor = None;
         if rows.len() > limit {
             rows.truncate(limit);
-            next_cursor = rows.last().map(|last| encode_cursor(id(last)));
+            next_cursor = rows.last().map(&cursor);
         }
         Page {
             data: rows,
@@ -66,6 +91,11 @@ impl<T> Page<T> {
 
 pub fn encode_cursor(id: Uuid) -> String {
     URL_SAFE_NO_PAD.encode(id.as_bytes())
+}
+
+/// The cursor for a row-numbered list: the row number's eight big-endian bytes.
+pub fn encode_row_cursor(row_number: i64) -> String {
+    URL_SAFE_NO_PAD.encode(row_number.to_be_bytes())
 }
 
 #[cfg(test)]
@@ -102,6 +132,29 @@ mod tests {
                 Err(ApiError::Validation(_))
             ));
         }
+    }
+
+    #[test]
+    fn a_row_cursor_round_trips_and_the_two_cursor_kinds_do_not_cross() {
+        let cursor = encode_row_cursor(9_000_000_000);
+        assert_eq!(
+            params(None, Some(&cursor)).after_row().unwrap(),
+            Some(9_000_000_000)
+        );
+        assert_eq!(params(None, None).after_row().unwrap(), None);
+        // An id cursor is 16 bytes, a row cursor 8: each is garbage to the other list's handler,
+        // which is a 422 rather than a silent restart at the top of the list.
+        let id = encode_cursor(Uuid::now_v7());
+        for bad in ["%%%", "", "AAAA", &id] {
+            assert!(matches!(
+                params(None, Some(bad)).after_row(),
+                Err(ApiError::Validation(_))
+            ));
+        }
+        assert!(matches!(
+            params(None, Some(&cursor)).after(),
+            Err(ApiError::Validation(_))
+        ));
     }
 
     #[test]

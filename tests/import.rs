@@ -916,7 +916,7 @@ fn name_columns() -> Vec<ColumnTarget> {
 /// The whole pipeline over one in-memory file: `COPY` into staging, then the upsert.
 async fn import_csv(conn: &mut PgConnection, j: &ImportJob, csv: &str) -> UpsertCounts {
     let staged = copy(conn, j, csv.as_bytes()).await;
-    upsert_from_staging(conn, j, staged)
+    upsert_from_staging(conn, j, staged.failed)
         .await
         .expect("the upsert")
 }
@@ -1056,7 +1056,7 @@ async fn fail_on_duplicate_aborts_before_any_write(pool: PgPool) {
           ada@example.com,Grace,Hopper,UTC\n",
     )
     .await;
-    let err = upsert_from_staging(&mut tx, &j, staged)
+    let err = upsert_from_staging(&mut tx, &j, staged.failed)
         .await
         .expect_err("a duplicate must abort the import");
     let ApiError::ConflictDetail { code, detail } = &err else {
@@ -1275,8 +1275,8 @@ async fn a_row_the_copy_refused_is_still_one_of_the_five_counts(pool: PgPool) {
 
     // Three of the five terms in one file: a row the `COPY` refused (`failed`), a row a later row
     // of the same file repeats (`collapsed`), and two new contacts (`imported`). The whole reason
-    // `upsert_from_staging` takes `StagingCounts` is that the five come out apportioned here, so
-    // the `COPY`'s own refusals have to be carried into them.
+    // `upsert_from_staging` takes the `COPY`'s refusal count is that the five come out apportioned
+    // in one place: those rows never reached staging, so nothing downstream can see them.
     let staged = copy(
         &mut tx,
         &j,
@@ -1289,7 +1289,9 @@ async fn a_row_the_copy_refused_is_still_one_of_the_five_counts(pool: PgPool) {
     .await;
     assert_eq!((staged.total_rows, staged.staged, staged.failed), (4, 3, 1));
 
-    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    let counts = upsert_from_staging(&mut tx, &j, staged.failed)
+        .await
+        .unwrap();
     assert_eq!(
         counts,
         UpsertCounts {
@@ -1357,7 +1359,9 @@ async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: P
     // be a cross-workspace deletion of a row this import had just created.
     erase(&mut tx, Some(other), "theirs@example.com").await;
 
-    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    let counts = upsert_from_staging(&mut tx, &j, staged.failed)
+        .await
+        .unwrap();
     assert!(
         contact(&mut tx, ws, "ada@example.com").await.is_none(),
         "this workspace's tombstone takes the contact back out"
@@ -1708,7 +1712,9 @@ async fn that_row_is_counted_in_memberships_declined_and_the_contact_still_updat
           carol@example.com,Carol,Shaw,UTC\n",
     )
     .await;
-    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    let counts = upsert_from_staging(&mut tx, &j, staged.failed)
+        .await
+        .unwrap();
 
     assert_eq!(
         counts,
@@ -1962,7 +1968,9 @@ async fn a_tag_name_the_api_would_refuse_is_an_error_row_naming_its_column(pool:
          carol@example.com,vip,\n"
     );
     let staged = copy(&mut tx, &j, csv.as_bytes()).await;
-    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    let counts = upsert_from_staging(&mut tx, &j, staged.failed)
+        .await
+        .unwrap();
 
     let refused = "must be 1-100 characters with no control characters".to_owned();
     assert_eq!(
@@ -2103,4 +2111,399 @@ async fn a_padded_custom_cell_is_stored_without_its_padding(pool: PgPool) {
         contact(&mut tx, ws, "ada@example.com").await.unwrap().3,
         json!({"plan": "pro", "tier": "gold"}),
     );
+}
+
+// ---- Task 7: the report, and the rows it rejected ----------------------------------------------
+
+fn report_uri(ws: Uuid, import: Uuid) -> String {
+    format!("/api/v1/workspaces/{ws}/imports/{import}")
+}
+
+/// What the run will write once `POST /imports/{id}/start` exists (Task 9): the counts the
+/// pipeline computed, on the import row, with the import marked `complete`. Written by hand here
+/// because running an import is that route's job, not this one's — but the NUMBERS are the
+/// pipeline's own, never the test's, which is the whole point of the sum assertion below.
+async fn finish(conn: &mut PgConnection, import: Uuid, total_rows: i64, c: &UpsertCounts) {
+    let done = sqlx::query(
+        "update imports set status = 'complete', total_rows = $2, imported = $3, updated = $4, \
+         skipped = $5, collapsed = $6, failed = $7, suppressed = $8, memberships_declined = $9, \
+         started_at = now(), finished_at = now() where id = $1",
+    )
+    .bind(import)
+    .bind(total_rows)
+    .bind(c.imported)
+    .bind(c.updated)
+    .bind(c.skipped)
+    .bind(c.collapsed)
+    .bind(c.failed)
+    .bind(c.suppressed)
+    .bind(c.memberships_declined)
+    .execute(conn)
+    .await
+    .expect("finish import");
+    assert_eq!(done.rows_affected(), 1);
+}
+
+async fn insert_error_at(pool: &PgPool, ws: Uuid, import: Uuid, row: i64, value: &str) {
+    sqlx::query(
+        "insert into import_errors \
+             (import_id, workspace_id, row_number, column_name, reason, value) \
+         values ($1, $2, $3, 'email', 'bad address', $4)",
+    )
+    .bind(import)
+    .bind(ws)
+    .bind(row)
+    .bind(value)
+    .execute(pool)
+    .await
+    .expect("insert import error");
+}
+
+#[sqlx::test]
+async fn the_report_names_every_count_separately(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "v@example.com", Role::Viewer).await;
+    let import = insert_import(&pool, ws).await;
+    // Seven different numbers, none of them a sum or a difference of the others: a handler that
+    // reads one column into another field cannot pass this by arithmetic accident.
+    sqlx::query(
+        "update imports set status = 'complete', filename = 'book.csv', total_rows = 97, \
+         imported = 11, updated = 22, skipped = 33, collapsed = 44, failed = 55, suppressed = 66, \
+         memberships_declined = 77, started_at = now(), finished_at = now() where id = $1",
+    )
+    .bind(import)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Fewer error rows than `failed`, which is what a file past `MAX_IMPORT_ERRORS` looks like:
+    // the report has to say both numbers or the operator reads the shorter one as the whole truth.
+    for row in 1..=3 {
+        insert_error_at(&pool, ws, import, row, "not-an-email").await;
+    }
+
+    let r = app.get(&report_uri(ws, import)).await;
+    r.assert_status_ok();
+    let b: Value = r.json();
+    assert_eq!(b["id"], import.to_string());
+    assert_eq!(b["status"], "complete");
+    assert_eq!(b["filename"], "book.csv");
+    assert_eq!(b["total_rows"], 97);
+    assert_eq!(b["imported"], 11);
+    assert_eq!(b["updated"], 22);
+    assert_eq!(b["skipped"], 33);
+    assert_eq!(b["collapsed"], 44);
+    assert_eq!(b["failed"], 55);
+    assert_eq!(b["suppressed"], 66);
+    assert_eq!(b["memberships_declined"], 77);
+    assert_eq!(
+        b["errors_recorded"], 3,
+        "55 rows failed and 3 of them were kept: an operator paging to the end of the list has \
+         seen the first 3, not all 55"
+    );
+    assert_eq!(b["error_reason"], Value::Null);
+    assert!(b["created_at"].is_string());
+    assert!(b["started_at"].is_string());
+    assert!(b["finished_at"].is_string());
+
+    // An import that died part-way says why, and says it has not counted the file: `null` is
+    // "still unknown", which a `0` would report as an empty file.
+    let dead = insert_import(&pool, ws).await;
+    sqlx::query(
+        "update imports set status = 'failed', error_reason = 'the file is not UTF-8', \
+         started_at = now(), finished_at = now() where id = $1",
+    )
+    .bind(dead)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let b: Value = app.get(&report_uri(ws, dead)).await.json();
+    assert_eq!(b["status"], "failed");
+    assert_eq!(b["error_reason"], "the file is not UTF-8");
+    assert_eq!(b["total_rows"], Value::Null);
+    assert_eq!(b["errors_recorded"], 0);
+}
+
+/// The FIVE row-level counts, named in the test's name so the next reader does not "fix" it by
+/// adding the other two. `suppressed` and `memberships_declined` describe rows already counted
+/// among these five — a suppressed address is still an imported or updated contact, and a declined
+/// membership belongs to one — so adding all seven counts those rows twice. The last assertion
+/// here is that the seven do NOT sum to `total_rows`, which is what makes the rule falsifiable.
+#[sqlx::test]
+async fn imported_updated_skipped_collapsed_and_failed_add_up_to_total_rows(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "v@example.com", Role::Viewer).await;
+    let first = insert_import(&pool, ws).await;
+    let second = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "bob@example.com", "Bob", "Barker").await;
+    unsubscribe(&mut tx, ws, list, "bob@example.com").await;
+    suppress_address(&mut tx, Some(ws), "sue@example.com").await;
+
+    // Six data rows, one of each kind the file can hold under `update existing`: a row the COPY
+    // refuses, a row a later row repeats, three new contacts and one that already exists. Two of
+    // those rows are ALSO a suppression and a declined subscription, which is exactly the overlap
+    // the sum must not double-count.
+    let j = job_with(
+        first,
+        ws,
+        tag_and_list_columns(),
+        vec![],
+        Dedup::UpdateExisting,
+    );
+    let staged = copy(
+        &mut tx,
+        &j,
+        b"email,tags,lists\n\
+          not-an-email,vip,news\n\
+          ada@example.com,vip,news\n\
+          ada@example.com,vip,news\n\
+          bob@example.com,vip,news\n\
+          sue@example.com,vip,news\n\
+          carol@example.com,vip,news\n",
+    )
+    .await;
+    assert_eq!(
+        staged.total_rows, 6,
+        "the file the test wrote has six data rows"
+    );
+    let counts = upsert_from_staging(&mut tx, &j, staged.failed)
+        .await
+        .unwrap();
+    finish(&mut tx, first, staged.total_rows, &counts).await;
+
+    // And three rows under `skip existing`, because `skipped` is zero in every other mode: the
+    // five cannot all be non-zero in one import.
+    let j = job_with(
+        second,
+        ws,
+        tag_and_list_columns(),
+        vec![],
+        Dedup::SkipExisting,
+    );
+    let other = copy(
+        &mut tx,
+        &j,
+        b"email,tags,lists\n\
+          ada@example.com,vip,news\n\
+          dan@example.com,vip,news\n\
+          not-an-email,vip,news\n",
+    )
+    .await;
+    assert_eq!(other.total_rows, 3);
+    let other_counts = upsert_from_staging(&mut tx, &j, other.failed)
+        .await
+        .unwrap();
+    finish(&mut tx, second, other.total_rows, &other_counts).await;
+    tx.commit().await.unwrap();
+
+    let five = |b: &Value| -> i64 {
+        ["imported", "updated", "skipped", "collapsed", "failed"]
+            .iter()
+            .map(|k| b[*k].as_i64().expect(k))
+            .sum()
+    };
+
+    let b: Value = app.get(&report_uri(ws, first)).await.json();
+    // The breakdown, not only its total: a sum assertion alone passes on any apportionment.
+    assert_eq!(
+        (
+            &b["imported"],
+            &b["updated"],
+            &b["skipped"],
+            &b["collapsed"],
+            &b["failed"],
+        ),
+        (&json!(3), &json!(1), &json!(0), &json!(1), &json!(1)),
+        "{b}"
+    );
+    assert_eq!(b["total_rows"], 6);
+    assert_eq!(five(&b), 6, "the five are the whole file: {b}");
+    assert_eq!(
+        (&b["suppressed"], &b["memberships_declined"]),
+        (&json!(1), &json!(1)),
+        "{b}"
+    );
+    assert_eq!(
+        five(&b) + b["suppressed"].as_i64().unwrap() + b["memberships_declined"].as_i64().unwrap(),
+        8,
+        "all seven come to more than the file's six rows, because two of the five are counted \
+         again by the other two. This is the test's point, not its bug."
+    );
+    assert_eq!(b["errors_recorded"], 1);
+
+    let b: Value = app.get(&report_uri(ws, second)).await.json();
+    assert_eq!(
+        (
+            &b["imported"],
+            &b["updated"],
+            &b["skipped"],
+            &b["collapsed"],
+            &b["failed"],
+        ),
+        (&json!(1), &json!(0), &json!(1), &json!(0), &json!(1)),
+        "{b}"
+    );
+    assert_eq!(b["total_rows"], 3);
+    assert_eq!(five(&b), 3, "{b}");
+}
+
+#[sqlx::test]
+async fn errors_are_cursor_paginated_and_scoped_to_the_workspace(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let app = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let ours = insert_import(&pool, a).await;
+    let theirs = insert_import(&pool, b).await;
+    for row in 1..=5 {
+        insert_error_at(&pool, a, ours, row, &format!("row-{row}@bad")).await;
+    }
+    for row in 1..=2 {
+        insert_error_at(&pool, b, theirs, row, "THEIRS").await;
+    }
+
+    // File order, two at a time, following the cursor to the end.
+    let (mut rows, mut uri, mut pages) = (
+        Vec::new(),
+        format!("{}/errors?limit=2", report_uri(a, ours)),
+        0,
+    );
+    loop {
+        let page: Value = app.get(&uri).await.json();
+        pages += 1;
+        assert!(pages <= 4, "the cursor is not advancing");
+        rows.extend(page["data"].as_array().expect("data").clone());
+        match page["next_cursor"].as_str() {
+            Some(cursor) => uri = format!("{}/errors?limit=2&cursor={cursor}", report_uri(a, ours)),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3, "five rows, two at a time");
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["row_number"].clone())
+            .collect::<Vec<_>>(),
+        [json!(1), json!(2), json!(3), json!(4), json!(5)],
+        "`row_number` is the CSV row, so the list is the file's own order"
+    );
+    assert_eq!(
+        rows[0],
+        json!({
+            "row_number": 1,
+            "column_name": "email",
+            "reason": "bad address",
+            "value": "row-1@bad",
+        }),
+        "which row, which column, why, and the cell that did it"
+    );
+    assert!(
+        !rows.iter().any(|r| r["value"] == "THEIRS"),
+        "the other workspace's rejected rows are not in this workspace's list"
+    );
+
+    // Another workspace's import, asked for under OUR workspace: 404, never its rows and never a
+    // 403 — nobody learns from this whether that import exists.
+    let r = app.get(&format!("{}/errors", report_uri(a, theirs))).await;
+    r.assert_status(StatusCode::NOT_FOUND);
+    let problem: Value = r.json();
+    assert_eq!(problem["type"], "urn:nm:problem:not-found");
+    assert_eq!(problem["data"], Value::Null);
+
+    // And asked for under THEIR workspace, by someone who is not a member of it.
+    app.get(&format!("{}/errors", report_uri(b, theirs)))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+
+    // A cursor that is not one is a 422, not a silent first page.
+    app.get(&format!("{}/errors?cursor=%25%25%25", report_uri(a, ours)))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test]
+async fn another_workspaces_import_report_is_404_not_403(pool: PgPool) {
+    let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
+    let app = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let theirs = insert_import(&pool, b).await;
+    sqlx::query("update imports set filename = 'THEIR-BOOK.csv' where id = $1")
+        .bind(theirs)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Control: our own import reads back, so the refusals below are the tenancy's.
+    let ours = insert_import(&pool, a).await;
+    app.get(&report_uri(a, ours)).await.assert_status_ok();
+
+    for uri in [report_uri(a, theirs), report_uri(b, theirs)] {
+        let r = app.get(&uri).await;
+        r.assert_status(StatusCode::NOT_FOUND);
+        let problem: Value = r.json();
+        assert_eq!(problem["type"], "urn:nm:problem:not-found");
+        assert!(
+            !problem.to_string().contains("THEIR-BOOK"),
+            "a 404 carries none of the resource it refused: {problem}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn the_audit_row_names_the_import_and_never_the_file_contents(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
+    let body = uploaded(
+        &app,
+        ws,
+        "book.csv",
+        "email,notes\nada@example.com,SECRET-CELL\n",
+    )
+    .await;
+    let import: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+    // Reading the report and the rejected rows is a read: it writes no audit row of its own.
+    app.get(&report_uri(ws, import)).await.assert_status_ok();
+    app.get(&format!("{}/errors", report_uri(ws, import)))
+        .await
+        .assert_status_ok();
+
+    let rows: Vec<(String, Option<String>, Option<String>, Value)> = sqlx::query_as(
+        "select action, target_type, target_id, metadata from audit_log \
+         where workspace_id = $1 order by id",
+    )
+    .bind(ws)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let about_the_import: Vec<_> = rows
+        .iter()
+        .filter(|r| r.1.as_deref() == Some("import"))
+        .collect();
+    assert_eq!(
+        about_the_import.len(),
+        1,
+        "the upload is logged and the two reads are not: {rows:?}"
+    );
+    let logged_import = about_the_import[0];
+    assert_eq!(
+        (
+            logged_import.0.as_str(),
+            logged_import.2.as_deref(),
+            &logged_import.3["filename"],
+        ),
+        (
+            "import.uploaded",
+            Some(&*import.to_string()),
+            &json!("book.csv"),
+        ),
+        "the row names the import by id, which is how the log is read back"
+    );
+
+    // The audit log is stored in plaintext and read by admins. The file's own cells — an address,
+    // a header, a value — are not the import's identity and never belong in it.
+    let logged = format!("{rows:?}");
+    for leak in ["SECRET-CELL", "ada@example.com", "notes"] {
+        assert!(
+            !logged.contains(leak),
+            "the audit row carries `{leak}` out of the file: {logged}"
+        );
+    }
 }

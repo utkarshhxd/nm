@@ -323,8 +323,14 @@ const ERASED_REASON: &str =
 ///
 /// **The caller must be in the transaction `copy_into_staging` ran in** — the staging table is
 /// `on commit drop` and cannot be reached from anywhere else — and that transaction's `COMMIT` is
-/// what makes this work durable. `staged` is what that `COPY` saw; it is taken here so that the
-/// five counts come out of one place already apportioned.
+/// what makes this work durable.
+///
+/// **`copy_failed` is [`StagingCounts::failed`] and is the only number the caller supplies**: the
+/// rows the `COPY` itself refused never reached staging, so this is the one term the statements
+/// below cannot see for themselves. Everything else — how many rows staged included — is counted
+/// here, in the same statement that computes the rest, so that a caller who passes a
+/// `StagingCounts` from a DIFFERENT `COPY` cannot silently shift `collapsed`. The five counts
+/// still come out of one place, already apportioned.
 ///
 /// Four rules, in the order they apply to a row:
 ///
@@ -343,7 +349,7 @@ const ERASED_REASON: &str =
 pub async fn upsert_from_staging(
     conn: &mut PgConnection,
     import: &ImportJob,
-    staged: StagingCounts,
+    copy_failed: i64,
 ) -> ApiResult<UpsertCounts> {
     let table = staging_table(import.id);
     let ws = import.workspace_id;
@@ -406,7 +412,7 @@ pub async fn upsert_from_staging(
     // `AssertSqlSafe`: the only interpolation is `staging_table`'s fixed prefix with the import id
     // in hex, and `action`, which is one of the two literals above. Nothing a client sent reaches
     // this string.
-    let (picked, erased, inserted, updated): (i64, i64, i64, i64) =
+    let (staged_rows, picked, erased, inserted, updated): (i64, i64, i64, i64, i64) =
         sqlx::query_as(AssertSqlSafe(format!(
             "with picked as ( \
                  select distinct on (email) * from {table} order by email, row_number desc \
@@ -437,7 +443,8 @@ pub async fn upsert_from_staging(
                  on conflict (workspace_id, email) {action} \
                  returning (xmax = 0) as inserted \
              ) \
-             select (select count(*) from picked), (select count(*) from erased), \
+             select (select count(*) from {table}), (select count(*) from picked), \
+                    (select count(*) from erased), \
                     (select count(*) from up where inserted), \
                     (select count(*) from up where not inserted)"
         )))
@@ -500,8 +507,8 @@ pub async fn upsert_from_staging(
         // Only `skip existing` leaves any: in the other two modes every live row is inserted or
         // updated.
         skipped: picked - erased - inserted - updated,
-        collapsed: staged.staged - picked,
-        failed: staged.failed + erased + gone,
+        collapsed: staged_rows - picked,
+        failed: copy_failed + erased + gone,
         memberships_declined: declined,
         suppressed,
     })
