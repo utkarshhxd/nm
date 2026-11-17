@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import AxeBuilder from "@axe-core/playwright";
-import { type BrowserContext, type Page, expect, test } from "@playwright/test";
+import { type BrowserContext, type Page, type Route, expect, test } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 
+import type { components } from "../src/api/schema";
 import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
@@ -560,4 +561,53 @@ test("another workspace's import is not found, and neither its report nor a 403 
   await expect(page.getByRole("heading", { name: "Import not found", exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Import report", exact: true })).toHaveCount(0);
   await expect(page.getByText("other.csv")).toHaveCount(0);
+});
+
+test("a one-column file reads as one column, not \"1 columns\"", async () => {
+  await upload(csv("Email\nsolo-one@example.com\n"));
+  await expect(page.getByText("1 column, separated by a comma", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Review mapping", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Review the mapping", exact: true })).toBeVisible();
+  await expect(will()).toContainText("1 of 1 column is imported");
+});
+
+/** The finished import's report, read by the screen, with `change` applied to what the server sent. */
+async function withReport(change: (r: components["schemas"]["ImportReport"]) => components["schemas"]["ImportReport"]) {
+  await page.route(`**/api/v1/workspaces/*/imports/*`, async (route: Route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    const res = await route.fetch();
+    return route.fulfill({ response: res, json: change((await res.json()) as components["schemas"]["ImportReport"]) });
+  });
+}
+
+test("a failed run that kept no rejected rows says so, and offers no download of nothing", async () => {
+  await upload(csv(["Email", "zero-a@example.com", "not-an-address", "also bad", ""].join("\n")));
+  await review("Email");
+  await run();
+  await expect(count("Failed")).toHaveText("2");
+  await expect(page.getByRole("button", { name: /^Download the/ })).toBeVisible();
+
+  // The savepoint path keeps `failed` and `total_rows` and none of the rows. A stub typed against
+  // the generated schema, because that path cannot be reached with a real file.
+  await withReport((r) => ({ ...r, errors_recorded: 0 }));
+  try {
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Import report", exact: true })).toBeVisible();
+    await expect(page.getByRole("note", { name: "No rejected rows were kept", exact: true })).toContainText(
+      "2 rows were rejected. None were kept.",
+    );
+    await expect(page.getByRole("button", { name: /^Download the/ })).toHaveCount(0);
+    await expect(rejected()).toHaveCount(0);
+    await expect(page.getByText("Showing the first", { exact: false })).toHaveCount(0);
+
+    // The mirror: no failed count but kept rows still on file. They are shown, not hidden.
+    await page.unroute("**/api/v1/workspaces/*/imports/*");
+    await withReport((r) => ({ ...r, failed: 0 }));
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Import report", exact: true })).toBeVisible();
+    await expect(rejected().getByRole("row")).toHaveCount(3);
+    await expect(page.getByText("No row was rejected.")).toHaveCount(0);
+  } finally {
+    await page.unroute("**/api/v1/workspaces/*/imports/*");
+  }
 });

@@ -139,16 +139,17 @@ export default function ImportDetail() {
     // A run that was started elsewhere, or before a reload, is still the server's to finish.
     refetchInterval: (q) => (q.state.data?.status === "running" ? RUNNING_POLL_MS : false),
   });
-  // Set by the mapping step when it sends the run, so the report that replaces it takes focus:
-  // the button that was pressed is gone, and focus would otherwise fall to <body>.
-  const started = useRef(false);
+  // The import whose run the mapping step sent, so the report that replaces it takes focus: the
+  // button that was pressed is gone, and focus would otherwise fall to <body>. Compared to the
+  // current id, not a flag, so a report for another import never takes focus it did not earn.
+  const startedFor = useRef<string | null>(null);
   // The layout renders no `Outlet` until the workspace resolves, so this is only a type guard.
   if (!workspace) return null;
 
   const status = report.data?.status;
   let body;
   if (held.data && (status === undefined || status === "pending")) {
-    body = <Mapping ws={workspace.id} id={importId} uploaded={held.data} onStart={() => (started.current = true)} />;
+    body = <Mapping ws={workspace.id} id={importId} uploaded={held.data} onStart={() => (startedFor.current = importId)} />;
   } else if (report.isPending) {
     body = (
       <div className="mt-8">
@@ -194,7 +195,7 @@ export default function ImportDetail() {
       </div>
     );
   } else {
-    body = <ReportView ws={workspace.id} report={report.data} focus={started.current} />;
+    body = <ReportView ws={workspace.id} report={report.data} focus={startedFor.current === importId} />;
   }
 
   return (
@@ -304,7 +305,7 @@ function Mapping({
     <>
       <h2 ref={heading} tabIndex={-1} className="mt-4 text-xl font-semibold">{reviewing ? "Review the mapping" : "Map the columns"}</h2>
       <p className="mt-2 text-fg-muted">
-        <span className="wrap-anywhere">{filename}</span>: {upload.columns.length.toLocaleString()} columns,
+        <span className="wrap-anywhere">{filename}</span>: {plural(upload.columns.length, "column", "columns")},
         separated by a {DELIMITERS[upload.delimiter] ?? "custom separator"};{" "}
         {upload.has_header ? "the first row is a header." : "there is no header row, so the columns are numbered."}
       </p>
@@ -427,8 +428,8 @@ function Mapping({
                 row is {hasHeader ? "skipped as a header" : "read as data"}.
               </li>
               <li>
-                {(mapping.length - ignored).toLocaleString()} of {mapping.length.toLocaleString()} columns
-                are imported, as listed above.
+                {(mapping.length - ignored).toLocaleString()} of {plural(mapping.length, "column is", "columns are")}{" "}
+                imported, as listed above.
               </li>
               <li>{DEDUP_WILL[mode]}</li>
               <li>If an address appears more than once in the file, it is imported once, from its last row.</li>
@@ -565,7 +566,13 @@ function Mapping({
   );
 }
 
-/** One cell of the error CSV, as `contacts/export.rs` writes one: neutralised against formulas, then quoted if it must be. */
+/**
+ * One cell of the error CSV, as `contacts/export.rs` writes one: neutralised against formulas, then quoted if it must be.
+ *
+ * Deliberate, ruled in review: a rejected `=1+1` is `=1+1` in the table and `'=1+1` here. The CSV is
+ * opened in a spreadsheet, and the table's first row matching the CSV's means the same row, not
+ * the same bytes. Do not "fix" the prefix away.
+ */
 function csvCell(cell: string): string {
   // shortcut: a leading tab or CR is always prefixed and every other lead is exempt only when the
   // whole cell is a finite number. JS and Rust agree on that for the cells an import can reject,
@@ -646,7 +653,7 @@ function ReportView({ ws, report, focus }: { ws: string; report: Report; focus: 
         </TableScroller>
       </div>
 
-      {report.failed > 0 ? (
+      {report.failed > 0 || report.errors_recorded > 0 ? (
         <RejectedRows ws={ws} report={report} unlisted={unlisted} />
       ) : (
         <p className="mt-6 text-fg-muted">No row was rejected.</p>
@@ -683,6 +690,8 @@ function RejectedRows({ ws, report, unlisted }: { ws: string; report: Report; un
     },
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     retry: false,
+    // Nothing was kept (the run failed before it wrote any): there is no list to fetch.
+    enabled: report.errors_recorded > 0,
   });
   const shown = rows.data?.pages.flatMap((p) => p.data) ?? [];
 
@@ -723,7 +732,19 @@ function RejectedRows({ ws, report, unlisted }: { ws: string; report: Report; un
   return (
     <section aria-labelledby="import-rejected" className="mt-8">
       <h3 id="import-rejected" className="text-lg font-semibold">Rejected rows</h3>
-      {unlisted > 0 ? (
+      {report.errors_recorded === 0 ? (
+        <div
+          role="note"
+          aria-label="No rejected rows were kept"
+          className="mt-3 rounded-md border border-border-strong bg-surface p-4"
+        >
+          <p className="font-medium">
+            {plural(report.failed, "row was", "rows were")} rejected. None {report.failed === 1 ? "was" : "were"} kept.
+          </p>
+          <p className="mt-1">There is no list of them here and no CSV to download.</p>
+        </div>
+      ) : null}
+      {unlisted > 0 && report.errors_recorded > 0 ? (
         <div
           role="note"
           aria-label="The rejected rows are not all listed"
@@ -739,14 +760,16 @@ function RejectedRows({ ws, report, unlisted }: { ws: string; report: Report; un
           </p>
         </div>
       ) : null}
+      {report.errors_recorded > 0 ? (
       <div className="mt-3">
         <Button busy={busy} onClick={() => void downloadCsv()}>
           Download the {plural(report.errors_recorded, "listed row", "listed rows")} as CSV
         </Button>
       </div>
+      ) : null}
       {failure ? <p role="alert" className="mt-2 text-danger-text">{failure}</p> : null}
 
-      {rows.isPending ? (
+      {report.errors_recorded === 0 ? null : rows.isPending ? (
         <div className="mt-4">
           <Skeleton label="Loading the rejected rows" rows={3} />
         </div>
