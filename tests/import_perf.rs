@@ -25,6 +25,20 @@
 //! To split it, the run turns on `log_min_duration_statement`, which makes Postgres time each of
 //! those statements server-side and write the figure to its own log — see `m1c-decisions.md` for
 //! the split that produced.
+//!
+//! **The third number is therefore read out of the container's log, not printed here.** That is
+//! the one figure this file cannot print, so here is exactly how to get it, which is how every
+//! memberships figure in `m1c-decisions.md` was taken:
+//!
+//! ```text
+//! docker logs --since 20m nm-postgres-1 2>&1 | grep 'LOG:  duration' | grep -vE 'parse |bind |plan:'
+//! ```
+//!
+//! Each run prints six lines in order: `create temporary table`, the `copy`, the error-budget
+//! `select count(*) … import_errors`, the `insert … select` into `contacts`, the memberships and
+//! tags statement, and the erasure sweep, then `COMMIT`. **Read the log before the next run**:
+//! docker rotates it, and a run that logs plans as well as durations can rotate its own figures
+//! away inside a minute.
 
 mod common;
 
@@ -199,10 +213,14 @@ async fn a_million_rows_against_the_two_minute_budget(pool: PgPool) {
             "set auto_explain.log_min_duration = 0",
             "set auto_explain.log_analyze = true",
             "set auto_explain.log_buffers = true",
-            // NOT `log_nested_statements`. It does show the thing worth knowing — the referential
-            // integrity triggers `list_memberships` and `contact_tags` fire one per inserted row —
-            // but at some 600,000 extra plans per run, which rotates the four plans that were
-            // wanted straight out of the container's log. Turn it on by hand for that one question.
+            // THE ONE THAT MEASURES THE REFERENTIAL INTEGRITY TRIGGERS, per constraint, in their
+            // own `Trigger for constraint …: time=… calls=…` lines. Without it their cost can only
+            // be inferred by subtracting plan nodes from the statement — and that subtraction is
+            // not sound, because a ModifyTable node's `actual time` already includes its children.
+            "set auto_explain.log_triggers = true",
+            // NOT `log_nested_statements`, which shows the same RI checks as some 600,000 extra
+            // plans per run and rotates the four plans that were wanted straight out of the
+            // container's log. `log_triggers` is the same answer at no cost.
         ] {
             sqlx::query(stmt)
                 .execute(&mut *tx)
