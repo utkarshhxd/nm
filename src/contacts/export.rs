@@ -71,6 +71,9 @@ pub struct Audit {
 /// whole book, who is the person with the most access. A leading `'` makes every one of them read
 /// the cell as text.
 ///
+/// A cell that already begins with `'` is prefixed too: the importer strips exactly one, so without
+/// this `'quoted` would read back as `quoted`.
+///
 /// **A cell that is a finite number is left alone**, so a number field of `-5` round-trips as `-5`
 /// and not as the text `'-5`. The test is on the whole cell with no `trim`: `-5-5`, `-inf`, `-nan`
 /// and `\t5` are not numbers and stay prefixed. An email that begins `+` or `-` also stays
@@ -83,10 +86,10 @@ pub struct Audit {
 /// `tags` and each `attr:<key>` of a multi_select: split on a `;` that no backslash precedes,
 /// then turn `\\`, `\;` and `\:` back into `\`, `;` and `:`. One rule, one unescape function. For
 /// `lists` only, split each entry at its one unescaped `:` into name and status first.
-fn push_cell(out: &mut String, cell: &str) {
+pub fn push_cell(out: &mut String, cell: &str) {
     let formula = matches!(
         cell.chars().next(),
-        Some('=' | '+' | '-' | '@' | '\t' | '\r')
+        Some('=' | '+' | '-' | '@' | '\t' | '\r' | '\'')
     ) && !cell.parse::<f64>().is_ok_and(f64::is_finite);
     let cell: Cow<str> = if formula {
         Cow::Owned(format!("'{cell}"))
@@ -120,7 +123,7 @@ fn push_row<'a>(out: &mut String, cells: impl IntoIterator<Item = &'a str>) {
 /// The same three characters as `escaped`, `:` included, although this column has no `name:status`
 /// shape to protect — so the importer undoes **one** rule across every multi-valued column rather
 /// than one rule per column.
-fn attr_text(value: Option<&Value>) -> String {
+pub fn attr_text(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s.clone(),
@@ -136,7 +139,7 @@ fn attr_text(value: Option<&Value>) -> String {
 
 /// [`escaped`]'s rule, applied in Rust rather than by the database. `\` first, so the escaping is
 /// not self-cancelling. Keep the two in step: they are one contract with the importer.
-fn escape_in_rust(text: &str) -> String {
+pub fn escape_in_rust(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace(';', "\\;")
         .replace(':', "\\:")
