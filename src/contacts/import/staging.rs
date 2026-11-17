@@ -7,6 +7,11 @@
 //! its way into `COPY`. A row that fails any of that never reaches staging; it becomes an
 //! `import_errors` row, and the rows after it carry on.
 //!
+//! **The other half of this module is [`upsert_from_staging`]**, which turns the whole staged file
+//! into contacts in three statements and touches no row on its own. The two belong together: what
+//! the `COPY` stages — a normalised address, its HMAC, and a null wherever the file said nothing —
+//! is exactly what lets the upsert be a set operation.
+//!
 //! **The file is parsed incrementally with `csv_core`**, which is the `csv` crate's own parser
 //! without the blocking `io::Read` around it. That is what lets an `AsyncRead` feed `COPY`
 //! without either holding the whole file in memory or bridging to a blocking thread (the
@@ -38,7 +43,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use super::{
-    ColumnTarget, ContactField, ImportJob,
+    ColumnTarget, ContactField, Dedup, ImportJob,
     csv::{split_list_entry, split_multi, split_multi_raw, unescape_cell},
     routes::MAX_IMPORT_COLUMNS,
 };
@@ -172,6 +177,9 @@ pub async fn copy_into_staging(
     let mut counts = StagingCounts::default();
     let mut buf = String::with_capacity(COPY_CHUNK + 4096);
     let mut row = 0i64;
+    // Whether the header row has gone by, which is not the same as `row == 1`: a file may begin
+    // with blank lines, and those are not rows.
+    let mut header_done = !import.has_header;
 
     let mut copy = conn
         .copy_in_raw(&format!("copy {table} ({COLUMNS}) from stdin (format csv)"))
@@ -193,15 +201,27 @@ pub async fn copy_into_staging(
         if oversize.is_none() && cells.len() <= 1 && cells.first().is_none_or(|f| f.is_empty()) {
             continue;
         }
+        // The FIRST NON-BLANK record is the header, not line 1: a file that begins with a blank
+        // line would otherwise have its real header parsed as data and every column named
+        // `Column N`.
+        //
         // Lossily, unlike every data cell below: a header here is only the label an error row
         // names a column by, so a replacement character in one costs a legible message and
         // nothing else. Refusing the header would refuse the whole file over its first line.
-        if row == 1 && import.has_header {
-            headers = cells
-                .iter()
-                .map(|f| unescape_cell(&String::from_utf8_lossy(f)))
-                .collect();
-            continue;
+        //
+        // A header the parser threw away is NOT one of those, and falls through to be an error row
+        // like any other record: with no cells there is nothing to name the columns by, and a
+        // silent `continue` here would return zero rows and zero errors for a file whose first
+        // line carries an unterminated `"` — a success on a failure path.
+        if !header_done {
+            header_done = true;
+            if oversize.is_none() {
+                headers = cells
+                    .iter()
+                    .map(|f| unescape_cell(&String::from_utf8_lossy(f)))
+                    .collect();
+                continue;
+            }
         }
         counts.total_rows += 1;
         match stage_row(secrets, import, &headers, row, &cells, oversize) {
@@ -223,7 +243,17 @@ pub async fn copy_into_staging(
     if !buf.is_empty() {
         copy.send(buf.into_bytes()).await?;
     }
-    copy.finish().await?;
+    // What `COPY` says it took, against what was rendered for it. A mismatch is a rendering bug —
+    // a quote or a newline escaped wrongly, so one line became two — and this is the one place it
+    // is still cheap to see. Without it the next stage reads data that silently does not match the
+    // file, and the counts it reports are wrong with nothing saying so.
+    let accepted = copy.finish().await?;
+    if accepted != counts.staged.unsigned_abs() {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "COPY took {accepted} rows of the {} rendered for it",
+            counts.staged
+        )));
+    }
 
     // Chunked because Postgres takes at most 65535 bind parameters in one statement, and six
     // columns times the error cap is past that.
@@ -243,6 +273,209 @@ pub async fn copy_into_staging(
         q.build().execute(&mut *conn).await?;
     }
     Ok(counts)
+}
+
+/// What the upsert made of the staged rows.
+///
+/// **The five are mutually exclusive and sum to [`StagingCounts::total_rows`]**: every row of the
+/// file lands in exactly one of them, which is what spec 7.5's breakdown means. `failed` carries
+/// the `COPY`'s own refusals forward, so this one struct is the whole apportionment and the caller
+/// has nothing left to add up.
+///
+/// `collapsed` is its own count and not part of `skipped`. A row the FILE de-duplicated against an
+/// earlier row of its own is not a row the DATABASE already had, and folding one into the other
+/// reports "these were already in your contacts" for rows that never were.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpsertCounts {
+    /// Rows that became a new contact.
+    pub imported: i64,
+    /// Rows applied to a contact that already existed.
+    pub updated: i64,
+    /// Rows left alone because the contact already existed (`skip existing`).
+    pub skipped: i64,
+    /// Rows a LATER row of the same file names the same address as.
+    pub collapsed: i64,
+    /// The `COPY`'s refusals, plus every row refused for an erasure here.
+    pub failed: i64,
+}
+
+/// What an `import_errors` row says about a row whose address has been erased on request.
+///
+/// Fixed text, and the only variable the row carries is `value`: the address the operator
+/// themselves put in the file. Nothing of the tombstone — not its note, its source, its date, nor
+/// who asked — may reach a refusal, because the refusal is read by whoever uploaded the file.
+const ERASED_REASON: &str =
+    "address-erased: this address was erased at its owner's request and may not be re-created";
+
+/// Turns the staged rows into contacts: one `insert … select` for the whole file.
+///
+/// **The caller must be in the transaction `copy_into_staging` ran in** — the staging table is
+/// `on commit drop` and cannot be reached from anywhere else — and that transaction's `COMMIT` is
+/// what makes this work durable. `staged` is what that `COPY` saw; it is taken here so that the
+/// five counts come out of one place already apportioned.
+///
+/// Four rules, in the order they apply to a row:
+///
+/// 1. **The file de-duplicates itself first**, last row wins (`distinct on (email) … order by
+///    row_number desc`), and the rows it drops are `collapsed`. This is about the file alone, so
+///    it happens before anything looks at the database.
+/// 2. **An erased address is never re-created** (spec decision 1). The check is an anti-join
+///    against the `gdpr_erasure` tombstones on the HMAC `copy_into_staging` already computed per
+///    row — not `suppressions::is_erased`, whose per-address advisory lock is not an option a
+///    million times over. Matched rows are `failed`, with [`ERASED_REASON`].
+/// 3. **The dedup mode decides what an existing contact gets**: updated field by field, skipped,
+///    or the whole import refused before it writes anything.
+/// 4. **A blank cell leaves the stored value alone** (spec 7.3). See the `do update` below.
+pub async fn upsert_from_staging(
+    conn: &mut PgConnection,
+    import: &ImportJob,
+    staged: StagingCounts,
+) -> ApiResult<UpsertCounts> {
+    let table = staging_table(import.id);
+    let ws = import.workspace_id;
+
+    // `fail on duplicate` is a pre-flight and not an `on conflict` arm: the operator asked for
+    // their file back untouched, and a per-row importer would already have written every row
+    // ahead of the duplicate before it found it. The address in the refusal is one the operator
+    // supplied in their own file.
+    if import.dedup == Dedup::FailOnDuplicate {
+        let clash: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "select s.email from {table} s \
+               join contacts c on c.workspace_id = $1 and c.email = s.email \
+              order by s.row_number limit 1"
+        )))
+        .bind(ws)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(email) = clash {
+            return Err(ApiError::ConflictDetail {
+                code: "import-duplicate-address",
+                detail: format!(
+                    "`{email}` is already a contact in this workspace, and this import was set \
+                     to fail on a duplicate"
+                ),
+            });
+        }
+    }
+
+    // What is left of this import's error budget. `copy_into_staging` has already spent some of
+    // it, and the cap is per import, not per stage.
+    let written: i64 = sqlx::query_scalar(
+        "select count(*) from import_errors where workspace_id = $1 and import_id = $2",
+    )
+    .bind(ws)
+    .bind(import.id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let budget = (MAX_IMPORT_ERRORS as i64 - written).max(0);
+
+    let action = match import.dedup {
+        // DECISION 4, IN SQL. A cell the file left blank, and a column it never mapped, both reach
+        // `excluded` as the empty string or NULL, and `coalesce(nullif(…))` then leaves what is
+        // stored alone — plain `excluded.col` would wipe a stored name with a blank cell. The same
+        // rule reaches `attributes` by key instead of by value: `||` writes the keys this row gave
+        // a value for and touches no other.
+        Dedup::UpdateExisting => {
+            "do update set \
+               first_name = coalesce(nullif(excluded.first_name, ''), contacts.first_name), \
+               last_name = coalesce(nullif(excluded.last_name, ''), contacts.last_name), \
+               timezone = coalesce(nullif(excluded.timezone, ''), contacts.timezone), \
+               attributes = contacts.attributes || excluded.attributes, \
+               updated_at = now()"
+        }
+        Dedup::SkipExisting | Dedup::FailOnDuplicate => "do nothing",
+    };
+
+    // `AssertSqlSafe`: the only interpolation is `staging_table`'s fixed prefix with the import id
+    // in hex, and `action`, which is one of the two literals above. Nothing a client sent reaches
+    // this string.
+    let (picked, erased, inserted, updated): (i64, i64, i64, i64) =
+        sqlx::query_as(AssertSqlSafe(format!(
+            "with picked as ( \
+                 select distinct on (email) * from {table} order by email, row_number desc \
+             ), \
+             live as ( \
+                 select s.* from picked s \
+                  where not exists (select 1 from suppressions where reason = 'gdpr_erasure' \
+                                      and email_hmac = s.email_hmac \
+                                      and (workspace_id = $1 or workspace_id is null)) \
+             ), \
+             erased as ( \
+                 select s.row_number, s.email from picked s \
+                  where not exists (select 1 from live l where l.row_number = s.row_number) \
+             ), \
+             reported as ( \
+                 insert into import_errors \
+                     (import_id, workspace_id, row_number, column_name, reason, value) \
+                 select $2, $1, e.row_number, 'email', $4, e.email \
+                   from erased e order by e.row_number limit $3 \
+                 returning 1 \
+             ), \
+             up as ( \
+                 insert into contacts \
+                     (id, workspace_id, email, first_name, last_name, timezone, attributes) \
+                 select l.id, $1, l.email, coalesce(l.first_name, ''), \
+                        coalesce(l.last_name, ''), l.timezone, l.attributes \
+                   from live l \
+                 on conflict (workspace_id, email) {action} \
+                 returning (xmax = 0) as inserted \
+             ) \
+             select (select count(*) from picked), (select count(*) from erased), \
+                    (select count(*) from up where inserted), \
+                    (select count(*) from up where not inserted)"
+        )))
+        .bind(ws)
+        .bind(import.id)
+        .bind(budget)
+        .bind(ERASED_REASON)
+        .fetch_one(&mut *conn)
+        .await?;
+
+    // THE ANTI-JOIN AGAIN, OVER THE IDS THIS IMPORT INSERTED, as the last statement before the
+    // caller's COMMIT. `c.id = s.id` matches only rows the insert above created: an updated
+    // contact kept its own id and the staged one was discarded.
+    //
+    // RESIDUAL WINDOW: an erasure that commits between this statement's snapshot and the caller's
+    // COMMIT is still missed. Its own transaction deleted the contacts it could see, and this
+    // import's rows were not visible to it yet, so neither side sees the other and the contact
+    // survives its erasure. The window is milliseconds and it is not closed here; see
+    // `.scratch/email-platform/issues/20-an-erasure-can-race-an-imports-commit.md` for the two
+    // ways to close it.
+    let residual = (budget - erased.min(budget)).max(0);
+    let gone: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "with gone as ( \
+             delete from contacts c using {table} s \
+              where c.workspace_id = $1 and c.id = s.id \
+                and exists (select 1 from suppressions where reason = 'gdpr_erasure' \
+                              and email_hmac = s.email_hmac \
+                              and (workspace_id = $1 or workspace_id is null)) \
+             returning s.row_number, c.email \
+         ), \
+         reported as ( \
+             insert into import_errors \
+                 (import_id, workspace_id, row_number, column_name, reason, value) \
+             select $2, $1, g.row_number, 'email', $4, g.email \
+               from gone g order by g.row_number limit $3 \
+             returning 1 \
+         ) \
+         select count(*) from gone"
+    )))
+    .bind(ws)
+    .bind(import.id)
+    .bind(residual)
+    .bind(ERASED_REASON)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    Ok(UpsertCounts {
+        imported: inserted - gone,
+        updated,
+        // Only `skip existing` leaves any: in the other two modes every live row is inserted or
+        // updated.
+        skipped: picked - erased - inserted - updated,
+        collapsed: staged.staged - picked,
+        failed: staged.failed + erased + gone,
+    })
 }
 
 /// The fields of one record, as `csv_core` leaves them: one buffer and the end offset of each.
@@ -375,8 +608,10 @@ fn stage_row(
                 }
             }
             // A blank cell is not a null: it leaves the stored value alone (spec 7.3), so it is
-            // simply not in the object the next stage merges.
-            ColumnTarget::Custom(key) if !cell.is_empty() => {
+            // simply not in the object the next stage merges. `trim`, like the name and timezone
+            // arms above: a cell of one space is a blank cell in a spreadsheet, and storing `" "`
+            // for it would overwrite a stored value with whitespace.
+            ColumnTarget::Custom(key) if !cell.trim().is_empty() => {
                 let def = job
                     .defs
                     .iter()
@@ -409,8 +644,16 @@ fn stage_row(
         }
     })?;
 
-    let email =
-        email.expect("the mapping names an email column, and a blank one fails to normalise");
+    // `copy_into_staging` refuses a mapping with no email column up front, so this is unreachable
+    // — but it is unreachable on a request path, where a panic is a 500 and a dropped connection.
+    // A `RowError` costs the same and says the same thing.
+    let email = email.ok_or_else(|| RowError {
+        row,
+        column: None,
+        reason: "this row has no email address, and the mapping must name a column for one"
+            .to_owned(),
+        value: None,
+    })?;
     let mut hmac = String::with_capacity(66);
     hmac.push_str("\\x");
     for b in suppression_hmac(secrets, &email) {
@@ -517,8 +760,8 @@ impl<R: AsyncRead + Unpin> Csv<R> {
     /// **Both buffers are capped, and a record past either cap is consumed at constant memory**:
     /// the offsets rewind, the parser keeps running to the record's end so the rows after it are
     /// still read, and the caller gets the reason to put in an `import_errors` row. `ends` stops
-    /// at [`MAX_IMPORT_COLUMNS`] + 1 and `out` at [`MAX_RECORD_BYTES`], so neither the file's size
-    /// nor a stray quote in it decides how much memory one import holds.
+    /// at [`MAX_IMPORT_COLUMNS`] and `out` at [`MAX_RECORD_BYTES`], so neither the file's size nor
+    /// a stray quote in it decides how much memory one import holds.
     async fn next(
         &mut self,
         out: &mut Vec<u8>,
@@ -529,10 +772,13 @@ impl<R: AsyncRead + Unpin> Csv<R> {
         loop {
             if oversize.is_some() {
                 // The record is already refused; keep the parser moving over the rest of it with
-                // the buffers rewound, so neither one grows for it. What is in them is then
-                // nonsense — `read_record` writes each end as a position in the whole record, so
-                // after a rewind they no longer index `out` at all — which is why a refused
-                // record is handed back with no fields rather than with these.
+                // the offsets rewound, so nothing accumulates for it. `out` may still double
+                // under it — a refused-for-its-fields record whose remainder does not fit still
+                // takes the `OutputFull` arm — but only up to `MAX_RECORD_BYTES`, which is what
+                // bounds this loop's memory either way. What is in the buffers is then nonsense —
+                // `read_record` writes each end as a position in the whole record, so after a
+                // rewind they no longer index `out` at all — which is why a refused record is
+                // handed back with no fields rather than with these.
                 nout = 0;
                 nend = 0;
             }
@@ -559,10 +805,14 @@ impl<R: AsyncRead + Unpin> Csv<R> {
                     }
                 }
                 csv_core::ReadRecordResult::OutputEndsFull => {
-                    if ends.len() > MAX_IMPORT_COLUMNS {
+                    // `>=`, and the cap is `MAX_IMPORT_COLUMNS` and not one more: a record of
+                    // exactly `MAX_IMPORT_COLUMNS` fields is inside the cap and needs exactly that
+                    // many offsets, so once `ends` holds them a record still asking for room has
+                    // more fields than the cap allows.
+                    if ends.len() >= MAX_IMPORT_COLUMNS {
                         oversize = oversize.or(Some(Oversize::Fields));
                     } else {
-                        ends.resize((ends.len() * 2).min(MAX_IMPORT_COLUMNS + 1), 0);
+                        ends.resize((ends.len() * 2).min(MAX_IMPORT_COLUMNS), 0);
                     }
                 }
                 csv_core::ReadRecordResult::Record => {

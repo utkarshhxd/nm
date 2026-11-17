@@ -862,3 +862,525 @@ async fn a_row_over_the_record_byte_cap_is_refused_for_its_length_not_its_width(
         "a long row must not be reported as a wide one: {reason}"
     );
 }
+
+// ---- Task 5: the set-based upsert ---------------------------------------------------------------
+
+use nm::{
+    contacts::import::staging::{UpsertCounts, upsert_from_staging},
+    error::ApiError,
+};
+
+fn job_with(
+    id: Uuid,
+    ws: Uuid,
+    mapping: Vec<ColumnTarget>,
+    defs: Vec<Definition>,
+    dedup: Dedup,
+) -> ImportJob {
+    ImportJob {
+        dedup,
+        ..job(id, ws, mapping, defs)
+    }
+}
+
+/// `email, first_name, last_name, timezone` in that order: the mapping most of these tests use.
+fn name_columns() -> Vec<ColumnTarget> {
+    vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::FirstName),
+        ColumnTarget::Field(ContactField::LastName),
+        ColumnTarget::Field(ContactField::Timezone),
+    ]
+}
+
+/// The whole pipeline over one in-memory file: `COPY` into staging, then the upsert.
+async fn import_csv(conn: &mut PgConnection, j: &ImportJob, csv: &str) -> UpsertCounts {
+    let staged = copy(conn, j, csv.as_bytes()).await;
+    upsert_from_staging(conn, j, staged)
+        .await
+        .expect("the upsert")
+}
+
+/// One contact as the upsert left it.
+async fn contact(
+    conn: &mut PgConnection,
+    ws: Uuid,
+    email: &str,
+) -> Option<(String, String, Option<String>, Value)> {
+    sqlx::query_as(
+        "select first_name, last_name, timezone, attributes from contacts \
+         where workspace_id = $1 and email = $2",
+    )
+    .bind(ws)
+    .bind(email)
+    .fetch_optional(conn)
+    .await
+    .expect("read contact")
+}
+
+async fn insert_contact(conn: &mut PgConnection, ws: Uuid, email: &str, first: &str, last: &str) {
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name, last_name, timezone, attributes) \
+         values ($1, $2, $3, $4, $5, 'Europe/Berlin', '{\"plan\": \"pro\"}'::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(email)
+    .bind(first)
+    .bind(last)
+    .execute(conn)
+    .await
+    .expect("insert contact");
+}
+
+/// The GDPR tombstone: the hash and no plaintext, with a `note` and a `source` that no refusal may
+/// ever echo back.
+async fn erase(conn: &mut PgConnection, ws: Option<Uuid>, email: &str) {
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email_hmac, reason, source, note) \
+         values ($1, $2, 'address', $3, 'gdpr_erasure', 'SOURCE-SECRET', 'NOTE-SECRET')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(suppression_hmac(&secrets(), email).as_slice())
+    .execute(conn)
+    .await
+    .expect("erase");
+}
+
+#[sqlx::test]
+async fn update_existing_leaves_a_blank_cell_alone(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+
+    // A blank `first_name`, a given `last_name`, and a `timezone` whose cell is blank too:
+    // decision 4 says only the second of the three may move.
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,,Byron,\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 0,
+            updated: 1,
+            skipped: 0,
+            collapsed: 0,
+            failed: 0
+        }
+    );
+
+    let got = contact(&mut tx, ws, "ada@example.com").await.unwrap();
+    assert_eq!(got.0, "Ada", "a blank cell may not clear a stored name");
+    assert_eq!(got.1, "Byron", "a cell with a value in it still writes");
+    assert_eq!(got.2.as_deref(), Some("Europe/Berlin"));
+    assert_eq!(got.3, json!({"plan": "pro"}), "an unnamed key is untouched");
+}
+
+#[sqlx::test]
+async fn skip_existing_writes_nothing_and_counts_it(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::SkipExisting);
+    let mut tx = pool.begin().await.unwrap();
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\n\
+         ada@example.com,Grace,Hopper,UTC\n\
+         bob@example.com,Bob,Barker,UTC\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 1,
+            updated: 0,
+            skipped: 1,
+            collapsed: 0,
+            failed: 0
+        }
+    );
+
+    let ada = contact(&mut tx, ws, "ada@example.com").await.unwrap();
+    assert_eq!((ada.0.as_str(), ada.1.as_str()), ("Ada", "Lovelace"));
+    assert!(contact(&mut tx, ws, "bob@example.com").await.is_some());
+}
+
+#[sqlx::test]
+async fn fail_on_duplicate_aborts_before_any_write(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::FailOnDuplicate);
+    let mut tx = pool.begin().await.unwrap();
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+
+    // The new address comes FIRST in the file, so a per-row importer would already have written it
+    // by the time it reached the duplicate.
+    let staged = copy(
+        &mut tx,
+        &j,
+        b"email,first_name,last_name,timezone\n\
+          new@example.com,New,Person,UTC\n\
+          ada@example.com,Grace,Hopper,UTC\n",
+    )
+    .await;
+    let err = upsert_from_staging(&mut tx, &j, staged)
+        .await
+        .expect_err("a duplicate must abort the import");
+    let ApiError::ConflictDetail { code, detail } = &err else {
+        panic!("expected a conflict naming the address, got {err:?}");
+    };
+    assert_eq!(*code, "import-duplicate-address");
+    assert!(detail.contains("ada@example.com"), "{detail}");
+
+    assert!(
+        contact(&mut tx, ws, "new@example.com").await.is_none(),
+        "the abort happens before any write, so the earlier row is not in the database"
+    );
+    let ada = contact(&mut tx, ws, "ada@example.com").await.unwrap();
+    assert_eq!(ada.0, "Ada");
+}
+
+#[sqlx::test]
+async fn two_rows_with_the_same_address_keep_the_last_and_count_the_collapse(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\n\
+         ada@example.com,First,Draft,UTC\n\
+         ada@example.com,Last,Word,UTC\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 1,
+            updated: 0,
+            skipped: 0,
+            collapsed: 1,
+            failed: 0
+        },
+        "a within-file collapse is not a skip: the database never had the row"
+    );
+
+    let got = contact(&mut tx, ws, "ada@example.com").await.unwrap();
+    assert_eq!((got.0.as_str(), got.1.as_str()), ("Last", "Word"));
+}
+
+#[sqlx::test]
+async fn an_erased_address_is_never_recreated_by_an_import(pool: PgPool) {
+    let (ws, other) = (
+        workspace(&pool, "acme").await,
+        workspace(&pool, "other").await,
+    );
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+    erase(&mut tx, Some(ws), "ada@example.com").await;
+    erase(&mut tx, None, "ins@example.com").await;
+    // Another workspace's erasure is not this workspace's business, and must not block this row.
+    erase(&mut tx, Some(other), "theirs@example.com").await;
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\n\
+         ada@example.com,Ada,Lovelace,UTC\n\
+         ins@example.com,Ins,Tance,UTC\n\
+         theirs@example.com,Their,Erasure,UTC\n\
+         bob@example.com,Bob,Barker,UTC\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 2,
+            updated: 0,
+            skipped: 0,
+            collapsed: 0,
+            failed: 2
+        }
+    );
+
+    assert!(contact(&mut tx, ws, "ada@example.com").await.is_none());
+    assert!(contact(&mut tx, ws, "ins@example.com").await.is_none());
+    assert!(contact(&mut tx, ws, "theirs@example.com").await.is_some());
+    assert!(contact(&mut tx, ws, "bob@example.com").await.is_some());
+}
+
+#[sqlx::test]
+async fn an_erased_address_is_never_updated_either(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+    // A contact the tombstone did not take with it. Erasing deletes the contact, so this is a
+    // state only a bug upstream can reach — which is the point: the anti-join in the insert is
+    // what refuses it, and the delete that runs last cannot undo an UPDATE to a row this import
+    // did not create.
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    erase(&mut tx, Some(ws), "ada@example.com").await;
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Grace,Hopper,UTC\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 0,
+            updated: 0,
+            skipped: 0,
+            collapsed: 0,
+            failed: 1
+        }
+    );
+    let got = contact(&mut tx, ws, "ada@example.com").await.unwrap();
+    assert_eq!(
+        (got.0.as_str(), got.1.as_str()),
+        ("Ada", "Lovelace"),
+        "an erased address is not written to, whether that write would be an insert or an update"
+    );
+}
+
+#[sqlx::test]
+async fn an_erasure_is_reported_without_echoing_anything_but_the_address(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+    erase(&mut tx, Some(ws), "ada@example.com").await;
+
+    import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Ada,Lovelace,UTC\n",
+    )
+    .await;
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    let (row, column, reason, value) = errors[0].clone();
+    assert_eq!(row, 2, "the line a spreadsheet shows");
+    assert_eq!(column.as_deref(), Some("email"));
+    assert!(reason.contains("address-erased"), "{reason}");
+    assert_eq!(
+        value.as_deref(),
+        Some("ada@example.com"),
+        "the operator's own address, and nothing else"
+    );
+    // The tombstone's own fields are the one thing an erasure refusal may never leak.
+    for secret in ["NOTE-SECRET", "SOURCE-SECRET"] {
+        assert!(!reason.contains(secret), "{reason}");
+        assert!(!value.as_deref().unwrap().contains(secret));
+    }
+}
+
+#[sqlx::test]
+async fn another_workspaces_contact_is_never_updated_by_an_import(pool: PgPool) {
+    let (theirs, mine) = (
+        workspace(&pool, "theirs").await,
+        workspace(&pool, "mine").await,
+    );
+    let import = insert_import(&pool, mine).await;
+    let j = job_with(import, mine, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+    insert_contact(&mut tx, theirs, "ada@example.com", "Ada", "Lovelace").await;
+
+    // The same address, imported by a workspace that is not the one holding it.
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Grace,Hopper,UTC\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 1,
+            updated: 0,
+            skipped: 0,
+            collapsed: 0,
+            failed: 0
+        },
+        "the other workspace's row is not an existing contact here"
+    );
+
+    let theirs_now = contact(&mut tx, theirs, "ada@example.com").await.unwrap();
+    assert_eq!(
+        (theirs_now.0.as_str(), theirs_now.1.as_str()),
+        ("Ada", "Lovelace"),
+        "another workspace's contact is never read and never written"
+    );
+    let mine_now = contact(&mut tx, mine, "ada@example.com").await.unwrap();
+    assert_eq!(
+        (mine_now.0.as_str(), mine_now.1.as_str()),
+        ("Grace", "Hopper")
+    );
+}
+
+#[sqlx::test]
+async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+
+    // The residual window, as close as one transaction can stage it: the contact is inserted, the
+    // tombstone lands afterwards, and the last statement before COMMIT has to take it back out.
+    // Running the upsert twice is what puts the erasure after the insert; the second run therefore
+    // counts the row both in the anti-join and in the delete, which a real race would not, so the
+    // counts are not what this asserts.
+    let staged = copy(
+        &mut tx,
+        &j,
+        b"email,first_name,last_name,timezone\nada@example.com,Ada,Lovelace,UTC\n",
+    )
+    .await;
+    let first = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    assert_eq!(first.imported, 1);
+    assert!(contact(&mut tx, ws, "ada@example.com").await.is_some());
+
+    erase(&mut tx, Some(ws), "ada@example.com").await;
+    let second = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+    assert!(
+        contact(&mut tx, ws, "ada@example.com").await.is_none(),
+        "the contact this import inserted is gone once the erasure lands"
+    );
+    assert!(second.failed >= 1, "{second:?}");
+}
+
+// ---- Task 5: the staging defects this task was handed -----------------------------------------
+
+#[sqlx::test]
+async fn a_leading_blank_line_does_not_eat_the_header(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job(
+        import,
+        ws,
+        vec![
+            ColumnTarget::Field(ContactField::Email),
+            ColumnTarget::Field(ContactField::FirstName),
+        ],
+        vec![],
+    );
+    let mut tx = pool.begin().await.unwrap();
+
+    // Line 1 is one quoted empty field, which is a blank line and not a row — an exporter writes
+    // them. The header is therefore on line 2, and has to be taken from the first NON-blank
+    // record. A row that fails in `first_name` is how the headers make themselves visible: the
+    // error row names the column by its header, or by `Column 2` if the header was parsed as data.
+    let long = "n".repeat(101);
+    let csv = format!("\"\"\nemail,first_name\na@b.co,{long}\nc@d.co,Ada\n");
+    let counts = copy(&mut tx, &j, csv.as_bytes()).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
+    assert_eq!(staged(&mut tx, import).await, [(4, "c@d.co".to_owned())]);
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 3, "the line a spreadsheet shows");
+    assert_eq!(
+        errors[0].1.as_deref(),
+        Some("first_name"),
+        "the header was read from line 2, not swallowed as a data row"
+    );
+}
+
+#[sqlx::test]
+async fn a_refused_first_record_is_an_error_row_even_when_it_was_the_header(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::Tags),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // An unclosed quote on line 1 makes the header itself one over-long record. A silent
+    // `StagingCounts::default()` would report an empty file for a 512 MiB upload with nothing
+    // saying why; a refused header is an error row like any other, and the rows after it stage.
+    let huge = "z".repeat(MAX_RECORD_BYTES + 1024);
+    let csv = format!("email,{huge}\na@b.co,x\n");
+    let counts = copy(&mut tx, &j, csv.as_bytes()).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
+    assert_eq!(staged(&mut tx, import).await, [(2, "a@b.co".to_owned())]);
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 1);
+    assert!(errors[0].2.contains("longer than"), "{}", errors[0].2);
+}
+
+#[sqlx::test]
+async fn a_whitespace_only_custom_cell_is_the_file_saying_nothing(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let def = field("plan", FieldKind::Text);
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Custom("plan".to_owned()),
+    ];
+    let j = job_with(import, ws, mapping, vec![def], Dedup::UpdateExisting);
+    let mut tx = pool.begin().await.unwrap();
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+
+    let counts = import_csv(&mut tx, &j, "email,plan\nada@example.com,\" \"\n").await;
+    assert_eq!(counts.updated, 1);
+    let got = contact(&mut tx, ws, "ada@example.com").await.unwrap();
+    assert_eq!(
+        got.3,
+        json!({"plan": "pro"}),
+        "a whitespace-only cell is a blank cell, not the string \" \""
+    );
+}
+
+#[sqlx::test]
+async fn a_record_of_exactly_the_column_cap_is_accepted_and_one_more_is_not(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let j = job(import, ws, email_column(), vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // `MAX_IMPORT_COLUMNS` is the cap, so a record OF that many fields is inside it and a record of
+    // one more is not. Both are refused here — the mapping has one column — but for different
+    // reasons, and the reason is the whole assertion.
+    let at_cap = vec!["x"; MAX_IMPORT_COLUMNS].join(",");
+    let over_cap = vec!["x"; MAX_IMPORT_COLUMNS + 1].join(",");
+    let csv = format!("email\n{at_cap}\n{over_cap}\n");
+    let counts = copy(&mut tx, &j, csv.as_bytes()).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 0, 2));
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors[0]
+            .2
+            .contains(&format!("the row has {MAX_IMPORT_COLUMNS} fields")),
+        "a record of exactly the cap is parsed, not thrown away: {}",
+        errors[0].2
+    );
+    assert!(
+        errors[1]
+            .2
+            .contains(&format!("more than {MAX_IMPORT_COLUMNS} fields")),
+        "{}",
+        errors[1].2
+    );
+}
