@@ -619,7 +619,12 @@ async fn a_row_that_is_not_utf8_is_an_error_row_naming_its_line(pool: PgPool) {
     let mut tx = pool.begin().await.unwrap();
 
     // Latin-1 out of someone's old system. The operator must learn that, not read "internal error".
-    let counts = copy(&mut tx, &j, b"email,first_name\na@b.co,Ada\nc@d.co,Jos\xe9\n").await;
+    let counts = copy(
+        &mut tx,
+        &j,
+        b"email,first_name\na@b.co,Ada\nc@d.co,Jos\xe9\n",
+    )
+    .await;
     assert_eq!((counts.total_rows, counts.staged, counts.failed), (2, 1, 1));
 
     let errors = error_rows(&mut tx, import).await;
@@ -797,7 +802,9 @@ async fn a_row_with_more_fields_than_the_column_cap_is_refused_and_the_rows_afte
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].0, 3);
     assert!(
-        errors[0].2.contains(&format!("more than {MAX_IMPORT_COLUMNS} fields")),
+        errors[0]
+            .2
+            .contains(&format!("more than {MAX_IMPORT_COLUMNS} fields")),
         "{}",
         errors[0].2
     );
@@ -971,7 +978,9 @@ async fn update_existing_leaves_a_blank_cell_alone(pool: PgPool) {
             updated: 1,
             skipped: 0,
             collapsed: 0,
-            failed: 0
+            failed: 0,
+            memberships_declined: 0,
+            suppressed: 0,
         }
     );
 
@@ -1005,7 +1014,9 @@ async fn skip_existing_writes_nothing_and_counts_it(pool: PgPool) {
             updated: 0,
             skipped: 1,
             collapsed: 0,
-            failed: 0
+            failed: 0,
+            memberships_declined: 0,
+            suppressed: 0,
         }
     );
 
@@ -1071,7 +1082,9 @@ async fn two_rows_with_the_same_address_keep_the_last_and_count_the_collapse(poo
             updated: 0,
             skipped: 0,
             collapsed: 1,
-            failed: 0
+            failed: 0,
+            memberships_declined: 0,
+            suppressed: 0,
         },
         "a within-file collapse is not a skip: the database never had the row"
     );
@@ -1111,7 +1124,9 @@ async fn an_erased_address_is_never_recreated_by_an_import(pool: PgPool) {
             updated: 0,
             skipped: 0,
             collapsed: 0,
-            failed: 2
+            failed: 2,
+            memberships_declined: 0,
+            suppressed: 0,
         }
     );
 
@@ -1147,7 +1162,9 @@ async fn an_erased_address_is_never_updated_either(pool: PgPool) {
             updated: 0,
             skipped: 0,
             collapsed: 0,
-            failed: 1
+            failed: 1,
+            memberships_declined: 0,
+            suppressed: 0,
         }
     );
     let got = contact(&mut tx, ws, "ada@example.com").await.unwrap();
@@ -1216,7 +1233,9 @@ async fn another_workspaces_contact_is_never_updated_by_an_import(pool: PgPool) 
             updated: 0,
             skipped: 0,
             collapsed: 0,
-            failed: 0
+            failed: 0,
+            memberships_declined: 0,
+            suppressed: 0,
         },
         "the other workspace's row is not an existing contact here"
     );
@@ -1265,7 +1284,9 @@ async fn a_row_the_copy_refused_is_still_one_of_the_five_counts(pool: PgPool) {
             updated: 0,
             skipped: 0,
             collapsed: 1,
-            failed: 1
+            failed: 1,
+            memberships_declined: 0,
+            suppressed: 0,
         }
     );
     assert_eq!(
@@ -1458,5 +1479,536 @@ async fn a_record_of_exactly_the_column_cap_is_accepted_and_one_more_is_not(pool
             .contains(&format!("more than {MAX_IMPORT_COLUMNS} fields")),
         "{}",
         errors[1].2
+    );
+}
+
+// ---- Task 6: what an import may and may not do to memberships and tags ------------------------
+
+use nm::lists::MembershipStatus;
+
+/// A list in this workspace. `double_optin` decides what a fresh membership is written as, and
+/// nothing here depends on the list's name.
+async fn insert_list(conn: &mut PgConnection, ws: Uuid, name: &str, double_optin: bool) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query("insert into lists (id, workspace_id, name, double_optin) values ($1, $2, $3, $4)")
+        .bind(id)
+        .bind(ws)
+        .bind(name)
+        .bind(double_optin)
+        .execute(conn)
+        .await
+        .expect("insert list");
+    id
+}
+
+/// The membership as the import left it: its status, who wrote it, and the day its unsubscribe was
+/// stamped. The stamp is read as a date string so that "the import did not touch it" is one
+/// equality and this file needs no date library.
+async fn membership(
+    conn: &mut PgConnection,
+    ws: Uuid,
+    list: Uuid,
+    email: &str,
+) -> Option<(MembershipStatus, Option<MembershipSource>, Option<String>)> {
+    sqlx::query_as(
+        "select m.status, m.source, to_char(m.unsubscribed_at at time zone 'UTC', 'YYYY-MM-DD') \
+           from list_memberships m \
+           join contacts c on c.workspace_id = m.workspace_id and c.id = m.contact_id \
+          where m.workspace_id = $1 and m.list_id = $2 and c.email = $3",
+    )
+    .bind(ws)
+    .bind(list)
+    .bind(email)
+    .fetch_optional(conn)
+    .await
+    .expect("read membership")
+}
+
+/// An unsubscribe that happened before this import, stamped on a fixed day so the assertion that
+/// the import left it alone is exact. `source` is `ui`: the consent log's answer to "who put this
+/// person on the list" belongs to the first writer, and an import may not rewrite it.
+async fn unsubscribe(conn: &mut PgConnection, ws: Uuid, list: Uuid, email: &str) {
+    let done = sqlx::query(
+        "insert into list_memberships \
+             (workspace_id, contact_id, list_id, status, unsubscribed_at, source) \
+         select $1, c.id, $2, 'unsubscribed', timestamptz '2020-01-01T00:00:00Z', 'ui' \
+           from contacts c where c.workspace_id = $1 and c.email = $3",
+    )
+    .bind(ws)
+    .bind(list)
+    .bind(email)
+    .execute(conn)
+    .await
+    .expect("unsubscribe");
+    assert_eq!(done.rows_affected(), 1, "{email} is not a contact yet");
+}
+
+/// A membership that was already there before this import, written by somebody else.
+async fn subscribe(conn: &mut PgConnection, ws: Uuid, list: Uuid, email: &str) {
+    let done = sqlx::query(
+        "insert into list_memberships \
+             (workspace_id, contact_id, list_id, status, subscribed_at, source) \
+         select $1, c.id, $2, 'subscribed', now(), 'ui' \
+           from contacts c where c.workspace_id = $1 and c.email = $3",
+    )
+    .bind(ws)
+    .bind(list)
+    .bind(email)
+    .execute(conn)
+    .await
+    .expect("subscribe");
+    assert_eq!(done.rows_affected(), 1, "{email} is not a contact yet");
+}
+
+/// `mailable_list_members` is the one definition of "may this member be emailed". A test that
+/// re-stated the rule instead of reading the view would pass while the send path disagreed.
+async fn is_mailable(conn: &mut PgConnection, ws: Uuid, list: Uuid, email: &str) -> bool {
+    sqlx::query_scalar(
+        "select exists (select 1 from mailable_list_members \
+                         where workspace_id = $1 and list_id = $2 and email = $3)",
+    )
+    .bind(ws)
+    .bind(list)
+    .bind(email)
+    .fetch_one(conn)
+    .await
+    .expect("read mailable_list_members")
+}
+
+/// A standing block on one address. Not an erasure: a suppressed address is still importable.
+async fn suppress_address(conn: &mut PgConnection, ws: Option<Uuid>, email: &str) {
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
+         values ($1, $2, 'address', $3, $4, 'bounced')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(email)
+    .bind(suppression_hmac(&secrets(), email).as_slice())
+    .execute(conn)
+    .await
+    .expect("suppress address");
+}
+
+async fn suppress_domain(conn: &mut PgConnection, ws: Option<Uuid>, domain: &str) {
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, domain, reason) \
+         values ($1, $2, 'domain', $3, 'complained')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(domain)
+    .execute(conn)
+    .await
+    .expect("suppress domain");
+}
+
+/// Every tag on one contact, by name.
+async fn tags_of(conn: &mut PgConnection, ws: Uuid, email: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "select t.name from contact_tags ct \
+           join tags t on t.workspace_id = ct.workspace_id and t.id = ct.tag_id \
+           join contacts c on c.workspace_id = ct.workspace_id and c.id = ct.contact_id \
+          where ct.workspace_id = $1 and c.email = $2 order by t.name",
+    )
+    .bind(ws)
+    .bind(email)
+    .fetch_all(conn)
+    .await
+    .expect("read contact_tags")
+}
+
+/// `email, tags, lists` in that order.
+fn tag_and_list_columns() -> Vec<ColumnTarget> {
+    vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::Tags),
+        ColumnTarget::Field(ContactField::Lists),
+    ]
+}
+
+/// The same job with a list for every imported row to be subscribed to.
+fn job_for_list(id: Uuid, ws: Uuid, mapping: Vec<ColumnTarget>, list: Uuid) -> ImportJob {
+    ImportJob {
+        list_id: Some(list),
+        ..job(id, ws, mapping, vec![])
+    }
+}
+
+#[sqlx::test]
+async fn an_import_never_resubscribes_an_unsubscribed_membership(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    unsubscribe(&mut tx, ws, list, "ada@example.com").await;
+    let j = job_for_list(import, ws, name_columns(), list);
+
+    import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Ada,Byron,UTC\n",
+    )
+    .await;
+
+    // THE COMPLIANCE ASSERTION OF THIS MILESTONE. Unsubscribing removes a row from the send, it
+    // does not un-send; an import that quietly puts the person back is the failure the whole
+    // suppression design exists to prevent.
+    assert_eq!(
+        membership(&mut tx, ws, list, "ada@example.com").await,
+        Some((
+            MembershipStatus::Unsubscribed,
+            Some(MembershipSource::Ui),
+            Some("2020-01-01".to_owned())
+        )),
+        "the import may not touch an unsubscribed membership: not its status, not the day it was \
+         stamped, and not who wrote it"
+    );
+    assert!(
+        !is_mailable(&mut tx, ws, list, "ada@example.com").await,
+        "and the send-time view must agree"
+    );
+}
+
+#[sqlx::test]
+async fn that_row_is_counted_in_memberships_declined_and_the_contact_still_updates(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    unsubscribe(&mut tx, ws, list, "ada@example.com").await;
+    // Carol is the control the count needs: she is already ON the list, so a `declined` that
+    // counted "this membership already existed" instead of "this membership is unsubscribed"
+    // would count her too, and the operator would read two refusals where there was one.
+    insert_contact(&mut tx, ws, "carol@example.com", "Carol", "Shaw").await;
+    subscribe(&mut tx, ws, list, "carol@example.com").await;
+    let j = job_for_list(import, ws, name_columns(), list);
+
+    let staged = copy(
+        &mut tx,
+        &j,
+        b"email,first_name,last_name,timezone\n\
+          ada@example.com,Ada,Byron,UTC\n\
+          bob@example.com,Bob,Barker,UTC\n\
+          carol@example.com,Carol,Shaw,UTC\n",
+    )
+    .await;
+    let counts = upsert_from_staging(&mut tx, &j, staged).await.unwrap();
+
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 1,
+            updated: 2,
+            skipped: 0,
+            collapsed: 0,
+            failed: 0,
+            memberships_declined: 1,
+            suppressed: 0,
+        },
+        "the contact is still updated; only the subscription is declined"
+    );
+    assert_eq!(
+        membership(&mut tx, ws, list, "carol@example.com")
+            .await
+            .map(|m| (m.0, m.1)),
+        Some((MembershipStatus::Subscribed, Some(MembershipSource::Ui))),
+        "a membership that already exists is not declined and is not rewritten"
+    );
+    // `memberships_declined` is NOT one of the five, and adding it in would count Ada twice.
+    assert_eq!(
+        counts.imported + counts.updated + counts.skipped + counts.collapsed + counts.failed,
+        staged.total_rows,
+        "the five are still the whole file: {counts:?}"
+    );
+    assert_eq!(
+        contact(&mut tx, ws, "ada@example.com").await.unwrap().1,
+        "Byron",
+        "the row is not skipped: the contact's own fields still move"
+    );
+    assert_eq!(
+        membership(&mut tx, ws, list, "bob@example.com")
+            .await
+            .map(|m| m.0),
+        Some(MembershipStatus::Subscribed),
+        "and the row beside it is subscribed as normal"
+    );
+}
+
+#[sqlx::test]
+async fn a_suppressed_address_imports_and_is_not_mailable(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    suppress_address(&mut tx, Some(ws), "bounced@example.com").await;
+    let j = job_for_list(import, ws, name_columns(), list);
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nbounced@example.com,Bo,Unced,UTC\n",
+    )
+    .await;
+
+    // Suppression is about mailing, not about existence: the contact and its membership are both
+    // written, and the eligibility view is what keeps the mail from going out.
+    assert_eq!(counts.imported, 1);
+    assert!(contact(&mut tx, ws, "bounced@example.com").await.is_some());
+    assert_eq!(
+        membership(&mut tx, ws, list, "bounced@example.com")
+            .await
+            .map(|m| m.0),
+        Some(MembershipStatus::Subscribed),
+    );
+    assert!(
+        !is_mailable(&mut tx, ws, list, "bounced@example.com").await,
+        "a subscribed membership on a suppressed address is still not mailable"
+    );
+}
+
+#[sqlx::test]
+async fn the_summary_counts_imported_contacts_that_are_suppressed(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    suppress_address(&mut tx, Some(ws), "bounced@example.com").await;
+    // An instance-wide domain block counts too: the operator's question is "how many of these can
+    // I never mail", and it does not care which row said so.
+    suppress_domain(&mut tx, None, "blocked.example").await;
+    let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\n\
+         bounced@example.com,Bo,Unced,UTC\n\
+         someone@blocked.example,Some,One,UTC\n\
+         ada@example.com,Ada,Lovelace,UTC\n",
+    )
+    .await;
+
+    assert_eq!(counts.imported, 3, "all three are contacts: {counts:?}");
+    assert_eq!(
+        counts.suppressed, 2,
+        "two of the three may never be mailed: {counts:?}"
+    );
+    assert_eq!(
+        counts.imported + counts.updated + counts.skipped + counts.collapsed + counts.failed,
+        3,
+        "`suppressed` describes rows already counted among the five: {counts:?}"
+    );
+}
+
+#[sqlx::test]
+async fn every_membership_an_import_writes_has_source_import(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let chosen = insert_list(&mut tx, ws, "news", false).await;
+    // A double-opt-in list the FILE names, so both ways a membership can be written are covered,
+    // and the list's own setting still decides the status.
+    let named = insert_list(&mut tx, ws, "offers", true).await;
+    let j = job_for_list(import, ws, tag_and_list_columns(), chosen);
+
+    import_csv(
+        &mut tx,
+        &j,
+        "email,tags,lists\nada@example.com,,offers:subscribed\n",
+    )
+    .await;
+
+    assert_eq!(
+        membership(&mut tx, ws, chosen, "ada@example.com")
+            .await
+            .map(|m| (m.0, m.1)),
+        Some((MembershipStatus::Subscribed, Some(MembershipSource::Import))),
+        "the list the operator chose"
+    );
+    assert_eq!(
+        membership(&mut tx, ws, named, "ada@example.com")
+            .await
+            .map(|m| (m.0, m.1)),
+        Some((MembershipStatus::Pending, Some(MembershipSource::Import))),
+        "a list the file named, pending because that list is double opt-in"
+    );
+    let unstamped: i64 = sqlx::query_scalar(
+        "select count(*) from list_memberships \
+          where workspace_id = $1 and source is distinct from 'import'",
+    )
+    .bind(ws)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(unstamped, 0, "an unexplainable membership is a consent bug");
+}
+
+#[sqlx::test]
+async fn tags_are_applied_and_an_unknown_tag_is_created_once(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let vip = Uuid::now_v7();
+    sqlx::query("insert into tags (id, workspace_id, name) values ($1, $2, 'vip')")
+        .bind(vip)
+        .bind(ws)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
+
+    import_csv(
+        &mut tx,
+        &j,
+        "email,tags,lists\n\
+         ada@example.com,vip;founder,\n\
+         bob@example.com,founder,\n",
+    )
+    .await;
+
+    assert_eq!(
+        tags_of(&mut tx, ws, "ada@example.com").await,
+        ["founder", "vip"]
+    );
+    assert_eq!(tags_of(&mut tx, ws, "bob@example.com").await, ["founder"]);
+    let names: Vec<(String, Uuid)> =
+        sqlx::query_as("select name, id from tags where workspace_id = $1 order by name")
+            .bind(ws)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(
+        names.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(),
+        ["founder", "vip"],
+        "two rows name `founder` and it is created once"
+    );
+    assert_eq!(
+        names[1].1, vip,
+        "and the tag that existed is reused, not remade"
+    );
+    // The tag list is `order by id desc`, documented as "Newest first": an id that is not time
+    // ordered would scatter imported tags through that list for ever.
+    assert!(names[0].1 > vip, "an imported tag's id is time-ordered");
+}
+
+#[sqlx::test]
+async fn an_unsubscribed_entry_and_an_unknown_list_name_both_write_nothing(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let news = insert_list(&mut tx, ws, "news", false).await;
+    let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,tags,lists\nada@example.com,,news:unsubscribed;ghost\n",
+    )
+    .await;
+
+    assert_eq!(counts.imported, 1, "the contact is still imported");
+    assert_eq!(
+        membership(&mut tx, ws, news, "ada@example.com").await,
+        None,
+        "a file entry that says `unsubscribed` is not a request to subscribe anyone"
+    );
+    assert_eq!(
+        counts.memberships_declined, 0,
+        "and nothing was declined: the file never asked"
+    );
+    let lists: i64 = sqlx::query_scalar("select count(*) from lists where workspace_id = $1")
+        .bind(ws)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        lists, 1,
+        "an import creates tags, which only label; it never creates a list, which takes mail"
+    );
+}
+
+#[sqlx::test]
+async fn skip_existing_writes_no_tags_and_no_membership_either(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    let j = ImportJob {
+        list_id: Some(list),
+        ..job_with(
+            import,
+            ws,
+            tag_and_list_columns(),
+            vec![],
+            Dedup::SkipExisting,
+        )
+    };
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,tags,lists\n\
+         ada@example.com,vip,\n\
+         bob@example.com,vip,\n",
+    )
+    .await;
+
+    assert_eq!((counts.imported, counts.skipped), (1, 1));
+    // "Skip existing — matched rows are counted in `skipped` and nothing is written" (spec 7.3).
+    // Nothing is nothing: not a tag, and not a subscription either.
+    assert!(tags_of(&mut tx, ws, "ada@example.com").await.is_empty());
+    assert_eq!(membership(&mut tx, ws, list, "ada@example.com").await, None);
+    assert_eq!(tags_of(&mut tx, ws, "bob@example.com").await, ["vip"]);
+    assert_eq!(
+        membership(&mut tx, ws, list, "bob@example.com")
+            .await
+            .map(|m| m.0),
+        Some(MembershipStatus::Subscribed),
+        "the row that was not skipped is subscribed as normal"
+    );
+}
+
+#[sqlx::test]
+async fn a_padded_custom_cell_is_stored_without_its_padding(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let mut tier = field("tier", FieldKind::Select);
+    tier.options = vec!["gold".to_owned()];
+    let defs = vec![field("plan", FieldKind::Text), tier];
+    let j = job_with(
+        import,
+        ws,
+        vec![
+            ColumnTarget::Field(ContactField::Email),
+            ColumnTarget::Custom("plan".to_owned()),
+            ColumnTarget::Custom("tier".to_owned()),
+        ],
+        defs,
+        Dedup::default(),
+    );
+
+    // The arm already treats a cell of nothing but spaces as the file saying nothing; a cell with
+    // padding AROUND a value has to lose the padding the same way, or `" gold "` is not one of the
+    // field's options and a good row becomes an error row.
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,plan,tier\nada@example.com, pro , gold \n",
+    )
+    .await;
+
+    assert_eq!(
+        counts.imported,
+        1,
+        "{:?}",
+        error_rows(&mut tx, import).await
+    );
+    assert_eq!(
+        contact(&mut tx, ws, "ada@example.com").await.unwrap().3,
+        json!({"plan": "pro", "tier": "gold"}),
     );
 }

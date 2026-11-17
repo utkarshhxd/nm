@@ -8,7 +8,8 @@
 //! `import_errors` row, and the rows after it carry on.
 //!
 //! **The other half of this module is [`upsert_from_staging`]**, which turns the whole staged file
-//! into contacts in three statements and touches no row on its own. The two belong together: what
+//! into contacts, memberships and tags in four statements and touches no row on its own. The two
+//! belong together: what
 //! the `COPY` stages — a normalised address, its HMAC, and a null wherever the file said nothing —
 //! is exactly what lets the upsert be a set operation.
 //!
@@ -52,6 +53,7 @@ use crate::{
     crypto::{secrets::Secrets, suppression_hmac},
     custom_fields::{Definition, FieldKind},
     error::{ApiError, ApiResult},
+    lists::MembershipSource,
     users::normalize_email,
     workspaces::validate_timezone,
 };
@@ -297,6 +299,16 @@ pub struct UpsertCounts {
     pub collapsed: i64,
     /// The `COPY`'s refusals, plus every row refused for an erasure here.
     pub failed: i64,
+    /// **Not one of the five.** Subscriptions this import asked for and did not get, because the
+    /// address is already `unsubscribed` on that list (spec 7.5). The row itself is still an
+    /// `imported` or an `updated` one — only the subscription was declined — so adding this to the
+    /// five would count that row twice and break the sum above.
+    pub memberships_declined: i64,
+    /// **Not one of the five, and not a membership count.** Contacts this import created or
+    /// updated whose address, or whose domain, is suppressed here or instance-wide. They are
+    /// imported (suppression is about mailing, not existence) and they are not mailable, and
+    /// spec 7.5 wants the number said out loud rather than discovered at send time.
+    pub suppressed: i64,
 }
 
 /// What an `import_errors` row says about a row whose address has been erased on request.
@@ -326,6 +338,8 @@ const ERASED_REASON: &str =
 /// 3. **The dedup mode decides what an existing contact gets**: updated field by field, skipped,
 ///    or the whole import refused before it writes anything.
 /// 4. **A blank cell leaves the stored value alone** (spec 7.3). See the `do update` below.
+/// 5. **Then the contacts that survived all of that get their lists and their tags**, in
+///    [`write_memberships_and_tags`], which is where spec 7.5's "may and may not" lives.
 pub async fn upsert_from_staging(
     conn: &mut PgConnection,
     import: &ImportJob,
@@ -360,11 +374,14 @@ pub async fn upsert_from_staging(
 
     // What is left of this import's error budget. `copy_into_staging` has already spent some of
     // it, and the cap is per import, not per stage.
-    let written: i64 = sqlx::query_scalar(
-        "select count(*) from import_errors where workspace_id = $1 and import_id = $2",
+    // The macro, not the runtime query: it names no staging table, so there is nothing dynamic in
+    // it, and `cargo sqlx prepare` then holds it to the schema the way every other fixed statement
+    // in this tree is held (see `suppressions::is_erased`).
+    let written = sqlx::query_scalar!(
+        r#"select count(*) as "n!" from import_errors where workspace_id = $1 and import_id = $2"#,
+        ws,
+        import.id,
     )
-    .bind(ws)
-    .bind(import.id)
     .fetch_one(&mut *conn)
     .await?;
     let budget = (MAX_IMPORT_ERRORS as i64 - written).max(0);
@@ -431,6 +448,8 @@ pub async fn upsert_from_staging(
         .fetch_one(&mut *conn)
         .await?;
 
+    let (declined, suppressed) = write_memberships_and_tags(conn, import).await?;
+
     // THE ANTI-JOIN AGAIN, OVER THE IDS THIS IMPORT INSERTED, as the last statement before the
     // caller's COMMIT. `c.id = s.id` matches only rows the insert above created: an updated
     // contact kept its own id and the staged one was discarded.
@@ -483,7 +502,160 @@ pub async fn upsert_from_staging(
         skipped: picked - erased - inserted - updated,
         collapsed: staged.staged - picked,
         failed: staged.failed + erased + gone,
+        memberships_declined: declined,
+        suppressed,
     })
+}
+
+/// A UUIDv7 built in SQL, because Postgres 16 has no `uuidv7()` and a tag's id may not be random:
+/// `GET /tags` is `order by id desc` and its documented contract is "Newest first", so a `v4` id
+/// would scatter every imported tag through that list for ever. 48 bits of millisecond timestamp,
+/// the version nibble `7`, the variant nibble `8`, and 72 bits of randomness around them — the
+/// same layout `Uuid::now_v7()` writes, and `clock_timestamp()` so that tags made in one statement
+/// still order among themselves.
+///
+/// A tag is the only row this module creates whose count is not known before the statement runs.
+/// Minting these ids in Rust would mean reading every distinct tag name in the file into memory
+/// first, which is the one thing this module refuses to do (see [`MAX_RECORD_BYTES`]).
+const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) * 1000)::bigint), \
+                            12, '0') || '7' || substr(md5(random()::text), 1, 3) \
+                            || '8' || substr(md5(random()::text), 1, 15))::uuid";
+
+/// Puts the imported contacts on their lists and their tags on them: one statement, after the
+/// contacts exist and before the erasure sweep (whose `delete` cascades through both tables, so a
+/// contact taken back takes its memberships and tags with it). Returns the two counts that are
+/// **not** among [`UpsertCounts`]'s five: `memberships_declined` and `suppressed`.
+///
+/// Spec 7.5 is the whole of it. An import **may** add tags and subscribe a contact to a list. It
+/// **may not** resurrect an unsubscribed membership, and here that is not a special case but the
+/// general rule: `on conflict … do nothing` — **an import never touches a membership that already
+/// exists**. That is stronger than §7.5 asks for and it is stronger on purpose:
+///
+/// - An `unsubscribed` row stays unsubscribed, with its `unsubscribed_at` where the unsubscribe
+///   put it. This is the M1a bulk-subscribe lesson: unsubscribing removes a row from the send, it
+///   does not un-send.
+/// - A `pending` row is not promoted (an import cannot confirm a double opt-in) and a `subscribed`
+///   one is not demoted back to `pending`.
+/// - `source` is left as the first writer set it. The consent log's answer to "how did this person
+///   get on this list" is that first write, and an import that stamped `import` over a `ui` row
+///   would destroy the answer while changing nothing else.
+///
+/// Note `list_memberships` and `contact_tags`, not `memberships` — which is which *users* belong
+/// to a workspace, and would compile.
+///
+/// Two rules the spec left open, decided here:
+///
+/// 1. **A list the FILE names is matched by name against this workspace's lists, and an import
+///    never creates one.** A tag only labels; a list receives mail, and has a `double_optin`
+///    setting and a consent story that a misspelt cell may not invent. A name that matches nothing
+///    writes nothing.
+/// 2. **An entry whose status is `unsubscribed` is not a request to subscribe anyone**, so it
+///    writes nothing and declines nothing. Any other status is a subscription request, and the
+///    LIST decides what is written — `pending` on a double-opt-in list, `subscribed` otherwise —
+///    exactly as `lists::add_member` does. An import may not hand itself a status the UI could not.
+async fn write_memberships_and_tags(
+    conn: &mut PgConnection,
+    import: &ImportJob,
+) -> ApiResult<(i64, i64)> {
+    let table = staging_table(import.id);
+    let written = match import.dedup {
+        // `skip existing` wrote nothing for a row whose contact already existed, and "nothing" has
+        // to reach its tags and its lists too. The staged id is the tell: it is the contact's id
+        // only where THIS import's insert created the contact.
+        Dedup::SkipExisting => "c.id = l.id",
+        Dedup::UpdateExisting | Dedup::FailOnDuplicate => "true",
+    };
+    // `AssertSqlSafe`: the only interpolations are `staging_table`'s fixed prefix with the import
+    // id in hex, `written` (one of the two literals above) and [`SQL_UUID_V7`]. Nothing a client
+    // sent reaches this string; the list the operator chose and the `import` provenance are bound.
+    let (declined, suppressed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+        // `picked` and `live` again, and for the same two reasons as the statement before this
+        // one: the file de-duplicates itself before anything looks at the database, and an erased
+        // address is touched by nothing — not even by a tag on the contact row it already had.
+        "with picked as ( \
+             select distinct on (email) * from {table} order by email, row_number desc \
+         ), \
+         live as ( \
+             select s.* from picked s \
+              where not exists (select 1 from suppressions where reason = 'gdpr_erasure' \
+                                  and email_hmac = s.email_hmac \
+                                  and (workspace_id = $1 or workspace_id is null)) \
+         ), \
+         target as ( \
+             select l.tags, l.lists, c.id as contact_id, c.email, c.email_domain \
+               from live l \
+               join contacts c on c.workspace_id = $1 and c.email = l.email \
+              where {written} \
+         ), \
+         named as ( \
+             select t.contact_id, btrim(e->>'name') as name \
+               from target t, lateral jsonb_array_elements(t.lists) e \
+              where lower(btrim(coalesce(e->>'status', ''))) <> 'unsubscribed' \
+         ), \
+         wanted as ( \
+             select t.contact_id, l.id as list_id, l.double_optin \
+               from target t join lists l on l.workspace_id = $1 and l.id = $2 \
+             union \
+             select n.contact_id, l.id, l.double_optin \
+               from named n join lists l on l.workspace_id = $1 and l.name = n.name \
+         ), \
+         declined as ( \
+             select 1 from wanted w \
+               join list_memberships m on m.workspace_id = $1 \
+                    and m.contact_id = w.contact_id and m.list_id = w.list_id \
+              where m.status = 'unsubscribed' \
+         ), \
+         added as ( \
+             insert into list_memberships \
+                 (workspace_id, contact_id, list_id, status, subscribed_at, source) \
+             select $1, w.contact_id, w.list_id, \
+                    case when w.double_optin then 'pending' else 'subscribed' end, \
+                    case when w.double_optin then null else now() end, $3 \
+               from wanted w \
+             on conflict (contact_id, list_id) do nothing \
+             returning 1 \
+         ), \
+         row_tags as ( \
+             select t.contact_id, btrim(v.value) as name \
+               from target t, lateral jsonb_array_elements_text(t.tags) v \
+              where btrim(v.value) <> '' \
+         ), \
+         made as ( \
+             insert into tags (id, workspace_id, name) \
+             select {SQL_UUID_V7}, $1, n.name from (select distinct name from row_tags) n \
+             on conflict (workspace_id, name) do nothing \
+             returning id, name \
+         ), \
+         known as ( \
+             select g.id, g.name from tags g \
+              where g.workspace_id = $1 and g.name in (select name from row_tags) \
+             union all \
+             select id, name from made \
+         ), \
+         tagged as ( \
+             insert into contact_tags (workspace_id, contact_id, tag_id) \
+             select distinct $1, r.contact_id, k.id \
+               from row_tags r join known k on k.name = r.name \
+             on conflict (contact_id, tag_id) do nothing \
+             returning 1 \
+         ), \
+         suppressed as ( \
+             select 1 from target t \
+              where exists (select 1 from suppressions s where s.lifted_at is null \
+                              and s.scope = 'address' and s.email = t.email \
+                              and (s.workspace_id = $1 or s.workspace_id is null)) \
+                 or exists (select 1 from suppressions s where s.lifted_at is null \
+                              and s.scope = 'domain' and s.domain = t.email_domain \
+                              and (s.workspace_id = $1 or s.workspace_id is null)) \
+         ) \
+         select (select count(*) from declined), (select count(*) from suppressed)"
+    )))
+    .bind(import.workspace_id)
+    .bind(import.list_id)
+    .bind(MembershipSource::Import)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok((declined, suppressed))
 }
 
 /// The fields of one record, as `csv_core` leaves them: one buffer and the end offset of each.
@@ -539,8 +711,8 @@ fn stage_row(
     // A record the parser threw away unread is refused here too, in its own words: a row over
     // `MAX_RECORD_BYTES` is told it is too long, not too wide, because the two faults send the
     // operator to different places in their file.
-    let too_wide = cells.len() > job.mapping.len()
-        && cells[job.mapping.len()..].iter().any(|f| !f.is_empty());
+    let too_wide =
+        cells.len() > job.mapping.len() && cells[job.mapping.len()..].iter().any(|f| !f.is_empty());
     if oversize.is_some() || too_wide {
         let reason = match oversize {
             Some(Oversize::Bytes) => format!(
@@ -616,16 +788,18 @@ fn stage_row(
                 }
             }
             // A blank cell is not a null: it leaves the stored value alone (spec 7.3), so it is
-            // simply not in the object the next stage merges. `trim`, like the name and timezone
-            // arms above: a cell of one space is a blank cell in a spreadsheet, and storing `" "`
-            // for it would overwrite a stored value with whitespace.
+            // simply not in the object the next stage merges. `trim` BOTH SIDES of this arm, like
+            // the name and timezone arms above: a cell of one space is a blank cell in a
+            // spreadsheet, and a cell of `" gold "` is the operator naming the option `gold` —
+            // guarding on the trimmed cell and then storing the untrimmed one stores `" pro "`
+            // with its padding and turns a good `select` row into an error row.
             ColumnTarget::Custom(key) if !cell.trim().is_empty() => {
                 let def = job
                     .defs
                     .iter()
                     .find(|d| d.key == *key)
                     .ok_or_else(|| bad(i, "no such custom field", &cell))?;
-                attrs.insert(key.clone(), typed(def, &cell));
+                attrs.insert(key.clone(), typed(def, cell.trim()));
             }
             ColumnTarget::Custom(_) => {}
         }
@@ -717,15 +891,16 @@ fn push_field(out: &mut String, value: Option<&str>) {
 /// decides what is valid, and there is no second opinion about `-5-5` or `1e999`.
 fn typed(d: &Definition, cell: &str) -> Value {
     match d.kind {
-        FieldKind::Number => cell
-            .parse::<i64>()
-            .map(Value::from)
-            .unwrap_or_else(|_| match cell.parse::<f64>() {
-                // `1e999` parses to an infinity, which is not a JSON number and not a quantity
-                // anyone meant to import.
-                Ok(f) if f.is_finite() => Value::from(f),
-                _ => Value::from(cell),
-            }),
+        FieldKind::Number => {
+            cell.parse::<i64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| match cell.parse::<f64>() {
+                    // `1e999` parses to an infinity, which is not a JSON number and not a quantity
+                    // anyone meant to import.
+                    Ok(f) if f.is_finite() => Value::from(f),
+                    _ => Value::from(cell),
+                })
+        }
         FieldKind::Boolean => match cell.to_ascii_lowercase().as_str() {
             "true" => Value::Bool(true),
             "false" => Value::Bool(false),
