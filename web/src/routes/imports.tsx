@@ -5,26 +5,14 @@ import { useNavigate } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
 import { api, problemText } from "../api/client";
-import type { components } from "../api/schema";
 import { Button } from "../components/button";
 import { EmptyState } from "../components/empty-state";
 import { Alert } from "../components/field";
 import { CONTROL } from "../components/input";
+import { type Uploaded, uploadKey } from "../lib/import-upload";
 import { atLeast } from "../lib/roles";
 import { CARD } from "../lib/ui";
 import { useWorkspace } from "./workspace-layout";
-
-type Upload = components["schemas"]["Upload"];
-
-/** What the mapping screen is given: the server's reading of the file, and the name the browser had for it. */
-export type Uploaded = { upload: Upload; filename: string };
-
-/**
- * Where an upload waits for the mapping screen. There is no `GET /imports/{id}` yet, so the upload
- * response is the only copy of what the server read: it travels in the query cache, and a reload
- * of the mapping screen loses it.
- */
-export const uploadKey = (ws: string, id: string) => ["import-upload", ws, id] as const;
 
 const KNOWN = {
   "insufficient-role": "Your role cannot import contacts. It takes editor or above.",
