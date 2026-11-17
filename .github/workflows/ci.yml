@@ -46,7 +46,26 @@ jobs:
       # has to diff it against their own machine.
       - name: Committed OpenAPI spec is current
         run: |
-          cargo run -q -- openapi > "$RUNNER_TEMP/openapi.generated.json"
+          # Not `cargo run … | diff -`: a pipeline's status is the LAST command's, so a generator
+          # that dies prints nothing, `diff` compares an empty stream against the committed file,
+          # and the step reports drift. That misreading cost three runs. Check the generator's own
+          # status first, and keep its stderr — it is the only place the reason appears.
+          if ! cargo run -q -- openapi \
+               > "$RUNNER_TEMP/openapi.generated.json" 2> "$RUNNER_TEMP/openapi.stderr"; then
+            status=$?
+            {
+              echo '## The OpenAPI generator failed; this is not drift'
+              echo
+              echo "\`cargo run -q -- openapi\` exited $status after writing"
+              echo "$(wc -c < "$RUNNER_TEMP/openapi.generated.json") bytes to stdout."
+              echo
+              echo '```'
+              tail -c 20000 "$RUNNER_TEMP/openapi.stderr"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::the openapi subcommand failed; see the job summary"
+            exit "$status"
+          fi
           if ! diff -u web/src/api/openapi.json "$RUNNER_TEMP/openapi.generated.json" \
                > "$RUNNER_TEMP/openapi.diff"; then
             {
