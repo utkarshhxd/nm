@@ -912,10 +912,21 @@ async fn a_client_that_stops_reading_is_cut_off_after_the_send_timeout(pool: PgP
 /// Reached by terminating the backend serving the open cursor, which is what a failover, an
 /// administrator or the OOM killer does. The connection is acquired here so its pid is known
 /// before it is handed over; nothing else on the pool is touched.
+///
+/// `ROWS` is this large on purpose, and shrinking it silently turns the test into a coin flip.
+/// The producer runs `CHUNKS_IN_FLIGHT` ahead and then blocks, so nothing drains the backend
+/// after the first few chunks. A result set that fits in the socket buffers between the two is
+/// therefore sent in full before the kill can land, the body ends cleanly because the export
+/// really did finish, and the old assertion read that as a truncated file. It passed on a slow
+/// machine and failed on a fast one. The wait on `ClientWrite` below is what actually makes this
+/// deterministic; the row count is what lets that wait succeed.
 #[sqlx::test]
 async fn a_query_that_dies_mid_stream_aborts_the_body_and_is_audited_incomplete(pool: PgPool) {
+    /// Comfortably more than any socket buffer between the backend and this process.
+    const ROWS: i64 = 200_000;
+
     let (ws, _owner, _admin) = workspace(&pool, "acme").await;
-    seed(&pool, ws, 20_000).await;
+    seed(&pool, ws, ROWS).await;
     let owner_id: Uuid = sqlx::query_scalar("select id from users where email = $1")
         .bind("owner-acme@example.com")
         .fetch_one(&pool)
@@ -956,6 +967,29 @@ async fn a_query_that_dies_mid_stream_aborts_the_body_and_is_audited_incomplete(
         "a data chunk"
     );
 
+    // The kill only means anything while the backend is still producing. Blocked on
+    // `ClientWrite` it provably is: it is mid-result, and it cannot progress until somebody
+    // drains it, which nothing here will do before the kill lands. Waiting for that state is what
+    // removes the race; without it a completed export is indistinguishable from a truncated one.
+    let mut blocked = false;
+    for _ in 0..100 {
+        blocked = sqlx::query_scalar(
+            "select exists (select 1 from pg_stat_activity \n             where pid = $1 and state = 'active' and wait_event = 'ClientWrite')",
+        )
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        blocked,
+        "the export's backend never blocked writing to us, so it had already finished: this run \n         says nothing about a mid-stream death. Raise ROWS above the socket buffers."
+    );
+
     let killed: bool = sqlx::query_scalar("select pg_terminate_backend($1)")
         .bind(pid)
         .fetch_one(&pool)
@@ -991,7 +1025,7 @@ async fn a_query_that_dies_mid_stream_aborts_the_body_and_is_audited_incomplete(
     assert_eq!(audit.len(), 1, "a failed export went unrecorded");
     assert_eq!(audit[0]["complete"], false);
     assert!(
-        audit[0]["rows"].as_u64().unwrap() < 20_000,
+        audit[0]["rows"].as_u64().unwrap() < ROWS as u64,
         "it stopped short of the whole book: {}",
         audit[0]["rows"]
     );
