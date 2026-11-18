@@ -315,11 +315,12 @@ async fn an_unrecognised_column_proposes_nothing(pool: PgPool) {
     let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
     let csv = "Email Address,Given Name,attr:ghost,id,suppressed\nada@example.com,Ada,x,1,true\n";
     let body = uploaded(&app, ws, "u.csv", csv).await;
-    assert!(
-        proposals(&body)
-            .iter()
-            .all(|p| *p == json!({"kind": "ignore"}))
-    );
+    let proposed = proposals(&body);
+    // THE LENGTH FIRST. `all` is true of an empty list, and a sniff returning zero columns for
+    // this five-column file is a state the sniff genuinely produces by design elsewhere — so
+    // without this line the assertion below passes on the one answer that would be most wrong.
+    assert_eq!(proposed.len(), 5, "five columns were read: {body}");
+    assert!(proposed.iter().all(|p| *p == json!({"kind": "ignore"})));
 }
 
 #[sqlx::test]
@@ -1301,6 +1302,13 @@ async fn an_erasure_is_reported_without_echoing_the_erased_address(pool: PgPool)
     }
 }
 
+/// **What enforces this is not this test.** `contacts` is unique on `(workspace_id, email)`, the
+/// upsert's conflict target is that same pair, and the workspace is a bound parameter rather than
+/// a predicate — so there is no line here to mutate and nothing this test can be made to miss.
+/// It is a statement of the property, not a pin on it.
+///
+/// The pin is `another_workspaces_contact_fails_no_duplicate_check` below, which covers the one
+/// place in the upsert where the workspace IS a predicate and nothing stands behind it.
 #[sqlx::test]
 async fn another_workspaces_contact_is_never_updated_by_an_import(pool: PgPool) {
     let (theirs, mine) = (
@@ -1343,6 +1351,54 @@ async fn another_workspaces_contact_is_never_updated_by_an_import(pool: PgPool) 
     assert_eq!(
         (mine_now.0.as_str(), mine_now.1.as_str()),
         ("Grace", "Hopper")
+    );
+}
+
+/// THE CROSS-TENANT PIN, and the one the test above cannot be.
+///
+/// `fail on duplicate` is a pre-flight `SELECT`, not an `on conflict` arm, so the join's
+/// `c.workspace_id = $1` is a predicate with nothing behind it: no unique index, no foreign key,
+/// no bound parameter standing in for it. Delete it and the import is refused — naming an address
+/// the operator did supply, but refusing it **because another workspace holds that address**. A
+/// cross-tenant existence leak, in a message the operator reads.
+#[sqlx::test]
+async fn another_workspaces_contact_fails_no_duplicate_check(pool: PgPool) {
+    let (theirs, mine) = (
+        workspace(&pool, "theirs").await,
+        workspace(&pool, "mine").await,
+    );
+    let import = insert_import(&pool, mine).await;
+    let j = job_with(import, mine, name_columns(), vec![], Dedup::FailOnDuplicate);
+    let mut tx = pool.begin().await.unwrap();
+    insert_contact(&mut tx, theirs, "ada@example.com", "Ada", "Lovelace").await;
+
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Grace,Hopper,UTC\n",
+    )
+    .await;
+    assert_eq!(
+        counts,
+        UpsertCounts {
+            imported: 1,
+            updated: 0,
+            skipped: 0,
+            collapsed: 0,
+            failed: 0,
+            memberships_declined: 0,
+            suppressed: 0,
+        },
+        "the other workspace's row is not a duplicate here, and the import runs"
+    );
+    assert!(
+        contact(&mut tx, mine, "ada@example.com").await.is_some(),
+        "the file was imported, not refused over a row in a workspace that is not this one"
+    );
+    let theirs_now = contact(&mut tx, theirs, "ada@example.com").await.unwrap();
+    assert_eq!(
+        (theirs_now.0.as_str(), theirs_now.1.as_str()),
+        ("Ada", "Lovelace")
     );
 }
 
@@ -2342,7 +2398,8 @@ async fn the_report_names_every_count_separately(pool: PgPool) {
 /// adding the other two. `suppressed` and `memberships_declined` describe rows already counted
 /// among these five — a suppressed address is still an imported or updated contact, and a declined
 /// membership belongs to one — so adding all seven counts those rows twice. The last assertion
-/// here is that the seven do NOT sum to `total_rows`, which is what makes the rule falsifiable.
+/// here is not that the seven fail to sum but WHICH rows the other two name, read from the
+/// database: a sum is implied by its parts, and only the overlap itself is falsifiable.
 #[sqlx::test]
 async fn imported_updated_skipped_collapsed_and_failed_add_up_to_total_rows(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
@@ -2439,12 +2496,27 @@ async fn imported_updated_skipped_collapsed_and_failed_add_up_to_total_rows(pool
         (&json!(1), &json!(1)),
         "{b}"
     );
-    assert_eq!(
-        five(&b) + b["suppressed"].as_i64().unwrap() + b["memberships_declined"].as_i64().unwrap(),
-        8,
-        "all seven come to more than the file's six rows, because two of the five are counted \
-         again by the other two. This is the test's point, not its bug."
+    // THE OVERLAP ITSELF, not the arithmetic of it. A `five + suppressed + declined == 8` line
+    // here would follow from the three assertions above and say nothing they do not; what makes
+    // the rule falsifiable is WHICH rows the other two name. Sue was counted in `suppressed` and
+    // is a contact, so her row is also one of the five; Bob was counted in `memberships_declined`
+    // and kept the unsubscribe that declined it, while his contact was updated all the same. Read
+    // from the database, not from the report that is being checked.
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        contact(&mut conn, ws, "sue@example.com").await.is_some(),
+        "the row counted in `suppressed` became a contact, so it is `imported` as well"
     );
+    assert_eq!(
+        membership(&mut conn, ws, list, "bob@example.com")
+            .await
+            .map(|m| m.0),
+        Some(MembershipStatus::Unsubscribed),
+        "the row counted in `memberships_declined` is a contact whose subscription was refused, \
+         not a row of its own"
+    );
+    assert!(contact(&mut conn, ws, "bob@example.com").await.is_some());
+    drop(conn);
     assert_eq!(b["errors_recorded"], 1);
 
     let b: Value = app.get(&report_uri(ws, second)).await.json();
@@ -2798,6 +2870,23 @@ async fn a_run_writes_every_count_it_computed_to_the_report(pool: PgPool) {
             "{email} was not subscribed to the list the request named"
         );
     }
+    // AND THE POINT OF ALL OF IT: a contact this import created, on the list this import put them
+    // on, is one the send may reach. Every other `is_mailable` assertion on this branch is
+    // negative, so `mailable_list_members` could have excluded imported memberships outright —
+    // add `and m.source is distinct from 'import'` to `0015_mailable_view.sql` and nothing went
+    // red — and the failure that permits is a million imported contacts no send can reach, with
+    // the suite green.
+    assert!(
+        is_mailable(&mut conn, ws, everyone, "ada@example.com").await,
+        "a contact the import subscribed is mailable, or the import did nothing worth doing"
+    );
+    // The negative beside it, from the same view and the same run: suppression is what makes a
+    // member unmailable here, not having arrived by import.
+    assert!(
+        !is_mailable(&mut conn, ws, everyone, "sue@example.com").await,
+        "a suppressed address is imported and subscribed, and is still not mailable"
+    );
+
     // And the row records the list it was asked for, which is the other place `list_id` is used.
     let stored: Option<Uuid> = sqlx::query_scalar("select list_id from imports where id = $1")
         .bind(import)
