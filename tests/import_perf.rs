@@ -34,11 +34,20 @@
 //! docker logs --since 20m nm-postgres-1 2>&1 | grep 'LOG:  duration' | grep -vE 'parse |bind |plan:'
 //! ```
 //!
-//! Each run prints six lines in order: `create temporary table`, the `copy`, the error-budget
-//! `select count(*) … import_errors`, the `insert … select` into `contacts`, the memberships and
-//! tags statement, and the erasure sweep, then `COMMIT`. **Read the log before the next run**:
-//! docker rotates it, and a run that logs plans as well as durations can rotate its own figures
-//! away inside a minute.
+//! After the `set` that turns the timing on, each run prints **seven** lines, in this order:
+//!
+//! 1. `create temporary table import_staging_…` — part of the `COPY` phase's wall clock
+//! 2. `copy import_staging_… from stdin` — the rest of it
+//! 3. `select count(*) … from import_errors` — the error budget, the upsert's first statement
+//! 4. `with picked as (…) insert into contacts …` — **phase 2**
+//! 5. `with picked as (…) insert into list_memberships … contact_tags …` — **phase 3**
+//! 6. `with gone as (delete from contacts …)` — the erasure sweep
+//! 7. `COMMIT`
+//!
+//! All seven are needed to check the split against the wall clock this test prints: they sum to it
+//! within 0.2 s, and line 1 is small but not zero, so leaving it out makes the sum miss. **Read the
+//! log before the next run**: docker rotates it, and a run that logs plans as well as durations can
+//! rotate its own figures away inside a minute.
 
 mod common;
 
