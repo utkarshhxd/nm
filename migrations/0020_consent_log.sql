@@ -38,16 +38,18 @@ comment on table consent_log is
 create index consent_log_by_contact on consent_log (workspace_id, contact_id, created_at desc);
 
 -- Enforces the comment. DELETE is left alone: the contact cascade is how erasure happens. The one
--- update allowed is the `on delete set null (list_id)` above, which Postgres runs as an UPDATE
--- that fires this trigger: it may clear `list_id` and must change nothing else.
+-- update allowed is the `on delete set null (list_id)` above. Postgres runs that as an UPDATE
+-- that fires this trigger, so a blanket refusal would make every list deletion fail. It is told
+-- apart from a hand-written `update ... set list_id = null` by `pg_trigger_depth()`: 1 for a
+-- statement, 2 for the referential action (measured on 16.15). That matters because `list_id` is
+-- evidence, and null already means "workspace-wide": nulling it by hand would silently turn a
+-- list-scoped row into a workspace-wide one. The `to_jsonb` comparison makes the allowed update
+-- change nothing else, and covers a column added later without anyone editing this function.
+-- Limit: an UPDATE issued from inside another trigger also runs at depth 2 and is not told apart.
 create function consent_log_append_only() returns trigger language plpgsql as $$
 begin
-  if old.list_id is not null and new.list_id is null
-     and (new.id, new.workspace_id, new.contact_id, new.action, new.source, new.source_ref,
-          new.ip, new.user_agent, new.token_jti, new.created_at)
-         is not distinct from
-         (old.id, old.workspace_id, old.contact_id, old.action, old.source, old.source_ref,
-          old.ip, old.user_agent, old.token_jti, old.created_at) then
+  if pg_trigger_depth() > 1 and old.list_id is not null and new.list_id is null
+     and to_jsonb(new) - 'list_id' = to_jsonb(old) - 'list_id' then
     return new;
   end if;
   raise exception 'consent_log is append-only: rows are never updated';

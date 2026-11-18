@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The consent log: one append-only row per consent change, so that years later the question
-//! "prove this person agreed" has an answer. Rows are never updated or deleted by the application.
+//! "prove this person agreed" has an answer. A row is never updated, and is removed only when the
+//! contact it belongs to is erased (the database cascades that; nothing here deletes).
 
 use std::net::IpAddr;
 

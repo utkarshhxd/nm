@@ -289,6 +289,10 @@ async fn a_consent_row_cannot_be_updated(pool: PgPool) {
         "update consent_log set ip = null",
         "update consent_log set created_at = now() + interval '1 day'",
         "update consent_log set contact_id = contact_id", // even a no-op change
+        // `list_id` is evidence, and null already means "workspace-wide": only the list's deletion
+        // may clear it, never a statement, alone or with another column, in bulk or singly.
+        "update consent_log set list_id = null, ip = null",
+        "update consent_log set list_id = null",
     ] {
         let err = sqlx::query(sql).execute(&pool).await.expect_err(sql);
         assert!(
@@ -299,9 +303,143 @@ async fn a_consent_row_cannot_be_updated(pool: PgPool) {
             "{sql}: {err}"
         );
     }
-    let action: String = sqlx::query_scalar("select action from consent_log")
+    let (action, list_id, ip): (String, Option<Uuid>, Option<IpAddr>) =
+        sqlx::query_as("select action, list_id, ip from consent_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(action, "confirmed");
+    assert_eq!(list_id, Some(l));
+    assert!(ip.is_some());
+}
+
+#[sqlx::test]
+async fn a_workspace_wide_row_cannot_be_given_a_list(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    let mut conn = pool.acquire().await.unwrap();
+    record(
+        &mut conn,
+        ws,
+        c,
+        None,
+        Action::Suppressed,
+        Source::Bounce,
+        &Context::default(),
+    )
+    .await
+    .unwrap();
+
+    let err = sqlx::query("update consent_log set list_id = $1")
+        .bind(l)
+        .execute(&pool)
+        .await
+        .expect_err("null to non-null must be refused");
+    assert!(
+        err.as_database_error()
+            .unwrap()
+            .message()
+            .contains("append-only")
+    );
+}
+
+/// The migration says a null-`list_id` row is still held to its workspace by the contact key.
+#[sqlx::test]
+async fn a_workspace_wide_row_for_another_workspaces_contact_cannot_be_written(pool: PgPool) {
+    let a = workspace(&pool, "alpha").await;
+    let b = workspace(&pool, "beta").await;
+    let contact_a = contact(&pool, a, "a@ex.test").await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let err = record(
+        &mut conn,
+        b,
+        contact_a,
+        None,
+        Action::Suppressed,
+        Source::Operator,
+        &Context::default(),
+    )
+    .await
+    .expect_err("the database must refuse it");
+    let db = err.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("23503"));
+    assert_eq!(
+        db.constraint(),
+        Some("consent_log_workspace_id_contact_id_fkey")
+    );
+}
+
+/// Every variant, so a Rust enum and the database's `check` list cannot drift apart unseen. The
+/// matches are exhaustive: a new variant fails to compile here until it is listed.
+#[sqlx::test]
+async fn every_action_and_source_round_trips_through_the_database(pool: PgPool) {
+    fn action_text(a: Action) -> &'static str {
+        match a {
+            Action::Subscribed => "subscribed",
+            Action::Confirmed => "confirmed",
+            Action::Unsubscribed => "unsubscribed",
+            Action::Resubscribed => "resubscribed",
+            Action::Suppressed => "suppressed",
+        }
+    }
+    fn source_text(s: Source) -> &'static str {
+        match s {
+            Source::Form => "form",
+            Source::Import => "import",
+            Source::Api => "api",
+            Source::Operator => "operator",
+            Source::OneClick => "one_click",
+            Source::PreferenceCenter => "preference_center",
+            Source::Bounce => "bounce",
+            Source::Complaint => "complaint",
+        }
+    }
+    let actions = [
+        Action::Subscribed,
+        Action::Confirmed,
+        Action::Unsubscribed,
+        Action::Resubscribed,
+        Action::Suppressed,
+    ];
+    let sources = [
+        Source::Form,
+        Source::Import,
+        Source::Api,
+        Source::Operator,
+        Source::OneClick,
+        Source::PreferenceCenter,
+        Source::Bounce,
+        Source::Complaint,
+    ];
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let mut conn = pool.acquire().await.unwrap();
+    for a in actions {
+        for s in sources {
+            record(&mut conn, ws, c, None, a, s, &Context::default())
+                .await
+                .unwrap_or_else(|e| panic!("{a:?} / {s:?}: {e}"));
+        }
+    }
+    let total: i64 = sqlx::query_scalar("select count(*) from consent_log")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(action, "confirmed");
+    assert_eq!(total as usize, actions.len() * sources.len());
+    for a in actions {
+        for s in sources {
+            let want = (action_text(a).to_owned(), source_text(s).to_owned());
+            let n: i64 = sqlx::query_scalar(
+                "select count(*) from consent_log where action = $1 and source = $2",
+            )
+            .bind(&want.0)
+            .bind(&want.1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "{want:?}");
+        }
+    }
 }
