@@ -225,14 +225,20 @@ test("an upload refused for size or rate says what to do, not just that it faile
   }
 });
 
-test("starting an import while another runs says so, and says the file is fine", async () => {
+test("starting an import while one runs says it may be this one, and says the file is fine", async () => {
   await upload(csv(PEOPLE));
   await review("Email Address");
   const glob = "**/api/v1/workspaces/*/imports/*/start";
   await refuse(glob, 409, "import-in-progress");
   try {
     await runButton().click();
-    await expect(page.getByRole("alert")).toContainText("Another import is already running");
+    // NOT "another import". The run that holds the workspace is commonly the operator's OWN,
+    // because the lock is held by a live transaction that has committed nothing — so a 409 after
+    // a cut connection is their own run, and a run in progress is in no list until it ends. The
+    // old copy sent them looking for somebody else's import.
+    await expect(page.getByRole("alert")).toContainText("An import is already running");
+    await expect(page.getByRole("alert")).toContainText("It may be this one");
+    await expect(page.getByRole("alert")).toContainText("appears in no list until it finishes");
     await expect(page.getByRole("alert")).toContainText("Nothing is wrong with this file");
   } finally {
     await page.unroute(glob);

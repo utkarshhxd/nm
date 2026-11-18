@@ -97,8 +97,13 @@ class Missing extends Error {}
 
 const KNOWN = {
   "insufficient-role": "Your role cannot run an import. It takes editor or above.",
+  // NOT "another import". This wording overrides the server's own `detail`, so it has to carry
+  // what that detail now says: the run holding the workspace may be THIS import, started by a
+  // request whose connection was lost, and a run in progress is in no list until it finishes.
+  // Telling the operator to wait for somebody else's import sends them looking for a run they
+  // cannot find.
   "import-in-progress":
-    "Another import is already running in this workspace, perhaps in another tab or started by someone else. Imports run one at a time. Nothing is wrong with this file: wait for that one to finish, then run this import again.",
+    "An import is already running in this workspace. It may be this one — if the request that started it lost its connection, the server is still working on it — or one started in another tab or by someone else. Imports run one at a time, and a run in progress appears in no list until it finishes. Nothing is wrong with this file: wait a minute, reload this page to see whether it has a report, and only run it again if it has not.",
 };
 
 /**
