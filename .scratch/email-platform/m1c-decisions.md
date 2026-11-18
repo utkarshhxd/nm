@@ -40,7 +40,7 @@ and is reported as a separate arm rather than folded into the headline.
 | Containers | Docker Desktop on WSL2. The VM is capped to **4 GB** by `~/.wslconfig` (`[wsl2] memory=4GB`, `autoMemoryReclaim=dropCache`). The container sees 16 CPUs and `MemTotal: 4007580 kB`, **shared with every other container on the host.** |
 | Postgres | `postgres:16-alpine`, **PostgreSQL 16.15** on `x86_64-pc-linux-musl`. Data on a docker volume, i.e. the WSL2 ext4 filesystem inside the vhdx on the NVMe above. |
 | Stock config | `shared_buffers = 128 MB`, `work_mem = 4 MB`, `maintenance_work_mem = 64 MB`, `max_wal_size = 1 GB`, `checkpoint_timeout = 5 min`, `effective_cache_size = 4 GB`, `random_page_cost = 4`, `max_parallel_workers = 8`, `fsync`/`synchronous_commit`/`full_page_writes` on, `data_checksums` off. |
-| Load | Nothing else was building or testing. Five containers unrelated to this project were running on the host and all five sat at 0.00% CPU for the whole measurement, as did this project's own idle dev server; the only non-idle containers were Postgres and the test. **Reproducing this needs the host otherwise idle, not these particular containers**, so they are not named here — a decision record committed to this repo is not the place to list what else is on somebody's laptop. |
+| Load | Nothing else was building or testing. **Four containers unrelated to this project** were running on the host, and all four sat at 0.00% CPU for the whole measurement, as did this project's own idle dev server — five idle containers in total. The only non-idle ones were Postgres and the test. **Reproducing this needs the host otherwise idle, not these particular containers**, so they are not named here: a decision record committed to this repo is not the place to list what else is on somebody's laptop. |
 
 ### What was measured, and what it does not cover
 
@@ -137,7 +137,11 @@ that quietly drops the runs at its edges:
 | memberships and tags | **62.58% (run 4)** | **71.84% (run 6)** |
 
 So: `COPY` **1.0–1.2%**, contacts **27.0–36.3%**, memberships and tags **62.6–71.8%**. The erasure
-sweep and the `COMMIT` are noise at 0.1–1.1 ms and 21–59 ms.
+sweep and the `COMMIT` are noise: **0.077–0.825 ms** for the sweep and **20.8–34.6 ms** for the
+`COMMIT`, across runs 1–3, which are the runs whose per-statement figures this file prints. (The
+`COMMIT` wall clock for all seven is in the table above and spans 21–59 ms; the sweep is not a
+column there, so its band is deliberately only the three runs shown, rather than a band quoting
+runs the reader cannot check.)
 
 (An earlier draft of this section said "63% to 72%" and "29–36%". The first contradicted its own
 parenthetical — run 4 is 62.6% — and the second excluded three of the seven runs. Nothing it
@@ -192,8 +196,12 @@ Trigger for constraint contact_tags_workspace_id_tag_id_fkey          …: time=
 - Memberships statement: **24,985.8 ms of 46,952.6 ms — 53.2%** is RI triggers, across 1,200,051
   calls. The four high-volume constraints run **17.7–23.7 µs per call** (17.68, 18.79, 23.28,
   23.74). The fifth, `tags_workspace_id_fkey`, is 29.4 µs — but that is 1.501 ms over **51 calls**,
-  which is timer noise at that count and not a slower check; it is inside the 1,200,051 and outside
-  the band, and both of those are worth saying.
+  and it is inside the 1,200,051 while being outside the band, so both facts are worth saying.
+  **Why it is higher is not established here.** The likeliest explanation is the one-off cost of
+  planning the RI check on its first call, amortised over 51 rows instead of 400,000; timer
+  granularity at that count is a second candidate. An earlier draft asserted the second as though
+  it had been read off something, which it had not. Nothing depends on which it is: 1.5 ms of a
+  46,953 ms statement changes no conclusion either way.
 - Contacts statement: **3,540.8 ms of 19,788.5 ms — 17.9%**, which also answers a thing the earlier
   draft missed entirely: `contacts` itself has a foreign key to `workspaces`, so the contacts
   statement pays a per-row RI check too.
@@ -255,7 +263,7 @@ image, same host, same fresh-volume lifecycle, only four settings differ.**
 | contacts | 169.930 s | 115.728 s | −31.9% |
 | memberships + tags | 292.608 s | 262.226 s | −10.4% |
 | checkpoints during the run | **7, all `reason: wal`** | **0** | |
-| WAL written for the import | **4,125 MB** | **3,106 MB** | **−25%** |
+| WAL since cluster init, read after the run (a proxy — see below) | **4,125 MB** | **3,106 MB** | **−24.7%** |
 
 **How much of a sample that is, said plainly.** The A/B delta is **one stock run against one tuned
 run** — runs 4 and 5. The tuned arm has three runs (5, 6, 7) and replicates at 374.8 s ± 2%; **the
@@ -282,7 +290,10 @@ $ docker logs nm-postgres-probe 2>&1 | grep -E "checkpoint starting" \
       7   wal                            (no `wal` line at all)
 
 $ docker logs nm-postgres-probe 2>&1 | grep -E "checkpoint complete" | tail -4
-# stock arm, the three that landed during the import:
+# stock arm. `tail -4` prints the LAST FOUR of the nine, so these are not a time-bounded
+# subset of the seven `wal` ones -- they are simply the last to complete, and the fourth
+# (omitted here) is the `shutdown immediate` that wrote 2 buffers. Of the seven `wal`
+# checkpoints, only these three were captured; the earlier four scrolled past `tail -4`.
 16:09:36 … wrote 7201 buffers (44.0%); … write=41.091 s,  sync=1.872 s, total=43.666 s
 16:10:11 … wrote 4346 buffers (26.5%); … write=29.850 s,  sync=0.136 s, total=30.377 s
 16:13:07 … wrote 5859 buffers (35.8%); … write=172.321 s, sync=0.001 s, total=172.629 s
@@ -294,10 +305,12 @@ $ docker exec nm-postgres-probe psql -U nm -d nm -tAc \
 ```
 
 **That WAL figure is WAL since the cluster was initialised, not since the import** — there is no
-cheap per-statement WAL counter, and this is the proxy. It is a fair one only because each arm ran
-on a cluster created minutes earlier whose only other writers were `initdb`, the migrations and one
-`#[sqlx::test]` database; the import is the overwhelming majority of it. It is still a proxy, and
-the −24.7% it reports is the difference between two proxies.
+cheap per-statement WAL counter, and this is the proxy. **It was read once per arm, after the test
+process exited and before the container was removed; there is no before-reading to subtract.** It
+is a fair proxy only because each arm ran on a cluster created minutes earlier whose only other
+writers were `initdb`, the migrations and one `#[sqlx::test]` database; the import is the
+overwhelming majority of it. It is still a proxy, and the −24.7% it reports is the difference
+between two proxies.
 
 The mechanism is visible and real. At `max_wal_size = 1 GB` an import that writes about 4.1 GB of
 WAL forces seven checkpoints; each one makes the next touch of every page write a full 8 kB image,
@@ -337,7 +350,7 @@ budget needs 2.69× to become 1.0×.**
 
 ### What `spec.md` §7.2 gets right, and what it is silent about
 
-The `COPY` half is **spectacularly** inside budget: **3.75–4.84 s for a million rows**, 1.0–1.3% of
+The `COPY` half is **spectacularly** inside budget: **3.75–4.84 s for a million rows**, 1.0–1.2% of
 the import, and it carries all the per-row Rust there is — `normalize_email`, `suppression_hmac`,
 `Uuid::now_v7`, validation and rendering — at **206,000 to 267,000 rows/sec** across the seven runs
 (267k in run 3, 206k in run 4). Nothing in this milestone's Rust is anywhere near the budget.
@@ -382,9 +395,9 @@ used, or the `COPY` number is off by 5.4×.**
    | contacts upsert | 173.046 ms | `Disk: 36856kB` | 19,788.484 ms | **0.87%** |
    | memberships and tags | 206.793 ms | `Disk: 29248kB` | 46,952.583 ms | **0.44%** |
 
-   At 200,000 rows that is 36.9 MB and 29.2 MB spilled; **scaling the spill linearly to a million
-   rows gives roughly 180 MB and 143 MB, once each per import — an extrapolation, not a
-   measurement.** An index on `(email, row_number desc)` would remove both sorts. **It is not the
+   At 200,000 rows that is **36.0 MiB and 28.6 MiB** spilled (`Disk:` reports kibibytes: 36,856
+   and 29,248 of them); **scaling linearly to a million rows gives roughly 180 MiB and 143 MiB,
+   once each per import — an extrapolation, not a measurement.** An index on `(email, row_number desc)` would remove both sorts. **It is not the
    fix**: under 1% of either statement, and building the index costs its own sort. Recorded
    because the question was asked and the plan answers it.
 
