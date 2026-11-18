@@ -45,10 +45,32 @@ a test without a concurrency hook, which is why there is no red test for it here
 `a_contact_erased_after_it_was_inserted_is_deleted_before_commit` stages the shape of it inside
 one transaction and proves step 2 fires, which is the closest one transaction can get.
 
-The same window applies, slightly wider, to the `update existing` path: step 2 only covers rows
-this import **inserted**, because an updated contact kept its own id. An erasure racing an update
-is a narrower case still — an erasure deletes the contact, so the row being updated would have to
-have been re-created between the two — and the fix for the insert window closes it as well.
+## The `update existing` path is NOT part of this window
+
+An earlier draft of this issue said the same window applied "slightly wider" to `update existing`,
+on the grounds that step 2 only covers rows this import **inserted** — an updated contact kept its
+own id, so `contacts.id = staging.id` does not match it. The second half is true and the
+conclusion drawn from it is wrong. **Row locking already closes that case, and it is the one thing
+the insert path has no equivalent of.**
+
+Take the two orderings:
+
+- **The erasure arrives after the import has updated the row.** Its `DELETE` matches a row this
+  import holds a write lock on, so it **blocks** until the import commits. It then re-checks the
+  row under EvalPlanQual, finds the predicate still matched (the update changed names, not the
+  address), and removes it. The contact goes. The erasure cannot slip past by committing first,
+  because it cannot commit at all while the lock is held.
+- **The erasure arrives before the import touches the row.** Then its tombstone is committed
+  before step 1's snapshot or inside step 2's, and the row is refused by the anti-join or taken
+  back by step 2. Either way the import creates nothing.
+
+There is no third ordering, which is why this issue is about the INSERT path alone: there the
+erasure's `DELETE` finds nothing to block on — the import's new row is uncommitted and invisible
+to it — so it commits straight through and the two transactions never see each other.
+
+This matters for the triage below. **As first written, this issue argued for paying for
+`serializable` and an import retry loop to close a window that row locking already closes.** The
+window that is actually open is the insert one, and it is milliseconds wide.
 
 ## Two ways to close it
 

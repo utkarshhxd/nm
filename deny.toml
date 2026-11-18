@@ -3,8 +3,12 @@ version = 2
 yanked = "deny"
 # RUSTSEC-2023-0071 (Marvin attack): a timing side channel in RSA PRIVATE-key operations (PKCS#1 v1.5
 # decryption and signing). No patched `rsa` exists upstream. Ignored because:
-#  - `rsa` reaches us only through `webauthn-rs`, which uses it for RS256 signature VERIFICATION only
-#    (webauthn-rs-core `crypto.rs:552`, crypto-glue `x509/chain.rs:368`): a public-key operation.
+#  - `rsa` reaches us through `webauthn-rs` and, in tests only, through the dev-dependency
+#    `webauthn-authenticator-rs`; both reach it via `crypto-glue`. Every use is RS256/RS384
+#    signature VERIFICATION — a public-key operation — at webauthn-rs-core `crypto.rs:562`
+#    (the `COSEKeyPublic::RsaS256` arm) and crypto-glue `x509/chain.rs:376` and `:388`.
+#    (The line numbers here were each several lines short of the call they name; they are the
+#    `verifier.verify(...)` lines in `crypto-glue 0.2.2` and `webauthn-rs-core 0.6.2`.)
 #  - NM holds no RSA private key and performs no RSA private-key operation, which is exactly what the
 #    attack targets.
 # RE-VERIFY ON EVERY `webauthn-rs` OR `crypto-glue` BUMP: crypto-glue already ships private-key

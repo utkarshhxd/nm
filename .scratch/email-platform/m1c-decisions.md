@@ -137,11 +137,12 @@ that quietly drops the runs at its edges:
 | memberships and tags | **62.58% (run 4)** | **71.84% (run 6)** |
 
 So: `COPY` **1.0–1.2%**, contacts **27.0–36.3%**, memberships and tags **62.6–71.8%**. The erasure
-sweep and the `COMMIT` are noise: **0.077–0.825 ms** for the sweep and **20.8–34.6 ms** for the
-`COMMIT`, across runs 1–3, which are the runs whose per-statement figures this file prints. (The
-`COMMIT` wall clock for all seven is in the table above and spans 21–59 ms; the sweep is not a
-column there, so its band is deliberately only the three runs shown, rather than a band quoting
-runs the reader cannot check.)
+sweep and the `COMMIT` are noise. The `COMMIT` is **21–59 ms across all seven runs**, which is the
+band the `COMMIT` column of the table above supports and therefore the one quoted here: narrowing
+it to runs 1–3 would print **20.8–34.6 ms** and drop run 7's 59 ms, the slowest of the seven, off
+the top of a band described as the whole span. The sweep is **0.077–0.825 ms across runs 1–3 only**,
+and that restriction is the real one: the sweep is not a column in the seven-run table, so a wider
+band for it would quote runs the reader cannot check.
 
 (An earlier draft of this section said "63% to 72%" and "29–36%". The first contradicted its own
 parenthetical — run 4 is 62.6% — and the second excluded three of the seven runs. Nothing it
@@ -312,10 +313,11 @@ writers were `initdb`, the migrations and one `#[sqlx::test]` database; the impo
 overwhelming majority of it. It is still a proxy, and the −24.7% it reports is the difference
 between two proxies.
 
-The mechanism is visible and real. At `max_wal_size = 1 GB` an import that writes about 4.1 GB of
-WAL forces seven checkpoints; each one makes the next touch of every page write a full 8 kB image,
-which brings the next checkpoint sooner. Raising the ceiling removed all seven and took about a
-quarter of the WAL volume with it.
+The mechanism is visible and real. At `max_wal_size = 1 GB` a cluster whose
+since-initialisation WAL reads about 4.1 GB after the import — the proxy named above, not a
+measurement of the import itself — forces seven checkpoints over the run; each one makes the
+next touch of every page write a full 8 kB image, which brings the next checkpoint sooner. Raising the
+ceiling removed all seven and took about a quarter of the WAL volume with it.
 
 **It is still a design finding and not a config finding.** The tuning buys 18.2%; the budget needs
 **63–74%**. The tuned arm is 3.19× over, and runs 6 and 7 at 368.2 s and 373.8 s put the tuned mean
@@ -397,9 +399,10 @@ used, or the `COPY` number is off by 5.4×.**
 
    At 200,000 rows that is **36.0 MiB and 28.6 MiB** spilled (`Disk:` reports kibibytes: 36,856
    and 29,248 of them); **scaling linearly to a million rows gives roughly 180 MiB and 143 MiB,
-   once each per import — an extrapolation, not a measurement.** An index on `(email, row_number desc)` would remove both sorts. **It is not the
-   fix**: under 1% of either statement, and building the index costs its own sort. Recorded
-   because the question was asked and the plan answers it.
+   once each per import — an extrapolation, not a measurement.** An index on
+   `(email, row_number desc)` would remove both sorts. **It is not the fix**: under 1%
+   of either statement, and building the index costs its own sort. Recorded because the question
+   was asked and the plan answers it.
 
 2. **The second `distinct on (email)` pass and the second anti-join against `suppressions` are not
    the problem.** This is the question nobody had measured. In the memberships statement, from the
