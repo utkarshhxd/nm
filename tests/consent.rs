@@ -199,3 +199,109 @@ async fn consent_rows_for_a_contact_come_back_newest_first(pool: PgPool) {
     let actions: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(actions, ["unsubscribed", "confirmed", "subscribed"]);
 }
+
+async fn one_row(pool: &PgPool, ws: Uuid, c: Uuid, l: Uuid) {
+    let cx = Context {
+        ip: Some("203.0.113.9".parse().unwrap()),
+        user_agent: Some("Mozilla/5.0 (test)".into()),
+        source_ref: Some("form-42".into()),
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    record(
+        &mut conn,
+        ws,
+        c,
+        Some(l),
+        Action::Confirmed,
+        Source::Form,
+        &cx,
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn deleting_a_list_keeps_the_consent_rows_and_only_clears_the_pointer(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    one_row(&pool, ws, c, l).await;
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(l)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let row: Row = sqlx::query_as(
+        "select workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent \
+         from consent_log",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            ws,
+            c,
+            None,
+            "confirmed".into(),
+            "form".into(),
+            Some("form-42".into()),
+            Some("203.0.113.9".parse().unwrap()),
+            Some("Mozilla/5.0 (test)".into()),
+        )
+    );
+}
+
+#[sqlx::test]
+async fn erasing_a_contact_removes_its_consent_rows_and_no_one_elses(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let gone = contact(&pool, ws, "gone@ex.test").await;
+    let kept = contact(&pool, ws, "kept@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    one_row(&pool, ws, gone, l).await;
+    one_row(&pool, ws, kept, l).await;
+
+    sqlx::query("delete from contacts where id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("the erasure cascade must succeed despite the append-only trigger");
+
+    let left: Vec<Uuid> = sqlx::query_scalar("select contact_id from consent_log")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, [kept]);
+}
+
+#[sqlx::test]
+async fn a_consent_row_cannot_be_updated(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    one_row(&pool, ws, c, l).await;
+
+    for sql in [
+        "update consent_log set action = 'subscribed'",
+        "update consent_log set ip = null",
+        "update consent_log set created_at = now() + interval '1 day'",
+        "update consent_log set contact_id = contact_id", // even a no-op change
+    ] {
+        let err = sqlx::query(sql).execute(&pool).await.expect_err(sql);
+        assert!(
+            err.as_database_error()
+                .unwrap()
+                .message()
+                .contains("append-only"),
+            "{sql}: {err}"
+        );
+    }
+    let action: String = sqlx::query_scalar("select action from consent_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(action, "confirmed");
+}

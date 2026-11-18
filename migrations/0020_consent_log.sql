@@ -6,8 +6,16 @@
 -- joining a contact of one workspace to a list of another cannot be written at all. The database
 -- refuses it, not a handler. `list_id` is null for a workspace-wide suppression; a null column
 -- skips its foreign key, so the contact key alone still holds that row to its workspace.
--- `on delete cascade` lets erasing a contact take its IP and user agent with it, and lets a
--- workspace delete clean up. No `updated_at`: a row is never changed.
+--
+-- The two keys differ on delete, on purpose. Do not make them match.
+--  * `contact_id` cascades. `delete from contacts` is how this product erases a person, and a
+--    row here carries their IP and user agent: keeping it after erasure would defeat the erasure.
+--    The record goes with the person.
+--  * `list_id` sets null. Deleting a list is routine housekeeping and must not destroy the proof
+--    that contacts who still exist consented. The row keeps its action, source, IP, user agent
+--    and time; only the pointer to the vanished list goes. The column list `(list_id)` is
+--    required: the bare form would also null `workspace_id`, which is `not null` (Postgres 15+).
+-- No `updated_at`: a row is never changed.
 create table consent_log (id uuid primary key,
   workspace_id uuid not null,
   contact_id uuid not null,
@@ -22,9 +30,28 @@ create table consent_log (id uuid primary key,
   token_jti text,
   created_at timestamptz not null default now(),
   foreign key (workspace_id, contact_id) references contacts (workspace_id, id) on delete cascade,
-  foreign key (workspace_id, list_id) references lists (workspace_id, id) on delete cascade);
+  foreign key (workspace_id, list_id) references lists (workspace_id, id) on delete set null (list_id));
 
 comment on table consent_log is
-  'Append-only: rows are never updated or deleted by the application. Only the deletion of a parent contact, list or workspace removes them.';
+  'Rows are never updated, and are removed only when the contact they belong to is erased.';
 
 create index consent_log_by_contact on consent_log (workspace_id, contact_id, created_at desc);
+
+-- Enforces the comment. DELETE is left alone: the contact cascade is how erasure happens. The one
+-- update allowed is the `on delete set null (list_id)` above, which Postgres runs as an UPDATE
+-- that fires this trigger: it may clear `list_id` and must change nothing else.
+create function consent_log_append_only() returns trigger language plpgsql as $$
+begin
+  if old.list_id is not null and new.list_id is null
+     and (new.id, new.workspace_id, new.contact_id, new.action, new.source, new.source_ref,
+          new.ip, new.user_agent, new.token_jti, new.created_at)
+         is not distinct from
+         (old.id, old.workspace_id, old.contact_id, old.action, old.source, old.source_ref,
+          old.ip, old.user_agent, old.token_jti, old.created_at) then
+    return new;
+  end if;
+  raise exception 'consent_log is append-only: rows are never updated';
+end $$;
+
+create trigger consent_log_no_update before update on consent_log
+  for each row execute function consent_log_append_only();
