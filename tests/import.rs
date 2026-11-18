@@ -851,6 +851,85 @@ async fn a_cell_larger_than_the_parsers_buffer_stages_intact(pool: PgPool) {
     );
 }
 
+/// A NUL in a list name is one row's problem, not the whole file's.
+///
+/// `lists` was the one cell arm with no validator, and a NUL reaches `jsonb` as the escape
+/// `\u0000`, which Postgres refuses to convert to `text` — not for that value, for the whole
+/// `COPY`. Every good row in the file goes with it, the request is a 500, and `import_errors` is
+/// empty, so the operator is told nothing at all about a file that has one bad character in it.
+#[sqlx::test]
+async fn a_nul_in_a_list_name_refuses_its_own_row_and_not_the_file(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::Lists),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // The bad row sits between two good ones, so a file-wide abort and a row-level refusal cannot
+    // be read as the same result.
+    let csv = b"email,lists\n\
+                good@example.com,news\n\
+                bad@example.com,ne\x00ws\n\
+                also@example.com,news\n";
+    let counts = copy(&mut tx, &j, csv).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (3, 2, 1));
+    assert_eq!(
+        staged(&mut tx, import).await,
+        [
+            (2, "good@example.com".to_owned()),
+            (4, "also@example.com".to_owned())
+        ],
+        "the rows either side of the bad one are still staged"
+    );
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 3, "the line a spreadsheet shows");
+    assert_eq!(errors[0].1.as_deref(), Some("lists"), "the column to blame");
+}
+
+/// The same abort from the other end: the error row's own `value`.
+///
+/// Every scalar arm already refuses a control character, so a NUL in one of those cells was always
+/// going to be an error row — but the row carried the NUL into `import_errors.value`, which is
+/// `text`, and that insert is one statement for every refusal the file produced. So one bad
+/// character cost the operator the report on all of them and made the import a 500, after the
+/// `COPY` had already succeeded.
+#[sqlx::test]
+async fn a_nul_in_a_refused_cell_does_not_take_the_error_report_with_it(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mapping = vec![
+        ColumnTarget::Field(ContactField::Email),
+        ColumnTarget::Field(ContactField::FirstName),
+    ];
+    let j = job(import, ws, mapping, vec![]);
+    let mut tx = pool.begin().await.unwrap();
+
+    // Two refusals, so the report that the bad one would have taken down has something in it.
+    let csv = b"email,first_name\n\
+                bad@example.com,A\x00da\n\
+                not-an-email,Bo\n\
+                good@example.com,Cy\n";
+    let counts = copy(&mut tx, &j, csv).await;
+    assert_eq!((counts.total_rows, counts.staged, counts.failed), (3, 1, 2));
+
+    let errors = error_rows(&mut tx, import).await;
+    assert_eq!(errors.len(), 2, "both refusals are reported, not neither");
+    assert_eq!(errors[0].0, 2);
+    assert_eq!(errors[0].1.as_deref(), Some("first_name"));
+    assert_eq!(
+        errors[0].3.as_deref(),
+        Some("Ada"),
+        "the cell is shown without the character that cannot be stored"
+    );
+    assert_eq!(errors[1].0, 3);
+    assert_eq!(errors[1].1.as_deref(), Some("email"));
+}
+
 #[sqlx::test]
 async fn a_row_over_the_record_byte_cap_is_refused_for_its_length_not_its_width(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
@@ -1842,10 +1921,14 @@ async fn every_membership_an_import_writes_has_source_import(pool: PgPool) {
     let named = insert_list(&mut tx, ws, "offers", true).await;
     let j = job_for_list(import, ws, tag_and_list_columns(), chosen);
 
+    // THE PADDING IS THE ASSERTION, not noise. Rust never trims a list name — the `lists` arm of
+    // `stage_row` stores the entry as the file wrote it — so the `btrim` in the `named` CTE is the
+    // only thing that makes ` offers ` the list `offers`. A spreadsheet produces this cell every
+    // day, and without the trim the membership is simply never written and nothing says why.
     import_csv(
         &mut tx,
         &j,
-        "email,tags,lists\nada@example.com,,offers:subscribed\n",
+        "email,tags,lists\nada@example.com,, offers :subscribed\n",
     )
     .await;
 
@@ -1930,10 +2013,14 @@ async fn an_unsubscribed_entry_and_an_unknown_list_name_both_write_nothing(pool:
     let news = insert_list(&mut tx, ws, "news", false).await;
     let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
 
+    // The status is padded for the same reason the name is in
+    // `every_membership_an_import_writes_has_source_import`: the `btrim` is in the SQL and
+    // nowhere else, and an untrimmed ` unsubscribed ` that fails to match would turn this file's
+    // "do not subscribe me" into a subscription.
     let counts = import_csv(
         &mut tx,
         &j,
-        "email,tags,lists\nada@example.com,,news:unsubscribed;ghost\n",
+        "email,tags,lists\nada@example.com,,news: unsubscribed ;ghost\n",
     )
     .await;
 
@@ -3683,3 +3770,4 @@ async fn an_upload_past_the_per_minute_limit_is_429(pool: PgPool) {
     uploaded(&app, other, "fine.csv", "email\nada@example.com\n").await;
     assert_eq!(count(&pool, "imports").await, 1);
 }
+

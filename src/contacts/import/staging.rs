@@ -218,9 +218,13 @@ pub async fn copy_into_staging(
         if !header_done {
             header_done = true;
             if oversize.is_none() {
+                // NUL dropped for the same reason [`cut`] drops it: a header name is what an
+                // error row's `column_name` is, and that is a `text` column too.
                 headers = cells
                     .iter()
-                    .map(|f| unescape_cell(&String::from_utf8_lossy(f)))
+                    .map(|f| {
+                        unescape_cell(&String::from_utf8_lossy(f).replace('\0', ""))
+                    })
                     .collect();
                 continue;
             }
@@ -692,8 +696,20 @@ fn fields<'a>(out: &'a [u8], ends: &[usize]) -> Vec<&'a [u8]> {
 }
 
 /// `value` as `import_errors` stores it.
+///
+/// **NUL characters are dropped, not kept and not refused.** `value` is a `text` column and
+/// Postgres stores no NUL in one, so a cell holding one would make the whole error insert fail —
+/// and that insert carries every refusal the file produced, so one bad character would cost the
+/// operator the report on all of them AND turn the import into a 500. The offending cell is shown
+/// for what else is wrong with it; a character that cannot be displayed is no loss in it.
 fn cut(value: &str) -> Option<String> {
-    Some(value.chars().take(MAX_ERROR_VALUE_CHARS).collect())
+    Some(
+        value
+            .chars()
+            .filter(|c| *c != '\0')
+            .take(MAX_ERROR_VALUE_CHARS)
+            .collect(),
+    )
 }
 
 /// One CSV row rendered for `COPY`, or the first thing wrong with it.
@@ -822,9 +838,31 @@ fn stage_row(
                     tags.push(validate_tag_name(&tag).map_err(|e| bad(i, &e.message, &tag))?);
                 }
             }
+            // A LIST NAME IS MATCHED, NEVER CREATED, so it does not take `validate_tag_name` the
+            // way the arm above does: a name over 100 characters simply matches no list and
+            // writes nothing, and refusing the row for its length would be this importer
+            // inventing a rule the lists API never applied to it.
+            //
+            // The CHARACTER rule it does take, and for a reason the other arms never had to
+            // state. This cell is carried to the next stage as `jsonb`, so a control character is
+            // not stored as itself but escaped — and `\u0000` is the one escape Postgres refuses
+            // to convert to `text`. It refuses it for the whole `COPY`, not for the row: every
+            // good row in the file goes with it, the request is a 500, and `import_errors` is
+            // empty, so the operator is told nothing about a file with one bad character in it.
+            // Caught here, it is one error row naming the column, like every other bad cell.
+            //
+            // The status too: it rides in the same object and reaches `jsonb` the same way.
             ColumnTarget::Field(ContactField::Lists) => {
                 for entry in split_multi_raw(&cell) {
                     let (list, status) = split_list_entry(entry);
+                    let status_chars = status.iter().flat_map(|s| s.chars());
+                    if list.chars().chain(status_chars).any(char::is_control) {
+                        return Err(bad(
+                            i,
+                            "a list name may not contain a control character",
+                            entry,
+                        ));
+                    }
                     lists.push(json!({"name": list, "status": status}));
                 }
             }
@@ -898,17 +936,13 @@ fn stage_row(
         line.push(',');
         push_field(&mut line, field.as_deref());
     }
-    // Postgres stores no NUL in `text` or `jsonb`, and one in the stream would abort the whole
-    // `COPY` — every good row in the file with it. The validators reject a control character in
-    // every field that has one; a tag or a list name has none, so this is where they are caught.
-    if line.contains('\0') {
-        return Err(RowError {
-            row,
-            column: None,
-            reason: "a cell contains a NUL byte, which cannot be stored".to_owned(),
-            value: None,
-        });
-    }
+    // NO LAST-LINE NUL GUARD HERE, because there is no last line a guard could read. Postgres
+    // stores no NUL in `text` or in `jsonb`, and one anywhere in this stream aborts the whole
+    // `COPY`. But by this point a NUL in a `text` column has already been refused by that
+    // column's validator — every arm above rejects control characters — and a NUL in one of the
+    // three `jsonb` columns is no longer a NUL: `serde_json` wrote it as the six characters
+    // `\u0000`, which `line.contains('\0')` cannot see and Postgres refuses anyway. A guard here
+    // would be unreachable and would read as cover the arms above are the only ones giving.
     line.push('\n');
     Ok(line)
 }
