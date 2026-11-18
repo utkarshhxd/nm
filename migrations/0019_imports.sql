@@ -65,4 +65,17 @@ create table import_errors (import_id uuid not null, workspace_id uuid not null,
   row_number bigint not null, column_name text, reason text not null, value text,
   foreign key (workspace_id, import_id) references imports (workspace_id, id) on delete cascade);
 
-create index import_errors_by_import on import_errors (workspace_id, import_id, row_number);
+-- UNIQUE, and the uniqueness is the point rather than a side effect of the index.
+--
+-- `GET /imports/{id}/errors` pages on `row_number` alone, with no tiebreaker column, so a second
+-- error row for one CSV row would be silently dropped at a page boundary. That is unreachable
+-- today: there are three writers — `stage_row`, which refuses a row whole and returns ONE
+-- `RowError`, and the two erasure reports in `upsert_from_staging`, which are mutually exclusive
+-- on a row — so one row produces at most one error. But that was held together by a comment, and
+-- a comment is not what a cursor should rest on.
+--
+-- Neither `reported` CTE carries an `on conflict` arm, which is deliberate: the day a stage does
+-- file a second error for one row, this turns it into a loud statement failure instead of a
+-- silent drop of exactly the row the operator needed to see. Give the cursor a tiebreaker column
+-- then, and drop this constraint in the same change.
+create unique index import_errors_by_import on import_errors (workspace_id, import_id, row_number);

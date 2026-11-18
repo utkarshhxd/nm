@@ -664,10 +664,12 @@ pub async fn list_import_errors(
     // Keyset on `row_number`, which `import_errors_by_import` is ordered by, and scoped on
     // `workspace_id` as well as `import_id` so the index is the one that answers it.
     //
-    // shortcut: one error row per rejected row, so `row_number` is the whole key. Every writer
-    // refuses a row whole (`stage_row` returns one `RowError`, the erasure sweeps report one row
-    // each). If a stage ever files two errors for one row, this cursor drops the second: give it
-    // a tiebreaker column then.
+    // shortcut: one error row per rejected row, so `row_number` is the whole key. That is not a
+    // convention any more — `import_errors_by_import` is UNIQUE on
+    // `(workspace_id, import_id, row_number)`, so a second error for one row is a statement
+    // failure at the writer and never a row this cursor can silently drop at a page boundary.
+    // Giving a stage a reason to file two means giving this cursor a tiebreaker column and
+    // dropping that constraint, in one change.
     let rows = sqlx::query_as!(
         ImportErrorRow,
         "select row_number, column_name, reason, value from import_errors \

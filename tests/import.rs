@@ -1401,10 +1401,19 @@ async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: P
     let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
     let mut tx = pool.begin().await.unwrap();
 
-    // The residual window, as close as one transaction can stage it. The first three rows are
-    // already contacts under the ids THIS import minted for them, which is exactly the state the
-    // insert leaves behind, and the tombstones land after that — where the anti-join in the insert
-    // can no longer see them and only the last statement before COMMIT can.
+    // The residual window, as close as one transaction can stage it. Rows 2-4 are already contacts
+    // under the ids THIS import minted for them, which is exactly the state the insert leaves
+    // behind, and the tombstones land after that — where the anti-join in the insert can no longer
+    // see them and only the last statement before COMMIT can.
+    //
+    // ROWS 5 AND 6 REPEAT THE TWO ERASED ADDRESSES, and they are not padding. In one call the
+    // anti-join and the delete cannot report the SAME row: every row the delete matches is
+    // tombstoned, so the anti-join saw the same tombstone and already filed it. That is the
+    // production invariant `import_errors_by_import` is unique for, and a fixture that breaks it
+    // is a fixture reaching a state no run can. `picked` keeps the LAST row per address, so the
+    // repeat is what the anti-join reports while the delete reports the collapsed row whose
+    // staged id the pre-inserted contact carries — the delete's predicate is `c.id = s.id` over
+    // the whole staging table, so it is the same mechanism either way.
     //
     // The last three rows are new, and they are here to keep the call honest: the delete may only
     // take back rows this import inserted, so `inserted >= gone` is an invariant of the real path
@@ -1418,6 +1427,8 @@ async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: P
           ada@example.com,Ada,Lovelace,UTC\n\
           ins@example.com,Ins,Tance,UTC\n\
           theirs@example.com,Their,Erasure,UTC\n\
+          ada@example.com,Ada,Lovelace,UTC\n\
+          ins@example.com,Ins,Tance,UTC\n\
           bob@example.com,Bob,Barker,UTC\n\
           carol@example.com,Carol,Shaw,UTC\n\
           dave@example.com,Dave,Theurer,UTC\n",
@@ -1454,14 +1465,21 @@ async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: P
         contact(&mut tx, ws, "theirs@example.com").await.is_some(),
         "another workspace's tombstone may not delete this workspace's contact"
     );
-    // The counts double-count here — this one call sees both the anti-join and the delete match
-    // the same two rows, which a real race never would — so only the floor is asserted.
+    // The counts double-count here — this one call sees the anti-join refuse the repeats and the
+    // delete take back the rows they collapsed, which a real race never would — so only the floor
+    // is asserted.
     assert!(counts.failed >= 2, "{counts:?}");
-    // The sweep reports its deletions the same way the anti-join does, and with the same silence
-    // about the address: the contact was taken back because it was erased, and writing the
-    // address into `import_errors` would put it back where the tombstone took it from.
+    // Rows 2 and 3 are the delete's, rows 5 and 6 the anti-join's: four refusals, no two for one
+    // row, which is what `import_errors_by_import` is unique for. And the delete reports its
+    // deletions with the same silence about the address as the anti-join — the contact was taken
+    // back BECAUSE it was erased, and writing the address into `import_errors` would put it back
+    // where the tombstone took it from.
     let errors = error_rows(&mut tx, import).await;
-    assert!(!errors.is_empty(), "the sweep files what it took back");
+    assert_eq!(
+        errors.iter().map(|e| e.0).collect::<Vec<_>>(),
+        [2, 3, 5, 6],
+        "the delete files the collapsed rows, the anti-join the picked ones, and neither twice"
+    );
     for (row, _, reason, value) in &errors {
         assert!(reason.contains("address-erased"), "row {row}: {reason}");
         assert_eq!(*value, None, "row {row} echoed an erased address");
