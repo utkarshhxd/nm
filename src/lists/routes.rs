@@ -14,7 +14,7 @@ use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
-    contacts,
+    consent, contacts,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
     pagination::{Page, PageParams},
@@ -574,6 +574,7 @@ async fn add_audited(
         list_id,
         contact_id,
         MembershipSource::of_single_add(principal),
+        &consent::Context::of_principal(principal),
     )
     .await?;
     audit::record(
@@ -608,7 +609,8 @@ async fn unsubscribe_audited(
 ) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
-    unsubscribe_member(&mut tx, workspace_id, list_id, contact_id).await?;
+    let cx = consent::Context::of_principal(principal);
+    unsubscribe_member(&mut tx, workspace_id, list_id, contact_id, &cx).await?;
     audit::record(
         &mut *tx,
         meta,

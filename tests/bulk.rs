@@ -490,7 +490,9 @@ async fn the_statement_itself_refuses_an_expired_snapshot(pool: PgPool) {
 
     // Live: the statement resolves the set, which is what makes the refusal below meaningful.
     // `unsubscribe` against a list nobody is on changes nothing, so only `selected` is read.
-    let live = nm::contacts::selection::unsubscribe(&mut conn, &frozen, &[], Uuid::now_v7())
+    let cx = nm::consent::Context::default();
+    let list = Uuid::now_v7();
+    let live = nm::contacts::selection::unsubscribe(&mut conn, &frozen, &[], list, &cx)
         .await
         .unwrap();
     assert_eq!(

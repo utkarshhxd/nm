@@ -31,6 +31,7 @@ use uuid::Uuid;
 use super::{ContactFilter, push_filter};
 use crate::{
     audit::Actor,
+    consent,
     crypto::{secrets::Secrets, tokens},
     error::{ApiError, ApiResult, FieldError},
     lists::{MembershipSource, MembershipStatus},
@@ -589,14 +590,26 @@ fn statement(
     excluded: &[Uuid],
     action: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> QueryBuilder<Postgres> {
+    statement_returning(sel, excluded, action, "1", "")
+}
+
+/// [`statement`] with the action's `returning` column named and `extra` appended to the final
+/// select, for an action whose caller needs to know which rows it changed.
+fn statement_returning(
+    sel: &Selection,
+    excluded: &[Uuid],
+    action: impl FnOnce(&mut QueryBuilder<Postgres>),
+    returning: &str,
+    extra: &str,
+) -> QueryBuilder<Postgres> {
     let mut q = QueryBuilder::<Postgres>::new("with sel as (select id from contacts where ");
     push_selected(&mut q, sel, excluded);
     q.push("), done as (");
     action(&mut q);
-    q.push(
-        " returning 1) \
-         select (select count(*) from sel)::bigint, (select count(*) from done)::bigint",
-    );
+    q.push(format!(
+        " returning {returning}) \
+         select (select count(*) from sel)::bigint, (select count(*) from done)::bigint{extra}"
+    ));
     q
 }
 
@@ -649,6 +662,44 @@ pub async fn untag(
     .await
 }
 
+/// Runs a membership-changing action and records `action` in the consent log for every contact it
+/// changed, in the caller's transaction. The statement returns the changed `contact_id`s, so the
+/// log names exactly the rows that moved.
+async fn run_recorded(
+    db: &mut PgConnection,
+    sel: &Selection,
+    excluded: &[Uuid],
+    list_id: Uuid,
+    (action, cx): (consent::Action, &consent::Context),
+    change: impl FnOnce(&mut QueryBuilder<Postgres>),
+) -> ApiResult<Counts> {
+    let mut q = statement_returning(
+        sel,
+        excluded,
+        change,
+        "contact_id",
+        ", coalesce((select array_agg(contact_id) from done), '{}')",
+    );
+    let (selected, affected, changed): (i64, i64, Vec<Uuid>) =
+        q.build_query_as().fetch_one(&mut *db).await?;
+    let lists = vec![list_id; changed.len()];
+    let source = consent::Source::Api;
+    consent::record_many(
+        db,
+        sel.workspace_id(),
+        (&changed, &lists),
+        action,
+        source,
+        cx,
+    )
+    .await
+    .map_err(consent::scrub)?;
+    Ok(Counts {
+        selected: selected.unsigned_abs(),
+        affected: affected.unsigned_abs(),
+    })
+}
+
 /// Adds every selected contact who is not on the list yet, with `status` (`pending` on a
 /// double-opt-in list). A membership that exists is never touched: `pending` is not promoted past
 /// the confirmation the list requires, and `unsubscribed` is not reversed, because nobody has
@@ -663,14 +714,19 @@ pub async fn untag(
 /// Anyone who later "fixes the asymmetry" by aligning this to that turns freezing into a bulk
 /// re-subscription of people who opted out, with nothing in the tests or the types to object.
 /// Section 15.3 carries the same question to the importer.
+///
+/// Each contact it adds gets a `subscribed` consent row, `Source::Api`, in the same transaction;
+/// a contact it skips gets none.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
     status: MembershipStatus,
+    cx: &consent::Context,
 ) -> ApiResult<Counts> {
-    run(db, sel, excluded, |q| {
+    let recorded = (consent::Action::Subscribed, cx);
+    run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) \
                 select ")
             .push_bind(sel.workspace_id())
@@ -688,14 +744,17 @@ pub async fn subscribe(
 }
 
 /// Marks every selected member of the list `unsubscribed`; a contact not on the list, or already
-/// unsubscribed, is not counted in `affected` and keeps its first `unsubscribed_at`.
+/// unsubscribed, is not counted in `affected` and keeps its first `unsubscribed_at`. Each one it
+/// changes gets an `unsubscribed` consent row, `Source::Api`, in the same transaction.
 pub async fn unsubscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
+    cx: &consent::Context,
 ) -> ApiResult<Counts> {
-    run(db, sel, excluded, |q| {
+    let recorded = (consent::Action::Unsubscribed, cx);
+    run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push(
             "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
              where status <> 'unsubscribed' and workspace_id = ",

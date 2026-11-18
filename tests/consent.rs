@@ -499,3 +499,310 @@ async fn every_action_and_source_round_trips_through_the_database(pool: PgPool) 
         }
     }
 }
+
+// ---- Task 3: every membership writer records consent -------------------------------------------
+
+use axum::http::StatusCode;
+use common::{TestApp, add_member};
+use nm::contacts::import::{
+    ColumnTarget, ContactField, Dedup, ImportJob,
+    staging::{copy_into_staging, upsert_from_staging},
+    upload_path,
+};
+use nm::{config::SecretKey, crypto::secrets::Secrets, workspaces::roles::Role};
+use serde_json::{Value, json};
+
+/// A workspace and a signed-in editor of it.
+async fn editor(pool: &PgPool, slug: &str) -> (Uuid, TestApp) {
+    let ws = workspace(pool, slug).await;
+    let email = format!("editor-{slug}@example.com");
+    let id = create_user(pool, &email, PW, false).await;
+    add_member(pool, ws, id, Role::Editor).await;
+    let mut app = TestApp::new(pool.clone()).await;
+    app.login(&email, PW).await;
+    (ws, app)
+}
+
+fn id_of(r: &axum_test::TestResponse) -> Uuid {
+    r.json::<Value>()["id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn api_list(app: &TestApp, ws: Uuid, name: &str, double_optin: bool) -> Uuid {
+    let r = app
+        .post(&format!("/api/v1/workspaces/{ws}/lists"))
+        .json(&json!({"name": name, "double_optin": double_optin}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    id_of(&r)
+}
+
+async fn api_contact(app: &TestApp, ws: Uuid, email: &str) -> Uuid {
+    let r = app
+        .post(&format!("/api/v1/workspaces/{ws}/contacts"))
+        .json(&json!({"email": email}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    id_of(&r)
+}
+
+/// `(action, source, source_ref)` of every consent row, sorted: rows written in one transaction
+/// share `created_at`, so nothing here may depend on the order they were written in.
+async fn consent_rows(pool: &PgPool) -> Vec<(String, String, Option<String>)> {
+    let mut rows: Vec<_> = sqlx::query_as("select action, source, source_ref from consent_log")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+async fn count(pool: &PgPool, table: &str) -> i64 {
+    let sql = sqlx::AssertSqlSafe(format!("select count(*) from {table}"));
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+#[sqlx::test]
+async fn subscribing_through_the_lists_api_writes_a_consent_row(pool: PgPool) {
+    let (ws, app) = editor(&pool, "acme").await;
+    let list = api_list(&app, ws, "news", false).await;
+    let c = api_contact(&app, ws, "a@ex.test").await;
+    let members = format!("/api/v1/workspaces/{ws}/lists/{list}/members");
+
+    app.post(&members)
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    let (who, l, action, source): (Uuid, Option<Uuid>, String, String) =
+        sqlx::query_as("select contact_id, list_id, action, source from consent_log")
+            .fetch_one(&pool)
+            .await
+            .expect("exactly one consent row for one new membership");
+    assert_eq!((who, l), (c, Some(list)));
+    assert_eq!(
+        (action.as_str(), source.as_str()),
+        ("subscribed", "operator")
+    );
+
+    // Adding someone already on the list changes nothing, so records nothing.
+    app.post(&members)
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    assert_eq!(count(&pool, "consent_log").await, 1);
+
+    app.post(&format!("{members}/{c}/unsubscribe"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    // A repeat unsubscribe changes nothing either.
+    app.post(&format!("{members}/{c}/unsubscribe"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    app.post(&members)
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    let actions: Vec<_> = consent_rows(&pool).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(actions, ["resubscribed", "subscribed", "unsubscribed"]);
+}
+
+#[sqlx::test]
+async fn subscribing_through_the_contacts_api_writes_a_consent_row(pool: PgPool) {
+    let (ws, app) = editor(&pool, "acme").await;
+    let list = api_list(&app, ws, "news", false).await;
+    let mut ids = vec![];
+    for i in 0..3 {
+        ids.push(api_contact(&app, ws, &format!("c{i}@ex.test")).await);
+    }
+    let body = json!({"ids": ids, "list_id": list});
+    let bulk = |action: &'static str| {
+        let (app, body) = (&app, &body);
+        async move {
+            app.post(&format!("/api/v1/workspaces/{ws}/contacts/bulk/{action}"))
+                .json(body)
+                .await
+                .assert_status_ok();
+        }
+    };
+
+    bulk("subscribe").await;
+    let rows = consent_rows(&pool).await;
+    assert_eq!(rows.len(), 3, "one row per contact: {rows:?}");
+    assert!(rows.iter().all(|r| r.0 == "subscribed" && r.1 == "api"));
+    let who: i64 = sqlx::query_scalar(
+        "select count(distinct contact_id) from consent_log \
+         where list_id = $1 and contact_id = any($2)",
+    )
+    .bind(list)
+    .bind(&ids)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(who, 3);
+
+    // Everyone is on the list already: the statement writes nothing, so records nothing.
+    bulk("subscribe").await;
+    assert_eq!(count(&pool, "consent_log").await, 3);
+
+    bulk("unsubscribe").await;
+    let rows = consent_rows(&pool).await;
+    let gone = rows
+        .iter()
+        .filter(|r| r.0 == "unsubscribed" && r.1 == "api");
+    assert_eq!(gone.count(), 3);
+    bulk("unsubscribe").await;
+    assert_eq!(count(&pool, "consent_log").await, 6);
+}
+
+/// The whole importer pipeline over an in-memory file, in one transaction as the real one runs it.
+async fn import_into(pool: &PgPool, ws: Uuid, list: Uuid, csv: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    let job = ImportJob {
+        id,
+        workspace_id: ws,
+        path: upload_path(id),
+        delimiter: b',',
+        has_header: true,
+        mapping: vec![ColumnTarget::Field(ContactField::Email)],
+        dedup: Dedup::default(),
+        list_id: Some(list),
+        defs: vec![],
+    };
+    let secrets = Secrets::new(&SecretKey([7u8; 32]));
+    let mut tx = pool.begin().await.unwrap();
+    let staged = copy_into_staging(&mut tx, &secrets, &job, csv.as_bytes())
+        .await
+        .unwrap();
+    upsert_from_staging(&mut tx, &job, staged.failed)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    id
+}
+
+#[sqlx::test]
+async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let list = list(&pool, ws, "news").await;
+    let id = import_into(&pool, ws, list, "email\na@ex.test\nb@ex.test\nc@ex.test\n").await;
+
+    let rows = consent_rows(&pool).await;
+    let want = (
+        "subscribed".to_owned(),
+        "import".to_owned(),
+        Some(id.to_string()),
+    );
+    assert_eq!(rows, [want.clone(), want.clone(), want]);
+    // No IP and no user agent: an importing operator is not the subscriber, and none is invented.
+    let evidence: i64 = sqlx::query_scalar(
+        "select count(*) from consent_log where ip is not null or user_agent is not null",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence, 0);
+
+    // The same file again writes no membership, so no consent row.
+    import_into(&pool, ws, list, "email\na@ex.test\nb@ex.test\nc@ex.test\n").await;
+    assert_eq!(count(&pool, "consent_log").await, 3);
+}
+
+/// The gate. One fixture drives all three writers; memberships and consent rows must match. And a
+/// writer in a file this test has never heard of fails the second half, whether or not any
+/// fixture reaches it.
+#[sqlx::test]
+async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPool) {
+    let (ws, app) = editor(&pool, "acme").await;
+    let list = api_list(&app, ws, "news", false).await;
+    let double = api_list(&app, ws, "digest", true).await;
+    let a = api_contact(&app, ws, "a@ex.test").await;
+    let b = api_contact(&app, ws, "b@ex.test").await;
+
+    app.post(&format!("/api/v1/workspaces/{ws}/lists/{list}/members"))
+        .json(&json!({"contact_id": a}))
+        .await
+        .assert_status_ok();
+    app.post(&format!("/api/v1/workspaces/{ws}/contacts/bulk/subscribe"))
+        .json(&json!({"ids": [a, b], "list_id": double}))
+        .await
+        .assert_status_ok();
+    import_into(&pool, ws, list, "email\nb@ex.test\nc@ex.test\nd@ex.test\n").await;
+    import_into(&pool, ws, double, "email\nd@ex.test\ne@ex.test\n").await;
+
+    let memberships = count(&pool, "list_memberships").await;
+    assert_eq!(memberships, 8, "the fixture must reach every writer");
+    assert_eq!(count(&pool, "consent_log").await, memberships);
+    let unlogged: i64 = sqlx::query_scalar(
+        "select count(*) from list_memberships m where not exists (select 1 from consent_log c \
+         where c.contact_id = m.contact_id and c.list_id = m.list_id)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unlogged, 0);
+
+    // Every file that writes `list_memberships` is one of the three the fixture drives.
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        const WRITES: [&str; 3] = [
+            "insert into list_memberships",
+            "update list_memberships",
+            "delete from list_memberships",
+        ];
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let src = std::fs::read_to_string(&p).unwrap().to_lowercase();
+                let src = src.split_whitespace().collect::<Vec<_>>().join(" ");
+                if WRITES.iter().any(|w| src.contains(w)) {
+                    out.push(p.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    let mut writers = vec![];
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    walk(&src, &mut writers);
+    writers.sort();
+    let writers: Vec<_> = writers
+        .iter()
+        .map(|p| p.rsplit_once("/src/").unwrap().1)
+        .collect();
+    assert_eq!(
+        writers,
+        [
+            "contacts/import/staging.rs",
+            "contacts/selection.rs",
+            "lists/mod.rs"
+        ],
+        "a new writer of list_memberships needs a consent row and a place in this fixture"
+    );
+}
+
+/// Postgres puts the failing row, with its IP and user agent, into a check violation's DETAIL.
+#[sqlx::test]
+async fn a_consent_write_failure_carries_the_sqlstate_and_not_the_row(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let err = sqlx::query(
+        "insert into consent_log (id, workspace_id, contact_id, action, source, user_agent, ip) \
+         values ($1, $2, $3, 'bogus', 'api', 'SECRET-AGENT', '203.0.113.77')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(c)
+    .execute(&pool)
+    .await
+    .expect_err("the check refuses it");
+    assert!(
+        format!("{err}{err:?}").contains("SECRET-AGENT"),
+        "the premise: Postgres echoes the row"
+    );
+
+    let shown = format!("{:?}", nm::consent::scrub(err));
+    assert!(shown.contains("23514"), "{shown}");
+    assert!(
+        !shown.contains("SECRET-AGENT") && !shown.contains("203.0.113.77"),
+        "{shown}"
+    );
+}

@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::Principal;
+use crate::consent;
 use crate::error::{ApiError, ApiResult, FieldError};
 
 pub mod routes;
@@ -149,12 +150,16 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 /// not demote a confirmed subscriber back to `pending`. An `unsubscribed` one is let back in, as a
 /// fresh member (so `unsubscribed_at` is cleared and `source` is the new add's; the audit log keeps
 /// the history).
+///
+/// A write is a consent row (`subscribed`, or `resubscribed` for the revival), `Source::Operator`,
+/// in the same transaction. Leaving a membership as it is records nothing.
 pub async fn add_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
     list_id: Uuid,
     contact_id: Uuid,
     source: MembershipSource,
+    cx: &consent::Context,
 ) -> ApiResult<MembershipStatus> {
     let double_optin = sqlx::query_scalar!(
         "select double_optin from lists where workspace_id = $1 and id = $2",
@@ -168,14 +173,14 @@ pub async fn add_member(
     } else {
         MembershipStatus::Subscribed
     };
-    let written = sqlx::query_scalar!(
+    let written = sqlx::query!(
         r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source)
            values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end, $5)
            on conflict (contact_id, list_id) do update
            set status = excluded.status, subscribed_at = excluded.subscribed_at,
                unsubscribed_at = null, source = excluded.source
            where list_memberships.status = 'unsubscribed'
-           returning status as "status: MembershipStatus""#,
+           returning status as "status: MembershipStatus", (xmax = 0) as "inserted!""#,
         workspace_id,
         contact_id,
         list_id,
@@ -190,7 +195,26 @@ pub async fn add_member(
         _ => e.into(),
     })?;
     match written {
-        Some(s) => Ok(s),
+        Some(w) => {
+            let action = if w.inserted {
+                consent::Action::Subscribed
+            } else {
+                consent::Action::Resubscribed
+            };
+            let source = consent::Source::Operator;
+            consent::record(
+                db,
+                workspace_id,
+                contact_id,
+                Some(list_id),
+                action,
+                source,
+                cx,
+            )
+            .await
+            .map_err(consent::scrub)?;
+            Ok(w.status)
+        }
         None => Ok(sqlx::query_scalar!(
             r#"select status as "status: MembershipStatus" from list_memberships
                where workspace_id = $1 and contact_id = $2 and list_id = $3"#,
@@ -204,29 +228,51 @@ pub async fn add_member(
 }
 
 /// Marks the membership `unsubscribed` and stamps `unsubscribed_at`; the row stays. Doing it again
-/// keeps the first stamp. `404` if the contact was never on this list, or it is not in this
-/// workspace.
+/// keeps the first stamp and records nothing: only a change is a consent row (`unsubscribed`,
+/// `Source::Operator`, same transaction). `404` if the contact was never on this list, or it is
+/// not in this workspace.
 pub async fn unsubscribe_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
     list_id: Uuid,
     contact_id: Uuid,
+    cx: &consent::Context,
 ) -> ApiResult<()> {
     let done = sqlx::query!(
         "update list_memberships \
-         set status = 'unsubscribed', \
-             unsubscribed_at = case when status = 'unsubscribed' then unsubscribed_at else now() end \
-         where workspace_id = $1 and list_id = $2 and contact_id = $3",
+         set status = 'unsubscribed', unsubscribed_at = now() \
+         where workspace_id = $1 and list_id = $2 and contact_id = $3 and status <> 'unsubscribed'",
         workspace_id,
         list_id,
         contact_id,
     )
-    .execute(db)
+    .execute(&mut *db)
     .await?;
-    if done.rows_affected() == 0 {
-        return Err(ApiError::NotFound);
+    if done.rows_affected() == 1 {
+        let source = consent::Source::Operator;
+        let action = consent::Action::Unsubscribed;
+        return consent::record(
+            db,
+            workspace_id,
+            contact_id,
+            Some(list_id),
+            action,
+            source,
+            cx,
+        )
+        .await
+        .map_err(consent::scrub);
     }
-    Ok(())
+    // Nothing changed: it was already unsubscribed (fine) or was never a member (404).
+    let exists = sqlx::query_scalar!(
+        "select true from list_memberships where workspace_id = $1 and list_id = $2 and contact_id = $3",
+        workspace_id,
+        list_id,
+        contact_id,
+    )
+    .fetch_optional(db)
+    .await?;
+    exists.map(|_| ()).ok_or(ApiError::NotFound)
 }
 
 #[cfg(test)]

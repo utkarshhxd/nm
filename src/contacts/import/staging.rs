@@ -49,6 +49,7 @@ use super::{
     routes::MAX_IMPORT_COLUMNS,
 };
 use crate::{
+    consent,
     contacts::{validate_attributes, validate_name},
     crypto::{secrets::Secrets, suppression_hmac},
     custom_fields::{Definition, FieldKind},
@@ -591,7 +592,7 @@ async fn write_memberships_and_tags(
     // `AssertSqlSafe`: the only interpolations are `staging_table`'s fixed prefix with the import
     // id in hex, `written` (one of the two literals above) and [`SQL_UUID_V7`]. Nothing a client
     // sent reaches this string; the list the operator chose and the `import` provenance are bound.
-    let (declined, suppressed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+    let (declined, suppressed, written_contacts, written_lists): (i64, i64, Vec<Uuid>, Vec<Uuid>) = sqlx::query_as(AssertSqlSafe(format!(
         // `picked` and `live` again, and for the same two reasons as the statement before this
         // one: the file de-duplicates itself before anything looks at the database, and an erased
         // address is touched by nothing — not even by a tag on the contact row it already had.
@@ -636,7 +637,7 @@ async fn write_memberships_and_tags(
                     case when w.double_optin then null else now() end, $3 \
                from wanted w \
              on conflict (contact_id, list_id) do nothing \
-             returning 1 \
+             returning contact_id, list_id \
          ), \
          row_tags as ( \
              select t.contact_id, btrim(v.value) as name \
@@ -671,13 +672,35 @@ async fn write_memberships_and_tags(
                               and s.scope = 'domain' and s.domain = t.email_domain \
                               and (s.workspace_id = $1 or s.workspace_id is null)) \
          ) \
-         select (select count(*) from declined), (select count(*) from suppressed)"
+         select (select count(*) from declined), (select count(*) from suppressed), \
+                coalesce((select array_agg(contact_id order by contact_id, list_id) from added), '{{}}'), \
+                coalesce((select array_agg(list_id order by contact_id, list_id) from added), '{{}}')"
     )))
     .bind(import.workspace_id)
     .bind(import.list_id)
     .bind(MembershipSource::Import)
     .fetch_one(&mut *conn)
     .await?;
+    // One row per membership this statement wrote, in the same transaction. A membership it left
+    // alone (`do nothing`) is no consent change and gets none. No IP or user agent: the importing
+    // operator's are not the subscriber's, and none is invented.
+    let cx = consent::Context {
+        source_ref: Some(import.id.to_string()),
+        ..consent::Context::default()
+    };
+    let (contacts, lists) = (&written_contacts, &written_lists);
+    let source = consent::Source::Import;
+    let action = consent::Action::Subscribed;
+    consent::record_many(
+        conn,
+        import.workspace_id,
+        (contacts, lists),
+        action,
+        source,
+        &cx,
+    )
+    .await
+    .map_err(consent::scrub)?;
     Ok((declined, suppressed))
 }
 
