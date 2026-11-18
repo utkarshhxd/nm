@@ -266,16 +266,29 @@ function Mapping({
 
   const start = useMutation({
     mutationFn: async () => {
-      const { data, error } = await api.POST("/api/v1/workspaces/{workspace_id}/imports/{id}/start", {
-        params: { path: { workspace_id: ws, id } },
-        body: {
-          mapping,
-          dedup: mode,
-          list_id: listId || null,
-          ...(delimiter === upload.delimiter ? {} : { delimiter }),
-          ...(hasHeader === upload.has_header ? {} : { has_header: hasHeader }),
-        },
-      });
+      let result;
+      try {
+        result = await api.POST("/api/v1/workspaces/{workspace_id}/imports/{id}/start", {
+          params: { path: { workspace_id: ws, id } },
+          body: {
+            mapping,
+            dedup: mode,
+            list_id: listId || null,
+            ...(delimiter === upload.delimiter ? {} : { delimiter }),
+            ...(hasHeader === upload.has_header ? {} : { has_header: hasHeader }),
+          },
+        });
+      } catch {
+        // `fetch` REJECTS when the connection goes, and the browser says "Failed to fetch". This
+        // request is the whole run, so losing it says nothing about whether the run finished —
+        // the server carries on with nobody attached, and pressing Run again while it does
+        // answers a 409 that cannot name the import, because an uncommitted run is in no list.
+        // So the only safe instruction is to go and look.
+        throw new Error(
+          "The connection to the server was lost while the import was running. The import may still be finishing on the server: reload this page in a minute to see its report before running anything again.",
+        );
+      }
+      const { data, error } = result;
       if (!data) throw new Error(problemText(error, KNOWN, "The import could not be run."));
       return data;
     },
@@ -350,9 +363,17 @@ function Mapping({
 
           <fieldset disabled={start.isPending} className="mt-6 min-w-0">
             <legend className="font-medium">How the file is read</legend>
+            {/* The old copy said to look at the samples again after a change. The samples and the
+                column list come from the upload, and nothing re-reads the file here, so there is
+                nothing new to look at — and if the correction changes how many columns the file
+                has, the mapping above is positional against the wrong parse. Re-reading the file
+                on a correction is server-side work and is ticketed; until then the copy says what
+                an operator can actually do. */}
             <p className="mt-1 text-sm text-fg-muted">
-              The columns above came from the guess shown at the top. If it was wrong, correct it
-              here. The mapping applies by column position, so look at the samples again after a change.
+              The columns above came from the guess shown at the top. If it was wrong, go back and
+              upload the file again — the table above was read with the old guess and is not
+              re-read here, and the mapping applies by column position. Correct it here only if
+              you are sure the columns stay the same.
             </p>
             <label className="mt-3 block font-medium" htmlFor="import-delimiter">
               Separator
