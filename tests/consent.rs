@@ -281,8 +281,11 @@ async fn erasing_a_contact_removes_its_consent_rows_and_no_one_elses(pool: PgPoo
 async fn a_consent_row_cannot_be_updated(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let c = contact(&pool, ws, "a@ex.test").await;
+    let c2 = contact(&pool, ws, "b@ex.test").await;
     let l = list(&pool, ws, "news").await;
+    // Two rows, so the unqualified statements below are bulk updates.
     one_row(&pool, ws, c, l).await;
+    one_row(&pool, ws, c2, l).await;
 
     for sql in [
         "update consent_log set action = 'subscribed'",
@@ -290,7 +293,7 @@ async fn a_consent_row_cannot_be_updated(pool: PgPool) {
         "update consent_log set created_at = now() + interval '1 day'",
         "update consent_log set contact_id = contact_id", // even a no-op change
         // `list_id` is evidence, and null already means "workspace-wide": only the list's deletion
-        // may clear it, never a statement, alone or with another column, in bulk or singly.
+        // may clear it, never a statement, alone or with another column.
         "update consent_log set list_id = null, ip = null",
         "update consent_log set list_id = null",
     ] {
@@ -303,12 +306,65 @@ async fn a_consent_row_cannot_be_updated(pool: PgPool) {
             "{sql}: {err}"
         );
     }
-    let (action, list_id, ip): (String, Option<Uuid>, Option<IpAddr>) =
+    let rows: Vec<(String, Option<Uuid>, Option<IpAddr>)> =
         sqlx::query_as("select action, list_id, ip from consent_log")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (action, list_id, ip) in rows {
+        assert_eq!(action, "confirmed");
+        assert_eq!(list_id, Some(l));
+        assert!(ip.is_some());
+    }
+}
+
+/// The trigger lets Postgres's own `set null (list_id)` through, and only if it changes nothing
+/// else. Postgres never changes anything else, so reaching that comparison takes a trigger of the
+/// test's own: a `before delete on lists` one runs an UPDATE at depth 2, like the referential action
+/// does. `sqlx::test` gives this test a private database, so the trigger and column die with it.
+#[sqlx::test]
+async fn a_depth_two_update_that_changes_more_than_list_id_is_refused(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    one_row(&pool, ws, c, l).await;
+    // A column the trigger function has never heard of: the comparison must cover it anyway.
+    sqlx::query("alter table consent_log add column note text")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (changed, install) in [
+        (
+            "ip",
+            "create or replace function nosy() returns trigger language plpgsql as $$ begin                update consent_log set list_id = null, ip = null where list_id = old.id;                return old; end $$;              create or replace trigger nosy before delete on lists                for each row execute function nosy();",
+        ),
+        (
+            "note",
+            "create or replace function nosy() returns trigger language plpgsql as $$ begin                update consent_log set list_id = null, note = 'edited' where list_id = old.id;                return old; end $$;",
+        ),
+    ] {
+        sqlx::raw_sql(install).execute(&pool).await.unwrap();
+        let err = sqlx::query("delete from lists where id = $1")
+            .bind(l)
+            .execute(&pool)
+            .await
+            .expect_err(changed);
+        assert!(
+            err.as_database_error()
+                .unwrap()
+                .message()
+                .contains("append-only"),
+            "{changed}: {err}"
+        );
+    }
+    // The refused deletes rolled back whole: the list and the untouched row are still there.
+    let (list_id, ip): (Option<Uuid>, Option<IpAddr>) =
+        sqlx::query_as("select list_id, ip from consent_log")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(action, "confirmed");
     assert_eq!(list_id, Some(l));
     assert!(ip.is_some());
 }
