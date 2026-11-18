@@ -43,15 +43,16 @@ impl MembershipStatus {
     }
 }
 
-/// How a membership was created, for the consent log. `import` and `form` have no writer yet
-/// (M1c, M1d) and are therefore not variants; the table's `check` already admits them. A row
-/// written before the column existed reads as NULL, never as one of these.
+/// How a membership was created, for the consent log. `form` has no writer yet (M1d) and is
+/// therefore not a variant; the table's `check` already admits it. A row written before the column
+/// existed reads as NULL, never as one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum MembershipSource {
     Ui,
     Api,
     Bulk,
+    Import,
 }
 
 impl MembershipSource {

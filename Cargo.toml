@@ -16,13 +16,17 @@ path = "src/main.rs"
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 anyhow = "1.0.104"
 argon2 = "0.6.0"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["multipart"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["serde"] }
 chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive"] }
 cookie = "0.18.2"
+csv = "1.4.0"
+# The `csv` crate's own parser, without the blocking `io::Read` wrapper: the importer feeds an
+# `AsyncRead` straight into `COPY`, which a reader that blocks cannot do.
+csv-core = "0.1.13"
 figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util = { version = "0.3.34", default-features = false }
 hmac = "0.13.0"
@@ -37,7 +41,7 @@ sha2 = "0.11.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "macros", "migrate", "uuid", "json", "ipnet", "chrono"] }
 subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 totp-rs = { version = "6.0.0", default-features = false, features = ["otpauth", "zeroize"] }
 tower = "0.5.3"
 tracing = "0.1.44"

@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select status, delimiter, has_header from imports where workspace_id = $1 and id = $2 for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "delimiter",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "delimiter"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "has_header",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "has_header"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6aeb78fc391ca378c5d3db951726cf4a223dbdb3ad437828bf990bf0a52670ad"
+}

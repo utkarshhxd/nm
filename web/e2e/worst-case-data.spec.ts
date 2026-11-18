@@ -226,6 +226,50 @@ const opens = (button: string, title: string) => async (p: Page) => {
   // A dialog has queries of its own (the custom field definitions): measure the form, not a skeleton.
   await expect(p.locator('[role="status"][aria-busy="true"]')).toHaveCount(0);
 };
+/**
+ * The import wizard's second half, which has no URL of its own for any of its states: the mapping
+ * lives in the tab that uploaded the file, and the report belongs to an import that has to be run
+ * to exist. So each state is reached by doing what an operator does, in the page, every time —
+ * a new import per visit, which is why this is an `open` and not a `path`.
+ */
+const LONG_COLUMN = "C".repeat(200);
+const LONG_CELL = "v".repeat(200);
+const importUpload = (text: string) => async (p: Page) => {
+  await p.getByLabel("CSV file", { exact: true }).setInputFiles({
+    name: `${"f".repeat(200)}.csv`,
+    mimeType: "text/csv",
+    buffer: Buffer.from(text),
+  });
+  await p.getByRole("button", { name: "Upload", exact: true }).click();
+  await expect(p.getByRole("heading", { name: "Map the columns", exact: true })).toBeVisible();
+};
+/** The long column goes to Time zone, so its cell is rejected and the report shows both. */
+const importReview = (text: string) => async (p: Page) => {
+  await importUpload(text)(p);
+  await p.getByLabel("Import column Email as", { exact: true }).selectOption({ label: "Email" });
+  await p.getByLabel(`Import column ${LONG_COLUMN} as`, { exact: true }).selectOption({ label: "Time zone" });
+  await p.getByRole("button", { name: "Review mapping", exact: true }).click();
+  await expect(p.getByRole("heading", { name: "Review the mapping", exact: true })).toBeVisible();
+  await p.getByLabel("Add every contact to a list", { exact: true }).selectOption({ label: LONG_NAME });
+  // The long list name is in the sentence that says what will happen, not only in the picker.
+  await expect(p.getByRole("region", { name: "What will happen", exact: true })).toContainText(LONG_NAME);
+};
+const importRun = (text: string) => async (p: Page) => {
+  await importReview(text)(p);
+  await p.getByRole("button", { name: "Run the import", exact: true }).click();
+  await expect(p.getByRole("heading", { name: "Import report", exact: true })).toBeVisible();
+  // The rejected rows are a query of their own: measure the table, not the skeleton before it.
+  const rejected = p.getByRole("table", { name: "Rejected rows", exact: true });
+  await expect(rejected).toBeVisible();
+  // The long values are in cells the screen renders: the column's name and the cut cell.
+  await expect(rejected.getByRole("cell", { name: LONG_COLUMN, exact: true }).first()).toBeVisible();
+  await expect(rejected.getByRole("cell", { name: LONG_CELL, exact: true }).first()).toBeVisible();
+  await expect(p.locator('[role="status"][aria-busy="true"]')).toHaveCount(0);
+};
+const IMPORT_FILE = `Email,${LONG_COLUMN}\nada@example.test,${LONG_CELL}\n`;
+/** The server keeps 10,000 error rows and counts every failed one: 3 more than that is the notice. */
+const CAPPED_FILE = `Email,${LONG_COLUMN}\n${Array.from({ length: 10_003 }, (_, n) => `cap${n}@example.test,${LONG_CELL}`).join("\n")}\n`;
+
 const SCREENS: Screen[] = [
   { name: "home", path: () => "/", ready: heading("NM") },
   { name: "new workspace", path: () => "/workspaces/new", ready: heading("Create workspace") },
@@ -354,6 +398,35 @@ const SCREENS: Screen[] = [
     path: () => `/w/${SLUG}/contacts`,
     ready: (p) => p.getByRole("grid", { name: "Contacts" }),
     open: opens("Export CSV", "Export these contacts"),
+  },
+  // The import wizard (M1c section 13): the upload, then every state of the screen it leads to.
+  { name: "import upload", path: () => `/w/${SLUG}/imports`, ready: heading("Import contacts") },
+  {
+    name: "import mapping",
+    path: () => `/w/${SLUG}/imports`,
+    ready: heading("Import contacts"),
+    open: importUpload(IMPORT_FILE),
+  },
+  {
+    name: "import confirmation",
+    path: () => `/w/${SLUG}/imports`,
+    ready: heading("Import contacts"),
+    open: importReview(IMPORT_FILE),
+  },
+  {
+    name: "import report",
+    path: () => `/w/${SLUG}/imports`,
+    ready: heading("Import contacts"),
+    open: importRun(IMPORT_FILE),
+  },
+  {
+    name: "import report, rejected rows cut at the cap",
+    path: () => `/w/${SLUG}/imports`,
+    ready: heading("Import contacts"),
+    open: async (p) => {
+      await importRun(CAPPED_FILE)(p);
+      await expect(p.getByRole("note", { name: "The rejected rows are not all listed", exact: true })).toBeVisible();
+    },
   },
 ];
 

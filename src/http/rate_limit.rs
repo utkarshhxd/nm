@@ -68,6 +68,31 @@ pub const SELECTION_PER_MINUTE: u32 = 10;
 /// never ends.
 pub const EXPORT_PER_MINUTE: u32 = 5;
 
+/// How many CSV uploads one workspace may start per window. Nothing counted them before: the
+/// route streams up to [`MAX_IMPORT_BYTES`](crate::contacts::import::routes::MAX_IMPORT_BYTES) to
+/// disk per call and leaves the file there until the import is run or swept, and a script could
+/// ask for that as fast as it liked.
+///
+/// **Sixty, and the reason is the opposite of the other three.** Those are sized against the pool,
+/// because a preview, a selection and an export each hold a connection for a long time. An upload
+/// holds one only for two statements at the end; what it spends is disk and the sniff's CPU, and a
+/// single upload's disk is already capped. So this number is not a pool budget — it is the line
+/// between a client and a hammer, and it has to sit **above the fastest legitimate client there
+/// is**, which is the e2e harness driving the real screen: `web/e2e/import.spec.ts` makes about 25
+/// uploads into one workspace, serially, as fast as a browser will go, and
+/// `web/e2e/worst-case-data.spec.ts` makes 8 per full `everyScreen` pass — four upload-bearing
+/// screens in both themes — over the three passes that take the whole `SCREENS` list, so **24**
+/// into its own workspace. (Its fourth call site passes a filtered list with no import screen in
+/// it, and uploads nothing.) One a second is past what either can reach — each of those uploads
+/// costs a navigation, a file chooser and a round trip — and past what a person at the mapping
+/// screen could ever want, and it still stops the thousands a minute a loop would otherwise get.
+/// **The margin over the harness is about 2.5×**, so a change to either file that batches uploads
+/// more tightly is a change that has to be measured against this number.
+///
+/// This counts uploads, not runs. What bounds the runs is the advisory lock in `start_import`:
+/// one import at a time per workspace, however many files are waiting.
+pub const IMPORT_PER_MINUTE: u32 = 60;
+
 const WINDOW: Duration = Duration::from_secs(60);
 
 pub struct RateLimiter {

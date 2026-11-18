@@ -24,6 +24,18 @@ jobs:
     env:
       DATABASE_URL: postgres://nm:nm@localhost:5432/nm
       SQLX_OFFLINE: "true"
+      # `cargo test` here linked 32 binaries and died with
+      # `collect2: fatal error: ld terminated with signal 7 [Bus error], core dumped`.
+      # SIGBUS out of `ld` is the shape of a failed mmap on the output file: the runner's disk
+      # filled. Debug info is almost all of it — a hosted runner has ~14 GB free and this tree's
+      # test binaries carry full DWARF.
+      #
+      # This is set in CI only, as environment rather than in Cargo.toml, so a developer keeps
+      # debuggable local builds. It almost certainly also explains the OpenAPI generator that died
+      # on three earlier runs writing nothing: a link killed this way exits non-zero with an empty
+      # stdout, which is exactly what that step's artifact showed.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
@@ -38,8 +50,71 @@ jobs:
       - run: cargo test
       - run: cargo sqlx prepare --check -- --all-targets
       # The committed spec is what web/src/api/schema.d.ts was generated from.
+      #
+      # This prints the drift rather than piping into `diff`, because a bare pipe says only that
+      # the two differ and GitHub expires a job's logs long before anyone asks why. This gate
+      # failed on a runner while passing locally, byte for byte, and there was no way left to see
+      # what it had found. The summary is for whoever opens the run; the artifact is for whoever
+      # has to diff it against their own machine.
       - name: Committed OpenAPI spec is current
-        run: cargo run -q -- openapi | diff - web/src/api/openapi.json
+        run: |
+          # The generator dies on the runner intermittently, writing nothing. Run 44042256634
+          # failed here with a zero-byte stdout; the identical code passed on the very next run.
+          # The cause is still unknown, so the two halves of this gate are kept apart.
+          #
+          # Keeping them apart matters because a pipeline's status is only the LAST command's:
+          # the earlier `cargo run … | diff -` form reported every one of those deaths as drift,
+          # and four runs on main were read as a spec difference that did not exist. Check the
+          # generator's own status first and keep its stderr — when this returns, that file is
+          # the only place the reason will appear.
+          #
+          # `status=$?` has to come from the command itself and not from inside `if ! cmd`:
+          # there `$?` is the NEGATION's status, which is 0 whenever the body runs, so the
+          # handler reported "exited 0" and then `exit 0`-ed — a crash passed the gate AND
+          # skipped the diff below. Confirmed with `bash -c 'if ! (exit 42); then echo $?; fi'`,
+          # which prints 0.
+          set +e
+          cargo run -q -- openapi \
+            > "$RUNNER_TEMP/openapi.generated.json" 2> "$RUNNER_TEMP/openapi.stderr"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '## The OpenAPI generator failed; this is not drift'
+              echo
+              echo "\`cargo run -q -- openapi\` exited $status after writing"
+              echo "$(wc -c < "$RUNNER_TEMP/openapi.generated.json") bytes to stdout."
+              echo
+              echo '```'
+              tail -c 20000 "$RUNNER_TEMP/openapi.stderr"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::the openapi subcommand failed; see the job summary"
+            exit "$status"
+          fi
+          if ! diff -u web/src/api/openapi.json "$RUNNER_TEMP/openapi.generated.json" \
+               > "$RUNNER_TEMP/openapi.diff"; then
+            {
+              echo '## The committed OpenAPI spec is not what the server generates'
+              echo
+              echo "committed:  $(wc -c < web/src/api/openapi.json) bytes"
+              echo "generated:  $(wc -c < "$RUNNER_TEMP/openapi.generated.json") bytes"
+              echo
+              echo '```diff'
+              head -c 60000 "$RUNNER_TEMP/openapi.diff"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::OpenAPI drift; see the job summary and the openapi-drift artifact"
+            exit 1
+          fi
+      - name: Keep the generated spec when it drifted
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-drift
+          path: ${{ runner.temp }}/openapi.*
+          if-no-files-found: ignore
+          retention-days: 7
 
   web:
     runs-on: ubuntu-latest

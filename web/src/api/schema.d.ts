@@ -795,6 +795,112 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * This workspace's imports, newest first, a page at a time. Each row is the same report
+         *     `GET /imports/{id}` answers with: a list screen shows a status and counts, and a second read
+         *     per row to get them would be the list all over again.
+         */
+        get: operations["list_imports"];
+        put?: never;
+        /**
+         * Takes a CSV as `multipart/form-data` (one part, `file`), keeps it on disk under a name derived
+         *     from the import's id, records the import as `pending`, and answers with the delimiter, a header
+         *     guess, and a proposed mapping from each column to a contact field or custom field.
+         * @description The proposal names a column only when the match is certain: the whole header, lowercased with
+         *     everything but letters and digits removed, equals a field's name the same way (`First Name` is
+         *     `first_name`; `Email Address` is nothing), or is the exporter's own `attr:<key>`, and no other
+         *     column or field also claims it. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
+         */
+        post: operations["create_import"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/imports/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The import's report. Every count is named separately, and the five row-level ones sum to
+         *     `total_rows` on a `complete` import — see [`ImportReport`] for which five and why the other
+         *     two are not among them.
+         */
+        get: operations["get_import"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/imports/{id}/errors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The rows this import rejected, in file order, a page at a time.
+         * @description **This is the first `errors_recorded` rejected rows, not necessarily all of them.** An import
+         *     keeps at most [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) error rows while its
+         *     `failed` count counts every rejected row, so on a worse file the end of this list is the end
+         *     of what was kept and not the end of the damage. `GET /imports/{id}` reports both numbers, and
+         *     a client that shows this list shows them together.
+         */
+        get: operations["list_import_errors"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/imports/{id}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirms the mapping and runs the import: `COPY` the file into a staging table, upsert out of
+         *     it, and write what that came to onto the import's row.
+         * @description **One transaction for the whole run.** The staging table is `create temporary table … on commit
+         *     drop`, so it exists only inside it, and that `COMMIT` is what makes the contacts durable.
+         *
+         *     **The delimiter and the header come from the stored values, never from a second sniff** — the
+         *     operator confirmed a mapping against those columns, and a sniff that disagreed at this point
+         *     would silently re-point every column. The request may carry `delimiter` and `has_header`
+         *     OVERRIDES, which replace them: a headerless file read as headed silently drops its first row,
+         *     and a misdetected delimiter misparses every row, and the operator who was shown the guess is
+         *     the one who can correct it. A request carrying neither uses what is stored.
+         *
+         *     **A refusal keeps the per-row report.** See the savepoint below.
+         */
+        post: operations["start_import"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/lists": {
         parameters: {
             query?: never;
@@ -1221,6 +1327,20 @@ export interface components {
         ChangeRole: {
             role: components["schemas"]["Role"];
         };
+        /** @description What one CSV column is written to. */
+        ColumnTarget: {
+            /** @enum {string} */
+            kind: "ignore";
+        } | {
+            /** @enum {string} */
+            kind: "field";
+            value: components["schemas"]["ContactField"];
+        } | {
+            /** @enum {string} */
+            kind: "custom";
+            /** @description A custom field, by its key. */
+            value: string;
+        };
         ConfirmRequest: {
             code: string;
         };
@@ -1242,6 +1362,13 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        /**
+         * @description A built-in contact column an import may write: the exporter's own header for it. `id`,
+         *     `created_at`, `updated_at` and `suppressed` are not here on purpose: the first three are the
+         *     database's, and an import may not bypass or lift a suppression (spec 7.5).
+         * @enum {string}
+         */
+        ContactField: "email" | "first_name" | "last_name" | "timezone" | "tags" | "lists";
         /** @description One list a contact is on, as the contact's page shows it. */
         ContactList: {
             /** Format: uuid */
@@ -1295,6 +1422,11 @@ export interface components {
             id: string;
             name: string;
         };
+        /**
+         * @description What to do with a row whose address is already a contact in the workspace (spec 7.3).
+         * @enum {string}
+         */
+        Dedup: "update_existing" | "skip_existing" | "fail_on_duplicate";
         Definition: {
             /**
              * Format: date-time
@@ -1330,6 +1462,129 @@ export interface components {
             challenge_id: string;
             /** @description The browser's `PublicKeyCredential`, in WebAuthn JSON form. */
             credential: Record<string, never>;
+        };
+        /**
+         * @description One rejected row, as the operator has to read it: which row, which column, why, and the cell
+         *     that did it.
+         */
+        ImportErrorRow: {
+            /** @description The column to blame, where one column is to blame. */
+            column_name?: string | null;
+            reason: string;
+            /**
+             * Format: int64
+             * @description **The line the row is on in the file, as a spreadsheet numbers them**, which is what an
+             *     operator has to open the file at. The header row takes line 1 of a headed file and a blank
+             *     line takes a number of its own, so the first data row of a headed file is line 2 and the
+             *     second is line 3.
+             *
+             *     It is therefore **not** an index into the data rows and does not run alongside
+             *     `total_rows`, which counts data rows only: a headed file of 10 rows reports
+             *     `total_rows = 10` and may hold an error on line 11.
+             */
+            row_number: number;
+            /**
+             * @description The offending cell as the file held it, cut short. Nothing else of the file is echoed, and
+             *     a row refused because its address was **erased on request** carries no value at all: the
+             *     erasure took that address out of the database, and this list is served for as long as the
+             *     import exists. `row_number` says which line of the file to look at.
+             */
+            value?: string | null;
+        };
+        /**
+         * @description What an import did, count by count (spec 7.5): *"'Imported 940,000 of 1,000,000' with no
+         *     breakdown is not a report."*
+         *
+         *     **`imported`, `updated`, `skipped`, `collapsed` and `failed` are the five row-level counts**,
+         *     and they are mutually exclusive: every row of the file lands in exactly one of them, so on a
+         *     `complete` import they sum to `total_rows`. (A `failed` import died part-way: its counts are
+         *     what it got to, and `total_rows` may still be `null`.)
+         *
+         *     **`suppressed` and `memberships_declined` are not row-level.** They describe rows already
+         *     counted among the five — a suppressed address is still an imported or updated contact, and a
+         *     declined subscription belongs to one — so adding all seven counts those rows twice.
+         */
+        ImportReport: {
+            /**
+             * Format: int64
+             * @description Rows a later row of the same file names the same address as. Not `skipped`: the file
+             *     de-duplicated itself, and the database never had these rows.
+             */
+            collapsed: number;
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * @description Why the import as a whole failed, and `null` otherwise. Never one row's reason: those are
+             *     in `GET /imports/{id}/errors`.
+             */
+            error_reason?: string | null;
+            /**
+             * Format: int64
+             * @description How many rejected rows `GET /imports/{id}/errors` can show. An import keeps at most
+             *     [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) of them while `failed` counts
+             *     every one, so **when this is less than `failed`, that list is the first `errors_recorded`
+             *     rejected rows in file order and not all of them** — an operator who pages to the end of it
+             *     has not seen everything wrong with the file, and has to be told so.
+             */
+            errors_recorded: number;
+            /**
+             * Format: int64
+             * @description Every rejected row. [`ImportReport::errors_recorded`] is how many of them were kept.
+             */
+            failed: number;
+            /** @description What the file was called when it was uploaded. A label; nothing opens it. */
+            filename: string;
+            /** Format: date-time */
+            finished_at?: string | null;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: int64
+             * @description Rows that became a new contact.
+             */
+            imported: number;
+            /**
+             * Format: int64
+             * @description Subscriptions this import asked for and did not get, because the address is already
+             *     `unsubscribed` on that list. The contact itself was still imported or updated.
+             */
+            memberships_declined: number;
+            /**
+             * Format: int64
+             * @description Rows left alone because the contact already existed (`skip existing`).
+             */
+            skipped: number;
+            /** Format: date-time */
+            started_at?: string | null;
+            /**
+             * @description `pending`, `complete` or `failed`.
+             *
+             *     **`running` is a state the database allows and this server never serves.** The run is one
+             *     transaction inside `POST /imports/{id}/start`, which writes `running` and commits once at
+             *     the end, so no reader outside that transaction ever sees it. A row can only be left
+             *     `running` by a process that died mid-run, and the next boot sweeps those to `failed`
+             *     before anything is served. Do not write a client that waits for it. When the run moves off
+             *     the request it will become reachable, and that is the change that should make this a typed
+             *     enum.
+             */
+            status: string;
+            /**
+             * Format: int64
+             * @description Imported or updated contacts whose address or domain is suppressed. They exist and they
+             *     are not mailable — said here rather than discovered at send time.
+             */
+            suppressed: number;
+            /**
+             * Format: int64
+             * @description `null` while the `COPY` is still counting the file. Not `0`, which would report an empty
+             *     file for an import that has not read its first row.
+             */
+            total_rows?: number | null;
+            /**
+             * Format: int64
+             * @description Rows applied to a contact that already existed.
+             */
+            updated: number;
         };
         /** @description What the invitee sees before accepting. */
         InvitePreview: {
@@ -1478,6 +1733,14 @@ export interface components {
             label: string;
             /** @description Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind. */
             options?: string[] | null;
+        };
+        /** @description The request body, for the document: the one part, named `file`. */
+        NewImport: {
+            /**
+             * Format: binary
+             * @description The CSV file. Its name is kept as a label and is never used as a path.
+             */
+            file: string;
         };
         NewInvite: {
             email: string;
@@ -1637,6 +1900,118 @@ export interface components {
                 label: string;
                 /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
                 options: string[];
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_ImportErrorRow: {
+            data: {
+                /** @description The column to blame, where one column is to blame. */
+                column_name?: string | null;
+                reason: string;
+                /**
+                 * Format: int64
+                 * @description **The line the row is on in the file, as a spreadsheet numbers them**, which is what an
+                 *     operator has to open the file at. The header row takes line 1 of a headed file and a blank
+                 *     line takes a number of its own, so the first data row of a headed file is line 2 and the
+                 *     second is line 3.
+                 *
+                 *     It is therefore **not** an index into the data rows and does not run alongside
+                 *     `total_rows`, which counts data rows only: a headed file of 10 rows reports
+                 *     `total_rows = 10` and may hold an error on line 11.
+                 */
+                row_number: number;
+                /**
+                 * @description The offending cell as the file held it, cut short. Nothing else of the file is echoed, and
+                 *     a row refused because its address was **erased on request** carries no value at all: the
+                 *     erasure took that address out of the database, and this list is served for as long as the
+                 *     import exists. `row_number` says which line of the file to look at.
+                 */
+                value?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_ImportReport: {
+            data: {
+                /**
+                 * Format: int64
+                 * @description Rows a later row of the same file names the same address as. Not `skipped`: the file
+                 *     de-duplicated itself, and the database never had these rows.
+                 */
+                collapsed: number;
+                /** Format: date-time */
+                created_at: string;
+                /**
+                 * @description Why the import as a whole failed, and `null` otherwise. Never one row's reason: those are
+                 *     in `GET /imports/{id}/errors`.
+                 */
+                error_reason?: string | null;
+                /**
+                 * Format: int64
+                 * @description How many rejected rows `GET /imports/{id}/errors` can show. An import keeps at most
+                 *     [`MAX_IMPORT_ERRORS`](super::staging::MAX_IMPORT_ERRORS) of them while `failed` counts
+                 *     every one, so **when this is less than `failed`, that list is the first `errors_recorded`
+                 *     rejected rows in file order and not all of them** — an operator who pages to the end of it
+                 *     has not seen everything wrong with the file, and has to be told so.
+                 */
+                errors_recorded: number;
+                /**
+                 * Format: int64
+                 * @description Every rejected row. [`ImportReport::errors_recorded`] is how many of them were kept.
+                 */
+                failed: number;
+                /** @description What the file was called when it was uploaded. A label; nothing opens it. */
+                filename: string;
+                /** Format: date-time */
+                finished_at?: string | null;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * Format: int64
+                 * @description Rows that became a new contact.
+                 */
+                imported: number;
+                /**
+                 * Format: int64
+                 * @description Subscriptions this import asked for and did not get, because the address is already
+                 *     `unsubscribed` on that list. The contact itself was still imported or updated.
+                 */
+                memberships_declined: number;
+                /**
+                 * Format: int64
+                 * @description Rows left alone because the contact already existed (`skip existing`).
+                 */
+                skipped: number;
+                /** Format: date-time */
+                started_at?: string | null;
+                /**
+                 * @description `pending`, `complete` or `failed`.
+                 *
+                 *     **`running` is a state the database allows and this server never serves.** The run is one
+                 *     transaction inside `POST /imports/{id}/start`, which writes `running` and commits once at
+                 *     the end, so no reader outside that transaction ever sees it. A row can only be left
+                 *     `running` by a process that died mid-run, and the next boot sweeps those to `failed`
+                 *     before anything is served. Do not write a client that waits for it. When the run moves off
+                 *     the request it will become reachable, and that is the change that should make this a typed
+                 *     enum.
+                 */
+                status: string;
+                /**
+                 * Format: int64
+                 * @description Imported or updated contacts whose address or domain is suppressed. They exist and they
+                 *     are not mailable — said here rather than discovered at send time.
+                 */
+                suppressed: number;
+                /**
+                 * Format: int64
+                 * @description `null` while the `COPY` is still counting the file. Not `0`, which would report an empty
+                 *     file for an import that has not read its first row.
+                 */
+                total_rows?: number | null;
+                /**
+                 * Format: int64
+                 * @description Rows applied to a contact that already existed.
+                 */
+                updated: number;
             }[];
             next_cursor?: string | null;
         };
@@ -1910,6 +2285,32 @@ export interface components {
             /** @description Base32 secret, shown only here. */
             secret: string;
         };
+        /** @description The confirmed mapping, and the run. */
+        StartImport: {
+            /**
+             * @description What to do with a row whose address is already a contact here. `update_existing` by
+             *     default, which is spec 7.3's blank-cell rule: a blank leaves the stored value alone.
+             */
+            dedup?: components["schemas"]["Dedup"];
+            /**
+             * @description Replaces the delimiter the upload sniffed: one of `,`, `;`, a tab or `|`. Left out, the
+             *     stored one is used — the file is never sniffed a second time.
+             */
+            delimiter?: string | null;
+            /** @description Replaces the header guess the upload made. Left out, the stored one is used. */
+            has_header?: boolean | null;
+            /**
+             * Format: uuid
+             * @description A list in this workspace to subscribe every imported contact to. The file's own `lists`
+             *     column, where it has one, is added to this rather than replacing it.
+             */
+            list_id?: string | null;
+            /**
+             * @description One target per CSV column, in the file's column order. One column must be `email`, and no
+             *     two columns may name the same single-write target.
+             */
+            mapping: components["schemas"]["ColumnTarget"][];
+        };
         /** @description A suppression as the API shows it. There is deliberately no hash field here. */
         Suppression: {
             /** Format: date-time */
@@ -2018,6 +2419,28 @@ export interface components {
         UpdateWorkspace: {
             name?: string | null;
             timezone?: string | null;
+        };
+        Upload: {
+            columns: components["schemas"]["UploadColumn"][];
+            /** @description One character: `,`, `;`, a tab or `|`. */
+            delimiter: string;
+            /** @description A guess: the first row is a header unless it holds an email address. */
+            has_header: boolean;
+            /** Format: uuid */
+            id: string;
+            /** Format: int64 */
+            total_bytes: number;
+        };
+        UploadColumn: {
+            /** @description The header cell, or `Column N` when the file has no header row. */
+            name: string;
+            /**
+             * @description `ignore` when the server is not sure: a blank costs one dropdown, a wrong guess writes the
+             *     wrong column into the wrong field.
+             */
+            proposed: components["schemas"]["ColumnTarget"];
+            /** @description Up to five non-blank values from the first 100 rows, as a spreadsheet shows them. */
+            samples: string[];
         };
         /**
          * @description Stored as text under a `check` constraint, not a Postgres enum.
@@ -4510,6 +4933,262 @@ export interface operations {
             };
             /** @description field-not-archived, or field-in-use: a segment still names it, and the problem lists which */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_imports: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ImportReport"];
+                };
+            };
+            /** @description insufficient-role: reading this workspace's imports takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["NewImport"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Upload"];
+                };
+            };
+            /** @description insufficient-role: importing takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description import-too-large: the file is over the size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not multipart/form-data, no `file` part, an unknown part, more than one file, empty-file: the file has no rows, too-many-columns, or too-many-rows */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many uploads for this workspace */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Import id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportReport"];
+                };
+            };
+            /** @description insufficient-role: reading an import's report takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such import in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_import_errors: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Import id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description File order, oldest row first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ImportErrorRow"];
+                };
+            };
+            /** @description insufficient-role: reading an import's rejected rows takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such import in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    start_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Import id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StartImport"];
+            };
+        };
+        responses: {
+            /** @description The import ran; every count is on the report */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportReport"];
+                };
+            };
+            /** @description insufficient-role: running an import takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, no such import in this workspace, or no such list */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description import-in-progress: this workspace is already running an import; import-already-started: an import runs once; or import-duplicate-address, which writes no contact and keeps the rejected rows */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a mapping naming a custom field that no longer takes values, two columns aimed at one target, mapping-needs-email, a delimiter that is not one of the four, import-file-gone, or an unknown field */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

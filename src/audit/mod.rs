@@ -41,6 +41,9 @@ pub mod actions {
     pub const CONTACTS_BULK_UNSUBSCRIBED: &str = "contacts.bulk_unsubscribed";
     pub const CONTACTS_BULK_DELETED: &str = "contacts.bulk_deleted";
     pub const CONTACTS_EXPORTED: &str = "contacts.exported";
+    pub const IMPORT_UPLOADED: &str = "import.uploaded";
+    pub const IMPORT_STARTED: &str = "import.started";
+    pub const IMPORT_FINISHED: &str = "import.finished";
     pub const LIST_CREATED: &str = "list.created";
     pub const LIST_UPDATED: &str = "list.updated";
     pub const LIST_DELETED: &str = "list.deleted";

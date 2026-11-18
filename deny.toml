@@ -3,14 +3,35 @@ version = 2
 yanked = "deny"
 # RUSTSEC-2023-0071 (Marvin attack): a timing side channel in RSA PRIVATE-key operations (PKCS#1 v1.5
 # decryption and signing). No patched `rsa` exists upstream. Ignored because:
-#  - `rsa` reaches us only through `webauthn-rs`, which uses it for RS256 signature VERIFICATION only
-#    (webauthn-rs-core `crypto.rs:552`, crypto-glue `x509/chain.rs:368`): a public-key operation.
+#  - `rsa` reaches us through `webauthn-rs` and, in tests only, through the dev-dependency
+#    `webauthn-authenticator-rs`; both reach it via `crypto-glue`. Every use is RS256/RS384
+#    signature VERIFICATION — a public-key operation — at webauthn-rs-core `crypto.rs:562`
+#    (the `COSEKeyPublic::RsaS256` arm) and crypto-glue `x509/chain.rs:376` and `:388`.
+#    (The line numbers here were each several lines short of the call they name; they are the
+#    `verifier.verify(...)` lines in `crypto-glue 0.2.2` and `webauthn-rs-core 0.6.2`.)
 #  - NM holds no RSA private key and performs no RSA private-key operation, which is exactly what the
 #    attack targets.
 # RE-VERIFY ON EVERY `webauthn-rs` OR `crypto-glue` BUMP: crypto-glue already ships private-key
 # operations (`new_key`, `oaep_sha256_decrypt`) that a future version could start using, and this
 # ignore would silently cover that. If either is reached by a new caller, drop the ignore.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0555 (`chrono-tz`), both `unmaintained`: no
+# vulnerability, no exploit, and no patched version can exist, because the finding IS the
+# maintenance status. They arrived from an advisory-database refresh, not from anything this
+# repository changed — `cargo deny` was green on these same versions earlier in this branch.
+#
+# Dropping our direct use would not remove either crate: `sqlx` is built with its `chrono` feature
+# and `utoipa` with its own, so `chrono` arrives transitively whatever we do. Removing it means
+# moving both to the `time` crate and rewriting every timestamp in the tree — a project-wide
+# migration, deliberately not smuggled into an unrelated milestone.
+#
+# RE-VERIFY WHEN EITHER IS TRUE, AND DROP THE IGNORE RATHER THAN EXTEND IT:
+#  - either advisory is reclassified from `unmaintained` to a vulnerability or an unsoundness, or
+#  - `sqlx` and `utoipa` both offer a `time` backend we can take, at which point the migration is
+#    a day's work and this ignore stops being the cheaper answer.
+#
+# An `unmaintained` crate is not harmless over time: the risk is that the next CVE in it never gets
+# a fix. This ignore buys schedule, not safety, and it is reviewed on the triggers above.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0543", "RUSTSEC-2026-0555"]
 
 [licenses]
 version = 2

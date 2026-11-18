@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update imports set status = 'complete', finished_at = now(), total_rows = $3, imported = $4, updated = $5, skipped = $6, collapsed = $7, failed = $8, suppressed = $9, memberships_declined = $10 where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ecafa60c943e5a6a23a06b1c4f4cbec0737430e5589a3825d37452c72800f691"
+}

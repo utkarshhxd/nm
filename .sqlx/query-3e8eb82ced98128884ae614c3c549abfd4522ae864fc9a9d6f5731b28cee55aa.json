@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update imports set status = 'failed', error_reason = $3, total_rows = $4, failed = $5, finished_at = now() where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e8eb82ced98128884ae614c3c549abfd4522ae864fc9a9d6f5731b28cee55aa"
+}

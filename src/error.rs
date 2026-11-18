@@ -57,6 +57,8 @@ pub enum ApiError {
     /// 422 with a problem code and a detail built at the call site, for a refusal that must name
     /// what was refused (a segment rule's unknown field, a limit and its number).
     UnprocessableDetail { code: &'static str, detail: String },
+    /// 413 with a problem code and a detail naming the limit that was passed.
+    PayloadTooLarge { code: &'static str, detail: String },
     /// 429 `rate-limited` plus a `Retry-After` header.
     TooManyRequests { retry_after_secs: u64 },
     /// 415 `unsupported-media-type`: a JSON endpoint got another content type.
@@ -118,6 +120,9 @@ impl IntoResponse for ApiError {
             }
             ApiError::UnprocessableDetail { code, detail } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, *code, detail.clone())
+            }
+            ApiError::PayloadTooLarge { code, detail } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, *code, detail.clone())
             }
             ApiError::TooManyRequests { retry_after_secs } => {
                 retry_after = Some(*retry_after_secs);

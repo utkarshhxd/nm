@@ -1,0 +1,204 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select i.id, i.status, i.filename, i.total_rows, i.imported, i.updated, i.skipped,\n                  i.collapsed, i.failed, i.suppressed, i.memberships_declined,\n                  (select count(*) from import_errors e\n                    where e.workspace_id = i.workspace_id and e.import_id = i.id)\n                      as \"errors_recorded!\",\n                  i.error_reason, i.created_at, i.started_at, i.finished_at\n             from imports i where i.workspace_id = $1 and i.id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "filename",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "filename"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "total_rows",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "total_rows"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "imported",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "imported"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "updated",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "updated"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "skipped",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "skipped"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "collapsed",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "collapsed"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "failed",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "failed"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "suppressed",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "suppressed"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "memberships_declined",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "memberships_declined"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "errors_recorded!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 12,
+        "name": "error_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "error_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "imports",
+            "name": "finished_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "e0cf45c19562bc50d4d115710665945a76158f501c5e36616ed135cb06629967"
+}

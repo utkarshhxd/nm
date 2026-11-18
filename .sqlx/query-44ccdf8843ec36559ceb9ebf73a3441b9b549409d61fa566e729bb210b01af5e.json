@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update imports set status = 'failed', error_reason = $1, finished_at = now() where status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "44ccdf8843ec36559ceb9ebf73a3441b9b549409d61fa566e729bb210b01af5e"
+}
