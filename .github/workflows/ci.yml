@@ -67,9 +67,18 @@ jobs:
           # and four runs on main were read as a spec difference that did not exist. Check the
           # generator's own status first and keep its stderr — when this returns, that file is
           # the only place the reason will appear.
-          if ! cargo run -q -- openapi \
-               > "$RUNNER_TEMP/openapi.generated.json" 2> "$RUNNER_TEMP/openapi.stderr"; then
-            status=$?
+          #
+          # `status=$?` has to come from the command itself and not from inside `if ! cmd`:
+          # there `$?` is the NEGATION's status, which is 0 whenever the body runs, so the
+          # handler reported "exited 0" and then `exit 0`-ed — a crash passed the gate AND
+          # skipped the diff below. Confirmed with `bash -c 'if ! (exit 42); then echo $?; fi'`,
+          # which prints 0.
+          set +e
+          cargo run -q -- openapi \
+            > "$RUNNER_TEMP/openapi.generated.json" 2> "$RUNNER_TEMP/openapi.stderr"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
             {
               echo '## The OpenAPI generator failed; this is not drift'
               echo
