@@ -494,7 +494,10 @@ pub struct ImportErrorRow {
     /// The column to blame, where one column is to blame.
     pub column_name: Option<String>,
     pub reason: String,
-    /// The offending cell as the file held it, cut short. Nothing else of the file is echoed.
+    /// The offending cell as the file held it, cut short. Nothing else of the file is echoed, and
+    /// a row refused because its address was **erased on request** carries no value at all: the
+    /// erasure took that address out of the database, and this list is served for as long as the
+    /// import exists. `row_number` says which line of the file to look at.
     pub value: Option<String>,
 }
 

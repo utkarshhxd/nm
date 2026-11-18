@@ -1189,7 +1189,7 @@ async fn an_erased_address_is_never_updated_either(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn an_erasure_is_reported_without_echoing_anything_but_the_address(pool: PgPool) {
+async fn an_erasure_is_reported_without_echoing_the_erased_address(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let import = insert_import(&pool, ws).await;
     let j = job_with(import, ws, name_columns(), vec![], Dedup::UpdateExisting);
@@ -1209,15 +1209,16 @@ async fn an_erasure_is_reported_without_echoing_anything_but_the_address(pool: P
     assert_eq!(row, 2, "the line a spreadsheet shows");
     assert_eq!(column.as_deref(), Some("email"));
     assert!(reason.contains("address-erased"), "{reason}");
-    assert_eq!(
-        value.as_deref(),
-        Some("ada@example.com"),
-        "the operator's own address, and nothing else"
-    );
+    // THE ERASED ADDRESS IS NOT WRITTEN BACK. `migrations/0014_suppressions.sql` nulls
+    // `suppressions.email` on a tombstone precisely so the address is gone; echoing the file's
+    // copy of it into `import_errors.value` would resurrect it into a table
+    // `GET /imports/{id}/errors` serves indefinitely, on the ordinary path of re-importing a list
+    // that still holds someone who asked to be erased. The row number is what the operator needs
+    // to find the line in their own file.
+    assert_eq!(value, None, "the erased address is never written back");
     // The tombstone's own fields are the one thing an erasure refusal may never leak.
     for secret in ["NOTE-SECRET", "SOURCE-SECRET"] {
         assert!(!reason.contains(secret), "{reason}");
-        assert!(!value.as_deref().unwrap().contains(secret));
     }
 }
 
@@ -1377,6 +1378,15 @@ async fn a_contact_erased_after_it_was_inserted_is_deleted_before_commit(pool: P
     // The counts double-count here — this one call sees both the anti-join and the delete match
     // the same two rows, which a real race never would — so only the floor is asserted.
     assert!(counts.failed >= 2, "{counts:?}");
+    // The sweep reports its deletions the same way the anti-join does, and with the same silence
+    // about the address: the contact was taken back because it was erased, and writing the
+    // address into `import_errors` would put it back where the tombstone took it from.
+    let errors = error_rows(&mut tx, import).await;
+    assert!(!errors.is_empty(), "the sweep files what it took back");
+    for (row, _, reason, value) in &errors {
+        assert!(reason.contains("address-erased"), "row {row}: {reason}");
+        assert_eq!(*value, None, "row {row} echoed an erased address");
+    }
 }
 
 // ---- Task 5: the staging defects this task was handed -----------------------------------------

@@ -313,9 +313,13 @@ pub struct UpsertCounts {
 
 /// What an `import_errors` row says about a row whose address has been erased on request.
 ///
-/// Fixed text, and the only variable the row carries is `value`: the address the operator
-/// themselves put in the file. Nothing of the tombstone — not its note, its source, its date, nor
-/// who asked — may reach a refusal, because the refusal is read by whoever uploaded the file.
+/// Fixed text, and **both writers file it with a null `value`**. Nothing of the tombstone — not
+/// its note, its source, its date, nor who asked — may reach a refusal, because the refusal is
+/// read by whoever uploaded the file. Neither may the address itself: `0014_suppressions.sql`
+/// nulls `suppressions.email` on an erasure so the address is gone, and writing the file's copy
+/// of it into `import_errors.value` would put it back into a table
+/// `GET /imports/{id}/errors` serves for ever. The row number says which line of the operator's
+/// own file to look at, which is what they need and all they need.
 const ERASED_REASON: &str =
     "address-erased: this address was erased at its owner's request and may not be re-created";
 
@@ -430,7 +434,7 @@ pub async fn upsert_from_staging(
              reported as ( \
                  insert into import_errors \
                      (import_id, workspace_id, row_number, column_name, reason, value) \
-                 select $2, $1, e.row_number, 'email', $4, e.email \
+                 select $2, $1, e.row_number, 'email', $4, null::text \
                    from erased e order by e.row_number limit $3 \
                  returning 1 \
              ), \
@@ -480,7 +484,7 @@ pub async fn upsert_from_staging(
          reported as ( \
              insert into import_errors \
                  (import_id, workspace_id, row_number, column_name, reason, value) \
-             select $2, $1, g.row_number, 'email', $4, g.email \
+             select $2, $1, g.row_number, 'email', $4, null::text \
                from gone g order by g.row_number limit $3 \
              returning 1 \
          ) \
