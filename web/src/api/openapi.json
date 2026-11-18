@@ -2816,6 +2816,9 @@
               }
             }
           },
+          "403": {
+            "description": "insufficient-role: reading this workspace's imports takes editor"
+          },
           "404": {
             "description": "not a member, or no such workspace"
           },
@@ -2920,6 +2923,9 @@
               }
             }
           },
+          "403": {
+            "description": "insufficient-role: reading an import's report takes editor"
+          },
           "404": {
             "description": "not a member, or no such import in this workspace"
           }
@@ -2986,6 +2992,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "insufficient-role: reading an import's rejected rows takes editor"
           },
           "404": {
             "description": "not a member, or no such import in this workspace"
@@ -5115,7 +5124,7 @@
               "string",
               "null"
             ],
-            "description": "The offending cell as the file held it, cut short. Nothing else of the file is echoed."
+            "description": "The offending cell as the file held it, cut short. Nothing else of the file is echoed, and\na row refused because its address was **erased on request** carries no value at all: the\nerasure took that address out of the database, and this list is served for as long as the\nimport exists. `row_number` says which line of the file to look at."
           }
         }
       },
@@ -5202,7 +5211,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`pending`, `running`, `complete` or `failed`."
+            "description": "`pending`, `complete` or `failed`.\n\n**`running` is a state the database allows and this server never serves.** The run is one\ntransaction inside `POST /imports/{id}/start`, which writes `running` and commits once at\nthe end, so no reader outside that transaction ever sees it. A row can only be left\n`running` by a process that died mid-run, and the next boot sweeps those to `failed`\nbefore anything is served. Do not write a client that waits for it. When the run moves off\nthe request it will become reachable, and that is the change that should make this a typed\nenum."
           },
           "suppressed": {
             "type": "integer",
@@ -6225,7 +6234,7 @@
                     "string",
                     "null"
                   ],
-                  "description": "The offending cell as the file held it, cut short. Nothing else of the file is echoed."
+                  "description": "The offending cell as the file held it, cut short. Nothing else of the file is echoed, and\na row refused because its address was **erased on request** carries no value at all: the\nerasure took that address out of the database, and this list is served for as long as the\nimport exists. `row_number` says which line of the file to look at."
                 }
               }
             }
@@ -6329,7 +6338,7 @@
                 },
                 "status": {
                   "type": "string",
-                  "description": "`pending`, `running`, `complete` or `failed`."
+                  "description": "`pending`, `complete` or `failed`.\n\n**`running` is a state the database allows and this server never serves.** The run is one\ntransaction inside `POST /imports/{id}/start`, which writes `running` and commits once at\nthe end, so no reader outside that transaction ever sees it. A row can only be left\n`running` by a process that died mid-run, and the next boot sweeps those to `failed`\nbefore anything is served. Do not write a client that waits for it. When the run moves off\nthe request it will become reachable, and that is the change that should make this a typed\nenum."
                 },
                 "suppressed": {
                   "type": "integer",

@@ -2259,7 +2259,7 @@ async fn insert_error_at(pool: &PgPool, ws: Uuid, import: Uuid, row: i64, value:
 #[sqlx::test]
 async fn the_report_names_every_count_separately(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
-    let app = member(&pool, ws, "v@example.com", Role::Viewer).await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
     let import = insert_import(&pool, ws).await;
     // Seven different numbers, none of them a sum or a difference of the others: a handler that
     // reads one column into another field cannot pass this by arithmetic accident.
@@ -2328,7 +2328,7 @@ async fn the_report_names_every_count_separately(pool: PgPool) {
 #[sqlx::test]
 async fn imported_updated_skipped_collapsed_and_failed_add_up_to_total_rows(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
-    let app = member(&pool, ws, "v@example.com", Role::Viewer).await;
+    let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
     let first = insert_import(&pool, ws).await;
     let second = insert_import(&pool, ws).await;
     let mut tx = pool.begin().await.unwrap();
@@ -2448,7 +2448,7 @@ async fn imported_updated_skipped_collapsed_and_failed_add_up_to_total_rows(pool
 #[sqlx::test]
 async fn errors_are_cursor_paginated_and_scoped_to_the_workspace(pool: PgPool) {
     let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
-    let app = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let app = member(&pool, a, "ed@example.com", Role::Editor).await;
     let ours = insert_import(&pool, a).await;
     let theirs = insert_import(&pool, b).await;
     for row in 1..=5 {
@@ -2519,7 +2519,7 @@ async fn errors_are_cursor_paginated_and_scoped_to_the_workspace(pool: PgPool) {
 #[sqlx::test]
 async fn another_workspaces_import_report_is_404_not_403(pool: PgPool) {
     let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
-    let app = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let app = member(&pool, a, "ed@example.com", Role::Editor).await;
     let theirs = insert_import(&pool, b).await;
     sqlx::query("update imports set filename = 'THEIR-BOOK.csv' where id = $1")
         .bind(theirs)
@@ -3231,9 +3231,23 @@ async fn an_editor_may_import_and_a_viewer_may_not(pool: PgPool) {
     assert_eq!(count(&pool, "contacts").await, 0);
     assert_eq!(import_row(&pool, import).await.0, "pending");
 
-    // A viewer may still read: refusing the run is not refusing the report.
-    viewer.get(&report_uri(ws, import)).await.assert_status_ok();
-    viewer.get(&imports_uri(ws)).await.assert_status_ok();
+    // AND THE REPORT TAKES EDITOR TOO. The spec's table reads "Start an import, read its report |
+    // editor" as one line, and the sharp case is the error list: it serves cell values from rows
+    // that were REFUSED — contact data a viewer can reach by no other route in this workspace.
+    // 403 and not 404: the workspace and the import are both theirs, and only their role is not.
+    for uri in [
+        report_uri(ws, import),
+        imports_uri(ws),
+        format!("{}/errors", report_uri(ws, import)),
+    ] {
+        let r = viewer.get(&uri).await;
+        r.assert_status(StatusCode::FORBIDDEN);
+        assert_eq!(
+            r.json::<Value>()["type"],
+            "urn:nm:problem:insufficient-role",
+            "{uri}"
+        );
+    }
 
     let r = editor.post(&start_uri(ws, import)).json(&body).await;
     r.assert_status_ok();
@@ -3244,7 +3258,7 @@ async fn an_editor_may_import_and_a_viewer_may_not(pool: PgPool) {
 #[sqlx::test]
 async fn the_list_is_cursor_paginated_and_ordered_newest_first(pool: PgPool) {
     let (a, b) = (workspace(&pool, "a").await, workspace(&pool, "b").await);
-    let app = member(&pool, a, "v@example.com", Role::Viewer).await;
+    let app = member(&pool, a, "ed@example.com", Role::Editor).await;
     let mut ours = Vec::new();
     for _ in 0..5 {
         ours.push(insert_import(&pool, a).await);
@@ -3770,4 +3784,3 @@ async fn an_upload_past_the_per_minute_limit_is_429(pool: PgPool) {
     uploaded(&app, other, "fine.csv", "email\nada@example.com\n").await;
     assert_eq!(count(&pool, "imports").await, 1);
 }
-

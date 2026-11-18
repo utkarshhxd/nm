@@ -65,6 +65,21 @@ pub const MAX_IMPORT_BYTES: u64 = 512 * 1024 * 1024;
 /// holding a line feed counts twice, and one line is discounted for a header the sniff has not
 /// read yet, so a headed file at the cap is not refused for its header. Counting records exactly
 /// means parsing the file, which is the work this cap exists to refuse to start.
+///
+/// **THIS CAP IS NOT REACHABLE BEHIND A DEFAULT PROXY, AND THAT IS A PROPERTY OF THE DESIGN, NOT
+/// OF ANY MEASUREMENT.** The run is synchronous — one transaction inside `POST
+/// /imports/{id}/start` — so the operator's request is open for the whole of it. `spec.md`
+/// budgets a 1M-row file at **under two minutes**, while nginx's `proxy_read_timeout` and an AWS
+/// ALB's idle timeout both default to **60 seconds**. A file at this cap therefore cannot
+/// complete behind either at the speed the spec itself allows: the proxy cuts the connection, the
+/// operator sees a network error, and the transaction goes on to commit or roll back with nobody
+/// attached — after which Run again answers `409 import-in-progress` naming no import, because
+/// the lock is held by a transaction that has committed nothing.
+///
+/// So an operator importing at this scale needs a raised proxy timeout, or files split well under
+/// it. The number that actually fits a 60-second window is a deployment's to find; what is fixed
+/// here is that 1M is the cap on what the FILE may hold, and never a promise that a 1M-row file
+/// completes over HTTP. Moving the run off the request is what retires this paragraph.
 pub const MAX_IMPORT_ROWS: u64 = 1_000_000;
 
 /// The most columns a file may have. The run copies each file into a staging table with one column
@@ -440,7 +455,15 @@ async fn record_upload(
 #[derive(Serialize, ToSchema)]
 pub struct ImportReport {
     pub id: Uuid,
-    /// `pending`, `running`, `complete` or `failed`.
+    /// `pending`, `complete` or `failed`.
+    ///
+    /// **`running` is a state the database allows and this server never serves.** The run is one
+    /// transaction inside `POST /imports/{id}/start`, which writes `running` and commits once at
+    /// the end, so no reader outside that transaction ever sees it. A row can only be left
+    /// `running` by a process that died mid-run, and the next boot sweeps those to `failed`
+    /// before anything is served. Do not write a client that waits for it. When the run moves off
+    /// the request it will become reachable, and that is the change that should make this a typed
+    /// enum.
     pub status: String,
     /// What the file was called when it was uploaded. A label; nothing opens it.
     pub filename: String,
@@ -514,6 +537,7 @@ pub struct ImportErrorRow {
     ),
     responses(
         (status = 200, body = ImportReport),
+        (status = 403, description = "insufficient-role: reading an import's report takes editor"),
         (status = 404, description = "not a member, or no such import in this workspace"),
     ),
 )]
@@ -523,7 +547,7 @@ pub async fn get_import(
     ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
 ) -> ApiResult<Json<ImportReport>> {
     let mut conn = state.pool.acquire().await?;
-    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Editor).await?;
     report(&mut conn, workspace_id, id).await.map(Json)
 }
 
@@ -559,6 +583,7 @@ async fn report(conn: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiRes
     params(("workspace_id" = Uuid, Path, description = "Workspace id"), PageParams),
     responses(
         (status = 200, description = "Newest first", body = Page<ImportReport>),
+        (status = 403, description = "insufficient-role: reading this workspace's imports takes editor"),
         (status = 404, description = "not a member, or no such workspace"),
         (status = 422, description = "a malformed cursor"),
     ),
@@ -570,7 +595,7 @@ pub async fn list_imports(
     ApiQuery(page): ApiQuery<PageParams>,
 ) -> ApiResult<Json<Page<ImportReport>>> {
     let mut conn = state.pool.acquire().await?;
-    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Editor).await?;
     let limit = page.limit();
     // Keyset on `id`, which is a UUIDv7, so `id desc` is newest first. `unique (workspace_id, id)`
     // is the index that answers it; no second index is needed for this list.
@@ -612,6 +637,7 @@ pub async fn list_imports(
     ),
     responses(
         (status = 200, description = "File order, oldest row first", body = Page<ImportErrorRow>),
+        (status = 403, description = "insufficient-role: reading an import's rejected rows takes editor"),
         (status = 404, description = "not a member, or no such import in this workspace"),
         (status = 422, description = "a malformed cursor"),
     ),
@@ -623,7 +649,7 @@ pub async fn list_import_errors(
     ApiQuery(page): ApiQuery<PageParams>,
 ) -> ApiResult<Json<Page<ImportErrorRow>>> {
     let mut conn = state.pool.acquire().await?;
-    authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
+    authorize(&mut *conn, &principal, workspace_id, Role::Editor).await?;
     // An import that is not this workspace's is a 404 and not an empty page: "no such import" and
     // "this import rejected nothing" are different facts, and only one of them is this client's
     // business. The listing below would answer both with `[]`.
@@ -923,9 +949,19 @@ pub async fn start_import(
                     "import {other} is already running in this workspace; one import runs at a \
                      time, and this one can be started when that one is over"
                 ),
-                // The holder's `running` is inside its own transaction, so there is no id to name.
-                None => "another import is already running in this workspace; one import runs at \
-                         a time, and this one can be started when that one is over"
+                // The holder's `running` is inside its own transaction, so there is no id to name
+                // — and that is also why this arm must not say "another". The run holds the
+                // advisory lock for its whole length and commits nothing until it ends, so the
+                // commonest way to reach this arm is the operator's OWN import: their connection
+                // was cut, or they gave up on the tab and pressed Run again, while the server is
+                // still working. Telling them to wait for somebody else's import sends them
+                // looking for a run they will not find in any list, because an uncommitted one is
+                // in none.
+                None => "an import is already running in this workspace — possibly this same \
+                         one, if the request that started it lost its connection and the server \
+                         is still working on it. One import runs at a time, and a run in \
+                         progress appears in no list until it finishes. Wait for it to end, then \
+                         read this import's report before starting anything again"
                     .to_owned(),
             },
         });

@@ -222,9 +222,7 @@ pub async fn copy_into_staging(
                 // error row's `column_name` is, and that is a `text` column too.
                 headers = cells
                     .iter()
-                    .map(|f| {
-                        unescape_cell(&String::from_utf8_lossy(f).replace('\0', ""))
-                    })
+                    .map(|f| unescape_cell(&String::from_utf8_lossy(f).replace('\0', "")))
                     .collect();
                 continue;
             }

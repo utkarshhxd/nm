@@ -1483,7 +1483,12 @@ export interface components {
              *     `total_rows = 10` and may hold an error on line 11.
              */
             row_number: number;
-            /** @description The offending cell as the file held it, cut short. Nothing else of the file is echoed. */
+            /**
+             * @description The offending cell as the file held it, cut short. Nothing else of the file is echoed, and
+             *     a row refused because its address was **erased on request** carries no value at all: the
+             *     erasure took that address out of the database, and this list is served for as long as the
+             *     import exists. `row_number` says which line of the file to look at.
+             */
             value?: string | null;
         };
         /**
@@ -1551,7 +1556,17 @@ export interface components {
             skipped: number;
             /** Format: date-time */
             started_at?: string | null;
-            /** @description `pending`, `running`, `complete` or `failed`. */
+            /**
+             * @description `pending`, `complete` or `failed`.
+             *
+             *     **`running` is a state the database allows and this server never serves.** The run is one
+             *     transaction inside `POST /imports/{id}/start`, which writes `running` and commits once at
+             *     the end, so no reader outside that transaction ever sees it. A row can only be left
+             *     `running` by a process that died mid-run, and the next boot sweeps those to `failed`
+             *     before anything is served. Do not write a client that waits for it. When the run moves off
+             *     the request it will become reachable, and that is the change that should make this a typed
+             *     enum.
+             */
             status: string;
             /**
              * Format: int64
@@ -1905,7 +1920,12 @@ export interface components {
                  *     `total_rows = 10` and may hold an error on line 11.
                  */
                 row_number: number;
-                /** @description The offending cell as the file held it, cut short. Nothing else of the file is echoed. */
+                /**
+                 * @description The offending cell as the file held it, cut short. Nothing else of the file is echoed, and
+                 *     a row refused because its address was **erased on request** carries no value at all: the
+                 *     erasure took that address out of the database, and this list is served for as long as the
+                 *     import exists. `row_number` says which line of the file to look at.
+                 */
                 value?: string | null;
             }[];
             next_cursor?: string | null;
@@ -1963,7 +1983,17 @@ export interface components {
                 skipped: number;
                 /** Format: date-time */
                 started_at?: string | null;
-                /** @description `pending`, `running`, `complete` or `failed`. */
+                /**
+                 * @description `pending`, `complete` or `failed`.
+                 *
+                 *     **`running` is a state the database allows and this server never serves.** The run is one
+                 *     transaction inside `POST /imports/{id}/start`, which writes `running` and commits once at
+                 *     the end, so no reader outside that transaction ever sees it. A row can only be left
+                 *     `running` by a process that died mid-run, and the next boot sweeps those to `failed`
+                 *     before anything is served. Do not write a client that waits for it. When the run moves off
+                 *     the request it will become reachable, and that is the change that should make this a typed
+                 *     enum.
+                 */
                 status: string;
                 /**
                  * Format: int64
@@ -4936,6 +4966,13 @@ export interface operations {
                     "application/json": components["schemas"]["Page_ImportReport"];
                 };
             };
+            /** @description insufficient-role: reading this workspace's imports takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description not a member, or no such workspace */
             404: {
                 headers: {
@@ -5035,6 +5072,13 @@ export interface operations {
                     "application/json": components["schemas"]["ImportReport"];
                 };
             };
+            /** @description insufficient-role: reading an import's report takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description not a member, or no such import in this workspace */
             404: {
                 headers: {
@@ -5071,6 +5115,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Page_ImportErrorRow"];
                 };
+            };
+            /** @description insufficient-role: reading an import's rejected rows takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description not a member, or no such import in this workspace */
             404: {
