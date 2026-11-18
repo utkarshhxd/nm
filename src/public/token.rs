@@ -75,7 +75,10 @@ pub fn issue(secrets: &Secrets, token: &Token) -> String {
 /// `422 link-invalid` for anything this instance did not issue, `422 link-expired` for a genuine
 /// link past its purpose's TTL. Two codes because the pages say different things. Neither carries
 /// the token.
-pub fn parse(secrets: &Secrets, raw: &str) -> ApiResult<Token> {
+///
+/// `expected` is the purpose of the endpoint calling: `Unsubscribe` links never expire, so one
+/// accepted at the confirm endpoint would confirm a membership for ever.
+pub fn parse(secrets: &Secrets, raw: &str, expected: Purpose) -> ApiResult<Token> {
     let invalid = || ApiError::Unprocessable("link-invalid");
     let (payload, sig) = raw.split_once('.').ok_or_else(invalid)?;
     let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| invalid())?;
@@ -84,7 +87,12 @@ pub fn parse(secrets: &Secrets, raw: &str) -> ApiResult<Token> {
         return Err(invalid());
     }
     let token: Token = serde_json::from_slice(&payload).map_err(|_| invalid())?;
-    if token.list_id.is_some() && token.purpose != Purpose::Confirm {
+    // The caller says which door it is; a genuine token for another purpose is not a key to this one.
+    if token.purpose != expected {
+        return Err(invalid());
+    }
+    // A list belongs to a confirmation and to nothing else.
+    if token.list_id.is_some() != (token.purpose == Purpose::Confirm) {
         return Err(invalid());
     }
     // A clock that went backwards makes the age negative: not expired.

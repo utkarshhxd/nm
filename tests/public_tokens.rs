@@ -43,7 +43,7 @@ fn flip(part: &str) -> String {
 fn a_token_round_trips_through_issue_and_parse() {
     let s = secrets(7);
     let t = token(Purpose::Confirm, 0);
-    assert_eq!(parse(&s, &issue(&s, &t)).unwrap(), t);
+    assert_eq!(parse(&s, &issue(&s, &t), Purpose::Confirm).unwrap(), t);
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn a_token_with_one_byte_altered_is_refused() {
         format!("{payload}.{}", flip(mac)),
     ] {
         assert!(matches!(
-            parse(&s, &altered),
+            parse(&s, &altered, Purpose::Preference),
             Err(ApiError::Unprocessable("link-invalid"))
         ));
     }
@@ -66,7 +66,7 @@ fn a_token_with_one_byte_altered_is_refused() {
 fn a_token_signed_with_another_secret_is_refused() {
     let raw = issue(&secrets(7), &token(Purpose::Preference, 0));
     assert!(matches!(
-        parse(&secrets(8), &raw),
+        parse(&secrets(8), &raw, Purpose::Preference),
         Err(ApiError::Unprocessable("link-invalid"))
     ));
 }
@@ -74,9 +74,20 @@ fn a_token_signed_with_another_secret_is_refused() {
 #[test]
 fn a_confirm_token_older_than_14_days_is_refused() {
     let s = secrets(7);
-    assert!(parse(&s, &issue(&s, &token(Purpose::Confirm, 13))).is_ok());
+    assert!(
+        parse(
+            &s,
+            &issue(&s, &token(Purpose::Confirm, 13)),
+            Purpose::Confirm
+        )
+        .is_ok()
+    );
     assert!(matches!(
-        parse(&s, &issue(&s, &token(Purpose::Confirm, 15))),
+        parse(
+            &s,
+            &issue(&s, &token(Purpose::Confirm, 15)),
+            Purpose::Confirm
+        ),
         Err(ApiError::Unprocessable("link-expired"))
     ));
 }
@@ -84,9 +95,20 @@ fn a_confirm_token_older_than_14_days_is_refused() {
 #[test]
 fn a_preference_token_older_than_90_days_is_refused() {
     let s = secrets(7);
-    assert!(parse(&s, &issue(&s, &token(Purpose::Preference, 89))).is_ok());
+    assert!(
+        parse(
+            &s,
+            &issue(&s, &token(Purpose::Preference, 89)),
+            Purpose::Preference
+        )
+        .is_ok()
+    );
     assert!(matches!(
-        parse(&s, &issue(&s, &token(Purpose::Preference, 91))),
+        parse(
+            &s,
+            &issue(&s, &token(Purpose::Preference, 91)),
+            Purpose::Preference
+        ),
         Err(ApiError::Unprocessable("link-expired"))
     ));
 }
@@ -95,7 +117,7 @@ fn a_preference_token_older_than_90_days_is_refused() {
 fn an_unsubscribe_token_two_years_old_is_accepted() {
     let s = secrets(7);
     let t = token(Purpose::Unsubscribe, 2 * 365);
-    assert_eq!(parse(&s, &issue(&s, &t)).unwrap(), t);
+    assert_eq!(parse(&s, &issue(&s, &t), Purpose::Unsubscribe).unwrap(), t);
 }
 
 #[test]
@@ -108,7 +130,7 @@ fn the_purpose_is_part_of_what_is_signed() {
     assert_ne!(swapped, json, "the purpose must appear in the payload");
     let forged = format!("{}.{mac}", URL_SAFE_NO_PAD.encode(swapped));
     assert!(matches!(
-        parse(&s, &forged),
+        parse(&s, &forged, Purpose::Unsubscribe),
         Err(ApiError::Unprocessable("link-invalid"))
     ));
 }
@@ -126,7 +148,44 @@ fn a_token_signed_under_another_domain_is_refused() {
         URL_SAFE_NO_PAD.encode(mac)
     );
     assert!(matches!(
-        parse(&secrets(7), &forged),
+        parse(&secrets(7), &forged, Purpose::Unsubscribe),
         Err(ApiError::Unprocessable("link-invalid"))
     ));
+}
+
+/// Unsubscribe links never expire, so one presented at the confirm endpoint would confirm a
+/// membership for ever. The caller names the purpose it serves; a genuine token for another is
+/// refused.
+#[test]
+fn a_token_issued_for_another_purpose_is_refused() {
+    let s = secrets(7);
+    let raw = issue(&s, &token(Purpose::Unsubscribe, 0));
+    assert!(matches!(
+        parse(&s, &raw, Purpose::Confirm),
+        Err(ApiError::Unprocessable("link-invalid"))
+    ));
+}
+
+#[test]
+fn a_token_issued_for_the_expected_purpose_is_accepted() {
+    let s = secrets(7);
+    let t = token(Purpose::Confirm, 0);
+    assert_eq!(parse(&s, &issue(&s, &t), Purpose::Confirm).unwrap(), t);
+}
+
+/// A list belongs to a confirmation and to nothing else; a confirmation with no list has nothing
+/// to confirm. Both halves are signed, so only `parse` can refuse them.
+#[test]
+fn list_id_is_present_exactly_when_the_purpose_is_confirm() {
+    let s = secrets(7);
+    let mut stray = token(Purpose::Preference, 0);
+    stray.list_id = Some(Uuid::now_v7());
+    let mut missing = token(Purpose::Confirm, 0);
+    missing.list_id = None;
+    for t in [stray, missing] {
+        assert!(matches!(
+            parse(&s, &issue(&s, &t), t.purpose),
+            Err(ApiError::Unprocessable("link-invalid"))
+        ));
+    }
 }
