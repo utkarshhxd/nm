@@ -35,14 +35,26 @@ created list has no refusals yet.
 
 **The clause maintains the invariant; it does not make violating it impossible.** The obvious
 enforcement is a partial unique index on `(workspace_id, email_hmac, list_id)` for live non-orphan
-rows. That was considered and deliberately not taken in a fix round, for a reason worth keeping:
+rows.
 
-> it moves the failure onto `on delete set null`. A list deletion would then have to null out
-> `list_id` on rows that would collide once nulled, and **deleting a list would start failing**.
+**Correction, 2026-11-21.** This issue first recorded the reason for deferring that index as "it
+moves the failure onto `on delete set null`, so deleting a list would start failing." **That is
+wrong**, and a re-review found it wrong by building the index and running the sequences: a list
+deletion does *not* fail, because `on delete set null` nulls `list_id` and the row drops out of the
+partial index. Delete-and-recreate adoption still works too.
 
-Trading "a rename can 500" for "a delete can 500" is not progress. Closing this properly means
-deciding what the key for a list refusal actually is — the name, the id, or a pair with an explicit
-rule for orphans — and that is a design pass, not a clause.
+What the index actually does is **catch the violation instead of preventing it** — it turns a
+silent duplicate into a `23505` on the subscriber's untick, which is a 500 on a public,
+unauthenticated page. That is the real cost and the real reason it needs a design pass rather than
+a clause in a fix round.
+
+One practical consequence for whoever takes it: **once a workspace already holds the duplicate,
+`create unique index` fails outright** (`Key (…) is duplicated`). Adding this index later needs a
+data repair first, and the repair has to decide which of two live refusals for one list is the one
+to keep.
+
+Closing this properly means deciding what the key for a list refusal actually is — the name, the
+id, or a pair with an explicit rule for orphans.
 
 ## What the next person needs to know
 
