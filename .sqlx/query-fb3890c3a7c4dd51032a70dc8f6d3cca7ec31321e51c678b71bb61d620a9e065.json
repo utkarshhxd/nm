@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into consent_log (id, workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+  "query": "insert into consent_log (id, workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent, token_jti) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
   "describe": {
     "columns": [],
     "parameters": {
@@ -13,10 +13,11 @@
         "Text",
         "Text",
         "Inet",
+        "Text",
         "Text"
       ]
     },
     "nullable": []
   },
-  "hash": "de73db538e36cf5d46068883a104ec223af574c8a39ca9790c5012b5c8af7919"
+  "hash": "fb3890c3a7c4dd51032a70dc8f6d3cca7ec31321e51c678b71bb61d620a9e065"
 }

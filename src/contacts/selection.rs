@@ -678,12 +678,16 @@ pub async fn untag(
 /// the same choice for the single-row writers), so both columns are left null. That is also why
 /// [`consent::scrub`] has no work here: with no evidence bound, a failing row's DETAIL echoes no
 /// personal data. Do not "fix" either half.
+///
+/// Which is why this takes a `source_ref` and not a whole [`consent::Context`]: a parameter that
+/// accepts evidence it will silently drop is a rule held by this comment alone, and a comment is
+/// not an enforcement. The type now says exactly what reaches the row.
 async fn run_recorded(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
-    (action, cx): (consent::Action, &consent::Context),
+    (action, source_ref): (consent::Action, Option<&str>),
     change: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> ApiResult<Counts> {
     let mut q = statement_logging(sel, excluded, change, "contact_id", |q| {
@@ -704,7 +708,7 @@ async fn run_recorded(
         .push(", ")
         .push_bind(consent::Source::Api)
         .push(", ")
-        .push_bind(cx.source_ref.clone())
+        .push_bind(source_ref.map(str::to_owned))
         .push(" from done)");
     });
     let (selected, affected): (i64, i64) = q.build_query_as().fetch_one(&mut *db).await?;
@@ -729,8 +733,8 @@ async fn run_recorded(
 /// re-subscription of people who opted out, with nothing in the tests or the types to object.
 /// Section 15.3 carries the same question to the importer.
 ///
-/// Each contact it adds gets a `subscribed` consent row, `Source::Api`, in the same transaction;
-/// a contact it skips gets none.
+/// Each contact it adds gets a consent row, `Source::Api`, in the same transaction — `requested`
+/// when `status` is `pending`, `subscribed` otherwise; a contact it skips gets none.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
@@ -739,7 +743,16 @@ pub async fn subscribe(
     status: MembershipStatus,
     cx: &consent::Context,
 ) -> ApiResult<Counts> {
-    let recorded = (consent::Action::Subscribed, cx);
+    // One `status` for the whole statement, so one action for the whole statement — read off what
+    // is about to be written, never off the list's `double_optin` flag, which is mutable.
+    // Exhaustive on purpose: a status added later must be given an action here before this
+    // compiles, rather than falling into a wildcard and being logged as something it is not.
+    let action = match status {
+        MembershipStatus::Pending => consent::Action::Requested,
+        MembershipStatus::Subscribed => consent::Action::Subscribed,
+        MembershipStatus::Unsubscribed => consent::Action::Unsubscribed,
+    };
+    let recorded = (action, cx.source_ref.as_deref());
     run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) \
                 select ")
@@ -767,7 +780,7 @@ pub async fn unsubscribe(
     list_id: Uuid,
     cx: &consent::Context,
 ) -> ApiResult<Counts> {
-    let recorded = (consent::Action::Unsubscribed, cx);
+    let recorded = (consent::Action::Unsubscribed, cx.source_ref.as_deref());
     run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push(
             "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \

@@ -15,6 +15,11 @@ use crate::error::{ApiError, ApiResult};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum Action {
+    /// A membership written `pending`: the person was asked, and has not agreed. It is its own
+    /// action rather than a `subscribed` row read back through `lists.double_optin`, because that
+    /// flag is mutable and unversioned — flipping it would otherwise re-decide, years later, what
+    /// an old row meant.
+    Requested,
     Subscribed,
     Confirmed,
     Unsubscribed,
@@ -37,13 +42,18 @@ pub enum Source {
 }
 
 /// The evidence kept with a row. `ip` and `user_agent` are personal data: never log a `Context`.
-/// It has no `Debug` for that reason.
+/// It has no `Debug` for that reason, and keeps none: a token nonce is not personal data, but the
+/// struct it joins is.
 #[derive(Clone, Default)]
 pub struct Context {
     pub ip: Option<IpAddr>,
     pub user_agent: Option<String>,
     /// The form id, the import id, the user id: whatever caused the change.
     pub source_ref: Option<String>,
+    /// The nonce of the public token that authorised the change: *which* link was clicked, not
+    /// merely that one was. Operator and API paths pass `None` and must keep doing so — a row
+    /// naming a link the subscriber never followed reads as if they had.
+    pub token_jti: Option<String>,
 }
 
 /// Appends one row. Takes the caller's connection so that it runs in the same transaction as the
@@ -64,7 +74,8 @@ pub async fn record(
 ) -> ApiResult<()> {
     sqlx::query!(
         "insert into consent_log (id, workspace_id, contact_id, list_id, action, source, \
-         source_ref, ip, user_agent) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         source_ref, ip, user_agent, token_jti) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         Uuid::now_v7(),
         workspace_id,
         contact_id,
@@ -74,6 +85,7 @@ pub async fn record(
         cx.source_ref,
         cx.ip as Option<IpAddr>,
         cx.user_agent,
+        cx.token_jti,
     )
     .execute(tx)
     .await
@@ -81,41 +93,13 @@ pub async fn record(
     Ok(())
 }
 
-/// Appends one row per `(contact_id, list_id)` pair, all with the same action, source and
-/// evidence. For a set-based writer whose rows do have to come back to Rust first — the importer
-/// reads them out of its own statement. A writer that can keep them in Postgres should: see the
-/// `logged` CTE in `contacts::selection`. The same transaction and scrubbing rules as [`record`]
-/// apply.
-pub async fn record_many(
-    tx: &mut PgConnection,
-    workspace_id: Uuid,
-    rows: &[(Uuid, Uuid)],
-    action: Action,
-    source: Source,
-    cx: &Context,
-) -> ApiResult<()> {
-    let ids: Vec<Uuid> = rows.iter().map(|_| Uuid::now_v7()).collect();
-    let (contacts, lists): (Vec<Uuid>, Vec<Uuid>) = rows.iter().copied().unzip();
-    sqlx::query!(
-        "insert into consent_log (id, workspace_id, contact_id, list_id, action, source, \
-         source_ref, ip, user_agent) \
-         select t.id, $1, t.contact_id, t.list_id, $5, $6, $7, $8::inet, $9 \
-           from unnest($2::uuid[], $3::uuid[], $4::uuid[]) as t(id, contact_id, list_id)",
-        workspace_id,
-        &ids,
-        &contacts,
-        &lists,
-        action as Action,
-        source as Source,
-        cx.source_ref,
-        cx.ip as Option<IpAddr>,
-        cx.user_agent,
-    )
-    .execute(tx)
-    .await
-    .map_err(scrub)?;
-    Ok(())
-}
+// There is deliberately no `record_many`. A set-based writer records its rows in the same
+// statement that wrote them, as a `logged` CTE over that statement's `returning` — see
+// `contacts::selection::run_recorded` and the importer's `write_memberships_and_tags`. A batch
+// helper taking one `Action` for every row could not express the importer's per-row status
+// (`pending` on a double-opt-in list, `subscribed` on a single-opt-in one, in one import), and it
+// had to send every id back to Rust and out again, which is a per-row cost on a million-row
+// import. `record` stays for the single-row writers and for the public routes.
 
 /// What a failed consent write becomes on its way to the log: a message, the SQLSTATE and the
 /// constraint, never the error. Postgres copies the failing row into a check violation's DETAIL,
@@ -123,8 +107,8 @@ pub async fn record_many(
 /// A constraint name comes from a migration, so it names no person and is kept — without it an
 /// opaque SQLSTATE is undiagnosable.
 ///
-/// `pub` for the test that proves the leak is closed; [`record`] and [`record_many`] apply it
-/// themselves, so no caller has to remember to.
+/// `pub` for the test that proves the leak is closed; [`record`] applies it itself, so no caller
+/// has to remember to.
 pub fn scrub(e: sqlx::Error) -> ApiError {
     let db = e.as_database_error();
     let state = db.and_then(|d| d.code());

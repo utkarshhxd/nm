@@ -151,8 +151,9 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 /// fresh member (so `unsubscribed_at` is cleared and `source` is the new add's; the audit log keeps
 /// the history).
 ///
-/// A write is a consent row (`subscribed`, or `resubscribed` for the revival), `Source::Operator`,
-/// in the same transaction. Leaving a membership as it is records nothing.
+/// A write is a consent row, `Source::Operator`, in the same transaction: `requested` whenever the
+/// status written is `pending`, otherwise `subscribed`, or `resubscribed` for the revival. Leaving
+/// a membership as it is records nothing.
 pub async fn add_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
@@ -196,10 +197,13 @@ pub async fn add_member(
     })?;
     match written {
         Some(w) => {
-            let action = if w.inserted {
-                consent::Action::Subscribed
-            } else {
-                consent::Action::Resubscribed
+            // The action follows the status that was WRITTEN, not the `double_optin` flag it came
+            // from: on a double-opt-in list the person has only been asked, whether this is a
+            // first add or the revival of an unsubscribed membership.
+            let action = match (w.status, w.inserted) {
+                (MembershipStatus::Pending, _) => consent::Action::Requested,
+                (_, true) => consent::Action::Subscribed,
+                (_, false) => consent::Action::Resubscribed,
             };
             let source = consent::Source::Operator;
             consent::record(

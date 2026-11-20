@@ -39,6 +39,20 @@ async fn list(pool: &PgPool, ws: Uuid, name: &str) -> Uuid {
     id
 }
 
+/// A list with `double_optin` said out loud. `list` above takes `0012`'s default, which is `true`.
+async fn list_optin(pool: &PgPool, ws: Uuid, name: &str, double_optin: bool) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query("insert into lists (id, workspace_id, name, double_optin) values ($1, $2, $3, $4)")
+        .bind(id)
+        .bind(ws)
+        .bind(name)
+        .bind(double_optin)
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
 type Row = (
     Uuid,
     Uuid,
@@ -59,6 +73,8 @@ async fn a_recorded_consent_row_carries_every_column_it_was_given(pool: PgPool) 
         ip: Some("203.0.113.9".parse().unwrap()),
         user_agent: Some("Mozilla/5.0 (test)".into()),
         source_ref: Some("form-42".into()),
+        // Not an operator path's business: `record_writes_the_token_jti_it_was_given` has it.
+        token_jti: None,
     };
     let mut conn = pool.acquire().await.unwrap();
     record(
@@ -205,6 +221,8 @@ async fn one_row(pool: &PgPool, ws: Uuid, c: Uuid, l: Uuid) {
         ip: Some("203.0.113.9".parse().unwrap()),
         user_agent: Some("Mozilla/5.0 (test)".into()),
         source_ref: Some("form-42".into()),
+        // Not an operator path's business: `record_writes_the_token_jti_it_was_given` has it.
+        token_jti: None,
     };
     let mut conn = pool.acquire().await.unwrap();
     record(
@@ -433,6 +451,7 @@ async fn a_workspace_wide_row_for_another_workspaces_contact_cannot_be_written(p
 async fn every_action_and_source_round_trips_through_the_database(pool: PgPool) {
     fn action_text(a: Action) -> &'static str {
         match a {
+            Action::Requested => "requested",
             Action::Subscribed => "subscribed",
             Action::Confirmed => "confirmed",
             Action::Unsubscribed => "unsubscribed",
@@ -453,6 +472,7 @@ async fn every_action_and_source_round_trips_through_the_database(pool: PgPool) 
         }
     }
     let actions = [
+        Action::Requested,
         Action::Subscribed,
         Action::Confirmed,
         Action::Unsubscribed,
@@ -689,6 +709,29 @@ async fn subscribing_through_the_contacts_api_writes_a_consent_row(pool: PgPool)
 
 /// The whole importer pipeline over an in-memory file, in one transaction as the real one runs it.
 async fn import_into(pool: &PgPool, ws: Uuid, list: Uuid, csv: &str) -> Uuid {
+    import_mapped(pool, ws, list, vec![ContactField::Email], csv).await
+}
+
+/// `import_into` over a file with more than an address column, so that one import can reach a
+/// second list by name and exercise the importer's per-row status.
+async fn import_with_lists(pool: &PgPool, ws: Uuid, list: Uuid, csv: &str) -> Uuid {
+    import_mapped(
+        pool,
+        ws,
+        list,
+        vec![ContactField::Email, ContactField::Lists],
+        csv,
+    )
+    .await
+}
+
+async fn import_mapped(
+    pool: &PgPool,
+    ws: Uuid,
+    list: Uuid,
+    fields: Vec<ContactField>,
+    csv: &str,
+) -> Uuid {
     let id = Uuid::now_v7();
     let job = ImportJob {
         id,
@@ -696,7 +739,7 @@ async fn import_into(pool: &PgPool, ws: Uuid, list: Uuid, csv: &str) -> Uuid {
         path: upload_path(id),
         delimiter: b',',
         has_header: true,
-        mapping: vec![ColumnTarget::Field(ContactField::Email)],
+        mapping: fields.into_iter().map(ColumnTarget::Field).collect(),
         dedup: Dedup::default(),
         list_id: Some(list),
         defs: vec![],
@@ -720,8 +763,10 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
     let id = import_into(&pool, ws, list, "email\na@ex.test\nb@ex.test\nc@ex.test\n").await;
 
     let rows = consent_rows(&pool).await;
+    // `list` above takes `0012`'s `double_optin` default, which is `true`, so these memberships
+    // land `pending`: the log says the three were asked, not that they agreed.
     let want = (
-        "subscribed".to_owned(),
+        "requested".to_owned(),
         "import".to_owned(),
         Some(id.to_string()),
     );
@@ -734,7 +779,15 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
     assert_eq!(count(&pool, "consent_log").await, 3);
 }
 
-/// The gate. One fixture drives all five writers; memberships and consent rows must match.
+/// The gate. One fixture drives the three writers that ADD a membership — `lists::add_member`,
+/// `selection::subscribe` and the importer — over both a single-opt-in and a double-opt-in list;
+/// memberships and consent rows must match one for one.
+///
+/// It does **not** reach `lists::unsubscribe_member` or `selection::unsubscribe`. Those two are
+/// covered by `subscribing_through_the_lists_api_writes_a_consent_row` and
+/// `subscribing_through_the_contacts_api_writes_a_consent_row` above, which also prove that a
+/// repeat unsubscribe changes nothing and so records nothing. Said plainly because the next
+/// person to add a writer will read this comment to decide where it belongs.
 ///
 /// The source scan below is a **tripwire, not a proof**: it fails when a file that never touched
 /// `list_memberships` starts to, which is where the next writer is most likely to appear. It
@@ -761,7 +814,10 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
     import_into(&pool, ws, double, "email\nd@ex.test\ne@ex.test\n").await;
 
     let memberships = count(&pool, "list_memberships").await;
-    assert_eq!(memberships, 8, "the fixture must reach every writer");
+    assert_eq!(
+        memberships, 8,
+        "the fixture must reach all three writers that add a membership"
+    );
     assert_eq!(count(&pool, "consent_log").await, memberships);
     let unlogged: i64 = sqlx::query_scalar(
         "select count(*) from list_memberships m where not exists (select 1 from consent_log c \
@@ -842,4 +898,196 @@ async fn a_consent_write_failure_carries_the_sqlstate_and_not_the_row(pool: PgPo
         !shown.contains("SECRET-AGENT") && !shown.contains("203.0.113.77"),
         "{shown}"
     );
+}
+
+// ---- Task 4a: the log tells "asked" from "agreed" ----------------------------------------------
+
+/// The actions recorded against one list, sorted. **Per list, never aggregated across lists:** a
+/// mixed import's two halves have to be asserted apart, or a mutation that moves both of them
+/// leaves the total unchanged and the assertion proves nothing.
+async fn actions_for(pool: &PgPool, list: Uuid) -> Vec<String> {
+    let mut rows: Vec<String> =
+        sqlx::query_scalar("select action from consent_log where list_id = $1")
+            .bind(list)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    rows.sort();
+    rows
+}
+
+/// The statuses of one list's memberships, sorted. The premise of every test below: the action
+/// must follow the status that was actually written, not the `double_optin` flag it came from,
+/// because that flag is mutable and a log read years later must not change when it is flipped.
+async fn statuses_for(pool: &PgPool, list: Uuid) -> Vec<String> {
+    let mut rows: Vec<String> =
+        sqlx::query_scalar("select status from list_memberships where list_id = $1")
+            .bind(list)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    rows.sort();
+    rows
+}
+
+#[sqlx::test]
+async fn adding_to_a_double_optin_list_through_the_lists_api_records_requested(pool: PgPool) {
+    let (ws, _, app) = editor(&pool, "acme").await;
+    let digest = api_list(&app, ws, "digest", true).await;
+    let c = api_contact(&app, ws, "a@ex.test").await;
+
+    app.post(&format!("/api/v1/workspaces/{ws}/lists/{digest}/members"))
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(statuses_for(&pool, digest).await, ["pending"]);
+    assert_eq!(actions_for(&pool, digest).await, ["requested"]);
+
+    // The revival of an unsubscribed membership is `requested` too, not `resubscribed`: on a
+    // double-opt-in list it puts the row back in `pending`, so the person has been asked again
+    // and has not agreed again. The action follows the status written, in both branches.
+    let members = format!("/api/v1/workspaces/{ws}/lists/{digest}/members");
+    app.post(&format!("{members}/{c}/unsubscribe"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    app.post(&members)
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    assert_eq!(statuses_for(&pool, digest).await, ["pending"]);
+    assert_eq!(
+        actions_for(&pool, digest).await,
+        ["requested", "requested", "unsubscribed"]
+    );
+}
+
+#[sqlx::test]
+async fn adding_to_a_single_optin_list_still_records_subscribed(pool: PgPool) {
+    let (ws, _, app) = editor(&pool, "acme").await;
+    let news = api_list(&app, ws, "news", false).await;
+    let c = api_contact(&app, ws, "a@ex.test").await;
+
+    app.post(&format!("/api/v1/workspaces/{ws}/lists/{news}/members"))
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(statuses_for(&pool, news).await, ["subscribed"]);
+    assert_eq!(actions_for(&pool, news).await, ["subscribed"]);
+}
+
+#[sqlx::test]
+async fn subscribing_a_selection_to_a_double_optin_list_records_requested(pool: PgPool) {
+    let (ws, _, app) = editor(&pool, "acme").await;
+    let digest = api_list(&app, ws, "digest", true).await;
+    let a = api_contact(&app, ws, "a@ex.test").await;
+    let b = api_contact(&app, ws, "b@ex.test").await;
+
+    app.post(&format!("/api/v1/workspaces/{ws}/contacts/bulk/subscribe"))
+        .json(&json!({"ids": [a, b], "list_id": digest}))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(statuses_for(&pool, digest).await, ["pending", "pending"]);
+    assert_eq!(actions_for(&pool, digest).await, ["requested", "requested"]);
+}
+
+/// One import touching both kinds of list in the same statement — the per-row case `record_many`
+/// could not express. The job's list is double opt-in; the file's `lists` column names the single
+/// opt-in one, so both halves are written by one `insert … select` and logged by one CTE.
+///
+/// The two halves are asserted **separately, by list**. A single count over `consent_log` would
+/// stay at four however the `case` is mis-written.
+#[sqlx::test]
+async fn an_import_records_requested_for_a_double_optin_list_and_subscribed_for_a_single_optin_one(
+    pool: PgPool,
+) {
+    let ws = workspace(&pool, "acme").await;
+    let digest = list_optin(&pool, ws, "digest", true).await;
+    let news = list_optin(&pool, ws, "news", false).await;
+
+    let id = import_with_lists(
+        &pool,
+        ws,
+        digest,
+        "email,lists\na@ex.test,news\nb@ex.test,news\n",
+    )
+    .await;
+
+    assert_eq!(statuses_for(&pool, digest).await, ["pending", "pending"]);
+    assert_eq!(
+        statuses_for(&pool, news).await,
+        ["subscribed", "subscribed"]
+    );
+    assert_eq!(actions_for(&pool, digest).await, ["requested", "requested"]);
+    assert_eq!(actions_for(&pool, news).await, ["subscribed", "subscribed"]);
+    // Still one import's provenance on every row, and still no invented evidence.
+    let rows = consent_rows(&pool).await;
+    assert_eq!(rows.len(), 4);
+    assert!(
+        rows.iter()
+            .all(|r| r.1 == "import" && r.2 == Some(id.to_string())),
+        "{rows:?}"
+    );
+    assert_eq!(with_evidence(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn record_writes_the_token_jti_it_was_given(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    let cx = Context {
+        token_jti: Some("01HQ0000000000000000000000".into()),
+        ..Context::default()
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    record(
+        &mut conn,
+        ws,
+        c,
+        Some(l),
+        Action::Confirmed,
+        Source::PreferenceCenter,
+        &cx,
+    )
+    .await
+    .unwrap();
+
+    let jti: Option<String> = sqlx::query_scalar("select token_jti from consent_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jti.as_deref(), Some("01HQ0000000000000000000000"));
+}
+
+/// No operator or API path may invent a token nonce, for the same reason none may invent an IP:
+/// a row that names a link the subscriber never clicked reads in court as if they had.
+#[sqlx::test]
+async fn an_operator_or_api_write_leaves_token_jti_null(pool: PgPool) {
+    let (ws, _, app) = editor(&pool, "acme").await;
+    let news = api_list(&app, ws, "news", false).await;
+    let digest = api_list(&app, ws, "digest", true).await;
+    let a = api_contact(&app, ws, "a@ex.test").await;
+    let b = api_contact(&app, ws, "b@ex.test").await;
+
+    app.post(&format!("/api/v1/workspaces/{ws}/lists/{news}/members"))
+        .json(&json!({"contact_id": a}))
+        .await
+        .assert_status_ok();
+    app.post(&format!("/api/v1/workspaces/{ws}/contacts/bulk/subscribe"))
+        .json(&json!({"ids": [a, b], "list_id": digest}))
+        .await
+        .assert_status_ok();
+    import_into(&pool, ws, news, "email\nc@ex.test\n").await;
+
+    // Without this the count below is true of an empty table.
+    assert_eq!(count(&pool, "consent_log").await, 4);
+    let named: i64 =
+        sqlx::query_scalar("select count(*) from consent_log where token_jti is not null")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(named, 0);
 }
