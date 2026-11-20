@@ -346,9 +346,10 @@ Of the five membership writers exactly one breaks this: `lists::add_member` revi
 #[test] fn the_contacts_api_cannot_resubscribe_an_unsubscribed_contact()
 #[test] fn the_lists_api_cannot_resubscribe_an_unsubscribed_contact()
 #[test] fn the_preference_center_can_resubscribe_because_the_person_asked()
+#[test] fn a_confirmation_link_that_predates_an_unsubscribe_does_not_revive_the_membership()  // /c/ is a writer too
 ```
 
-- [ ] **Step 2: Run and watch them.** Exactly one fails: `the_lists_api_cannot_resubscribe_an_unsubscribed_contact`. The other three already pass — the import and contacts API because their writers end in `do nothing`, the preference center because Task 6 shipped it. Say so in the report; that is expected, not a guard that proves nothing.
+- [ ] **Step 2: Run and watch them.** Exactly one fails: `the_lists_api_cannot_resubscribe_an_unsubscribed_contact`. The other four already pass — the import and contacts API because their writers end in `do nothing`, the preference center because Task 6 shipped it, and the confirm route because `src/public/confirm.rs` already guards on `status = 'pending'`. Say so in the report; that is expected, not a guard that proves nothing. The confirm-route test is here because Task 4b's review found that `confirm.rs` *claims* invariant 1 in a comment and nothing held it — a claim with no test is how this branch keeps shipping untrue statements.
 - [ ] **Step 3: Implement.** Delete the revival arm and branch in `lists::add_member`, and rewrite the one `tests/consent.rs` assertion. No other writer changes.
 - [ ] **Step 3b: Rewrite the doc comment on `selection::subscribe`** that calls `lists::add_member`'s revival of an unsubscribed membership deliberate. It becomes false with this task. Make it say what is then true: no writer revives an unsubscribed membership, and only the subscriber acting through their own token can, via the preference center.
 - [ ] **Step 4: Run and watch pass.**
