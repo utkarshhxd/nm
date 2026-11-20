@@ -112,8 +112,9 @@ test("the built-in page is rendered, and the honeypot is not shown to a person",
   // The decoy is in the markup and out of sight: a person never fills it in, so a filled one is
   // a script. It is positioned off-screen rather than `display: none`, which is the first thing
   // a script skips — so the assertion is where the browser actually laid it out, measured, and
-  // not `toBeHidden`, which a 1px off-screen box does not satisfy.
-  const decoy = page.getByLabel("Website", { exact: true });
+  // not `toBeHidden`, which a 1px off-screen box does not satisfy. Its label says what to do with
+  // it, for the pages that are served without the inline stylesheet.
+  const decoy = page.getByLabel("Leave this field empty", { exact: true });
   const box = await decoy.boundingBox();
   expect(box, "the honeypot must be in the page for a script to find").not.toBeNull();
   expect(box?.x ?? 0, `the honeypot is on screen at ${JSON.stringify(box)}`).toBeLessThan(-1000);

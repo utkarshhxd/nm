@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) select $1, $2, l, 'subscribed', now(), $4::text from unnest($3::uuid[]) l on conflict (contact_id, list_id) do update set status = 'subscribed', subscribed_at = now(), source = excluded.source where list_memberships.status = 'pending' returning list_id",
+  "query": "insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) select $1, $2, l, 'subscribed', now(), $4::text from unnest($3::uuid[]) l on conflict (contact_id, list_id) do nothing returning list_id",
   "describe": {
     "columns": [
       {
@@ -27,5 +27,5 @@
       false
     ]
   },
-  "hash": "2de3f069d1679b646cdc7f6bd1d789b5e545bfa82d71e5ac1716fe92c95f0233"
+  "hash": "562b0b15f1e2f8c55c9c06fc4f78f5489d4609d2792a243b07f8bf650c76bdd2"
 }

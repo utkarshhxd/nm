@@ -28,7 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use sqlx::PgConnection;
 use url::form_urlencoded;
@@ -47,7 +47,6 @@ use crate::{
         token::{self, Purpose, Token},
     },
     suppressions,
-    users::normalize_email,
 };
 
 pub fn routes() -> Router<AppState> {
@@ -119,6 +118,13 @@ async fn show(
 /// The limiter's verdict is read **before** the form is looked up and obeyed **after**: the
 /// answer a refused submission gives is this form's own success page, so the form has to be
 /// loaded to produce it.
+///
+/// **So the limiter sheds no database load here**, unlike every route that refuses early: a
+/// refused submission still runs `by_slug` and `lists_of`. Two indexed reads, bounded at 60 a
+/// minute per address — but a flood from many addresses is bounded by the number of addresses and
+/// not by this limiter, and the pool is what would feel it. Shedding earlier would mean answering
+/// a refusal with something that is not this form's page, which is the one thing spec §8.9
+/// forbids.
 async fn submit(
     State(state): State<AppState>,
     meta: RequestMeta,
@@ -177,69 +183,99 @@ async fn apply(
     lists: &[(Uuid, bool)],
     submitted: &HashMap<String, Vec<String>>,
 ) -> ApiResult<Outcome> {
-    let Ok(email) = normalize_email(first(submitted, "email")) else {
-        return Ok(Outcome::Invalid);
-    };
+    // A form with no lists left subscribes nobody, so it writes nothing at all — not even the
+    // contact row. `form_lists.list_id` cascades, so this is a live state and not a hypothetical
+    // (`0023_forms_and_jobs.sql`), and a contact with no membership and no consent row is the
+    // wrong artefact for this product to leave behind: nothing would say where it came from or
+    // what it agreed to. It is decided by the form's configuration, which is the same for every
+    // submitter, so it tells nobody anything.
+    if lists.is_empty() {
+        return Ok(Outcome::Done);
+    }
+
     let mut tx = state.pool.begin().await?;
-    // `is_suppressed`, not `blocking_suppression`'s narrower cousins: a workspace-wide opt-out
-    // (`docs/adr/0001`), a complaint, a bounce, an operator's block and an erasure tombstone all
-    // mean "do not mail this address", and a public form is the one caller with no operator
-    // behind it to overrule that. It fails closed on an address it cannot normalise, which is
-    // unreachable here because `normalize_email` above already refused those.
+    // **The shape is checked here, before anything that depends on the address, and that position
+    // is the whole point.** `contacts::create` is what validates the optional fields, and it only
+    // runs for an address that is not already a contact — so checking by attempting the insert
+    // answered `email=<target>&first_name=%01` three different ways: the error page for a new
+    // address, the success page for an existing one (validation never ran), and the success page
+    // for a suppressed one (it returns below, before any contact lookup). One request, no
+    // statistics, an address-existence oracle. Everything this call reads is the submission and
+    // the workspace's custom field definitions; it cannot ask a question about the address, which
+    // is what makes its answer safe to differ.
+    let checked =
+        match contacts::check(&mut tx, form.workspace_id, new_contact(form, submitted)).await {
+            Ok(checked) => checked,
+            // A malformed address, a name too long, a custom field that will not take what was typed.
+            // The shape of what was submitted, which the submitter can see and fix.
+            Err(ApiError::Validation(_)) => return Ok(Outcome::Invalid),
+            Err(e) => return Err(e),
+        };
+    let email = checked.email().to_owned();
+
+    // **A bounce is let through; every other block refuses.** A workspace-wide opt-out
+    // (`docs/adr/0001`), a complaint, an operator's manual block and an erasure tombstone are all
+    // consent decisions, and a public form is the one caller with no operator behind it to
+    // overrule one. `Bounced` is not a consent decision — it is a deliverability fact, with no
+    // door a subscriber can knock on, and somebody re-typing their address into a signup form is
+    // usually fixing exactly that. The double opt-in confirmation is itself the deliverability
+    // test, so letting them past costs one email to an address that may fail again.
+    //
+    // `blocking_suppression` normalises the address itself and fails closed on one it cannot
+    // read; ours is already normalised by `check` above, so that arm is unreachable here.
     //
     // shortcut: this early return is a **timing** oracle, and byte-identity does not close it.
-    // Measured on the dev container, fastest of five, warm: a new address 6.2-7.0 ms, a
-    // suppressed one 2.0 ms — the suppressed path skips the contact insert, two membership
-    // statements, the consent row and the `jobs` row. About 4 ms and a factor of three: not
+    // Measured on the dev container, fastest of five, warm: a new address 8.1-9.1 ms, a
+    // suppressed one 2.7-3.0 ms — the suppressed path skips the contact insert, two membership
+    // statements, the consent row and the `jobs` row. About 5 ms and a factor of three: not
     // visible in one sample over the internet, and perfectly visible in a few hundred. Closing it
     // means spending the same time either way — a fixed deadline the handler sleeps to, which
     // costs every honest submission the slowest path's latency and has to be re-tuned whenever
     // the writes change. Do that when an existence oracle at this resolution is worth 5 ms to
     // somebody; until then it is recorded here rather than unmeasured.
-    if suppressions::is_suppressed(&mut *tx, &state.secrets, form.workspace_id, &email).await? {
+    let block =
+        suppressions::blocking_suppression(&mut *tx, &state.secrets, form.workspace_id, &email)
+            .await?;
+    if block.is_some_and(|b| b.reason != suppressions::Reason::Bounced) {
         return Ok(Outcome::Done);
     }
     let contact_id = match contact_id(&mut tx, form.workspace_id, &email).await? {
         Some(id) => id,
-        None => match contacts::create(
-            &mut tx,
-            &state.secrets,
-            form.workspace_id,
-            new_contact(form, submitted, &email),
-        )
-        .await
-        {
-            Ok(id) => id,
-            // `email-taken`: another submission of the same address committed between the select
-            // above and this insert. The unique violation has already aborted this transaction,
-            // so there is nothing to do but roll it back — and nothing is lost, because the
-            // request that won wrote what this one would have.
-            // `address-erased`: unreachable, since the tombstone is a suppression and the check
-            // above found it. Kept as an arm rather than an `unreachable!`, because a panic in
-            // this handler is a 500 for a stranger.
-            Err(ApiError::Conflict(_)) => return Ok(Outcome::Done),
-            // A name too long, a custom field that will not take what was typed. The shape of
-            // what was submitted, which the submitter can see and fix.
-            Err(ApiError::Validation(_)) => return Ok(Outcome::Invalid),
-            Err(e) => return Err(e),
-        },
+        None => {
+            match contacts::create_checked(&mut tx, &state.secrets, form.workspace_id, &checked)
+                .await
+            {
+                Ok(id) => id,
+                // `email-taken`: another submission of the same address committed between the select
+                // above and this insert. The unique violation has already aborted this transaction,
+                // so there is nothing to do but roll it back — and nothing is lost, because the
+                // request that won wrote what this one would have.
+                // `address-erased`: unreachable, since the tombstone is a suppression and the check
+                // above found it. Kept as an arm rather than an `unreachable!`, because a panic in
+                // this handler is a 500 for a stranger.
+                Err(ApiError::Conflict(_)) => return Ok(Outcome::Done),
+                Err(e) => return Err(e),
+            }
+        }
     };
 
-    // Read inside the transaction, and used only to *name* what the writes below did: the SQL
-    // guards are what decide whether anything happened. Same shape as the preference center.
+    // Read inside the transaction, before the writes. It decides which lists are waiting on a
+    // confirmation email, and nothing else: the SQL guards below decide what is written.
     let prior = statuses(&mut tx, form.workspace_id, contact_id, lists).await?;
     let double: Vec<Uuid> = lists.iter().filter(|l| l.1).map(|l| l.0).collect();
     let single: Vec<Uuid> = lists.iter().filter(|l| !l.1).map(|l| l.0).collect();
 
-    // Double opt-in: `pending`, and `do nothing` if there is any row already. That guard is
-    // invariant 1 — a membership someone unsubscribed from is not revived by a form naming their
-    // address — and it is also what bounds this route as a mailer: one confirmation email per
-    // (address, list), ever, however many times the form is submitted.
+    // **Both statements below are `do nothing` on conflict: a submission creates a membership or
+    // it changes nothing.** Anyone can type anyone's address into a public form, so every
+    // transition this route could make to an *existing* row is a transition made by a stranger.
+    // That is plainly right for `unsubscribed` (invariant 1), and it is right for `pending` too:
+    // promoting a pending membership is confirmation, confirmation is the token's job, and a
+    // `confirmed` consent row with no `token_jti` written because somebody guessed an address is
+    // a forged record of consent in an append-only log. It stays `pending`; whether another
+    // confirmation email goes out is `RESEND_AFTER_MINUTES`'s decision below.
     //
-    // shortcut: a person who loses the confirmation email therefore cannot ask for another, and
-    // the form is where spec §6 says they would. Give the resend its own throttle keyed on the
-    // address rather than the IP before relaxing this — without one, an unauthenticated route
-    // that re-enqueues on every submission will send a victim 60 emails a minute.
+    // `Action::Confirmed` and `Action::Resubscribed` are therefore both unreachable from this
+    // module, and that is the invariant, not an omission.
     let requested: Vec<Uuid> = sqlx::query_scalar!(
         "insert into list_memberships (workspace_id, contact_id, list_id, status, source) \
          select $1, $2, l, 'pending', $4::text from unnest($3::uuid[]) l \
@@ -253,16 +289,12 @@ async fn apply(
     .fetch_all(&mut *tx)
     .await?;
 
-    // Single opt-in: `subscribed`. `status = 'pending'` is the whole guard — an `unsubscribed`
-    // row stays unsubscribed (invariant 1, and the reason `Resubscribed` is unreachable from
-    // here), and a row already `subscribed` changes nothing and so records nothing.
+    // Single opt-in: `subscribed` outright, and only where there was no row at all.
     let subscribed: Vec<Uuid> = sqlx::query_scalar!(
         "insert into list_memberships \
              (workspace_id, contact_id, list_id, status, subscribed_at, source) \
          select $1, $2, l, 'subscribed', now(), $4::text from unnest($3::uuid[]) l \
-         on conflict (contact_id, list_id) do update \
-            set status = 'subscribed', subscribed_at = now(), source = excluded.source \
-          where list_memberships.status = 'pending' \
+         on conflict (contact_id, list_id) do nothing \
          returning list_id",
         form.workspace_id,
         contact_id,
@@ -299,29 +331,43 @@ async fn apply(
             &cx,
         )
         .await?;
+    }
+
+    // Every list this contact is `pending` on now: the ones just asked for, **and** the ones that
+    // were already waiting for a confirmation. The second group is the resend, and it writes no
+    // consent row — nothing changed, and `requested` was recorded when they were first asked.
+    // `prior` was read inside this transaction before the writes, so this needs no second query.
+    //
+    // It is every list and not only the double-opt-in ones, because a membership can be `pending`
+    // on a list that is single opt-in today: the flag is mutable, and `GET /c/{token}` promotes a
+    // pending row whatever the list now says. Leaving those out would make a row that only a
+    // token can settle one that nothing can ever send a token for.
+    let waiting = requested.iter().copied().chain(
+        lists
+            .iter()
+            .map(|l| l.0)
+            .filter(|l| prior.get(l) == Some(&MembershipStatus::Pending)),
+    );
+    for list_id in waiting {
         enqueue_confirmation(
             &mut tx,
             state,
             form.workspace_id,
             contact_id,
-            *list_id,
+            list_id,
             &email,
         )
         .await?;
     }
     for list_id in subscribed {
-        // `pending` before the write means the person had already been asked and this submission
-        // is what settled it: the same word `GET /c/{token}` records for that transition.
-        let action = match prior.get(&list_id) {
-            Some(MembershipStatus::Pending) => consent::Action::Confirmed,
-            _ => consent::Action::Subscribed,
-        };
+        // Always `Subscribed`: the statement above only returns rows it inserted, so every one of
+        // these is a membership that did not exist a moment ago.
         consent::record(
             &mut tx,
             form.workspace_id,
             contact_id,
             Some(list_id),
-            action,
+            consent::Action::Subscribed,
             consent::Source::Form,
             &cx,
         )
@@ -330,6 +376,29 @@ async fn apply(
     tx.commit().await?;
     Ok(Outcome::Done)
 }
+
+/// How long one `(contact, list)` must wait between confirmation emails, in minutes.
+///
+/// **It exists because the alternative was a dead end that reports success.** Until this was
+/// added, a submission naming an address whose membership was already `pending` enqueued nothing
+/// — one confirmation per address and list, ever — and still answered "Check your email". A
+/// person whose confirmation went to spam, or who mistyped and fixed it, had no way left to
+/// confirm, and the page told them to wait for an email that would never come. Re-submitting the
+/// form is the resend this milestone has: spec §8.6 has an expired confirmation offer to re-send,
+/// and `public::confirm`'s expired page says in so many words that signing up again is how.
+///
+/// **What the window is for.** This route is unauthenticated, so the address in the box need not
+/// belong to whoever typed it. With no throttle, a submission loop sends a victim one email per
+/// request — 60 a minute, the per-IP limit, from each address an attacker has. Fifteen minutes
+/// keyed on the contact and the list caps that at four an hour per list however many IPs are
+/// used, which is what an ordinary signup form on the internet permits, and is longer than
+/// anybody waits before retrying a lost email. It is **not** keyed on the IP: the victim is the
+/// address, and an attacker chooses their own address freely (`PUBLIC_PER_MINUTE` explains why
+/// that bound is a different kind of bound).
+///
+/// Nothing stores this but the `jobs` rows themselves, so there is no state to expire and nothing
+/// to clean up.
+const RESEND_AFTER_MINUTES: i64 = 15;
 
 /// One `jobs` row per double-opt-in list, each carrying **its own** `Purpose::Confirm` token:
 /// `token::parse` requires a `list_id` on exactly the confirm tokens, so one token cannot cover
@@ -340,6 +409,25 @@ async fn apply(
 /// `public::token::Token`'s field list is frozen once the first unsubscribe link ships
 /// (`deny_unknown_fields`, and `Purpose::Unsubscribe` has no TTL), so anything a job needs travels
 /// alongside. The shape is `0023_forms_and_jobs.sql`'s, which M2's worker parses.
+///
+/// **Enqueues nothing if this `(contact, list)` already had one inside [`RESEND_AFTER_MINUTES`]**,
+/// decided in the same statement as the insert rather than by a read followed by a write, so a
+/// second submission cannot slip between the two. Two genuinely concurrent submissions can still
+/// both insert, since neither transaction sees the other's uncommitted row; the result is two
+/// emails instead of one, which is the bound being off by one and not the bound being absent.
+///
+/// **`created_at` is the rule and `id > …` is the index.** `jobs` only grows — M1d writes rows and
+/// nothing drains them until M2 — so a predicate on `payload` and `created_at` alone would be a
+/// sequential scan of that table taken on every submission of a public form, which is the
+/// `is_erased` mistake this same task was sent to fix. `jobs.id` is a UUIDv7, so a lower bound on
+/// the primary key is a lower bound on enqueue time: the scan is the rows from the last fifteen
+/// minutes, and the `payload` comparison runs on those alone. `contacts::create` keeps its ids v7
+/// for the same kind of reason, and says so.
+///
+/// Measured at 50,000 jobs spread over 30 days: with the `id` bound, `Index Scan using jobs_pkey`,
+/// 2 buffers, 0.045 ms. The same lookup without it, `Seq Scan`, 1,786 buffers, 10.6 ms — and that
+/// is the figure that keeps rising. Dropping the bound does not change a single answer, which is
+/// why it needs saying here that it is not redundant.
 async fn enqueue_confirmation(
     tx: &mut PgConnection,
     state: &AppState,
@@ -359,9 +447,15 @@ async fn enqueue_confirmation(
             nonce: Uuid::now_v7().to_string(),
         },
     );
+    let cutoff = Utc::now() - chrono::Duration::minutes(RESEND_AFTER_MINUTES);
     sqlx::query!(
         "insert into jobs (id, workspace_id, kind, payload) \
-         values ($1, $2, 'confirmation_email', $3)",
+         select $1, $2, 'confirmation_email', $3 \
+          where not exists (select 1 from jobs \
+                             where id > $4 and created_at > $5 \
+                               and workspace_id = $2 and kind = 'confirmation_email' \
+                               and payload->>'contact_id' = $6 \
+                               and payload->>'list_id' = $7)",
         Uuid::now_v7(),
         workspace_id,
         serde_json::json!({
@@ -370,10 +464,26 @@ async fn enqueue_confirmation(
             "email": email,
             "token": token,
         }),
+        uuid_at(cutoff),
+        cutoff,
+        contact_id.to_string(),
+        list_id.to_string(),
     )
     .execute(tx)
     .await?;
     Ok(())
+}
+
+/// The smallest UUIDv7 that could have been generated at `at`, for use as a lower bound on a
+/// v7 primary key. Only the first 48 bits — the millisecond timestamp — carry meaning here; the
+/// rest is whatever `new_v7` fills in, which is why this is a bound and not an identity.
+fn uuid_at(at: DateTime<Utc>) -> Uuid {
+    let seconds = at.timestamp().max(0).unsigned_abs();
+    Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        seconds,
+        at.timestamp_subsec_nanos(),
+    ))
 }
 
 /// The form's lists and each one's `double_optin`, which is **the list's** decision and never the
@@ -449,12 +559,18 @@ fn first<'a>(submitted: &'a HashMap<String, Vec<String>>, name: &str) -> &'a str
 /// as empty values, so a form whose optional fields were skipped does not overwrite anything with
 /// nothing.
 ///
-/// `contacts::create` validates all of it: this function decides only *which* input feeds which
-/// column. An unknown input name — anything the page did not render — is ignored by construction,
-/// because this walks the form's fields rather than the body.
-fn new_contact(form: &Form, submitted: &HashMap<String, Vec<String>>, email: &str) -> NewContact {
+/// `contacts::check` validates all of it, the address included: this function decides only
+/// *which* input feeds which column. An unknown input name — anything the page did not render —
+/// is ignored by construction, because this walks the form's fields rather than the body.
+///
+/// **It is only ever used to create a contact, never to update one.** A submission naming an
+/// address that is already a contact writes no field of theirs, so a stranger who guesses an
+/// address cannot overwrite that person's name, time zone or custom data from a public form. That
+/// falls out of `apply` taking the existing id and stopping, and it is written down here because
+/// a later "it would be helpful to keep their details fresh" is how it would be undone.
+fn new_contact(form: &Form, submitted: &HashMap<String, Vec<String>>) -> NewContact {
     let mut new = NewContact {
-        email: email.to_owned(),
+        email: first(submitted, "email").to_owned(),
         ..NewContact::default()
     };
     let mut attributes = Map::new();
@@ -534,10 +650,17 @@ fn render(form: &Form, error: Option<&str>) -> Response {
     }
     // `aria-hidden` and `tabindex="-1"` keep it away from a screen reader and out of the tab
     // order, so the decoy costs a person using either nothing at all. The CSS that hides it is in
-    // `page::STYLE`; a form page served with the stylesheet stripped shows an unlabelled extra
-    // input, which is the failure mode worth having.
+    // `page::STYLE`.
+    //
+    // **The label says what to do with it, because sometimes it is visible.** Reader mode, a
+    // style-stripping extension and a restrictive in-app webview all drop the inline `<style>`,
+    // and this field then appears to a sighted person like any other. Labelled "Website" it reads
+    // as a plausible optional field, they fill it in, and their submission is silently discarded
+    // — which is the one failure this control must never produce. A script matches on the input's
+    // `name`, which is unchanged, and does not read the label.
     body.push_str(&format!(
-        "<div class=\"hp\" aria-hidden=\"true\"><label for=\"{HONEYPOT}\">Website</label>\
+        "<div class=\"hp\" aria-hidden=\"true\">\
+         <label for=\"{HONEYPOT}\">Leave this field empty</label>\
          <input id=\"{HONEYPOT}\" name=\"{HONEYPOT}\" type=\"text\" tabindex=\"-1\" \
          autocomplete=\"off\"></div>\n"
     ));

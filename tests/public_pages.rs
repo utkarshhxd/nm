@@ -157,11 +157,15 @@ impl Pending {
     }
 }
 
-/// `(action, source, ip, token_jti, source_ref)` of every consent row, oldest first.
+/// `(action, source, ip, token_jti, source_ref, user_agent)` of every consent row, oldest first.
+///
+/// The user agent is here because it is evidence like the IP is, and because nothing noticed when
+/// it was only passed and never read.
 type Evidence = (
     String,
     String,
     Option<IpAddr>,
+    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -191,7 +195,9 @@ async fn live_suppressions(
 }
 
 async fn consent_rows(pool: &PgPool) -> Vec<Evidence> {
-    sqlx::query_as("select action, source, ip, token_jti, source_ref from consent_log order by id")
+    sqlx::query_as(
+        "select action, source, ip, token_jti, source_ref, user_agent from consent_log \n         order by id",
+    )
         .fetch_all(pool)
         .await
         .unwrap()
@@ -1439,11 +1445,13 @@ impl Signup {
         format!("/f/{}/{form_slug}", self.slug)
     }
 
-    /// A submission, as a browser posts one.
+    /// A submission, as a browser posts one — user agent included, because it is evidence the
+    /// consent row keeps.
     async fn submit(&self, form_slug: &str, body: &str) -> axum_test::TestResponse {
         self.app
             .post(&self.url(form_slug))
             .content_type("application/x-www-form-urlencoded")
+            .add_header("user-agent", UA)
             .text(body)
             .await
     }
@@ -1461,6 +1469,27 @@ impl Signup {
     }
 }
 
+/// Blocks `email` in this workspace, through the hash the lookup really uses. A fabricated
+/// `email_hmac` here would match nothing, and every assertion that followed would hold for the
+/// wrong reason - the failure a Task 5/6 test shipped with.
+async fn block_address(s: &Signup, email: &str, reason: &str) {
+    let hmac = nm::crypto::suppression_hmac(&s.app.state.secrets, email);
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason)          values ($1, $2, 'address', $3, $4, $5)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s.workspace)
+    .bind(email)
+    .bind(hmac.as_slice())
+    .bind(reason)
+    .execute(&s.app.pool)
+    .await
+    .unwrap();
+}
+
+/// What a submitting browser calls itself in these tests.
+const UA: &str = "nm-public-form-test";
+
 /// Every queued job, as `(kind, payload)`, oldest first.
 async fn jobs(pool: &PgPool) -> Vec<(String, serde_json::Value)> {
     sqlx::query_as("select kind, payload from jobs order by id")
@@ -1476,13 +1505,20 @@ async fn contact_count(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
-/// A response as the invariant compares them: the status, the body, and every header but `date`,
-/// which the HTTP server stamps with the wall clock and which no handler chooses.
+/// A response as the invariant compares them: the status, the body, and every header a handler
+/// chooses.
+///
+/// Two are dropped. `date` is the HTTP server's wall clock. `ratelimit-remaining` counts **this
+/// address's** budget down by one per request by construction, so two sequential requests can
+/// never carry the same value and comparing it would only ever assert that time passed — it says
+/// nothing about the address that was submitted, which is what invariant 7 is about. That the
+/// `POST` route carries no `RateLimit-*` headers at all is asserted where it belongs, in
+/// `a_rate_limited_submission_answers_exactly_as_a_real_one`.
 fn answer(r: &axum_test::TestResponse) -> (StatusCode, String, Vec<(String, String)>) {
     let mut headers: Vec<(String, String)> = r
         .headers()
         .iter()
-        .filter(|(name, _)| name.as_str() != "date")
+        .filter(|(name, _)| !matches!(name.as_str(), "date" | "ratelimit-remaining"))
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
@@ -1523,6 +1559,11 @@ async fn a_new_address_on_a_double_optin_list_is_pending_and_enqueues_a_job(pool
         rows[0].4,
         Some(form.to_string()),
         "which form was submitted"
+    );
+    assert_eq!(
+        rows[0].5.as_deref(),
+        Some(UA),
+        "the user agent is evidence beside the IP"
     );
 
     // The name it collected really did land on the contact, so the fields are wired and not
@@ -1667,6 +1708,32 @@ async fn the_response_is_identical_for_new_existing_and_suppressed(pool: PgPool)
     );
     assert_eq!(consent_rows(&pool).await.len(), 1);
     assert_eq!(jobs(&pool).await.len(), 1);
+
+    // **The same three, with a field besides the address that cannot be stored.** This is where
+    // the oracle was: the optional fields are validated by `contacts::create`, which only runs
+    // for an address that is not already a contact, so a well-formed address with a malformed
+    // name used to answer the error page for a stranger, the success page for a subscriber, and
+    // the success page for a suppressed address — one request, no statistics. Varying only the
+    // address, as the three submissions above do, cannot see it.
+    let bad_name = |address: &str| format!("email={address}&first_name=%01");
+    let new_bad = s.submit("newsletter", &bad_name("other@ex.test")).await;
+    let existing_bad = s.submit("newsletter", &bad_name("new@ex.test")).await;
+    let suppressed_bad = s.submit("newsletter", &bad_name(blocked)).await;
+
+    assert_eq!(answer(&new_bad), answer(&existing_bad));
+    assert_eq!(answer(&new_bad), answer(&suppressed_bad));
+    // And it is the refusal, not the success page: the shape of what was typed is the one thing
+    // this route may answer differently, because the submitter can see it and fix it.
+    assert!(
+        new_bad.text().contains("Check the details"),
+        "{}",
+        new_bad.text()
+    );
+    assert_ne!(answer(&new), answer(&new_bad));
+    // Nothing of the three was written: the same counts as before this block.
+    assert_eq!(contact_count(&pool).await, 1);
+    assert_eq!(consent_rows(&pool).await.len(), 1);
+    assert_eq!(jobs(&pool).await.len(), 1);
 }
 
 /// Review Focus 5. The address is blocked workspace-wide, so nothing is written - and the second
@@ -1792,6 +1859,7 @@ async fn a_form_submission_cannot_resubscribe_an_unsubscribed_contact(pool: PgPo
         .assert_status_ok();
 
     let got = s.memberships().await;
+    assert_eq!(got.len(), 2, "the fixture must have both memberships");
     assert!(
         got.iter().all(|(_, status, _)| status == "unsubscribed"),
         "{got:?}"
@@ -1907,6 +1975,10 @@ async fn a_form_whose_lists_were_all_deleted_accepts_no_submission(pool: PgPool)
     assert_eq!(s.memberships().await, []);
     assert_eq!(consent_rows(&pool).await.len(), 0);
     assert_eq!(jobs(&pool).await.len(), 0);
+    // And no contact either. A contact row with no membership and no consent row says nothing
+    // about where it came from or what it agreed to, which is the wrong thing for this product
+    // to be left holding.
+    assert_eq!(contact_count(&pool).await, 0);
 }
 
 /// Two guessable slugs, and one answer for every way of missing. A workspace that does not exist,
@@ -1922,11 +1994,35 @@ async fn an_unknown_form_and_another_workspaces_form_are_the_same_page(pool: PgP
     let theirs = s.app.get("/f/acme/newsletter").await; // exists, but not in `acme`
     let no_form = s.app.get("/f/acme/nothing").await;
     let no_workspace = s.app.get("/f/nobody/newsletter").await;
-    for r in [&theirs, &no_form, &no_workspace] {
-        assert_eq!(r.status_code(), StatusCode::NOT_FOUND);
-        assert_eq!(r.text(), theirs.text());
+    for (what, r) in [("no form", &no_form), ("no workspace", &no_workspace)] {
+        assert_eq!(r.status_code(), StatusCode::NOT_FOUND, "{what}");
+        assert_eq!(answer(r), answer(&theirs), "{what}");
     }
-    // The premise: that form really is reachable at its own workspace's slug.
+
+    // And the same three through `POST`, which takes its own branch and carries its own headers
+    // — no `RateLimit-*`, where the `GET` above has them. A miss must not be told apart there
+    // either.
+    let theirs = s.submit("newsletter", "email=new@ex.test").await;
+    let no_form = s
+        .app
+        .post("/f/acme/nothing")
+        .content_type("application/x-www-form-urlencoded")
+        .text("email=new@ex.test")
+        .await;
+    let no_workspace = s
+        .app
+        .post("/f/nobody/newsletter")
+        .content_type("application/x-www-form-urlencoded")
+        .text("email=new@ex.test")
+        .await;
+    for (what, r) in [("no form", &no_form), ("no workspace", &no_workspace)] {
+        assert_eq!(r.status_code(), StatusCode::NOT_FOUND, "{what}");
+        assert_eq!(answer(r), answer(&theirs), "{what}");
+    }
+    assert_eq!(contact_count(&pool).await, 0, "a miss writes nothing");
+
+    // The premise: that form really is reachable at its own workspace's slug, so the three
+    // refusals above are refusals and not a route that is broken for everyone.
     other
         .app
         .get("/f/globex/newsletter")
@@ -2024,4 +2120,227 @@ async fn a_submission_with_no_usable_address_asks_for_it_again(pool: PgPool) {
     assert!(r.text().contains("<form method=\"post\">"), "{}", r.text());
     assert_eq!(contact_count(&pool).await, 0);
     assert_eq!(s.memberships().await, []);
+}
+
+/// Re-submitting the form is the only resend this milestone has — `public::confirm`'s expired
+/// page says so, and spec 8.6 requires an expired confirmation to offer one. So a submission that
+/// finds the membership already `pending` enqueues another confirmation email, and the window in
+/// `RESEND_AFTER_MINUTES` is what stops that being a mailer aimed by whoever can type an address.
+///
+/// The window is moved by backdating the queued row rather than by sleeping fifteen minutes. Both
+/// halves of the throttle are exercised: the immediate repeat must be blocked (which is only true
+/// if the lookup finds the fresh row at all), and the backdated one must not be (which is only
+/// true if `created_at` is what decides).
+#[sqlx::test]
+async fn a_second_submission_resends_the_confirmation_only_after_the_window(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+
+    s.submit("newsletter", "email=lost@ex.test")
+        .await
+        .assert_status_ok();
+    assert_eq!(jobs(&pool).await.len(), 1);
+
+    // Straight away: the page still says "check your email", and no second email is queued.
+    let again = s.submit("newsletter", "email=lost@ex.test").await;
+    again.assert_status_ok();
+    assert_eq!(
+        jobs(&pool).await.len(),
+        1,
+        "a repeat inside the window must not queue a second email"
+    );
+
+    // Fifteen minutes later, without waiting fifteen minutes. `created_at` is what the throttle
+    // reads; the `id` bound beside it is only there to keep the lookup off a table scan.
+    sqlx::query("update jobs set created_at = now() - interval '16 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    s.submit("newsletter", "email=lost@ex.test")
+        .await
+        .assert_status_ok();
+    let queued = jobs(&pool).await;
+    assert_eq!(
+        queued.len(),
+        2,
+        "the lost confirmation can be asked for again"
+    );
+    assert_ne!(
+        queued[0].1["token"], queued[1].1["token"],
+        "a resend issues a new link, not a copy of the one that went missing"
+    );
+
+    // Three submissions, two emails, and still one act of consent: the membership was asked for
+    // once and nothing about it changed.
+    assert_eq!(
+        s.memberships().await,
+        [(list, "pending".to_owned(), Some("form".to_owned()))]
+    );
+    let rows = consent_rows(&pool).await;
+    assert_eq!(rows.len(), 1, "a resend is not a second consent");
+    assert_eq!(rows[0].0, "requested");
+
+    // And the resent link works, which is the whole point of sending it.
+    let token = queued[1].1["token"].as_str().unwrap().to_owned();
+    let confirmed = s.app.get(&format!("/c/{token}")).await;
+    confirmed.assert_status_ok();
+    assert!(
+        confirmed.text().contains("subscribed"),
+        "{}",
+        confirmed.text()
+    );
+    assert_eq!(
+        s.memberships().await,
+        [(list, "subscribed".to_owned(), Some("form".to_owned()))]
+    );
+}
+
+/// The resend follows the membership, not the submission: a list the contact has already
+/// confirmed, or has left, is not emailed again by submitting the form that names it.
+#[sqlx::test]
+async fn a_resend_is_only_for_a_membership_still_waiting_to_be_confirmed(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let news = s.list("News", true).await;
+    let digest = s.list("Digest", true).await;
+    s.form("newsletter", &[news, digest], None).await;
+    let contact = make_contact(&pool, s.workspace, "known@ex.test").await;
+    make_member(&pool, s.workspace, contact, news, "subscribed").await;
+    make_member(&pool, s.workspace, contact, digest, "unsubscribed").await;
+
+    s.submit("newsletter", "email=known@ex.test")
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        jobs(&pool).await.len(),
+        0,
+        "one list is confirmed and the other was left: neither is waiting on an email"
+    );
+    assert_eq!(consent_rows(&pool).await.len(), 0);
+}
+
+/// Confirmation is the token's job, and only the token's.
+///
+/// `list_memberships.status` is `pending` and the list is single opt-in — reachable by flipping
+/// `double_optin` after somebody was asked, which an operator may do at any time. A submission
+/// naming that address must leave the row alone: promoting it would write a `confirmed` consent
+/// row, with no `token_jti`, for a person who did nothing, because a stranger typed their address
+/// into a public form. That is a forged record of consent in an append-only log.
+#[sqlx::test]
+async fn a_submission_cannot_confirm_someone_elses_pending_membership(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", false).await; // single opt-in now
+    s.form("newsletter", &[list], None).await;
+    let contact = make_contact(&pool, s.workspace, "asked@ex.test").await;
+    make_member(&pool, s.workspace, contact, list, "pending").await;
+
+    let r = s.submit("newsletter", "email=asked@ex.test").await;
+    r.assert_status_ok();
+
+    assert_eq!(
+        s.memberships().await,
+        [(list, "pending".to_owned(), None)],
+        "a stranger's submission does not confirm anybody"
+    );
+    assert_eq!(
+        consent_rows(&pool).await.len(),
+        0,
+        "and writes no record of a consent that did not happen"
+    );
+    // What it may do is ask again, by email, to the address itself - which is the only way that
+    // row can ever be settled.
+    assert_eq!(jobs(&pool).await.len(), 1);
+    assert_eq!(jobs(&pool).await[0].1["email"], "asked@ex.test");
+}
+
+/// A bounce is a deliverability fact, not a consent decision, and nothing a subscriber can lift.
+/// Someone re-typing their address into a signup form is usually fixing exactly that, and the
+/// confirmation email is itself the deliverability test — so a bounced address signs up, and
+/// every other block still refuses.
+#[sqlx::test]
+async fn a_bounced_address_may_sign_up_again_and_a_complaint_may_not(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    block_address(&s, "bounced@ex.test", "bounced").await;
+    block_address(&s, "angry@ex.test", "complained").await;
+    block_address(&s, "blocked@ex.test", "manual").await;
+    block_address(&s, "gone@ex.test", "unsubscribed_all").await;
+
+    for email in [
+        "bounced@ex.test",
+        "angry@ex.test",
+        "blocked@ex.test",
+        "gone@ex.test",
+    ] {
+        s.submit("newsletter", &format!("email={email}"))
+            .await
+            .assert_status_ok();
+    }
+
+    // Exactly one of the four got through, and it is the bounce.
+    let queued = jobs(&pool).await;
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].1["email"], "bounced@ex.test");
+    assert_eq!(contact_count(&pool).await, 1);
+    let rows = consent_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "requested");
+}
+
+/// The real proof behind "a public route never writes the subscriber's IP into `audit_log`",
+/// which is otherwise true only by construction and would stay true only by luck.
+///
+/// `0020_consent_log.sql` cascades consent rows on erasure *because* they carry an IP and a user
+/// agent. `audit::record` writes `meta.ip` and `meta.user_agent` unconditionally, `audit_log` has
+/// no foreign keys and nothing deletes from it — so the same data written there would outlive the
+/// erasure that is supposed to remove it. `contacts::create` does not audit (the authenticated
+/// route above it does), so today nothing under `src/public` audits at all. A handler that never
+/// names the audit module cannot write one.
+///
+/// Same shape as the cookie walk above, and the same two limits: only `//` line comments are
+/// skipped, and a string literal holding the word would be a false positive.
+#[test]
+fn no_handler_under_src_public_records_an_audit_row() {
+    fn walk(dir: &Path, seen: &mut Vec<String>, offenders: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, seen, offenders);
+                continue;
+            }
+            if p.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let name = p.to_string_lossy().replace('\\', "/");
+            let name = name.rsplit_once("/src/").unwrap().1.to_owned();
+            let source = std::fs::read_to_string(&p).unwrap();
+            if source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.to_lowercase().contains("audit"))
+            {
+                offenders.push(name.clone());
+            }
+            seen.push(name);
+        }
+    }
+    let mut seen = vec![];
+    let mut offenders = vec![];
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/public"),
+        &mut seen,
+        &mut offenders,
+    );
+    // Without this the assertion below is true of an empty directory.
+    assert!(seen.len() >= 5, "the walk found only {seen:?}");
+    assert_eq!(
+        offenders,
+        Vec::<String>::new(),
+        "a public handler names the audit log; a subscriber's IP and user agent belong in \
+         `consent_log`, which an erasure cascades, and `audit_log` has no foreign keys and \
+         nothing that deletes from it"
+    );
 }

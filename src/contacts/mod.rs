@@ -168,18 +168,39 @@ fn canonical_value(d: &Definition, v: &Value) -> Result<Value, &'static str> {
     }
 }
 
-/// Inserts a contact and returns its id. The caller passes the transaction (so the audit row
-/// commits with it) and has already authorised the actor. `409 email-taken` if the normalised
-/// address exists in this workspace, `409 address-erased` if it was erased; `422` per invalid field.
+/// A [`NewContact`] whose every field [`create`] would check, checked — and nothing else. It says
+/// what was submitted is well formed; it says nothing about whether the address may be a contact
+/// here, which is [`create_checked`]'s erasure guard and the unique index.
 ///
-/// Every write path into `contacts` must go through this function or re-check `suppressions::is_erased`
-/// itself: the erasure guard lives here, so a bulk `INSERT` elsewhere bypasses it silently.
-pub async fn create(
+/// It exists so that a caller which may or may not go on to insert can run **the same** checks
+/// either way. `public::forms` is that caller: a public form answers a malformed submission the
+/// same way whether or not the address is already a contact, or the difference between the two
+/// answers is an address-existence oracle in one request (M1d invariant 7). Validating by
+/// attempting the insert cannot work there, because the oracle's third leg is a suppressed
+/// address, which never reaches an insert at all.
+pub struct Checked {
+    email: String,
+    first: String,
+    last: String,
+    tz: Option<String>,
+    attrs: Value,
+}
+
+impl Checked {
+    /// The normalised address — what `contacts.email` holds, and what a suppression lookup has to
+    /// be given rather than the raw string the submitter typed.
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+}
+
+/// Validates every field of a `NewContact` against this workspace's custom field definitions.
+/// `422` per invalid field, as [`create`] gives.
+pub async fn check(
     db: &mut PgConnection,
-    secrets: &Secrets,
     workspace_id: Uuid,
     new: NewContact,
-) -> ApiResult<Uuid> {
+) -> ApiResult<Checked> {
     let email = normalize_email(&new.email);
     let first = validate_name("first_name", new.first_name.as_deref().unwrap_or(""));
     let last = validate_name("last_name", new.last_name.as_deref().unwrap_or(""));
@@ -196,6 +217,47 @@ pub async fn create(
         errors.extend(attrs.err().into_iter().flatten());
         return Err(ApiError::Validation(errors));
     };
+    Ok(Checked {
+        email: email.clone(),
+        first: first.clone(),
+        last: last.clone(),
+        tz: tz.map(str::to_owned),
+        attrs: attrs.clone(),
+    })
+}
+
+/// Inserts a contact and returns its id. The caller passes the transaction (so the audit row
+/// commits with it) and has already authorised the actor. `409 email-taken` if the normalised
+/// address exists in this workspace, `409 address-erased` if it was erased; `422` per invalid field.
+///
+/// Every write path into `contacts` must go through this function or re-check `suppressions::is_erased`
+/// itself: the erasure guard lives in [`create_checked`], so a bulk `INSERT` elsewhere bypasses it
+/// silently.
+pub async fn create(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    new: NewContact,
+) -> ApiResult<Uuid> {
+    let checked = check(&mut *db, workspace_id, new).await?;
+    create_checked(db, secrets, workspace_id, &checked).await
+}
+
+/// [`create`] once the fields are known good. Split out for the caller that has to validate
+/// before it knows whether it will insert; see [`Checked`].
+pub async fn create_checked(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    checked: &Checked,
+) -> ApiResult<Uuid> {
+    let Checked {
+        email,
+        first,
+        last,
+        tz,
+        attrs,
+    } = checked;
     // Erasure is permanent: a tombstoned address never becomes a contact again, however it
     // arrives. This is what stops the next import re-creating the person.
     if is_erased(&mut *db, secrets, workspace_id, email).await? {

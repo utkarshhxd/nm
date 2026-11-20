@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into jobs (id, workspace_id, kind, payload) select $1, $2, 'confirmation_email', $3 where not exists (select 1 from jobs where id > $4 and created_at > $5 and workspace_id = $2 and kind = 'confirmation_email' and payload->>'contact_id' = $6 and payload->>'list_id' = $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cac82ba2126eee8a7635006f9e2f16118802fc678ab3ebe471991cb96ea4c22f"
+}
