@@ -121,7 +121,15 @@ queue. This is the honest cost of the milestone order in `spec.md` §11, and it 
 
 ### 7.1 `consent_log` — append-only
 
-One row per consent change, never updated, never deleted:
+One row per consent change, never updated, and deleted only when the contact it belongs to is
+erased:
+
+**Amended 2026-11-20, during M1d implementation.** This said "never deleted", which the schema
+contradicts and should: `0020` cascades a contact's consent rows on erasure, deliberately,
+because a row here carries that person's IP and user agent and keeping it after a GDPR erasure
+would defeat the erasure. The two obligations genuinely conflict — proving consent wants the row
+kept, erasing the person wants it gone — and erasure wins, because a person who has exercised
+that right is not someone we intend to mail. The sentence was wrong, not the schema.
 
 `id`, `workspace_id`, `contact_id`, `list_id` (nullable: a workspace-wide suppression has no
 list), `action` (`requested`, `subscribed`, `confirmed`, `unsubscribed`, `resubscribed`, `suppressed`),
