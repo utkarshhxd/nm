@@ -847,29 +847,53 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
     .unwrap();
     assert_eq!(unlogged, 0);
 
-    // Every file that so much as names `list_memberships` — readers included. Matching the table
-    // rather than a write verb is the same size and strictly stronger: `insert into` split over
-    // two lines, `public.list_memberships`, a quoted name, `merge into` and a table name built
-    // with `format!` all evade a verb list, and the first two are ordinary formatting.
-    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+    // Every file whose CODE so much as names `list_memberships` — readers included. Matching the
+    // table rather than a write verb is the same size and strictly stronger: `insert into` split
+    // over two lines, `public.list_memberships`, a quoted name, `merge into` and a table name
+    // built with `format!` all evade a verb list, and the first two are ordinary formatting.
+    //
+    // **Comment lines are skipped**, the way `public_pages.rs`'s cookie walk skips them. This
+    // fired twice on prose: `src/suppressions/mod.rs` explains its lock ordering against the
+    // membership table without writing a membership, and the documented remedy — adding the file
+    // to the list below — is the wrong one. A non-writer sitting on a writers' list dulls the
+    // tripwire, because the next person's census failure then means either "a new writer landed"
+    // or "somebody mentioned the table", and only one of those needs a consent row. Skipping
+    // comments is what lets the prose name the thing it is discussing and keeps this list exactly
+    // the files that touch the table in code.
+    //
+    // Limit: only `//` line comments are recognised, which is all this codebase uses. A `/* */`
+    // block would hide a real writer, and a string literal holding the name is a false positive —
+    // neither has happened, and a Rust parser does not belong in a test fixture.
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>, scanned: &mut usize) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs")
-                && std::fs::read_to_string(&p)
-                    .unwrap()
-                    .to_lowercase()
-                    .contains("list_memberships")
+                walk(&p, out, scanned);
+                continue;
+            }
+            if p.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            *scanned += 1;
+            if std::fs::read_to_string(&p)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.to_lowercase().contains("list_memberships"))
             {
                 out.push(p.to_string_lossy().replace('\\', "/"));
             }
         }
     }
     let mut touching = vec![];
+    let mut scanned = 0;
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    walk(&src, &mut touching);
+    walk(&src, &mut touching, &mut scanned);
     touching.sort();
+    // A mis-globbed or empty scan must not read as success. The list below would already catch it
+    // — an empty `touching` fails that `assert_eq` — but only by accident of the list being
+    // non-empty today, so the floor is said out loud and checked before it.
+    assert!(scanned >= 40, "the walk read only {scanned} source files");
     let touching: Vec<_> = touching
         .iter()
         .map(|p| p.rsplit_once("/src/").unwrap().1)

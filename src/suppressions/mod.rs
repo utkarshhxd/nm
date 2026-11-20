@@ -263,9 +263,7 @@ pub async fn erase_address(
 /// (`public::unsubscribe`). `true` if a row was written, `false` if the address was already
 /// blocked in this workspace.
 ///
-/// **Why the one-click route writes here at all**, when its visible job is the membership rows
-/// (the table is deliberately not named: `tests/consent.rs` keeps a census of the files that
-/// mention it, and this one is not a writer of memberships, only a reader of this comment):
+/// **Why the one-click route writes here at all**, when its visible job is `list_memberships`:
 /// `docs/adr/0001-contacts-have-no-status-column.md` decided that the workspace-wide opt-out is a
 /// row in this table and nowhere else, *because it outlives the contact row*. A membership sweep
 /// alone is undone by an erasure followed by a re-import, or by an import that names the same
@@ -275,7 +273,7 @@ pub async fn erase_address(
 ///
 /// `created_by_user_id` is null and `source` is `one_click`: nobody signed in did this.
 ///
-/// **Call this before writing any membership row in the same transaction.** It takes
+/// **Call this before writing any `list_memberships` row in the same transaction.** It takes
 /// [`lock_address`], and `contacts::routes::erase_contact` takes that lock *first* and then
 /// deletes the contact, which cascades to the membership rows. A caller that locked membership
 /// rows first would form an ABBA cycle with the erase path, and Postgres breaks one by aborting a
@@ -342,14 +340,10 @@ pub async fn unsubscribe_all(
 ///
 /// `lifted_by_user_id` stays null, which already means "no signed-in user did this".
 ///
-/// **Call this before writing any membership row in the same transaction**, for the reason
+/// **Call this before writing any `list_memberships` row in the same transaction**, for the reason
 /// [`unsubscribe_all`] gives: `erase_address` deletes this row and only then deletes the contact,
 /// so a caller that locked the membership rows first would deadlock with an erase of the same
 /// address.
-///
-/// (The membership table is named in neither of these two comments on purpose: `tests/consent.rs`
-/// keeps a census of every file that mentions it, as a tripwire for a new writer of membership
-/// status, and this file is not one — it would be a false entry on that list.)
 pub async fn lift_unsubscribed_all(
     db: &mut PgConnection,
     secrets: &Secrets,
