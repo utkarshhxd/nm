@@ -399,7 +399,7 @@ Validation: at least one list; `slug` matches `^[a-z0-9][a-z0-9-]{1,62}$`, uniqu
 
 **Files:** Create `src/public/forms.rs`; modify `src/public/mod.rs`, `tests/consent.rs` (the writer array); test `tests/public_pages.rs`.
 
-`GET /f/{slug}` renders the form; `POST /f/{slug}` submits it. Both are rate-limited per IP with Task 4b's limiter. **The response is byte-identical for a new address, an existing subscriber, a suppressed address, a honeypot trip and a rate-limit refusal** (invariants 7 and 9) — a redirect to `redirect_url`, or the built-in "check your email" page.
+`GET /f/{workspace}/{slug}` renders the form; `POST /f/{workspace}/{slug}` submits it. `{workspace}` is `workspaces.slug` (globally unique since `0005`); the form slug stays unique per workspace. Spec §7.2 was amended for this — `/f/{slug}` alone cannot serve two workspaces that both call a form `newsletter`. Both are rate-limited per IP with Task 4b's limiter. A form whose lists have all been deleted accepts no submissions and answers exactly as every other refusal does. **The response is byte-identical for a new address, an existing subscriber, a suppressed address, a honeypot trip and a rate-limit refusal** (invariants 7 and 9) — a redirect to `redirect_url`, or the built-in "check your email" page.
 
 **A rate-limited submission renders that same success page. It does not answer `429` with `RateLimit-*` headers**, as every other limited route in this tree does. That departure is deliberate and required by spec §7.2 and §8.9: the route must not disclose anything, and a distinguishable refusal tells a scraper it has been seen.
 

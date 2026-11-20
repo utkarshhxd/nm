@@ -50,7 +50,13 @@ was given.
 ## 5. Constraints
 
 - Every tenant table carries `workspace_id`; cross-workspace reach returns 404, never 403, never
-  the data. Public endpoints resolve their workspace **from the token**, never from a parameter.
+  the data. Token-authenticated public endpoints resolve their workspace **from the token**, never
+  from a parameter.
+
+  **Amended 2026-11-20.** This originally said "public endpoints" without qualification, which
+  cannot hold for the form routes: they are reached by someone who has never been mailed, so there
+  is no token to resolve from and the workspace must come from the path. The rule as amended binds
+  `/c/` and `/u/`, which do carry tokens. See §7.2.
 - Migrations are append-only once released. `0012_lists.sql` already carries
   `double_optin boolean not null default true` and `visibility ('public','private')`, and
   `list_memberships.status` already allows `pending`. **M1a decided this; M1d honours it and must
@@ -143,8 +149,19 @@ one test asserts it for each writer.
 | `GET /c/{token}` | Confirms a pending membership. Idempotent: a second visit says "already confirmed", never errors. |
 | `GET /u/{token}` | The unsubscribe + preference page. |
 | `POST /u/{token}` | Body `List-Unsubscribe=One-Click` → unsubscribe from everything, 200, no body needed. Any other body → apply the form's checkboxes. |
-| `GET /f/{slug}` | The hosted signup page for a form. |
-| `POST /f/{slug}` | Submit it. |
+| `GET /f/{workspace}/{slug}` | The hosted signup page for a form. |
+| `POST /f/{workspace}/{slug}` | Submit it. |
+
+**Amended 2026-11-20, during M1d implementation.** These were originally `/f/{slug}`, which
+contradicts the form slug being unique *per workspace* — two operators cannot both be served from
+`/f/newsletter`. The alternative, a globally unique form slug, hands the first tenant to register
+`newsletter` a name no other tenant can ever use, and the fix after launch would be a breaking URL
+change for live embed codes.
+
+`{workspace}` is `workspaces.slug`, which `0005_workspaces.sql:3` already declares `not null
+unique`, so no new column and no new migration. It is not a secret: it appears in the embed snippet
+on the operator's own site. When M2 ships tracking domains with on-demand TLS, a form served from
+the operator's own host can drop the segment, because there the host already names the workspace.
 
 All five are unauthenticated, CSRF-exempt by design (they are token-authenticated), rate-limited
 per IP, and **must not disclose whether an address exists**: `POST /f/{slug}` answers identically
