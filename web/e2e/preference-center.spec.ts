@@ -3,7 +3,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import {
   type APIRequestContext,
-  type Browser,
   type BrowserContext,
   type Page,
   expect,
@@ -31,10 +30,14 @@ import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
  */
 
 /**
- * This file's own per-IP rate-limit budget, from RFC 5737's documentation range. No other spec
- * uses this address; one that reused it would inherit this file's spending.
+ * This file's two per-IP rate-limit budgets, from RFC 5737's documentation range. No other spec
+ * uses either address; one that reused them would inherit this file's spending.
  *
- * **Eight** of `PUBLIC_PER_MINUTE`'s 60, and the last test asserts the browser sent exactly that:
+ * **Two addresses, because the two halves of this file are two browsers.** The limiter keys on the
+ * address, so the JavaScript-off context carrying an address of its own costs nothing and keeps
+ * the worse of the two margins at 10× rather than 6×.
+ *
+ * `ADDRESS` — **6** of `PUBLIC_PER_MINUTE`'s 60:
  *
  * 1. `GET /f/{ws}/{slug}` — the signup page, swept.
  * 2. `POST /f/{ws}/{slug}` — the signup, whose answer ("Check your email") is swept too.
@@ -42,22 +45,32 @@ import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
  * 4. `GET /u/{token}` — the preference centre, swept, walked by keyboard.
  * 5. `GET /u/{token}` — the preference centre again, to change something on it.
  * 6. `POST /u/{token}` — the change.
- * 7. `GET /u/{token}` — with JavaScript off.
- * 8. `POST /u/{token}` — with JavaScript off.
  *
- * Every sweep loops over two colour schemes and three viewport widths **without reloading**:
- * `prefers-color-scheme` and the viewport are live, so a sweep of one page costs one request
- * rather than six. That is the difference between this file fitting in the budget and not.
+ * `QUIET` — **4**, everything with JavaScript switched off:
+ *
+ * 1. `GET /u/{token}` and 2. `POST /u/{token}` — the preference centre saves.
+ * 3. `GET /f/{ws}/{slug}` and 4. `POST /f/{ws}/{slug}` — the signup form submits. This is the page
+ *    an operator embeds on somebody else's site, so it is the one where a visitor with scripting
+ *    off is least hypothetical.
+ *
+ * The last test asserts both counts off a context-level listener. Every sweep loops over two
+ * colour schemes and three viewport widths **without reloading**: `prefers-color-scheme` and the
+ * viewport are live, so a sweep of one page costs one request rather than six. That is the
+ * difference between this file fitting in the budget and not.
  */
 const ADDRESS = "198.51.100.12";
+const QUIET = "198.51.100.13";
 const FORWARDED = "x-forwarded-for";
-const SPENT = 8;
+const SPENT = 6;
+const SPENT_QUIET = 4;
 
 test.use({ extraHTTPHeaders: { [FORWARDED]: ADDRESS } });
 test.describe.configure({ mode: "serial" });
 
 const SLUG = "access";
 const SUBSCRIBER = "reader@example.test";
+/** A second address, so the JavaScript-off signup is a signup and not a repeat submission. */
+const QUIET_SUBSCRIBER = "quiet-reader@example.test";
 /** The widest letter and nowhere to break it: an operator-typed name is what reflows these pages. */
 const LONG_LIST = "W".repeat(100);
 
@@ -73,14 +86,18 @@ const SIZES = [
 ];
 const THEMES = ["light", "dark"] as const;
 
-let browser: Browser;
 let api: APIRequestContext;
+/** The ordinary browser, on `ADDRESS`. */
 let context: BrowserContext;
 let page: Page;
+/** The same browser with script execution switched off, on `QUIET`. */
+let silent: BrowserContext;
+let quiet: Page;
 let csrf = "";
 const ids = { ws: "", digest: "", long: "", contact: "" };
-/** Every request to a public route this file's browsers made, for the budget assertion. */
+/** Every request to a public route each browser made, for the budget assertion. */
 const spent: string[] = [];
+const spentQuiet: string[] = [];
 
 async function post(path: string, data: unknown): Promise<{ id: string }> {
   const res = await api.post(path, { data, headers: { "X-CSRF-Token": csrf } });
@@ -96,19 +113,29 @@ async function memberships(): Promise<[string, string][]> {
   return got.data.map((m) => [m.list_id === ids.digest ? "digest" : "long", m.status]);
 }
 
-/** The consent log for this contact, newest first. An authenticated read: no public budget. */
-async function consent(): Promise<{ action: string; source: string; ip: string | null }[]> {
+/** The consent log for a contact, newest first. An authenticated read: no public budget. */
+async function consent(
+  contact = ids.contact,
+): Promise<{ action: string; source: string; ip: string | null }[]> {
   const got = (await (
-    await api.get(`/api/v1/workspaces/${ids.ws}/contacts/${ids.contact}/consent`)
+    await api.get(`/api/v1/workspaces/${ids.ws}/contacts/${contact}/consent`)
   ).json()) as { data: { action: string; source: string; ip: string | null }[] };
   return got.data;
 }
 
-/** Counts what a context's pages send to `/c/`, `/u/` and `/f/`. */
-function meter(ctx: BrowserContext): void {
+/** The id of the contact at `email` in this workspace, or "" if there is none. */
+async function contactId(email: string): Promise<string> {
+  const found = (await (
+    await api.get(`/api/v1/workspaces/${ids.ws}/contacts?q=${encodeURIComponent(email)}`)
+  ).json()) as { data: { id: string }[] };
+  return found.data[0]?.id ?? "";
+}
+
+/** Counts what a context's pages send to `/c/`, `/u/` and `/f/`, into that context's own ledger. */
+function meter(ctx: BrowserContext, into: string[]): void {
   ctx.on("request", (request) => {
     const path = new URL(request.url()).pathname;
-    if (/^\/[cuf]\//.test(path)) spent.push(`${request.method()} ${path.slice(0, 12)}…`);
+    if (/^\/[cuf]\//.test(path)) into.push(`${request.method()} ${path.slice(0, 12)}…`);
   });
 }
 
@@ -234,7 +261,16 @@ async function sweep(p: Page, where: string): Promise<string[]> {
         await p.setViewportSize({ width: size.width, height: size.height });
         const at = `${where} (${theme}, ${size.name})`;
         found.push(...(await p.evaluate(reflowProblems)).map((problem) => `${at}: ${problem}`));
-        found.push(...(await axeProblems(new AxeBuilder({ page: p }), at)));
+        // `color-contrast` by name on every scan, not just "no violations". These pages are
+        // written entirely in `oklch()` — the same thing that forced the focus ring to be
+        // measured through a canvas — and a contrast rule that cannot resolve a colour lands in
+        // `incomplete`, which reads exactly like a clean page. This sweep's colour evidence is
+        // worth nothing unless that rule actually passed.
+        found.push(
+          ...(await axeProblems(new AxeBuilder({ page: p }), at, {
+            requireRules: ["color-contrast"],
+          })),
+        );
       }
     }
   } finally {
@@ -283,8 +319,7 @@ function dimRings(seen: Stop[], where: string): string[] {
 
 /* ----------------------------------------------------------------------------------- setup --- */
 
-test.beforeAll(async ({ playwright, browser: launched }) => {
-  browser = launched;
+test.beforeAll(async ({ playwright, browser }) => {
   api = await playwright.request.newContext({ baseURL: "http://localhost:8090" });
   expect(
     (await api.post("/api/v1/auth/login", { data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD } }))
@@ -319,11 +354,22 @@ test.beforeAll(async ({ playwright, browser: launched }) => {
   });
 
   context = await browser.newContext();
-  meter(context);
+  meter(context, spent);
   page = await context.newPage();
+
+  // `page.context().setJavaScriptEnabled(false)` does not exist in Playwright — it is a Puppeteer
+  // method. `javaScriptEnabled` is a context option, so the quiet browser is a context of its own,
+  // and it claims its own address so its spending does not come out of the margin above.
+  silent = await browser.newContext({
+    javaScriptEnabled: false,
+    extraHTTPHeaders: { [FORWARDED]: QUIET },
+  });
+  meter(silent, spentQuiet);
+  quiet = await silent.newPage();
 });
 
 test.afterAll(async () => {
+  await silent.close();
   await context.close();
   await api.dispose();
 });
@@ -355,10 +401,7 @@ test("the_signup_form_is_sound_and_its_decoy_is_not_in_the_tab_order", async () 
 
   expect(problems).toEqual([]);
 
-  const search = (await (
-    await api.get(`/api/v1/workspaces/${ids.ws}/contacts?q=${encodeURIComponent(SUBSCRIBER)}`)
-  ).json()) as { data: { id: string }[] };
-  ids.contact = search.data[0]?.id ?? "";
+  ids.contact = await contactId(SUBSCRIBER);
   expect(ids.contact, "the submission reached this workspace").not.toBe("");
   expect(await memberships()).toEqual([["digest", "pending"]]);
 });
@@ -436,58 +479,92 @@ test("unticking_a_list_stops_it_and_the_page_says_which_one", async () => {
   expect(written).toEqual([`subscribed ${ADDRESS}`, `unsubscribed ${ADDRESS}`]);
 });
 
-test("the_preference_centre_still_works_with_javascript_switched_off", async () => {
-  // `page.context().setJavaScriptEnabled(false)` does not exist in Playwright — it is a Puppeteer
-  // method. `javaScriptEnabled` is a context option, so the context is built with it.
-  const silent = await browser.newContext({
-    javaScriptEnabled: false,
-    extraHTTPHeaders: { [FORWARDED]: ADDRESS },
-  });
-  meter(silent);
-  try {
-    const quiet = await silent.newPage();
-    await quiet.goto(unsubscribePath(ids.ws, ids.contact));
-    await expect(
-      quiet.getByRole("heading", { name: "Your email preferences", exact: true }),
-    ).toBeVisible();
+/**
+ * THE CONTROL FOR THE TWO TESTS BELOW, and it is run before them.
+ *
+ * `javaScriptEnabled: false` is a flag whose effect these pages cannot show: there is no script on
+ * any of them to fail to run, so a context in which the flag quietly stopped working would pass
+ * every assertion in those tests and they would be JavaScript tests wearing the wrong name. The
+ * same `data:` page is opened in both browsers and must come out differently, because a control
+ * that reads the same either way is not a control. It costs no server request and no budget.
+ */
+const CANARY = "data:text/html,<title>quiet</title><script>document.title='script ran'</script>";
 
-    // Nothing on these pages is script, so nothing about them should change: the box is ticked
-    // by the browser, the form is posted by the browser, and the server renders the answer.
-    await quiet.getByLabel("Weekly digest", { exact: true }).check();
-    await quiet.getByRole("button", { name: "Save preferences", exact: true }).click();
-    await expect(quiet).toHaveTitle("Your preferences are saved");
-    await expect(quiet.getByRole("status")).toHaveText("You will now get Weekly digest.");
-    await expect(quiet.getByLabel("Weekly digest", { exact: true })).toBeChecked();
-    // AND THE CONTROL, because `javaScriptEnabled: false` is a flag whose effect this page cannot
-    // show: there is no script on it to fail to run, so a context where the flag quietly stopped
-    // working would pass every assertion above and this test would be a JavaScript test wearing
-    // the wrong name. A `data:` page costs no public budget and no server request.
-    const canary = await silent.newPage();
-    await canary.goto(
-      "data:text/html,<title>quiet</title><script>document.title='script ran'</script>",
+test("the_quiet_browser_runs_no_script_and_the_ordinary_one_does", async () => {
+  const ran = await context.newPage();
+  const did_not = await silent.newPage();
+  try {
+    await ran.goto(CANARY);
+    await expect(ran, "the ordinary browser did not run the canary's script").toHaveTitle(
+      "script ran",
     );
-    await expect(canary, "the context still runs script").toHaveTitle("quiet");
+    await did_not.goto(CANARY);
+    await expect(did_not, "the quiet browser still runs script").toHaveTitle("quiet");
   } finally {
-    await silent.close();
+    await ran.close();
+    await did_not.close();
   }
+});
+
+test("the_preference_centre_still_works_with_javascript_switched_off", async () => {
+  await quiet.goto(unsubscribePath(ids.ws, ids.contact));
+  await expect(
+    quiet.getByRole("heading", { name: "Your email preferences", exact: true }),
+  ).toBeVisible();
+
+  // Nothing on this page is script, so nothing about it should change: the box is ticked by the
+  // browser, the form is posted by the browser, and the server renders the answer.
+  await quiet.getByLabel("Weekly digest", { exact: true }).check();
+  await quiet.getByRole("button", { name: "Save preferences", exact: true }).click();
+  await expect(quiet).toHaveTitle("Your preferences are saved");
+  await expect(quiet.getByRole("status")).toHaveText("You will now get Weekly digest.");
+  await expect(quiet.getByLabel("Weekly digest", { exact: true })).toBeChecked();
 
   // The membership is `subscribed` again; the consent row for it is `resubscribed`, which is the
-  // log's word for the same transition and is pinned in Rust.
+  // log's word for the same transition and is pinned in Rust. Its address is `QUIET`, which is
+  // what proves this browser's own header reached the server — the budget below rests on it.
   expect(new Map(await memberships())).toEqual(
     new Map([
       ["digest", "subscribed"],
       ["long", "subscribed"],
     ]),
   );
-  expect((await consent())[0]?.action, "a resubscribe through the preference centre").toBe(
+  const latest = (await consent())[0];
+  expect([latest?.action, latest?.source, latest?.ip]).toEqual([
     "resubscribed",
-  );
+    "preference_center",
+    QUIET,
+  ]);
+});
+
+/**
+ * The one the coordinator's review asked for, and the one that matters most of the three.
+ *
+ * `/f/{workspace}/{slug}` is the page an operator **embeds on somebody else's site**, reached by
+ * visitors whose browser the operator knows nothing about. A signup that needs script to submit is
+ * a signup that silently does not happen, and `src/public/page.rs` promises these pages work
+ * without it. Nothing else on this branch tests that for the form.
+ */
+test("the_signup_form_still_submits_with_javascript_switched_off", async () => {
+  await quiet.goto(`/f/${SLUG}/join`);
+  await expect(quiet.getByRole("heading", { name: "Join the list", exact: true })).toBeVisible();
+  await quiet.getByLabel("Email address", { exact: true }).fill(QUIET_SUBSCRIBER);
+  await quiet.getByRole("button", { name: "Join", exact: true }).click();
+  await expect(quiet.getByRole("heading", { name: "Check your email", exact: true })).toBeVisible();
+
+  // The answer page is the same for every submitter, so it says nothing about whether this one
+  // was written. The database does.
+  const signed_up = await contactId(QUIET_SUBSCRIBER);
+  expect(signed_up, "the scriptless submission reached this workspace").not.toBe("");
+  const asked = (await consent(signed_up))[0];
+  expect([asked?.action, asked?.source, asked?.ip]).toEqual(["requested", "form", QUIET]);
 });
 
 test("this_file_spends_what_it_says_it_spends", async () => {
   // The whole suite shares one `PUBLIC_PER_MINUTE` window per address, refusals counted, and once
-  // tripped it stays tripped for the minute. If this number moves, update the ledger at the top of
-  // this file **and** the margin recorded at `PUBLIC_PER_MINUTE` in `src/http/rate_limit.rs`,
-  // which is the worst spender on the branch and is this one.
-  expect(spent, `the public requests this file made were: ${spent.join(", ")}`).toHaveLength(SPENT);
+  // tripped it stays tripped for the minute. If either number moves, update the ledger at the top
+  // of this file **and** the margin recorded at `PUBLIC_PER_MINUTE` in `src/http/rate_limit.rs`,
+  // where this file is the worst spender on the branch.
+  expect(spent, `on ${ADDRESS}: ${spent.join(", ")}`).toHaveLength(SPENT);
+  expect(spentQuiet, `on ${QUIET}: ${spentQuiet.join(", ")}`).toHaveLength(SPENT_QUIET);
 });

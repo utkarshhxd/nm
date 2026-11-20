@@ -148,14 +148,16 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 ///   prove the snippet's field names are the ones the route reads.
 /// * `web/e2e/contact-detail.spec.ts` — **1** on `198.51.100.11`: one submission, so that the
 ///   consent panel has a row carrying the subscriber's own IP and user agent to show.
-/// * `web/e2e/preference-center.spec.ts` — **8** on `198.51.100.12`, the heaviest spender on the
-///   branch: all three public pages, a signup, a confirmation, a saved preference form and the
-///   same form again with JavaScript off. It is not 36 because an axe and reflow sweep of a page
+/// * `web/e2e/preference-center.spec.ts` — **6** on `198.51.100.12` and **4** on `198.51.100.13`,
+///   the heaviest spender on the branch and the only one holding two addresses. The six are all
+///   three public pages, a signup and a confirmation and a saved preference form; the four are the
+///   same preference form and the same signup form driven by a second browser with JavaScript
+///   switched off, which is a context of its own and therefore gets an address of its own rather
+///   than eating the first one's margin. It is not 36 because an axe and reflow sweep of a page
 ///   loops over two colour schemes and three widths **without reloading** — `prefers-color-scheme`
-///   and the viewport are live. That file asserts its own total, so this entry cannot drift
-///   quietly.
+///   and the viewport are live. That file asserts both totals, so this entry cannot drift quietly.
 ///
-/// The budget is per address, so the margin is the worst spec's: **7.5×** (was 15× before
+/// The budget is per address, so the margin is the worst address's: **10×** (was 15× before
 /// `preference-center.spec.ts`). A spec added under `/c/`, `/u/` or `/f/` picks a fresh address
 /// from RFC 5737's range and counts its own cost here; one that reuses another spec's address
 /// inherits its spending, and the failure looks exactly like a product bug.
@@ -168,7 +170,8 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// reads the same whichever address it belongs to. What can is the consent row a public route
 /// writes, which carries the client address — `forms.spec.ts` reads it back over the API,
 /// `contact-detail.spec.ts` off the consent panel, `preference-center.spec.ts` off the two rows
-/// the preference form writes.
+/// the preference form writes — and, for its second address, off the rows the JavaScript-off
+/// browser's own save and signup write.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
 const WINDOW: Duration = Duration::from_secs(60);
