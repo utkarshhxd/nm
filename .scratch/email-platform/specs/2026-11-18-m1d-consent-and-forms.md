@@ -43,6 +43,8 @@ was given.
   how, the when or the where is worse than none, because it invites false confidence.
 - **An unsubscribe that does not stick.** Any path that lets a later import, API call or form
   submission silently re-subscribe someone who left is a product-ending defect, not a bug.
+  **Clarified 2026-11-20:** deleting the contact or the list is such a path, and was one. See the
+  amendment to invariant 1 in §8.
 - **A public endpoint that leaks.** Tokens that are guessable, enumerable, or that disclose
   whether an address exists in a workspace.
 - A preference center that shows someone a list they were never on, or hides one they are on.
@@ -198,6 +200,21 @@ contact detail screen; the public name/description/visibility fields on the list
 1. **An unsubscribe is never silently reversed.** An import, an API call or a form submission
    naming an address that unsubscribed from a list leaves that membership `unsubscribed` unless
    the person themselves acts through a token. One test per writer.
+
+   **Amended 2026-11-20.** As written this was satisfiable by a membership row alone, and the
+   M1d whole-branch review found that it was: a per-list unsubscribe lived *only* in that row, so
+   **deleting the contact or deleting the list destroyed the refusal along with its consent
+   history** — after which an import re-subscribed the person and the log could not say they had
+   ever left. Because the importer matches a list by name, delete-recreate-import resurrected
+   everyone who had left. Every test for this invariant held the contact and the list alive, so
+   none of them could see it.
+
+   The invariant therefore reads: **the refusal must not depend on the membership row, the
+   contact row or the list row surviving.** A per-list unsubscribe is recorded as a `list`-scope
+   suppression keyed on `(workspace_id, email_hmac, list_name)` — address-keyed, like every other
+   suppression, and like `gdpr_erasure` it outlives the thing it protects. Only the person, acting
+   through a token, lifts it. One test per writer still stands, and each now has a sibling that
+   deletes the contact or the list first.
 2. A `pending` membership is never mailable, and `confirmed` is the only transition that makes it
    so. (`is_mailable` already refuses `pending`; the test proves the transition.)
 3. One-click unsubscribe takes effect in **under five seconds**, measured end to end, and is
