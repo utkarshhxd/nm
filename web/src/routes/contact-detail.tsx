@@ -514,8 +514,9 @@ function Lists({
             <p className="mt-3 text-fg-muted">
               Unsubscribing sets the membership to unsubscribed and keeps it: the row stays here
               and is not deleted, so the opt-out is not lost the next time this contact is
-              imported. Adding the list again subscribes them, or marks them pending on a
-              double opt-in list, which cannot be mailed until they confirm.
+              imported. Adding a list this contact already has a membership on does nothing,
+              whatever it says — an unsubscribe can only be undone by the contact themselves,
+              through the link in their own mail.
             </p>
           ) : null}
           {lists.data.some((l) => l.status === "pending") ? (

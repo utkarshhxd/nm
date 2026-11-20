@@ -506,7 +506,7 @@ pub async fn mailable_count(
     ),
     request_body = NewMember,
     responses(
-        (status = 200, description = "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one", body = Membership),
+        (status = 200, description = "The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had", body = Membership),
         (status = 403, description = "insufficient-role: changing a list's members takes editor"),
         (status = 404, description = "not a member, or no such list or contact in this workspace"),
     ),
@@ -683,7 +683,7 @@ pub async fn list_contact_lists(
     ),
     request_body = NewContactList,
     responses(
-        (status = 200, description = "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one", body = Membership),
+        (status = 200, description = "The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had", body = Membership),
         (status = 403, description = "insufficient-role: changing a contact's lists takes editor"),
         (status = 404, description = "not a member, or no such contact or list in this workspace"),
     ),

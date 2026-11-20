@@ -149,9 +149,11 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
-/// Puts the contact on the list and returns the status that was written: `Subscribed` on a
-/// single-opt-in list, `Pending` on a double-opt-in one. The caller passes the transaction and has
-/// already authorised the actor. `404` if either id is not in this workspace.
+/// Puts the contact on the list and returns the membership's status — for a new member the one
+/// just written, `Subscribed` on a single-opt-in list and `Pending` on a double-opt-in one; for a
+/// contact already on the list, the status it already had, which may not be the one asked for. The
+/// caller passes the transaction and has already authorised the actor. `404` if either id is not
+/// in this workspace.
 ///
 /// A membership that already exists is left exactly as it is, whatever it says, and the status it
 /// already has is what comes back. Adding someone twice must not demote a confirmed subscriber
@@ -210,7 +212,16 @@ pub async fn add_member(
             let action = match w.status {
                 MembershipStatus::Pending => consent::Action::Requested,
                 MembershipStatus::Subscribed => consent::Action::Subscribed,
-                MembershipStatus::Unsubscribed => consent::Action::Unsubscribed,
+                // Unreachable: this arm's row was just inserted with `status` above, which is only
+                // ever `Pending` or `Subscribed`, and `do nothing` returns nothing on conflict.
+                // It fails instead of naming an action, because the compile-time guard is the
+                // point and a consent row saying the wrong thing outlives the `500` that would
+                // have been noticed. `record` is append-only, so a wrong row cannot be corrected.
+                MembershipStatus::Unsubscribed => {
+                    return Err(ApiError::Internal(anyhow::anyhow!(
+                        "add_member inserted a membership with an unwritable status"
+                    )));
+                }
             };
             let source = consent::Source::Operator;
             consent::record(

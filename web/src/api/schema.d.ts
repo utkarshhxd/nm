@@ -4531,7 +4531,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            /** @description The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5509,7 +5509,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            /** @description The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had */
             200: {
                 headers: {
                     [name: string]: unknown;
