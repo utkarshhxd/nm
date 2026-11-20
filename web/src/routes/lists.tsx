@@ -15,6 +15,7 @@ import { ErrorState } from "../components/error-state";
 import { Alert, Field } from "../components/field";
 import { CONTROL } from "../components/input";
 import { MembershipBadge } from "../components/membership-badge";
+import { Select } from "../components/select";
 import { Skeleton } from "../components/skeleton";
 import { TableScroller } from "../components/table-scroller";
 import { atLeast } from "../lib/roles";
@@ -132,7 +133,9 @@ function AllLists({ ws, slug, canEdit }: { ws: string; slug: string; canEdit: bo
  * member is then `pending` and not mailable until they confirm, and nothing in this milestone
  * sends the confirmation — so the checkbox says it rather than leaving someone to find out.
  *
- * Visibility is not offered: it does nothing until the preference center exists.
+ * Visibility decides whether the preference centre offers this list to someone who is not on it.
+ * A private list is still shown there to its own members, so hiding one never leaves a subscriber
+ * unable to leave it.
  */
 function ListForm({
   ws,
@@ -149,6 +152,9 @@ function ListForm({
   const [name, setName] = useState(existing?.name ?? "");
   const [description, setDescription] = useState(existing?.description ?? "");
   const [doubleOptin, setDoubleOptin] = useState(existing?.double_optin ?? true);
+  const [visibility, setVisibility] = useState<List["visibility"]>(
+    existing?.visibility ?? "private",
+  );
 
   const create = useMutation({
     mutationFn: async () => {
@@ -163,6 +169,7 @@ function ListForm({
                 ? {}
                 : { description: description.trim() }),
               ...(doubleOptin === existing.double_optin ? {} : { double_optin: doubleOptin }),
+              ...(visibility === existing.visibility ? {} : { visibility }),
             },
           })
         : await api.POST("/api/v1/workspaces/{workspace_id}/lists", {
@@ -171,6 +178,7 @@ function ListForm({
               name: name.trim(),
               description: description.trim(),
               double_optin: doubleOptin,
+              visibility,
             },
           });
       if (!data) throw new Error(problemText(error, KNOWN, "The list could not be saved."));
@@ -211,6 +219,26 @@ function ListForm({
           value={description}
           onChange={(e) => setDescription(e.target.value)}
         />
+      </div>
+      <div className="mt-4">
+        <label className="block font-medium" htmlFor="list-visibility">
+          Visibility
+        </label>
+        <Select
+          id="list-visibility"
+          className="mt-1"
+          aria-describedby="list-visibility-hint"
+          value={visibility}
+          onChange={(e) => setVisibility(e.target.value as List["visibility"])}
+        >
+          <option value="private">Private</option>
+          <option value="public">Public</option>
+        </Select>
+        <span id="list-visibility-hint" className="mt-1 block text-sm text-fg-muted">
+          A public list is offered in the preference centre to anyone holding a link, so they can
+          join it. A private one is shown there only to people already on it — hiding a list never
+          leaves someone unable to leave it.
+        </span>
       </div>
       <div className="mt-4">
         <label className="flex w-fit items-center gap-2 font-medium">

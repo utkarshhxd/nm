@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .merge(crate::tags::routes::routes())
         .merge(crate::suppressions::routes::routes())
         .merge(crate::audit::routes::routes())
+        .merge(crate::consent::routes::routes())
         // The subscriber's pages, at top-level paths and with no session. Merged here like every
         // other module, which puts them inside the CSRF layer `app::router` wraps around this —
         // `http::csrf` gates `/api/v1/` only, so they are exempt by construction and need no

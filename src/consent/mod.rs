@@ -6,13 +6,19 @@
 
 use std::net::IpAddr;
 
+use serde::Serialize;
 use sqlx::PgConnection;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 
-/// Stored as text under a `check` constraint, as `lists::MembershipStatus` is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+pub mod routes;
+
+/// What changed — and for `requested`, what did not: the person was **asked** and has not
+/// agreed. Stored as text under a `check` constraint, as `lists::MembershipStatus` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum Action {
     /// A membership written `pending`: the person was asked, and has not agreed. It is its own
@@ -27,8 +33,10 @@ pub enum Action {
     Suppressed,
 }
 
-/// What caused the change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+/// What caused the change. **The code path, never the actor**: a session-authenticated operator
+/// using bulk subscribe is `Api`, because that is the writer the change went through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum Source {
     Form,

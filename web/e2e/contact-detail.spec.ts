@@ -6,7 +6,11 @@ import { type BrowserContext, type Page, expect, test } from "@playwright/test";
 import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
-/** One small workspace, seeded once through the API and shared by the tests, which only read it. */
+/**
+ * One small workspace, seeded once through the API and shared by the tests. Every test but the
+ * last only reads it; `the_list_editor_sets_a_lists_visibility` creates a list of its own rather
+ * than editing one the earlier tests count.
+ */
 test.describe.configure({ mode: "serial" });
 
 const SLUG = "detailco";
@@ -218,4 +222,60 @@ test("enter_on_a_grid_row_opens_the_contact", async () => {
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(new RegExp(`/contacts/${ids.ada}$`));
   await expect(page.getByRole("heading", { name: "ada@example.test", exact: true })).toBeVisible();
+});
+
+/**
+ * The consent panel answers "did this person agree, and how?".
+ *
+ * Ada's two memberships were written by an operator through the API in `beforeAll`: one to a
+ * single-opt-in list, which is agreement, and one to a double-opt-in list, which is only a
+ * request. Both must be legible as what they are, with the path they arrived by beside them.
+ *
+ * It does not assert a `confirmed` row, and cannot: the only writer of one is `GET /c/{token}`,
+ * the token exists only inside an enqueued `confirmation_email` job, and this harness has no way
+ * to read that queue — no database client on PATH and no API or CLI over `jobs`. M1d Task 12's
+ * preference-centre spec is where that gap has to be closed.
+ */
+test("consent_history_says_how_each_membership_was_made", async () => {
+  await page.goto(contact(ids.ada));
+  const consent = page.getByRole("region", { name: "Consent history", exact: true });
+  const log = consent.getByRole("table");
+  const row = (list: string) => log.getByRole("row").filter({ hasText: list });
+
+  // The single-opt-in list: subscribed outright, by an operator.
+  await expect(row("Announcements")).toContainText("Subscribed");
+  await expect(row("Announcements")).toContainText("Operator");
+  // The double-opt-in list: ASKED, not agreed. A panel that showed this as "Subscribed" would be
+  // asserting consent nobody gave.
+  await expect(row("Newsletter")).toContainText("Requested");
+  await expect(row("Newsletter")).not.toContainText("Subscribed");
+  await expect(consent).toContainText("asked and has not agreed yet");
+
+  // An operator's own request is not the subscriber's evidence, so neither row carries one.
+  await expect(log).not.toContainText("IP address");
+  await expect(log).not.toContainText("Browser");
+});
+
+test("the_list_editor_sets_a_lists_visibility", async () => {
+  await page.goto(`/w/${SLUG}/lists`);
+  await page.getByRole("button", { name: "New list", exact: true }).click();
+  const creating = page.getByRole("dialog", { name: "New list", exact: true });
+  await creating.getByLabel("Name", { exact: true }).fill("Topics");
+  await creating.getByLabel("Visibility", { exact: true }).selectOption("public");
+  await creating.getByRole("button", { name: "Create list", exact: true }).click();
+
+  // The visibility cell itself, not the row: the list's own name would satisfy a row-wide match.
+  const row = page.getByRole("row").filter({ hasText: "Topics" });
+  await expect(row.getByRole("cell").nth(2)).toHaveText("public");
+  await row.getByRole("link", { name: "Topics", exact: true }).click();
+  const settings = page.getByRole("region", { name: "Settings", exact: true });
+  await expect(settings.locator('dt:text-is("Visibility") + dd')).toHaveText("public");
+
+  // And back again: the control reads the list it is editing, rather than defaulting every time.
+  await page.getByRole("button", { name: "Edit list", exact: true }).click();
+  const editing = page.getByRole("dialog", { name: "Edit list", exact: true });
+  await expect(editing.getByLabel("Visibility", { exact: true })).toHaveValue("public");
+  await editing.getByLabel("Visibility", { exact: true }).selectOption("private");
+  await editing.getByRole("button", { name: "Save list", exact: true }).click();
+  await expect(settings.locator('dt:text-is("Visibility") + dd')).toHaveText("private");
 });

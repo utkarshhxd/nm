@@ -2069,6 +2069,76 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/consent": {
+      "get": {
+        "tags": [
+          "crate::consent::routes"
+        ],
+        "summary": "One contact's consent history, newest first.",
+        "description": "**Ordered and paged by `id`, not `created_at`.** `created_at` ties — Postgres `now()` is\ntransaction-start time, a membership write and its consent row share a transaction, and the\nset-based writers insert a whole batch in one statement — so paging on it would skip or\nrepeat the rows that share a value. `id` is UUID v7, so `id desc` is both a total order and\nnewest-first; `0024_consent_log_paging_index.sql` is the index that serves it.",
+        "operationId": "list_consent",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every consent row for this contact, newest first, paged by row id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ConsentEntry"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
       "get": {
         "tags": [
@@ -4579,6 +4649,18 @@
           }
         }
       },
+      "Action": {
+        "type": "string",
+        "description": "What changed — and for `requested`, what did not: the person was **asked** and has not\nagreed. Stored as text under a `check` constraint, as `lists::MembershipStatus` is.",
+        "enum": [
+          "requested",
+          "subscribed",
+          "confirmed",
+          "unsubscribed",
+          "resubscribed",
+          "suppressed"
+        ]
+      },
       "ApiKeySummary": {
         "type": "object",
         "description": "A key as listed: its prefix identifies it, nothing in it can authenticate.",
@@ -5035,6 +5117,77 @@
               "type": "string"
             },
             "description": "Shown only here."
+          }
+        }
+      },
+      "ConsentEntry": {
+        "type": "object",
+        "description": "One row of the log, with the list's name joined on.\n\n**The evidence columns are the point of the row**, not decoration on it: a row that says\n`subscribed` without saying how is what this milestone exists to prevent. `ip` and\n`user_agent` are the subscriber's own, written only by the public routes where the request\nreally was theirs; an operator or API change carries neither and names the actor in\n`source_ref` instead.",
+        "required": [
+          "id",
+          "action",
+          "source",
+          "created_at"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/Action",
+            "description": "`requested` means the person was **asked** and has not agreed — a double opt-in that is\nstill pending. It is not a softer `subscribed`."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "ip": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The subscriber's own address, on the public routes only."
+          },
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Null for a workspace-wide change, and for a row whose list has since been deleted —\n`0020_consent_log.sql` nulls the pointer and keeps the evidence."
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The list's name now. Null whenever `list_id` is."
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source",
+            "description": "The code path the change arrived by, never who made it: a session-authenticated operator\nusing bulk subscribe is recorded as `api`."
+          },
+          "source_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Whatever caused the change: the form id, the import id, the user or API key id."
+          },
+          "token_jti": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The nonce of the public token that authorised the change: *which* link was clicked."
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The subscriber's own, on the public routes only."
           }
         }
       },
@@ -5757,7 +5910,7 @@
           },
           "visibility": {
             "$ref": "#/components/schemas/Visibility",
-            "description": "Unused until the preference center, which shows the `public` lists as topics."
+            "description": "Whether the preference center offers this list to somebody who is not on it. A `private`\nlist is still shown there to its own members, so hiding one never leaves a subscriber\nunable to leave it (`public::unsubscribe::topics`)."
           }
         }
       },
@@ -6503,6 +6656,94 @@
           }
         }
       },
+      "Page_ConsentEntry": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One row of the log, with the list's name joined on.\n\n**The evidence columns are the point of the row**, not decoration on it: a row that says\n`subscribed` without saying how is what this milestone exists to prevent. `ip` and\n`user_agent` are the subscriber's own, written only by the public routes where the request\nreally was theirs; an operator or API change carries neither and names the actor in\n`source_ref` instead.",
+              "required": [
+                "id",
+                "action",
+                "source",
+                "created_at"
+              ],
+              "properties": {
+                "action": {
+                  "$ref": "#/components/schemas/Action",
+                  "description": "`requested` means the person was **asked** and has not agreed — a double opt-in that is\nstill pending. It is not a softer `subscribed`."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "ip": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The subscriber's own address, on the public routes only."
+                },
+                "list_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid",
+                  "description": "Null for a workspace-wide change, and for a row whose list has since been deleted —\n`0020_consent_log.sql` nulls the pointer and keeps the evidence."
+                },
+                "list_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The list's name now. Null whenever `list_id` is."
+                },
+                "source": {
+                  "$ref": "#/components/schemas/Source",
+                  "description": "The code path the change arrived by, never who made it: a session-authenticated operator\nusing bulk subscribe is recorded as `api`."
+                },
+                "source_ref": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Whatever caused the change: the form id, the import id, the user or API key id."
+                },
+                "token_jti": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The nonce of the public token that authorised the change: *which* link was clicked."
+                },
+                "user_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The subscriber's own, on the public routes only."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Contact": {
         "type": "object",
         "required": [
@@ -7028,7 +7269,7 @@
                 },
                 "visibility": {
                   "$ref": "#/components/schemas/Visibility",
-                  "description": "Unused until the preference center, which shows the `public` lists as topics."
+                  "description": "Whether the preference center offers this list to somebody who is not on it. A `private`\nlist is still shown there to its own members, so hiding one never leaves a subscriber\nunable to leave it (`public::unsubscribe::topics`)."
                 }
               }
             }
@@ -7672,6 +7913,20 @@
             "description": "Base32 secret, shown only here."
           }
         }
+      },
+      "Source": {
+        "type": "string",
+        "description": "What caused the change. **The code path, never the actor**: a session-authenticated operator\nusing bulk subscribe is `Api`, because that is the writer the change went through.",
+        "enum": [
+          "form",
+          "import",
+          "api",
+          "operator",
+          "one_click",
+          "preference_center",
+          "bounce",
+          "complaint"
+        ]
       },
       "StartImport": {
         "type": "object",

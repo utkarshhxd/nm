@@ -1,0 +1,139 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select c.id, c.action as \"action: Action\", c.source as \"source: Source\",\n                  c.list_id, l.name as \"list_name?\", c.source_ref, c.ip as \"ip: IpAddr\",\n                  c.user_agent, c.token_jti, c.created_at\n           from consent_log c\n           left join lists l on l.workspace_id = c.workspace_id and l.id = c.list_id\n           where c.workspace_id = $1 and c.contact_id = $2 and ($3::uuid is null or c.id < $3)\n           order by c.id desc limit $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "action: Action",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "action"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "source: Source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "list_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "list_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "list_name?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "source_ref",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "source_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "ip: IpAddr",
+        "type_info": "Inet",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "ip"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "user_agent",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "user_agent"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "token_jti",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "token_jti"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "consent_log",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "5483426d759319e1009fe3f17f1c2da66a8da1f099c3d4808520005b4d2913a2"
+}

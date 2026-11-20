@@ -634,6 +634,30 @@ export interface paths {
         patch: operations["update_contact"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/consent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One contact's consent history, newest first.
+         * @description **Ordered and paged by `id`, not `created_at`.** `created_at` ties — Postgres `now()` is
+         *     transaction-start time, a membership write and its consent row share a transaction, and the
+         *     set-based writers insert a whole batch in one statement — so paging on it would skip or
+         *     repeat the rows that share a value. `id` is UUID v7, so `id desc` is both a total order and
+         *     newest-first; `0024_consent_log_paging_index.sql` is the index that serves it.
+         */
+        get: operations["list_consent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
         parameters: {
             query?: never;
@@ -1197,6 +1221,12 @@ export interface components {
             /** Format: uuid */
             workspace_id: string;
         };
+        /**
+         * @description What changed — and for `requested`, what did not: the person was **asked** and has not
+         *     agreed. Stored as text under a `check` constraint, as `lists::MembershipStatus` is.
+         * @enum {string}
+         */
+        Action: "requested" | "subscribed" | "confirmed" | "unsubscribed" | "resubscribed" | "suppressed";
         /** @description A key as listed: its prefix identifies it, nothing in it can authenticate. */
         ApiKeySummary: {
             /** Format: date-time */
@@ -1380,6 +1410,47 @@ export interface components {
         ConfirmResponse: {
             /** @description Shown only here. */
             recovery_codes: string[];
+        };
+        /**
+         * @description One row of the log, with the list's name joined on.
+         *
+         *     **The evidence columns are the point of the row**, not decoration on it: a row that says
+         *     `subscribed` without saying how is what this milestone exists to prevent. `ip` and
+         *     `user_agent` are the subscriber's own, written only by the public routes where the request
+         *     really was theirs; an operator or API change carries neither and names the actor in
+         *     `source_ref` instead.
+         */
+        ConsentEntry: {
+            /**
+             * @description `requested` means the person was **asked** and has not agreed — a double opt-in that is
+             *     still pending. It is not a softer `subscribed`.
+             */
+            action: components["schemas"]["Action"];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            /** @description The subscriber's own address, on the public routes only. */
+            ip?: string | null;
+            /**
+             * Format: uuid
+             * @description Null for a workspace-wide change, and for a row whose list has since been deleted —
+             *     `0020_consent_log.sql` nulls the pointer and keeps the evidence.
+             */
+            list_id?: string | null;
+            /** @description The list's name now. Null whenever `list_id` is. */
+            list_name?: string | null;
+            /**
+             * @description The code path the change arrived by, never who made it: a session-authenticated operator
+             *     using bulk subscribe is recorded as `api`.
+             */
+            source: components["schemas"]["Source"];
+            /** @description Whatever caused the change: the form id, the import id, the user or API key id. */
+            source_ref?: string | null;
+            /** @description The nonce of the public token that authorised the change: *which* link was clicked. */
+            token_jti?: string | null;
+            /** @description The subscriber's own, on the public routes only. */
+            user_agent?: string | null;
         };
         Contact: {
             /** @description Custom field values by field key. Values of archived fields stay readable here. */
@@ -1723,7 +1794,11 @@ export interface components {
             name: string;
             /** Format: date-time */
             updated_at: string;
-            /** @description Unused until the preference center, which shows the `public` lists as topics. */
+            /**
+             * @description Whether the preference center offers this list to somebody who is not on it. A `private`
+             *     list is still shown there to its own members, so hiding one never leaves a subscriber
+             *     unable to leave it (`public::unsubscribe::topics`).
+             */
             visibility: components["schemas"]["Visibility"];
         };
         /** @description A contact's standing on one list. */
@@ -1972,6 +2047,41 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_ConsentEntry: {
+            data: {
+                /**
+                 * @description `requested` means the person was **asked** and has not agreed — a double opt-in that is
+                 *     still pending. It is not a softer `subscribed`.
+                 */
+                action: components["schemas"]["Action"];
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                id: string;
+                /** @description The subscriber's own address, on the public routes only. */
+                ip?: string | null;
+                /**
+                 * Format: uuid
+                 * @description Null for a workspace-wide change, and for a row whose list has since been deleted —
+                 *     `0020_consent_log.sql` nulls the pointer and keeps the evidence.
+                 */
+                list_id?: string | null;
+                /** @description The list's name now. Null whenever `list_id` is. */
+                list_name?: string | null;
+                /**
+                 * @description The code path the change arrived by, never who made it: a session-authenticated operator
+                 *     using bulk subscribe is recorded as `api`.
+                 */
+                source: components["schemas"]["Source"];
+                /** @description Whatever caused the change: the form id, the import id, the user or API key id. */
+                source_ref?: string | null;
+                /** @description The nonce of the public token that authorised the change: *which* link was clicked. */
+                token_jti?: string | null;
+                /** @description The subscriber's own, on the public routes only. */
+                user_agent?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Contact: {
             data: {
                 /** @description Custom field values by field key. Values of archived fields stay readable here. */
@@ -2191,7 +2301,11 @@ export interface components {
                 name: string;
                 /** Format: date-time */
                 updated_at: string;
-                /** @description Unused until the preference center, which shows the `public` lists as topics. */
+                /**
+                 * @description Whether the preference center offers this list to somebody who is not on it. A `private`
+                 *     list is still shown there to its own members, so hiding one never leaves a subscriber
+                 *     unable to leave it (`public::unsubscribe::topics`).
+                 */
                 visibility: components["schemas"]["Visibility"];
             }[];
             next_cursor?: string | null;
@@ -2431,6 +2545,12 @@ export interface components {
             /** @description Base32 secret, shown only here. */
             secret: string;
         };
+        /**
+         * @description What caused the change. **The code path, never the actor**: a session-authenticated operator
+         *     using bulk subscribe is `Api`, because that is the writer the change went through.
+         * @enum {string}
+         */
+        Source: "form" | "import" | "api" | "operator" | "one_click" | "preference_center" | "bounce" | "complaint";
         /** @description The confirmed mapping, and the run. */
         StartImport: {
             /**
@@ -4555,6 +4675,50 @@ export interface operations {
                 content?: never;
             };
             /** @description invalid name, time zone or attribute, or an unknown field such as `email` */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_consent: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every consent row for this contact, newest first, paged by row id */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ConsentEntry"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
             422: {
                 headers: {
                     [name: string]: unknown;

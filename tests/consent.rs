@@ -1331,3 +1331,197 @@ async fn a_confirmation_link_that_predates_an_unsubscribe_does_not_revive_the_me
         "no `confirmed` row for a confirmation that did not happen"
     );
 }
+
+// ---- Task 11: the consent history route --------------------------------------------------------
+
+/// Every page of `GET …/contacts/{id}/consent`, followed to the end, as `(ids, page sizes)`.
+///
+/// The bound is a guard, not a limit: a cursor that never advances would otherwise hang the
+/// test suite instead of failing it.
+async fn consent_history(app: &TestApp, ws: Uuid, c: Uuid, limit: u32) -> (Vec<Uuid>, Vec<usize>) {
+    let path = format!("/api/v1/workspaces/{ws}/contacts/{c}/consent");
+    let mut ids: Vec<Uuid> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let url = match &cursor {
+            Some(after) => format!("{path}?limit={limit}&cursor={after}"),
+            None => format!("{path}?limit={limit}"),
+        };
+        let r = app.get(&url).await;
+        r.assert_status_ok();
+        let body: Value = r.json();
+        let page = body["data"].as_array().unwrap();
+        sizes.push(page.len());
+        ids.extend(
+            page.iter()
+                .map(|row| row["id"].as_str().unwrap().parse::<Uuid>().unwrap()),
+        );
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => return (ids, sizes),
+        }
+    }
+    panic!("the cursor never ran out: {sizes:?}");
+}
+
+/// Cross-workspace reach answers as if the contact did not exist — never 403, never the history.
+#[sqlx::test]
+async fn another_workspaces_consent_history_is_404(pool: PgPool) {
+    let (mine, _, app) = editor(&pool, "mineco").await;
+    let theirs = workspace(&pool, "theirsco").await;
+    let their_contact = contact(&pool, theirs, "them@ex.test").await;
+    let their_list = list(&pool, theirs, "news").await;
+    // A real row to be leaked, so a 404 below cannot be "there was nothing to show anyway".
+    let mut conn = pool.acquire().await.unwrap();
+    record(
+        &mut conn,
+        theirs,
+        their_contact,
+        Some(their_list),
+        Action::Subscribed,
+        Source::Api,
+        &Context::default(),
+    )
+    .await
+    .unwrap();
+
+    // Their contact id under my workspace: the contact lookup is the 404.
+    app.get(&format!(
+        "/api/v1/workspaces/{mine}/contacts/{their_contact}/consent"
+    ))
+    .await
+    .assert_status(StatusCode::NOT_FOUND);
+    // Their contact under their own workspace, which I am not a member of: `authorize` is.
+    app.get(&format!(
+        "/api/v1/workspaces/{theirs}/contacts/{their_contact}/consent"
+    ))
+    .await
+    .assert_status(StatusCode::NOT_FOUND);
+
+    // And the same request for a contact of mine answers, so the two refusals above are about
+    // the workspace and not about the route being unreachable.
+    let mine_contact = api_contact(&app, mine, "me@ex.test").await;
+    app.get(&format!(
+        "/api/v1/workspaces/{mine}/contacts/{mine_contact}/consent"
+    ))
+    .await
+    .assert_status_ok();
+}
+
+/// The reason the route pages on `id` and not on `created_at`.
+#[sqlx::test]
+async fn consent_history_pages_without_skipping_or_repeating_rows_that_share_a_timestamp(
+    pool: PgPool,
+) {
+    let (ws, _, app) = editor(&pool, "pagingco").await;
+    let c = api_contact(&app, ws, "paged@ex.test").await;
+    let l = api_list(&app, ws, "news", false).await;
+
+    // SEVEN ROWS IN ONE TRANSACTION, which is the whole fixture. Postgres `now()` is
+    // transaction-start time, so all seven carry the same `created_at` — and a `created_at`
+    // cursor over them either stops after the first page or returns the same rows for ever. A
+    // fixture whose rows each had a timestamp of their own would pass this test with the bug in
+    // place, which is why they are written together rather than in a loop of statements.
+    let mut tx = pool.begin().await.unwrap();
+    for _ in 0..7 {
+        record(
+            &mut tx,
+            ws,
+            c,
+            Some(l),
+            Action::Subscribed,
+            Source::Api,
+            &Context::default(),
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let stamps: Vec<DateTime<Utc>> = sqlx::query_scalar(
+        "select created_at from consent_log where workspace_id = $1 and contact_id = $2",
+    )
+    .bind(ws)
+    .bind(c)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut distinct = stamps.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        (stamps.len(), distinct.len()),
+        (7, 1),
+        "the fixture must tie, or this test proves nothing"
+    );
+
+    let expected: Vec<Uuid> = sqlx::query_scalar(
+        "select id from consent_log where workspace_id = $1 and contact_id = $2 order by id desc",
+    )
+    .bind(ws)
+    .bind(c)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    // Pages smaller than the set, so the boundary is crossed twice.
+    let (seen, sizes) = consent_history(&app, ws, c, 3).await;
+    assert_eq!(sizes, [3, 3, 1], "three pages of the size asked for");
+    assert_eq!(seen, expected, "every row exactly once, newest first");
+}
+
+/// What the panel reads: the action, the source, the list, and the evidence where there is any.
+#[sqlx::test]
+async fn consent_history_says_which_action_arrived_how_and_with_what_evidence(pool: PgPool) {
+    let (ws, _, app) = editor(&pool, "shapeco").await;
+    let c = api_contact(&app, ws, "shape@ex.test").await;
+    let l = api_list(&app, ws, "news", true).await;
+    app.post(&format!("/api/v1/workspaces/{ws}/lists/{l}/members"))
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    // A public-route row, which is the only kind that carries the subscriber's own evidence.
+    let mut conn = pool.acquire().await.unwrap();
+    record(
+        &mut conn,
+        ws,
+        c,
+        Some(l),
+        Action::Confirmed,
+        Source::Form,
+        &Context {
+            ip: Some("203.0.113.9".parse().unwrap()),
+            user_agent: Some("Mozilla/5.0 (test)".into()),
+            source_ref: Some("form-42".into()),
+            token_jti: Some("01HQ0000000000000000000000".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let body: Value = app
+        .get(&format!("/api/v1/workspaces/{ws}/contacts/{c}/consent"))
+        .await
+        .json();
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+
+    assert_eq!(rows[0]["action"], "confirmed");
+    assert_eq!(rows[0]["source"], "form");
+    assert_eq!(rows[0]["list_name"], "news");
+    assert_eq!(rows[0]["list_id"], l.to_string());
+    assert_eq!(rows[0]["source_ref"], "form-42");
+    assert_eq!(rows[0]["ip"], "203.0.113.9");
+    assert_eq!(rows[0]["user_agent"], "Mozilla/5.0 (test)");
+    assert_eq!(rows[0]["token_jti"], "01HQ0000000000000000000000");
+
+    // The operator's own add to a double-opt-in list is `requested`: the person was ASKED. And
+    // it carries no IP and no user agent — the operator's request is not the subscriber's
+    // evidence — so the panel can never show one address as though it were the other's.
+    assert_eq!(rows[1]["action"], "requested");
+    assert_eq!(rows[1]["source"], "operator");
+    assert_eq!(rows[1]["ip"], Value::Null);
+    assert_eq!(rows[1]["user_agent"], Value::Null);
+    assert_eq!(rows[1]["token_jti"], Value::Null);
+}

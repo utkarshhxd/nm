@@ -85,7 +85,9 @@ pub struct List {
     /// `true`: a new member is `pending` until they confirm. `false`: a new member is
     /// `subscribed` at once.
     pub double_optin: bool,
-    /// Unused until the preference center, which shows the `public` lists as topics.
+    /// Whether the preference center offers this list to somebody who is not on it. A `private`
+    /// list is still shown there to its own members, so hiding one never leaves a subscriber
+    /// unable to leave it (`public::unsubscribe::topics`).
     pub visibility: Visibility,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
