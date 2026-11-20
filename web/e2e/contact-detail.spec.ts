@@ -354,6 +354,16 @@ test("the_list_editor_sets_a_lists_visibility", async () => {
   // The visibility cell itself, not the row: the list's own name would satisfy a row-wide match.
   const row = page.getByRole("row").filter({ hasText: "Topics" });
   await expect(row.getByRole("cell").nth(2)).toHaveText("public");
+  // And against the API, which is this suite's rule: the `<dd>` below renders from a query the
+  // mutation invalidates, so it does reflect what the server stored — but that is an inference
+  // about cache behaviour, and the point of checking twice is not to have to make it.
+  const stored = async () => {
+    const lists = (await (
+      await context.request.get(`/api/v1/workspaces/${workspaceId}/lists?limit=200`)
+    ).json()) as { data: { name: string; visibility: string }[] };
+    return lists.data.find((l) => l.name === "Topics")?.visibility;
+  };
+  expect(await stored()).toBe("public");
   await row.getByRole("link", { name: "Topics", exact: true }).click();
   const settings = page.getByRole("region", { name: "Settings", exact: true });
   await expect(settings.locator('dt:text-is("Visibility") + dd')).toHaveText("public");
@@ -365,4 +375,5 @@ test("the_list_editor_sets_a_lists_visibility", async () => {
   await editing.getByLabel("Visibility", { exact: true }).selectOption("private");
   await editing.getByRole("button", { name: "Save list", exact: true }).click();
   await expect(settings.locator('dt:text-is("Visibility") + dd')).toHaveText("private");
+  expect(await stored()).toBe("private");
 });

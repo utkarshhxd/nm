@@ -138,6 +138,17 @@ test("the_snippet_posts_to_this_workspace_and_the_server_accepts_what_it_sends",
   const html = await snippet().inputValue();
   expect(html).toContain(`action="http://localhost:8090/f/${SLUG}/newsletter"`);
 
+  // The snippet runs inside the embedder's document, not ours. Without `accept-charset` a form
+  // in a non-UTF-8 page submits its body in that page's encoding, and a non-ASCII name arrives
+  // mis-decoded.
+  expect(html).toContain('accept-charset="utf-8"');
+  // Every element id carries the form's slug, so two of the operator's forms on one page do not
+  // produce duplicate ids with every label pointing at the first.
+  const elementIds = [...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1] ?? "");
+  expect(elementIds.length).toBeGreaterThan(1);
+  expect(elementIds.filter((id) => id.startsWith("nm-newsletter-"))).toEqual(elementIds);
+  expect(new Set(elementIds).size, "no id appears twice").toBe(elementIds.length);
+
   // The snippet is pasted onto the operator's own site, so nothing of ours is there to help it:
   // its `action` and its input names are the whole contract with `POST /f/{workspace}/{slug}`.
   // Submitting exactly what the snippet declares is the only check that the two still agree — a
@@ -231,11 +242,16 @@ test("editing_a_form_changes_what_the_snippet_posts_to", async () => {
 test("editing_a_form_keeps_the_fields_the_editor_does_not_show", async () => {
   const email = { target: { kind: "email" }, required: true, label: "Email address" };
   const seats = { target: { kind: "custom", value: "seats" }, required: false, label: "Seats" };
+  // The custom field is deliberately placed BEFORE a built-in, which is an order the editor
+  // cannot produce from its own controls: it offers email, then the built-ins, then the custom
+  // fields. So the assertion below is about the order being preserved, not about it happening to
+  // match the order the editor would have emitted anyway.
+  const first = { target: { kind: "first_name" }, required: false, label: "First name" };
   const created = await post(ids.ws, "/forms", {
     slug: "keepsfields",
     name: "Keeps fields",
     list_ids: [ids.list],
-    fields: [email, seats],
+    fields: [email, seats, first],
     headline: "Before",
     button_label: "Join",
   });
@@ -269,8 +285,8 @@ test("editing_a_form_keeps_the_fields_the_editor_does_not_show", async () => {
   expect(saved.headline, "the edit itself went through").toBe("After");
   expect(
     saved.fields.map((f) => (f.target.kind === "custom" ? `custom.${f.target.value}` : f.target.kind)),
-    "the number field the editor never rendered is still collected",
-  ).toEqual(["email", "custom.seats"]);
+    "the number field the editor never rendered is still collected, in the place it held",
+  ).toEqual(["email", "custom.seats", "first_name"]);
 
   // Deleted here, so the last test still finds the one form this file created through the UI.
   const removed = await context.request.delete(

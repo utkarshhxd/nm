@@ -286,22 +286,35 @@ function nameOf(target: FormTarget): [name: string, type: string, autocomplete: 
  * this control must not produce.
  */
 function snippet(action: string, form: Form): string {
-  const lines = [`<form method="post" action="${esc(action)}">`];
+  // `accept-charset`, because **this markup is pasted into somebody else's document and inherits
+  // its encoding.** A form in a non-UTF-8 document submits its body in that document's encoding
+  // (HTML5 §4.10.21.6) and the route reads the body as UTF-8 — so without this, a subscriber
+  // called Ögmundur arrives from a legacy page as mis-decoded bytes and is stored that way. The
+  // hosted page needs nothing of the sort: it is ours and is already UTF-8. This is the one
+  // artifact on these screens that runs where we do not control the document around it.
+  const lines = [`<form method="post" accept-charset="utf-8" action="${esc(action)}">`];
+  // Element ids carry the form's slug as well as the `nm-` prefix. The prefix keeps them clear of
+  // the host page's own ids; the slug keeps two of the operator's forms on one page clear of each
+  // other, which is otherwise duplicate ids and every `<label for=…>` pointing at the first form.
+  // A slug is unique per workspace and is `[a-z0-9-]`, so it is a valid id part and the pair
+  // cannot collide for anyone embedding their own forms.
+  const idOf = (name: string) => esc(`nm-${form.slug}-${name}`);
   for (const field of form.fields) {
     const [name, type, autocomplete] = nameOf(field.target);
-    const id = `nm-${name}`;
+    const id = idOf(name);
     lines.push(
       "  <p>",
-      `    <label for="${esc(id)}">${esc(field.label)}</label><br>`,
-      `    <input id="${esc(id)}" name="${esc(name)}" type="${type}" ` +
+      `    <label for="${id}">${esc(field.label)}</label><br>`,
+      `    <input id="${id}" name="${esc(name)}" type="${type}" ` +
         `autocomplete="${autocomplete}"${field.required ? " required" : ""}>`,
       "  </p>",
     );
   }
+  const decoy = idOf("website");
   lines.push(
     '  <div aria-hidden="true" style="position:absolute;left:-10000px">',
-    '    <label for="nm-website">Leave this field empty</label>',
-    '    <input id="nm-website" name="website" type="text" tabindex="-1" autocomplete="off">',
+    `    <label for="${decoy}">Leave this field empty</label>`,
+    `    <input id="${decoy}" name="website" type="text" tabindex="-1" autocomplete="off">`,
     "  </div>",
     `  <button type="submit">${esc(form.button_label)}</button>`,
     "</form>",
