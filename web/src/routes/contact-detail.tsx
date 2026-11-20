@@ -859,10 +859,22 @@ function ConsentHistory({ ws, contactId }: { ws: string; contactId: string }) {
                     {moment.format(new Date(r.created_at))}
                   </td>
                   <td className="py-2 pe-3">{ACTION[r.action] ?? r.action}</td>
-                  {/* Null where the change was workspace-wide, and where the list has since been
-                      deleted: the row keeps its evidence and loses only the pointer. */}
+                  {/* ONE LABEL FOR BOTH CASES, BECAUSE THE ROW CANNOT TELL THEM APART. A
+                      workspace-wide change is written with a null `list_id`, and
+                      `0020_consent_log.sql`'s `on delete set null (list_id)` nulls it again when
+                      the list is deleted — the row keeps its action, source and evidence and
+                      loses only the pointer. `list_name` comes from a left join on that column,
+                      so it is null in exactly the same rows.
+
+                      There was a `r.list_id ? "A deleted list" : "Whole workspace"` here. It was
+                      unreachable: by the time `list_id` is null there is nothing left to branch
+                      on, so every deleted list's row read as a workspace-wide one — a one-list
+                      unsubscribe shown as if the person had left everything. Do not re-add it in
+                      any form, including one keyed on `action`: a new writer would make it wrong
+                      again, silently, in the record that exists to be trusted. Telling the two
+                      apart needs the list's name snapshotted at write time, by every writer. */}
                   <td className="py-2 pe-3 wrap-anywhere">
-                    {r.list_name ?? (r.list_id ? "A deleted list" : "Whole workspace")}
+                    {r.list_name ?? "Whole workspace, or a list since deleted"}
                   </td>
                   <td className="py-2 pe-3">{SOURCE[r.source] ?? r.source}</td>
                   <td className="py-2">
@@ -892,6 +904,12 @@ function ConsentHistory({ ws, contactId }: { ws: string; contactId: string }) {
             arrived by, not who made it: an operator subscribing people in bulk is recorded as
             API, and the address and browser are only ever the subscriber&rsquo;s own, from a page
             they opened themselves.
+          </p>
+          <p className="mt-3 text-fg-muted">
+            A row with no list named is either a change across the whole workspace or one to a
+            list that has since been deleted. Deleting a list clears the pointer from these rows
+            and keeps everything else, and nothing recorded at the time says which of the two it
+            was, so this will not guess.
           </p>
         </>
       )}

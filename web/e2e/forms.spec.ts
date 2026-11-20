@@ -18,14 +18,18 @@ import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
  */
 test.describe.configure({ mode: "serial" });
 
+/** This file's own address, from RFC 5737's documentation range. No other spec uses it. */
+const ADDRESS = "198.51.100.10";
+const FORWARDED = "x-forwarded-for";
+
 /**
- * Its own per-IP rate-limit budget: this file posts the snippet to `POST /f/…`, which is one of
- * the five public routes limited at `PUBLIC_PER_MINUTE` per address. See the
+ * Its own per-IP rate-limit budget: this file posts a form submission to `POST /f/…`, one of the
+ * five public routes limited at `PUBLIC_PER_MINUTE` per address. See the
  * `NM_TRUST_PROXY_HEADERS` comment in `support/server.ts`. **One** request of the 60 is spent
  * against this address; everything else here is the authenticated admin UI, which is limited per
  * workspace and does not touch this budget.
  */
-test.use({ extraHTTPHeaders: { "x-forwarded-for": "198.51.100.10" } });
+test.use({ extraHTTPHeaders: { [FORWARDED]: ADDRESS } });
 
 const SLUG = "formsadmin";
 const RIVAL = "formsrival";
@@ -83,6 +87,12 @@ test.beforeAll(async ({ browser }) => {
 
   ids.ws = await workspace(SLUG, "Forms Admin Co");
   ids.list = (await post(ids.ws, "/lists", { name: "News", double_optin: false })).id;
+
+  // Two custom fields chosen to be awkward on purpose. `company` is a text field *labelled*
+  // "First name", which is what a built-in is called — `custom_fields::validate_key` and
+  // `validate_label` both allow it. `seats` is a `number`, which the editor does not offer.
+  await post(ids.ws, "/custom-fields", { key: "company", label: "First name", kind: "text" });
+  await post(ids.ws, "/custom-fields", { key: "seats", label: "Seats", kind: "number" });
 
   // The other tenant, seeded over the API: what matters about it is that its form carries the
   // same slug as the one created through the UI below.
@@ -157,6 +167,24 @@ test("the_snippet_posts_to_this_workspace_and_the_server_accepts_what_it_sends",
     await context.request.get(`/api/v1/workspaces/${ids.ws}/contacts/${found.data[0]?.id}/lists`)
   ).json()) as { data: { list_id: string; status: string }[] };
   expect(memberships.data.map((m) => [m.list_id, m.status])).toEqual([[ids.list, "subscribed"]]);
+
+  // AND THE PROOF THAT THIS FILE'S CLAIMED ADDRESS REACHED THE SERVER, which is what the
+  // rate-limit budget recorded at `PUBLIC_PER_MINUTE` rests on. A public route writes the client
+  // address into the consent row it creates, so reading that row back says what the server
+  // actually saw.
+  //
+  // It is asserted rather than assumed because `test.use({ extraHTTPHeaders })` reaching a
+  // context built by `browser.newContext()` is a Playwright detail, not something this file
+  // controls: measured true on Playwright 1.65, and if a future version changes it every request
+  // here silently moves to 127.0.0.1 and spends the window every other spec shares, with nothing
+  // failing. A limiter counter cannot see that — a fresh window reads the same whichever address
+  // it belongs to. This is an authenticated read and costs no public budget.
+  const consent = (await (
+    await context.request.get(`/api/v1/workspaces/${ids.ws}/contacts/${found.data[0]?.id}/consent`)
+  ).json()) as { data: { action: string; source: string; ip: string | null }[] };
+  expect(consent.data.map((r) => [r.action, r.source, r.ip])).toEqual([
+    ["subscribed", "form", ADDRESS],
+  ]);
 });
 
 test("each_workspaces_snippet_names_its_own_workspace", async () => {
@@ -186,6 +214,70 @@ test("editing_a_form_changes_what_the_snippet_posts_to", async () => {
     new RegExp(`action="http://localhost:8090/f/${SLUG}/signup"`),
   );
   await expect(page.getByText("Sign up for the weekly")).toBeVisible();
+});
+
+/**
+ * **A field the editor does not render must survive an edit that does not mention it.**
+ *
+ * A PATCH replaces `fields` outright, and `forms::validate_fields` accepts a custom field of any
+ * kind — so a form collecting a `number`, creatable over the API, used to lose that field the
+ * first time anyone touched the headline in the UI. Nothing warned, and every later submission
+ * dropped the value on the floor. Not *offering* non-text kinds is the ruled shortcut; deleting
+ * them was not.
+ *
+ * The same form is also the collision case for the control names: a text custom field labelled
+ * "First name" sits beside the built-in of that name, and the two must stay tellable apart.
+ */
+test("editing_a_form_keeps_the_fields_the_editor_does_not_show", async () => {
+  const email = { target: { kind: "email" }, required: true, label: "Email address" };
+  const seats = { target: { kind: "custom", value: "seats" }, required: false, label: "Seats" };
+  const created = await post(ids.ws, "/forms", {
+    slug: "keepsfields",
+    name: "Keeps fields",
+    list_ids: [ids.list],
+    fields: [email, seats],
+    headline: "Before",
+    button_label: "Join",
+  });
+
+  await page.goto(`/w/${SLUG}/forms/${created.id}`);
+  await expect(page.getByRole("heading", { name: "Keeps fields", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Edit form", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Edit form", exact: true });
+
+  // The editor does not offer the `number` field — that part is the ruling, and is checked here
+  // so the test below cannot be read as proving something it does not.
+  await expect(dialog.getByRole("checkbox", { name: "Collect Seats", exact: true })).toHaveCount(0);
+  // But the two "First name" controls are distinct, built-in and custom.
+  await expect(
+    dialog.getByRole("checkbox", { name: "Collect First name", exact: true }),
+  ).toHaveCount(1);
+  await expect(
+    dialog.getByRole("checkbox", { name: "Collect First name (custom field)", exact: true }),
+  ).toHaveCount(1);
+
+  await dialog.getByLabel("Headline", { exact: true }).fill("After");
+  await dialog.getByRole("button", { name: "Save form", exact: true }).click();
+  // The Headline cell itself: "After" as a page-wide substring also matches "Redirect after
+  // signing up", so a loose locator here would pass before the dialog had even saved.
+  const settings = page.getByRole("region", { name: "Settings", exact: true });
+  await expect(settings.locator('dt:text-is("Headline") + dd')).toHaveText("After");
+
+  const saved = (await (
+    await context.request.get(`/api/v1/workspaces/${ids.ws}/forms/${created.id}`)
+  ).json()) as { headline: string; fields: { target: { kind: string; value?: string } }[] };
+  expect(saved.headline, "the edit itself went through").toBe("After");
+  expect(
+    saved.fields.map((f) => (f.target.kind === "custom" ? `custom.${f.target.value}` : f.target.kind)),
+    "the number field the editor never rendered is still collected",
+  ).toEqual(["email", "custom.seats"]);
+
+  // Deleted here, so the last test still finds the one form this file created through the UI.
+  const removed = await context.request.delete(
+    `/api/v1/workspaces/${ids.ws}/forms/${created.id}`,
+    { headers: { "X-CSRF-Token": csrf } },
+  );
+  expect(removed.status()).toBe(204);
 });
 
 test("axe_reports_no_violations_on_the_forms_screens", async () => {

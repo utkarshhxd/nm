@@ -143,13 +143,22 @@ export function publicPath(workspaceSlug: string, formSlug: string): string {
  * (`custom_fields::validate_key` allows it), and sharing a slot with the built-in would tie two
  * separate inputs' ticks together.
  */
-type Offer = { key: string; target: FormTarget; label: string };
+type Offer = { key: string; target: FormTarget; label: string; named: string };
+
+/**
+ * The accessible name of an offered field's controls. It has to be unique for the same reason
+ * `key` does, and for a second one: a custom field may be *labelled* "First name" as well as
+ * keyed it, and three pairs of controls all called "Collect First name" are three controls a
+ * screen reader user — and `getByRole(…, { name })` — cannot tell apart. The visible label stays
+ * the operator's own word, and only the name is qualified.
+ */
+const named = (label: string, custom: boolean) => (custom ? `${label} (custom field)` : label);
 
 /** The optional built-in targets, in the order they are offered and rendered. */
 const BUILT_IN: Offer[] = [
-  { key: "first_name", target: { kind: "first_name" }, label: "First name" },
-  { key: "last_name", target: { kind: "last_name" }, label: "Last name" },
-  { key: "timezone", target: { kind: "timezone" }, label: "Time zone" },
+  { key: "first_name", target: { kind: "first_name" }, label: "First name", named: "First name" },
+  { key: "last_name", target: { kind: "last_name" }, label: "Last name", named: "Last name" },
+  { key: "timezone", target: { kind: "timezone" }, label: "Time zone", named: "Time zone" },
 ];
 
 type Collected = { on: boolean; label: string; required: boolean };
@@ -240,6 +249,7 @@ export function FormEditor({
         key: `custom:${d.key}`,
         target: { kind: "custom" as const, value: d.key },
         label: d.label,
+        named: named(d.label, true),
       })),
   ];
 
@@ -248,10 +258,29 @@ export function FormEditor({
     setPicked((was) => ({ ...was, [offer.key]: { ...state(offer), ...change } }));
 
   const body = () => {
+    // **A PATCH REPLACES `fields` OUTRIGHT, SO ANYTHING THIS EDITOR DOES NOT RENDER MUST BE
+    // CARRIED THROUGH IT UNTOUCHED.** `forms::validate_fields` accepts a custom field of any
+    // kind, so a form collecting a `number` or a `select` can be created over the API — and the
+    // ruling was that this editor does not *offer* those, not that it deletes them. Built from
+    // the offered fields alone, saving an unrelated change here would silently drop the field
+    // and every future submission's value with it, with nothing on screen to say so.
+    //
+    // So the existing list is walked in its own order, which is also the order the public page
+    // renders in: a field this editor knows is replaced by what was typed or dropped if it was
+    // unticked, and one it does not know is kept exactly as it came back from the API.
+    const known = (f: FormField) =>
+      f.target.kind !== "email" && offered.find((o) => sameTarget(o.target, f.target));
     const chosen: FormField[] = [
       { target: EMAIL, required: true, label: emailLabel.trim() },
+      ...fields.flatMap((f) => {
+        const offer = known(f);
+        if (!offer) return f.target.kind === "email" ? [] : [f];
+        const it = state(offer);
+        return it.on ? [{ target: offer.target, required: it.required, label: it.label.trim() }] : [];
+      }),
+      // Ticked here and not on the form already, so it has no place in the order above.
       ...offered
-        .filter((o) => state(o).on)
+        .filter((o) => state(o).on && !fields.some((f) => sameTarget(f.target, o.target)))
         .map((o) => ({
           target: o.target,
           required: state(o).required,
@@ -306,7 +335,7 @@ export function FormEditor({
         <label className="flex w-fit items-center gap-2 font-medium">
           <Checkbox
             checked={it.on}
-            aria-label={`Collect ${offer.label}`}
+            aria-label={`Collect ${offer.named}`}
             onChange={(e) => set(offer, { on: e.target.checked })}
           />
           {offer.label}
@@ -315,7 +344,7 @@ export function FormEditor({
           <div className="ms-7 mt-1 flex flex-wrap items-center gap-3">
             <input
               className="min-h-(--control-h) rounded-sm border border-border-strong bg-surface px-3 text-fg"
-              aria-label={`${offer.label} label`}
+              aria-label={`${offer.named} label`}
               maxLength={100}
               value={it.label}
               onChange={(e) => set(offer, { label: e.target.value })}
@@ -323,7 +352,7 @@ export function FormEditor({
             <label className="flex items-center gap-2">
               <Checkbox
                 checked={it.required}
-                aria-label={`Require ${offer.label}`}
+                aria-label={`Require ${offer.named}`}
                 onChange={(e) => set(offer, { required: e.target.checked })}
               />
               Required

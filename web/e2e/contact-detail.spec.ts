@@ -20,7 +20,18 @@ let page: Page;
 let workspaceId = "";
 let csrf = "";
 
-const ids = { ada: "", bounced: "", blocked: "", single: "", double: "" };
+const ids = { ada: "", bounced: "", blocked: "", single: "", double: "", signedUp: "" };
+
+/**
+ * This file's own per-IP rate-limit budget, claimed because the consent-panel test needs a row
+ * carrying the subscriber's own IP and user agent, and the only writer of one is a public route.
+ * **One** request of `PUBLIC_PER_MINUTE`'s 60 is spent against this address: a single
+ * `POST /f/…`. `consent_history_shows_a_self_signup_with_its_own_evidence` asserts the panel
+ * shows this exact address, which is also what proves the header reached the server.
+ */
+const ADDRESS = "198.51.100.11";
+const FORWARDED = "x-forwarded-for";
+const SIGNED_UP = "signed-up@example.test";
 
 async function post(path: string, data: unknown, scoped = true): Promise<{ id: string }> {
   const url = scoped ? `/api/v1/workspaces/${workspaceId}${path}` : `/api/v1${path}`;
@@ -35,6 +46,8 @@ async function put(path: string): Promise<void> {
   });
   expect(res.ok(), `put ${path} -> ${res.status()}`).toBe(true);
 }
+
+test.use({ extraHTTPHeaders: { [FORWARDED]: ADDRESS } });
 
 test.beforeAll(async ({ browser }) => {
   test.setTimeout(120_000);
@@ -104,6 +117,40 @@ test.beforeAll(async ({ browser }) => {
   }
   await post(`/lists/${ids.double}/members`, { contact_id: ids.ada });
   await put(`/contacts/${ids.ada}/tags/${vip}`);
+
+  // Somebody who signed up themselves, so the consent panel has a row carrying their own IP and
+  // user agent — the only writer of one is a public route, and a form submission is the only
+  // public route this harness can reach without a token from an email it cannot read.
+  // Its own list, because `list_detail_shows_a_mailable_count_after_a_skeleton` asserts the
+  // exact number of mailable members on `ids.single`.
+  const signups = (await post("/lists", { name: "Signups", double_optin: false })).id;
+  await post("/forms", {
+    slug: "joinus",
+    name: "Join us",
+    list_ids: [signups],
+    fields: [{ target: { kind: "email" }, required: true, label: "Email address" }],
+    headline: "Join us",
+    button_label: "Join",
+  });
+  const joined = await context.request.post(`/f/${SLUG}/joinus`, { form: { email: SIGNED_UP } });
+  expect(joined.status(), await joined.text()).toBe(200);
+  const found = (await (
+    await context.request.get(
+      `/api/v1/workspaces/${workspaceId}/contacts?q=${encodeURIComponent(SIGNED_UP)}`,
+    )
+  ).json()) as { data: { id: string }[] };
+  ids.signedUp = found.data[0]?.id ?? "";
+  expect(ids.signedUp, "the form submission created the contact").not.toBe("");
+
+  // A list that is then deleted, so one of their consent rows loses its pointer. `0020`'s
+  // `on delete set null (list_id)` keeps the row and nulls the column.
+  const doomed = (await post("/lists", { name: "Closing down", double_optin: false })).id;
+  await post(`/lists/${doomed}/members`, { contact_id: ids.signedUp });
+  const removed = await context.request.delete(
+    `/api/v1/workspaces/${workspaceId}/lists/${doomed}`,
+    { headers: { "X-CSRF-Token": csrf } },
+  );
+  expect(removed.status()).toBe(204);
 
   await post("/suppressions", { scope: "address", email: "bounced@example.test", reason: "bounced" });
   // The block a workspace admin cannot see in the workspace's own suppression list.
@@ -229,12 +276,12 @@ test("enter_on_a_grid_row_opens_the_contact", async () => {
  *
  * Ada's two memberships were written by an operator through the API in `beforeAll`: one to a
  * single-opt-in list, which is agreement, and one to a double-opt-in list, which is only a
- * request. Both must be legible as what they are, with the path they arrived by beside them.
+ * request. Both must be legible as what they are, with the path they arrived by beside them, and
+ * neither may carry evidence, because an operator's own request is not the subscriber's.
  *
  * It does not assert a `confirmed` row, and cannot: the only writer of one is `GET /c/{token}`,
  * the token exists only inside an enqueued `confirmation_email` job, and this harness has no way
- * to read that queue — no database client on PATH and no API or CLI over `jobs`. M1d Task 12's
- * preference-centre spec is where that gap has to be closed.
+ * to read that queue. M1d Task 12's preference-centre spec is where that gap is being closed.
  */
 test("consent_history_says_how_each_membership_was_made", async () => {
   await page.goto(contact(ids.ada));
@@ -251,9 +298,49 @@ test("consent_history_says_how_each_membership_was_made", async () => {
   await expect(row("Newsletter")).not.toContainText("Subscribed");
   await expect(consent).toContainText("asked and has not agreed yet");
 
-  // An operator's own request is not the subscriber's evidence, so neither row carries one.
-  await expect(log).not.toContainText("IP address");
-  await expect(log).not.toContainText("Browser");
+  // Neither row carries evidence. Asserted against the row rather than the panel, and alongside
+  // the positive case below: on its own, "no IP address here" also passes when the panel renders
+  // no evidence at all, for anyone.
+  await expect(row("Announcements")).not.toContainText("IP address");
+  await expect(row("Newsletter")).not.toContainText("IP address");
+  await expect(row("Announcements")).toContainText("Reference");
+});
+
+/**
+ * The other half, and the one that makes the assertions above mean something: somebody who
+ * signed themselves up through the hosted form. A public route is the only writer that records
+ * the subscriber's own address and browser, and showing them is the panel's whole purpose — this
+ * is the row an operator reads when asked to prove consent.
+ *
+ * It also covers a row whose list has been deleted. `0020_consent_log.sql` nulls `list_id` and
+ * keeps everything else, which makes that row indistinguishable from a workspace-wide one, so
+ * the panel says so instead of guessing. The label was `"Whole workspace"` alone until review:
+ * the branch meant to catch this case tested `list_id`, which is exactly what deletion clears,
+ * so a one-list unsubscribe read on screen as if the person had left the entire workspace.
+ */
+test("consent_history_shows_a_self_signup_with_its_own_evidence", async () => {
+  await page.goto(contact(ids.signedUp));
+  const consent = page.getByRole("region", { name: "Consent history", exact: true });
+  const log = consent.getByRole("table");
+
+  const signup = log.getByRole("row").filter({ hasText: "Signups" });
+  await expect(signup).toContainText("Subscribed");
+  await expect(signup).toContainText("Signup form");
+  // The evidence itself, by value: this address is the one the spec claims, and the browser
+  // string is Playwright's own, so both prove the row carries what the request really sent.
+  await expect(signup).toContainText("IP address");
+  await expect(signup).toContainText(ADDRESS);
+  await expect(signup).toContainText("Browser");
+  await expect(signup).toContainText(/Mozilla|HeadlessChrome/);
+
+  // The deleted list's row: still here, still saying what happened, no longer saying to what.
+  const orphan = log.getByRole("row").filter({ hasText: "Whole workspace, or a list since deleted" });
+  await expect(orphan).toHaveCount(1);
+  await expect(orphan).toContainText("Subscribed");
+  await expect(consent).toContainText("either a change across the whole workspace or one to a list");
+  // And the list it named really is gone, so the row above is the deletion case and not a
+  // workspace-wide change that happened to look like one.
+  await expect(log).not.toContainText("Closing down");
 });
 
 test("the_list_editor_sets_a_lists_visibility", async () => {

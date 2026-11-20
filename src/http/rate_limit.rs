@@ -140,14 +140,28 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// counts refusals, so once tripped it stays tripped for the minute. `web/e2e/support/server.ts`
 /// therefore sets `NM_TRUST_PROXY_HEADERS`, and each spec that touches a public page claims an
 /// `X-Forwarded-For` of its own, so the budget is per spec file rather than per run.
-/// Two specs do today, each on an address of its own: `web/e2e/public-form.spec.ts` spends **4**
-/// of the 60 on `198.51.100.9` (two page views and two submissions), and
-/// `web/e2e/forms.spec.ts` spends **1** on `198.51.100.10` (it posts a generated embed snippet to
-/// `POST /f/…` to prove the snippet's field names are the ones the route reads). The budget is
-/// per address, so the margin is the worst spec's: **15×**. A spec added under `/c/`, `/u/` or
-/// `/f/` picks a fresh address from RFC 5737's range and counts its own cost here; one that
-/// reuses another spec's address inherits its spending, and the failure looks exactly like a
-/// product bug.
+/// Three specs do today, each on an address of its own:
+///
+/// * `web/e2e/public-form.spec.ts` — **4** of the 60 on `198.51.100.9`: two page views and two
+///   submissions.
+/// * `web/e2e/forms.spec.ts` — **1** on `198.51.100.10`: it posts a generated embed snippet, to
+///   prove the snippet's field names are the ones the route reads.
+/// * `web/e2e/contact-detail.spec.ts` — **1** on `198.51.100.11`: one submission, so that the
+///   consent panel has a row carrying the subscriber's own IP and user agent to show.
+///
+/// The budget is per address, so the margin is the worst spec's: **15×**. A spec added under
+/// `/c/`, `/u/` or `/f/` picks a fresh address from RFC 5737's range and counts its own cost
+/// here; one that reuses another spec's address inherits its spending, and the failure looks
+/// exactly like a product bug.
+///
+/// **A spec that claims an address asserts that the server saw it**, rather than trusting that
+/// it went out. `test.use({ extraHTTPHeaders })` does reach a context built by
+/// `browser.newContext()` — measured on Playwright 1.65 — but that is Playwright's behaviour and
+/// not something a spec here controls, and if it ever changes the spec moves back to the shared
+/// 127.0.0.1 window with nothing failing. A limiter counter cannot catch that: a fresh window
+/// reads the same whichever address it belongs to. What can is the consent row a public route
+/// writes, which carries the client address — `forms.spec.ts` reads it back over the API,
+/// `contact-detail.spec.ts` off the consent panel.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
 const WINDOW: Duration = Duration::from_secs(60);
