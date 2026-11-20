@@ -403,3 +403,46 @@ async fn an_erasure_does_not_block_the_same_address_in_another_workspace(pool: P
         .await
         .assert_status(StatusCode::CONFLICT);
 }
+
+/// **A `list`-scope refusal carries the plaintext address too, so an erasure has to take it.** It
+/// is a row that outlives the contact on purpose, which is exactly why the erase path has to be
+/// the one thing that reaches it: the tombstone it leaves behind refuses the address everywhere
+/// anyway, so nothing is lost but the readable copy.
+#[sqlx::test]
+async fn erasing_an_address_takes_its_per_list_refusals_with_it(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let (c, list, _) = mailable_contact(&w, ADDRESS).await;
+    let mut conn = pool.acquire().await.unwrap();
+    nm::suppressions::unsubscribe_list(&mut conn, &w.admin.state.secrets, w.id, list, ADDRESS)
+        .await
+        .expect("refuse one list");
+    drop(conn);
+    let before: Vec<(Option<String>, String)> = sqlx::query_as(
+        "select email, reason from suppressions where workspace_id = $1 and scope = 'list'",
+    )
+    .bind(w.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        before,
+        vec![(
+            Some("gone.person@example.test".to_owned()),
+            "unsubscribed_list".to_owned()
+        )],
+        "the premise: the row exists and it holds the address in plain text"
+    );
+
+    w.admin
+        .post(&erase_path(w.id, c))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let rows: Vec<(Option<String>, String)> =
+        sqlx::query_as("select email, reason from suppressions where workspace_id = $1")
+            .bind(w.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![(None, "gdpr_erasure".to_owned())]);
+}

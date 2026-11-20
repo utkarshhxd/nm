@@ -371,6 +371,15 @@ async fn save(
     let Some(email) = contact_email(&mut tx, token.workspace_id, token.contact_id).await? else {
         return Ok(no_longer_valid());
     };
+    // **Before any row of `suppressions` or `list_memberships` is touched, and that order is load
+    // bearing.** `contacts::routes::erase_contact` takes this same advisory lock, then deletes the
+    // suppression rows for the address, then deletes the contact — which cascades to the
+    // membership rows. This page writes a suppression row of its own now (`lift_unsubscribed_all`
+    // below, then `unsubscribe_list`), so a save that reached the lock *after* locking one of
+    // those rows would be an ABBA cycle with the erase path, and Postgres breaks one by aborting a
+    // side with `40P01`: a `500` and a rolled-back save for somebody who pressed a button once.
+    // `public::forms::apply` takes it in the same place for the same reason.
+    suppressions::lock_address_for(&mut tx, &state.secrets, &email).await?;
     let before = topics(&mut tx, token.workspace_id, token.contact_id).await?;
     let prior: HashMap<Uuid, Option<MembershipStatus>> =
         before.iter().map(|t| (t.id, t.status)).collect();
