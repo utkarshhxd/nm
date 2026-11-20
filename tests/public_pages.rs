@@ -278,12 +278,23 @@ fn no_handler_under_src_public_names_cookiejar() {
             }
             let name = p.to_string_lossy().replace('\\', "/");
             let name = name.rsplit_once("/src/").unwrap().1.to_owned();
+            // One needle — `cookie`, case-insensitively — which catches every realistic
+            // spelling: `CookieJar`, `TypedHeader<Cookie>`, `header::COOKIE` and
+            // `headers.get("cookie")`. An earlier version matched only `cookiejar` and `COOKIE`
+            // so that prose about cookies could still be written in these files; that let the two
+            // commonest spellings through, and a needle narrowed to keep a comment legal is the
+            // wrong trade. **Comment lines are skipped instead**, so the prose stays and the
+            // needle stays wide.
+            //
+            // Limit: only `//` line comments are recognised, which is all this codebase uses. A
+            // `/* */` block would hide a match, and a string holding the word would be a false
+            // positive — neither has happened, and both fail safe towards being noticed.
             let source = std::fs::read_to_string(&p).unwrap();
-            // Two needles, for the two ways a handler could reach the session. `cookiejar`
-            // matched case-insensitively catches the extractor however it is spelled; `COOKIE`
-            // matched case-**sensitively** catches `header::COOKIE` and a raw header read, while
-            // leaving prose about cookies — like the sentence above — free to be written.
-            if source.to_lowercase().contains("cookiejar") || source.contains("COOKIE") {
+            if source
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.to_lowercase().contains("cookie"))
+            {
                 offenders.push(name.clone());
             }
             seen.push(name);
@@ -306,6 +317,10 @@ fn no_handler_under_src_public_names_cookiejar() {
     );
 }
 
+/// **This covers `/c/` only, which is every public page there is today and will not be.** Tasks 5,
+/// 6 and 9 add `/u/` and `/f/`; each must be added here, or the name of this test becomes a claim
+/// it does not check. The `429` page is covered by the per-IP test below, which is the only place
+/// a refusal can be produced.
 #[sqlx::test]
 async fn every_public_page_is_no_store(pool: PgPool) {
     let p = pending(&pool, "acme").await;
@@ -345,6 +360,10 @@ async fn the_confirm_route_is_refused_past_the_per_ip_limit(pool: PgPool) {
     assert_eq!(over.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert!(over.maybe_header("retry-after").is_some());
     assert_eq!(over.header("ratelimit-remaining"), "0");
+    // The refusal is the answer a stranger is likeliest to see, so it is a page and not an
+    // RFC 9457 document — and, like every page, one a shared cache must not keep.
+    assert_eq!(over.header("content-type"), "text/html; charset=utf-8");
+    assert_eq!(over.header("cache-control"), "no-store");
 
     // A valid link from the same address is refused too, so the limit is on the route and not on
     // the shape of the token.

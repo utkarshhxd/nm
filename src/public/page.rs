@@ -25,6 +25,19 @@ use axum::{
 /// as much of an opening as one in a double-quoted attribute, and nothing in a `format!` string
 /// records which kind the author used. `&` is first by construction — it is a `match`, not a chain
 /// of `replace` calls, so an entity this function writes can never be re-escaped by a later arm.
+///
+/// **What it is correct for: element text, and attribute values you quote.** Two contexts it does
+/// not make safe, both of which the forms work in Task 9 will meet:
+///
+/// shortcut: an **unquoted** attribute value is still exploitable after this — space, tab,
+/// newline, `/`, `=` and a backtick all end one, and none of the five is needed. Quote every
+/// attribute (`title="{}"`, never `title={}`) and this holds; widen the escape set only if some
+/// markup here ever stops quoting.
+///
+/// shortcut: this is **not a URL sanitiser**. `<a href="{}">` with `javascript:alert(1)` escapes
+/// to itself and still runs on click. A value that becomes a URL — spec §7.3 gives a form an
+/// operator-supplied `redirect_url` — needs its scheme checked against an allowlist before it
+/// reaches a page; add that where the first such value appears, not here.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -102,6 +115,29 @@ mod tests {
         assert_eq!(esc(">"), "&gt;");
         assert_eq!(esc("\""), "&quot;");
         assert_eq!(esc("'"), "&#39;");
+    }
+
+    /// `esc` being correct is worth nothing if `shell` stops calling it. Every title today is a
+    /// literal, so only this test stands between Task 6 — which renders operator-typed list names
+    /// through this shell — and an injected tag. Deleting `let title = esc(title);` reds it.
+    #[tokio::test]
+    async fn shell_escapes_its_title_in_both_places_it_puts_it() {
+        let res = shell("<script>alert(1)</script>", "<p>body</p>".to_owned());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>"), "the title opened a tag: {html}");
+        assert!(
+            html.contains("<title>&lt;script&gt;alert(1)&lt;/script&gt;</title>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<h1>&lt;script&gt;alert(1)&lt;/script&gt;</h1>"),
+            "{html}"
+        );
+        // The body is the caller's HTML and is deliberately not escaped here.
+        assert!(html.contains("<p>body</p>"));
     }
 
     #[test]

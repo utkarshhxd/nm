@@ -48,6 +48,15 @@ fn notice(status: StatusCode, title: &str, body: &str) -> Response {
 /// is the same page whether or not the address exists (spec M1d invariant 6). That is the point of
 /// it: an attacker holding an old link must not learn from the answer whether the person is still
 /// a contact here.
+///
+/// **The expired page tells the reader a new email can be sent and gives them no button to send
+/// one, and that is deliberate — do not "finish" it.** Invariant 6 says an expired link offers to
+/// re-send *without disclosing whether the address exists*, and the two halves fight: a resend
+/// control reachable from an expired token would have to act on the contact the token names, and
+/// anything it does that a token for a deleted contact cannot do is an address-existence oracle,
+/// which is spec §4's third anti-goal. Sending unconditionally is worse — it makes this page a
+/// free mailer, aimed by whoever holds an old link. The signup form (Task 9) is where a new
+/// confirmation is asked for, and it answers identically for every address by construction.
 fn expired() -> Response {
     notice(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -75,7 +84,9 @@ async fn confirm(
 ) -> ApiResult<Response> {
     // Before the token is even looked at, and keyed on the address rather than the workspace: the
     // workspace is inside the token, so there is nothing else to count against until it parses,
-    // and parsing is the work an attacker would be making us do.
+    // and parsing is the work an attacker would be making us do. `From<IpAddr> for Key` buckets
+    // an IPv6 address to its /64, so this cannot be dodged by sending from a fresh address; do
+    // not bucket here as well, and do not key on anything but the address.
     let quota = state.public_limit.check(meta.ip.unwrap_or(UNKNOWN_IP));
     if let Some(retry_after_secs) = quota.over {
         let mut headers = quota.headers;
