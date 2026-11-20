@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source, list_id, list_name) select $1, $2, 'list', $3, $4, 'unsubscribed_list', 'preference_center', l.id, l.name from lists l where l.workspace_id = $2 and l.id = $5 for key share on conflict (workspace_id, scope, email_hmac, domain, list_name) where lifted_at is null do update set list_id = excluded.list_id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5f4357dbe0821e66dd918e7a067127b5073ff0b2ae9cfcb9629c73fd947622d7"
+}

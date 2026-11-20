@@ -781,6 +781,17 @@ pub async fn subscribe(
 /// changes gets an `unsubscribed` consent row, `Source::Api`, in the same transaction.
 ///
 /// `source_ref` and not a [`consent::Context`], for the reason [`subscribe`] gives.
+///
+/// **Writes no `list`-scope suppression, so none of these unsubscribes survives deleting the
+/// contact or the list**, the same as [`lists::unsubscribe_member`](crate::lists::unsubscribe_member)
+/// and for the same reason: a row keyed on the address that outlives everything it is about is the
+/// subscriber's own act (`docs/adr/0001`, `0027`). There is a second reason here that is this
+/// function's alone, and it would have to be answered before anyone changes the first: the hash a
+/// suppression is keyed on is derived in Rust from the instance secret, `contacts` stores no hash
+/// column, and this statement covers up to [`MAX_SELECTION`] contacts in one transaction — so a
+/// set-based insert is impossible without sending that key to the database, and the row-by-row
+/// alternative takes N advisory locks in one transaction, which is the failure the SHORTCUT on
+/// `suppressions::lock_address` names. `issues/35`.
 pub async fn unsubscribe(
     db: &mut PgConnection,
     sel: &Selection,

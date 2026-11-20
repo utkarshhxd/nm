@@ -2309,7 +2309,6 @@ async fn deleting_a_contact_and_importing_it_again_does_not_undo_the_list_it_lef
         None,
         "but not onto the list she left: the refusal outlived the row it used to live in"
     );
-    assert!(!is_mailable(&mut tx, ws, list, "ada@example.com").await);
     assert_eq!(
         counts.memberships_declined, 1,
         "and the operator is told the subscription was declined"

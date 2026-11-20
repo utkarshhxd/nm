@@ -95,29 +95,70 @@ create index suppressions_orphaned_by_name on suppressions (workspace_id, list_n
 -- of `lists.name` added later would not know to call it. This is the same "make it impossible"
 -- shape `consent_log`'s append-only triggers use.
 --
--- Adoption is what lets every reader match on `list_id` alone. It cannot collide: `new.id` is
--- fresh on insert, and two live orphans cannot share one `(workspace, address, name)` because
--- `suppressions_live` forbids it.
+-- Adoption is what lets every reader match on `list_id` alone. On the insert path it cannot
+-- collide: `new.id` is fresh, and two live orphans cannot share one `(workspace, address, name)`
+-- because `suppressions_live` forbids it.
 --
--- The `not exists` on the rename is the one collision this can meet: an orphaned refusal already
--- naming `new.name`, left by an earlier list of that name, for the same address. Renaming onto it
--- would violate `suppressions_live` and fail the operator's rename with a 500. That row keeps its
--- old name instead, which costs nothing — it still carries `list_id`, which is the only thing any
--- reader matches on, and the orphan beside it is adopted in the same statement run below.
+-- **Its `not exists` is for the rename path only, and it holds an invariant the rename statement
+-- below depends on: at most one live list-scope row per address per list.** A rename that the
+-- carve-out skipped leaves a row on `new.id` under its old name; adopting an orphan onto the same
+-- list beside it would make two, under different names — and the NEXT rename of that list then
+-- moves both to the same name at once and violates `suppressions_live` from inside the trigger,
+-- failing the operator's rename. Nothing is lost by declining: the row already on `new.id` refuses
+-- that list, which is all any reader asks, and the orphan keeps waiting for a list of its name,
+-- which cannot exist while this one holds it. On the insert path the clause is always true, so the
+-- adoption that makes delete-and-recreate work is untouched.
+--
+-- **The `not exists` on the rename tests the live-uniqueness key, not a special case of it.** A
+-- rename moves a row to a `list_name` another live row for the same address may already hold, and
+-- `suppressions_live` is `(workspace_id, scope, email_hmac, domain, list_name) where lifted_at is
+-- null` — so the test has to be "does this address already have a LIVE list-scope row under
+-- `new.name`", with no clause about what that row's `list_id` happens to be. It was once written
+-- `and o.list_id is null`, which read the obvious source (an orphan left by an earlier list of
+-- that name) as the only one; a live row with a `list_id` and a stale `list_name` collides exactly
+-- as hard, and an operator's rename failed with `duplicate key value violates unique constraint
+-- "suppressions_live"` and rolled back.
+--
+-- The row that is skipped keeps its old name, which costs no refusal: it still carries `list_id`,
+-- which is the only thing any reader matches on, and the row that already holds `new.name` covers
+-- the name. `lift_unsubscribed_list` matches on `list_id` too, so the subscriber clears both.
+--
+-- **`s.lifted_at is null`, so a rename never rewrites history.** `0014` keeps a lifted row rather
+-- than deleting it so the blocklist can say what was once blocked, and for a list-scope row that
+-- means *which named list* somebody refused and later rejoined. Renaming the list afterwards must
+-- not restate the past. Only this statement narrows: the foreign key's `on delete set null` above
+-- has to reach lifted rows as well, which is why `suppressions_by_list` carries no `lifted_at`
+-- predicate, and the adoption below is a write of the same kind as this one.
+--
+-- **Both triggers are ORIGIN, not `enable always`, and that is the opposite of `consent_log`'s
+-- choice in `0026`.** An ORIGIN trigger does not fire under `session_replication_role =
+-- 'replica'`, which is the mode a logical subscriber's apply worker and `pg_restore
+-- --disable-triggers` run in. That is right here and wrong there because the two do different
+-- jobs. `consent_log`'s triggers enforce a *guarantee* — nothing may ever edit or delete evidence
+-- — and a guarantee one `SET` away from a bypass is not one, so it fires on every machine even at
+-- the cost of stalling a subscriber (`issues/32`). These two *propagate data*: the row changes
+-- they make on the primary are replicated as ordinary `suppressions` UPDATEs and arrive at the
+-- subscriber on their own. Firing here as well would apply the same change twice — and the second
+-- application runs against rows the first already moved, so it is not even idempotent. The
+-- subscriber must take these rows as sent, not recompute them.
 create function suppressions_follow_list_name() returns trigger
   language plpgsql as $$
 begin
   if tg_op = 'UPDATE' then
     update suppressions s set list_name = new.name
-     where s.list_id = new.id
+     where s.list_id = new.id and s.lifted_at is null
        and not exists (select 1 from suppressions o
                         where o.workspace_id = s.workspace_id and o.scope = 'list'
-                          and o.lifted_at is null and o.list_id is null
+                          and o.lifted_at is null
                           and o.list_name = new.name and o.email_hmac = s.email_hmac);
   end if;
-  update suppressions set list_id = new.id
-   where workspace_id = new.workspace_id and scope = 'list' and lifted_at is null
-     and list_id is null and list_name = new.name;
+  update suppressions s set list_id = new.id
+   where s.workspace_id = new.workspace_id and s.scope = 'list' and s.lifted_at is null
+     and s.list_id is null and s.list_name = new.name
+     and not exists (select 1 from suppressions o
+                      where o.workspace_id = new.workspace_id and o.scope = 'list'
+                        and o.lifted_at is null and o.list_id = new.id
+                        and o.email_hmac = s.email_hmac);
   return null;
 end;
 $$;

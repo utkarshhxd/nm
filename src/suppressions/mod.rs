@@ -473,6 +473,19 @@ pub async fn lift_unsubscribed_all(
 /// The `list_name` snapshot is read from `lists` here rather than taken from the caller, so a
 /// rename between rendering the page and saving it cannot store a name the list never had.
 ///
+/// **`for key share` on that read, and it is not decoration.** Without it the plain `select` takes
+/// the statement's READ COMMITTED snapshot, so a rename committing in that window is invisible: the
+/// row stores the OLD name, and the rename's trigger has already run and will not come back for it.
+/// The foreign key's own `FOR KEY SHARE` is taken *after* the row is built, which is too late to
+/// change what was read. Nothing looks wrong while the list lives, because every reader matches on
+/// `list_id` — and then deleting that list and recreating it under its current name finds no
+/// correctly-named orphan to adopt, and the next import resurrects the person. That is the defect
+/// this whole scope exists to close, reintroduced by one statement. `name` belongs to
+/// `lists_workspace_id_name_key`, so renaming is a key update: `for key share` conflicts with it,
+/// the insert blocks and re-reads, and the stored name is the committed one. Measured against
+/// Postgres 16: plain `select` stores the stale name and does not block; `for key share` blocks
+/// for the writer's lifetime and stores the new one.
+///
 /// `do update set list_id` adopts an orphan — a refusal of an earlier list of this name, whose own
 /// list was deleted — rather than leaving the insert to do nothing. The two denote the same list,
 /// because the name is what "the same list" means here.
@@ -480,6 +493,16 @@ pub async fn lift_unsubscribed_all(
 /// **Call this before writing any `list_memberships` row in the same transaction**, for exactly
 /// the reason [`unsubscribe_all`] gives: it takes [`lock_address`], and the erase path takes that
 /// lock first and only then deletes the contact, which cascades to the membership rows.
+///
+/// **`for key share` also fixes the lock order rather than disturbing it, which is why it is safe
+/// to add here.** The membership insert that follows takes `FOR KEY SHARE` on the same `lists` row
+/// through its own foreign key, so without this line the order was `suppressions` then `lists`,
+/// while a rename and a list deletion both take `lists` and then `suppressions` — an ABBA cycle
+/// that Postgres breaks with `40P01`. Reproduced against Postgres 16: a concurrent rename and
+/// preference-center save deadlocked, and the victim was the operator's rename. Reading the `lists`
+/// row first puts this path in the same order as both of those. The erase path never touches
+/// `lists`, and the rename and deletion paths never take the address advisory lock, so no other
+/// pair is affected.
 pub async fn unsubscribe_list(
     db: &mut PgConnection,
     secrets: &Secrets,
@@ -502,7 +525,7 @@ pub async fn unsubscribe_list(
         "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source, \
          list_id, list_name) \
          select $1, $2, 'list', $3, $4, 'unsubscribed_list', 'preference_center', l.id, l.name \
-           from lists l where l.workspace_id = $2 and l.id = $5 \
+           from lists l where l.workspace_id = $2 and l.id = $5 for key share \
          on conflict (workspace_id, scope, email_hmac, domain, list_name) where lifted_at is null \
          do update set list_id = excluded.list_id",
         Uuid::now_v7(),

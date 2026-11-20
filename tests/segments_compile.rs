@@ -15,6 +15,8 @@ use std::collections::HashMap;
 
 use common::{PW, create_user, create_workspace};
 use nm::{
+    config::SecretKey,
+    crypto::secrets::Secrets,
     custom_fields::FieldKind,
     segments::{
         compile::push_rules,
@@ -1053,4 +1055,80 @@ fn no_caller_supplied_text_reaches_the_sql() {
             "the predicate carries the constant `{constant}`, which no rule can compile to: {sql}"
         );
     }
+}
+
+/// **A `list`-scope refusal is not the `suppressed` field, and this is the only place that could
+/// have got it wrong in silence.**
+///
+/// `blocking` and the admin API decode `scope` and `reason` into `Scope` and `Reason`, which have
+/// no variant for a list row — so a reader there that lost its scope filter fails to decode and
+/// the request errors. These arms return a boolean. A fifth arm added here, or a scope filter
+/// dropped from one of the four, reports somebody who unsubscribed from one list as blocked from
+/// **all** mail, with nothing to notice it: `suppressed is_true` is what the Contacts screen
+/// filters on and what a segment excludes recipients by.
+///
+/// The before/after is the test. The fixture's own `suppressed` set is read first, so the
+/// assertion after the refusal is "this did not move", not "this has some value".
+#[sqlx::test]
+async fn a_list_scope_refusal_does_not_reach_the_suppressed_field(pool: PgPool) {
+    async fn suppressed(pool: &PgPool, ws: Uuid) -> Vec<String> {
+        matching(
+            pool,
+            ws,
+            &all(vec![json!({"field": "suppressed", "op": "is_true"})]),
+        )
+        .await
+    }
+    async fn mailable(pool: &PgPool, ws: Uuid) -> Vec<String> {
+        matching(
+            pool,
+            ws,
+            &all(vec![json!({"field": "suppressed", "op": "is_false"})]),
+        )
+        .await
+    }
+
+    let fx = seed(&pool).await;
+    let before_suppressed = suppressed(&pool, fx.ws).await;
+    let before_mailable = mailable(&pool, fx.ws).await;
+    assert_eq!(
+        (&before_suppressed[..], &before_mailable[..]),
+        (
+            &["c@globex.com".to_owned()][..],
+            &["a@acme.com".to_owned(), "b@acme.com".to_owned()][..]
+        ),
+        "the premise: `a` is mailable before it leaves one list"
+    );
+
+    // Through the writer the preference center uses, not a row built here: a hand-written row
+    // would only prove this file's reading of the schema.
+    let mut conn = pool.acquire().await.expect("a connection");
+    nm::suppressions::unsubscribe_list(
+        &mut conn,
+        &Secrets::new(&SecretKey([7u8; 32])),
+        fx.ws,
+        fx.list,
+        "a@acme.com",
+    )
+    .await
+    .expect("refuse one list");
+    drop(conn);
+    let live: i64 = sqlx::query_scalar(
+        "select count(*) from suppressions where scope = 'list' and lifted_at is null",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "the premise: the refusal is really there");
+
+    assert_eq!(
+        suppressed(&pool, fx.ws).await,
+        before_suppressed,
+        "leaving one list made somebody blocked from all mail"
+    );
+    assert_eq!(
+        mailable(&pool, fx.ws).await,
+        before_mailable,
+        "and dropped them out of every segment that selects mailable contacts"
+    );
 }

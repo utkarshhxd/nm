@@ -257,6 +257,14 @@ pub async fn add_member(
 /// keeps the first stamp and records nothing: only a change is a consent row (`unsubscribed`,
 /// `Source::Operator`, same transaction). `404` if the contact was never on this list, or it is
 /// not in this workspace.
+///
+/// **Writes no `list`-scope suppression, so this unsubscribe does not survive deleting the contact
+/// or the list.** That is the whole of what a durable refusal is for (`0027`), and it is withheld
+/// here on the same rule `docs/adr/0001` applies to the workspace-wide one: a suppression row
+/// keyed on the address, outliving every row it is about, is the subscriber's own act and no
+/// operator's. `public::unsubscribe::save` is the only writer, and `lift_unsubscribed_list` is
+/// reachable only through a token delivered to the address. `issues/35` carries what that leaves
+/// open and what closing it would cost.
 pub async fn unsubscribe_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
