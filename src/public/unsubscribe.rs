@@ -415,6 +415,44 @@ async fn save(
             .await?
     };
 
+    // **The durable half of a per-list unsubscribe, and the half a deletion cannot take.** The
+    // `list_memberships` row below dies with the contact and with the list; this one is keyed on
+    // the address and outlives both, the way `unsubscribe_all` already does for "everything".
+    // Without it, deleting a contact or a list — two routine Editor actions — destroyed the
+    // refusal with its consent history, and the next import put the person back (spec §8
+    // invariant 1, amended 2026-11-20).
+    //
+    // **Here, before the membership statements, for the same ordering reason the lift above
+    // gives**: the erase path takes the address lock and then the membership rows, so this has to
+    // take them in that order too or the two deadlock. That is also why both loops are driven by
+    // `off` and `on` — the lists this save is about to change, computed from the rows read in this
+    // transaction — rather than by the `returning` of statements that have not run yet.
+    //
+    // Neither loop records a consent row of its own. The per-list `unsubscribed` and
+    // `resubscribed` rows written below already say what happened on each list, and a second row
+    // per list would be the same fact twice in an append-only table. The workspace-wide pair is
+    // different only because nothing else in the log carries it.
+    for list_id in &off {
+        suppressions::unsubscribe_list(
+            &mut tx,
+            &state.secrets,
+            token.workspace_id,
+            *list_id,
+            &email,
+        )
+        .await?;
+    }
+    for list_id in &on {
+        suppressions::lift_unsubscribed_list(
+            &mut tx,
+            &state.secrets,
+            token.workspace_id,
+            *list_id,
+            &email,
+        )
+        .await?;
+    }
+
     // **Unticking every box is not a workspace-wide opt-out, and that is a decision.** Unticking
     // means what it says: not these lists. Somebody who unticks four topics may well intend to
     // come back, and a `suppressions` row is permanent, survives erasure and covers lists that do

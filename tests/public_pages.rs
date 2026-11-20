@@ -1456,10 +1456,11 @@ async fn a_private_list_the_contact_is_not_on_cannot_be_joined_by_posting_its_id
 /// M2. The two ways to say "stop" on this page are deliberately not the same act, and the
 /// difference is durable rather than cosmetic, so it is pinned here.
 ///
-/// Unticking every box means "not these lists": the memberships go, and nothing is written that
-/// outlives the contact row. Somebody who unticks four topics may well intend to come back, and a
-/// `suppressions` row is permanent, survives an erase-and-re-import and covers lists that do not
-/// exist yet — more than they said.
+/// Unticking every box means "not these lists", and since `0027` it means that durably: one
+/// `list`-scope refusal per box, which is what stops a deletion and an import undoing it. What it
+/// still does not write is the workspace-wide opt-out, which is permanent, covers lists that do
+/// not exist yet and would be more than they said. Somebody who unticks four topics may well
+/// intend to come back to a fifth.
 ///
 /// Saying "all of it" is an explicit control on the page, which posts the same RFC 8058 body a
 /// mail client's button does and so takes the same path, suppression and all. The page is not
@@ -1487,10 +1488,19 @@ async fn unticking_every_box_is_not_the_workspace_wide_opt_out_but_the_page_offe
     p.post_unsub(&p.unsub("n1", 0), "").await.assert_status_ok();
     let got = p.statuses().await;
     assert!(got.iter().all(|(_, s)| s == "unsubscribed"), "{got:?}");
+    let written = live_suppressions(&pool, p.workspace).await;
+    // The length first, because `all` over an empty list is true of a page that wrote nothing at
+    // all, which is not what this is asserting.
     assert_eq!(
-        live_suppressions(&pool, p.workspace).await,
-        [],
-        "unticking the boxes wrote a permanent workspace-wide opt-out nobody asked for"
+        written.len(),
+        2,
+        "one per-list refusal per box that was unticked: {written:?}"
+    );
+    assert!(
+        written
+            .iter()
+            .all(|(reason, _, _)| reason == "unsubscribed_list"),
+        "unticking the boxes wrote a permanent workspace-wide opt-out nobody asked for: {written:?}"
     );
     assert_eq!(
         consent_by_list(&pool)
@@ -1506,8 +1516,13 @@ async fn unticking_every_box_is_not_the_workspace_wide_opt_out_but_the_page_offe
     p.post_unsub(&p.unsub("n2", 0), ONE_CLICK)
         .await
         .assert_status_ok();
+    let workspace_wide: Vec<_> = live_suppressions(&pool, p.workspace)
+        .await
+        .into_iter()
+        .filter(|(reason, _, _)| reason != "unsubscribed_list")
+        .collect();
     assert_eq!(
-        live_suppressions(&pool, p.workspace).await,
+        workspace_wide,
         [(
             "unsubscribed_all".to_owned(),
             "one_click".to_owned(),
@@ -2806,4 +2821,172 @@ fn no_handler_under_src_public_records_an_audit_row() {
          `consent_log`, which an erasure cascades, and `audit_log` has no foreign keys and \
          nothing that deletes from it"
     );
+}
+
+// ---- C-1/C-4: a per-list unsubscribe that a deletion cannot erase ------------------------------
+
+/// Every live `list`-scope refusal in the workspace, as `(list_id, email)`.
+async fn list_refusals(pool: &PgPool, workspace: Uuid) -> Vec<(Option<Uuid>, Option<String>)> {
+    sqlx::query_as(
+        "select list_id, email from suppressions \
+          where workspace_id = $1 and scope = 'list' and lifted_at is null order by id",
+    )
+    .bind(workspace)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// **Unticking a box has to leave something behind that the contact row cannot take with it.**
+/// The membership it writes dies with the contact (`list_memberships` cascades) and with the list,
+/// and an import then put the person straight back on the list they had just left. The durable
+/// half is a `list`-scope suppression, keyed on the address like every other row in that table.
+#[sqlx::test]
+async fn unticking_a_box_writes_a_refusal_that_outlives_the_contact(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    let keep = p.on_list("Keep", "public", "subscribed").await;
+    let email = Some("subscriber-acme@ex.test".to_owned());
+
+    // `keep` stays ticked; `weekly` and the pending `news` do not.
+    p.post_unsub(&p.unsub("n1", 0), &format!("list={keep}"))
+        .await
+        .assert_status_ok();
+
+    let refused = list_refusals(&pool, p.workspace).await;
+    assert!(
+        refused.contains(&(Some(weekly), email.clone())),
+        "{refused:?}"
+    );
+    assert!(
+        refused.contains(&(Some(p.list), email.clone())),
+        "the pending one was unticked too, so it is refused too: {refused:?}"
+    );
+    assert!(
+        !refused.iter().any(|(l, _)| *l == Some(keep)),
+        "a box that was already ticked and stayed ticked is not a refusal: {refused:?}"
+    );
+
+    // The move this whole row exists for. Deleting a contact is not erasing one, so nothing else
+    // in the workspace remembers afterwards.
+    sqlx::query("delete from contacts where id = $1")
+        .bind(p.contact)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        list_refusals(&pool, p.workspace).await.len(),
+        2,
+        "the refusals are keyed on the address, so the contact's deletion does not reach them"
+    );
+}
+
+/// **The person themselves must always be able to come back.** Ticking a box is a genuine
+/// re-subscribe, so it lifts the refusal and records `resubscribed`; getting this backwards turns
+/// a consent feature into a trap. `tests/import.rs` holds the other direction — an import never
+/// lifts one.
+#[sqlx::test]
+async fn ticking_a_box_lifts_the_refusal_that_unticking_it_wrote(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+
+    // Nothing ticked: out of both.
+    p.post_unsub(&p.unsub("n1", 0), "").await.assert_status_ok();
+    assert_eq!(list_refusals(&pool, p.workspace).await.len(), 2);
+
+    p.post_unsub(&p.unsub("n2", 0), &format!("list={weekly}"))
+        .await
+        .assert_status_ok();
+
+    let refused = list_refusals(&pool, p.workspace).await;
+    assert!(
+        !refused.iter().any(|(l, _)| *l == Some(weekly)),
+        "the box they ticked again is theirs to clear: {refused:?}"
+    );
+    assert!(
+        refused.iter().any(|(l, _)| *l == Some(p.list)),
+        "and the one they left alone is not cleared with it: {refused:?}"
+    );
+    let rows = consent_by_list(&pool).await;
+    assert!(
+        rows.contains(&(
+            Some(weekly),
+            "resubscribed".to_owned(),
+            "preference_center".to_owned()
+        )),
+        "{rows:?}"
+    );
+}
+
+/// Blocks one list for `email`, through the writer the preference center uses.
+async fn refuse_list(s: &Signup, email: &str, list: Uuid) {
+    let mut conn = s.app.pool.acquire().await.unwrap();
+    nm::suppressions::unsubscribe_list(&mut conn, &s.app.state.secrets, s.workspace, list, email)
+        .await
+        .expect("refuse one list");
+}
+
+/// **Spec §8.9 and invariant 9: the page may not answer a question about an address.** A
+/// submission naming a list this address has left is skipped in silence and still renders the
+/// success page a submission that wrote everything renders — the same bytes, not merely the same
+/// status. The two submissions are compared against each other rather than against a string
+/// written here, which would only pin this file's idea of the page.
+#[sqlx::test]
+async fn a_submission_for_a_list_the_address_left_answers_exactly_as_a_successful_one(
+    pool: PgPool,
+) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    refuse_list(&s, "gone@ex.test", list).await;
+
+    let accepted = s.submit("newsletter", "email=fresh@ex.test").await;
+    let refused = s.submit("newsletter", "email=gone@ex.test").await;
+
+    accepted.assert_status_ok();
+    refused.assert_status_ok();
+    assert_eq!(
+        refused.text(),
+        accepted.text(),
+        "a refused submission that renders a different page is an address oracle"
+    );
+
+    // And nothing was written for it: no membership, no contact, no confirmation email.
+    assert_eq!(
+        s.memberships().await,
+        [(list, "pending".to_owned(), Some("form".to_owned()))],
+        "only the address that had not left is on the list"
+    );
+    assert_eq!(contact_count(&pool).await, 1);
+    let queued = jobs(&pool).await;
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].1["email"], "fresh@ex.test");
+}
+
+/// The other half of the same rule: a refusal of ONE list is not a refusal of the form. A form on
+/// two lists still subscribes the submitter to the one they never left.
+#[sqlx::test]
+async fn a_form_on_two_lists_still_signs_the_submitter_up_to_the_one_they_never_left(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let left = s.list("News", true).await;
+    let kept = s.list("Offers", true).await;
+    s.form("newsletter", &[left, kept], None).await;
+    refuse_list(&s, "gone@ex.test", left).await;
+
+    s.submit("newsletter", "email=gone@ex.test")
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        s.memberships().await,
+        [(kept, "pending".to_owned(), Some("form".to_owned()))],
+        "the list they left is skipped and the other one is not"
+    );
+    let queued = jobs(&pool).await;
+    assert_eq!(
+        queued.len(),
+        1,
+        "one confirmation, for one list: {queued:?}"
+    );
+    assert_eq!(queued[0].3, Some(kept));
 }

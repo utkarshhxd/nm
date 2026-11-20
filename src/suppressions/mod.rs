@@ -329,7 +329,11 @@ pub async fn erase_address(
     let hmac = suppression_hmac(secrets, email);
     lock_address(db, &hmac).await?;
     sqlx::query!(
-        "delete from suppressions where workspace_id = $1 and scope = 'address' and email_hmac = $2",
+        // No `scope` filter, so a `list` row goes with the rest: it carries the plaintext address
+        // too, and erasure means nothing readable about the address survives. A domain row has a
+        // null `email_hmac` and matches nothing here, so dropping the filter cannot widen this to
+        // one.
+        "delete from suppressions where workspace_id = $1 and email_hmac = $2",
         workspace_id,
         hmac.as_slice(),
     )
@@ -402,8 +406,8 @@ pub async fn unsubscribe_all(
     let written = sqlx::query_scalar!(
         "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source) \
          values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click') \
-         on conflict (workspace_id, scope, email_hmac, domain) where lifted_at is null \
-         do nothing returning id",
+         on conflict (workspace_id, scope, email_hmac, domain, list_name) \
+         where lifted_at is null do nothing returning id",
         Uuid::now_v7(),
         workspace_id,
         email,
@@ -455,6 +459,123 @@ pub async fn lift_unsubscribed_all(
     Ok(lifted.is_some())
 }
 
+/// The subscriber's own refusal of **one list**, written by the preference center when a box they
+/// had ticked is unticked. The durable half of that unsubscribe: the `list_memberships` row is the
+/// other half, and it dies with the contact or with the list, which is the defect this exists to
+/// close (spec §8 invariant 1, amended 2026-11-20; `0027_list_scope_suppressions.sql`).
+///
+/// It is **not** a block on the address. Nothing address-level may read it: `blocking`,
+/// `is_suppressed`, `is_suppressed_excluding_bounce` and the four address arms of
+/// `mailable_list_members` all filter on `scope`, the admin API reads `address_suppressions`, and
+/// `Scope` and `Reason` have no variant that would decode one. The reader that honours it is the
+/// view's fifth clause, the importer, and `public::forms`.
+///
+/// The `list_name` snapshot is read from `lists` here rather than taken from the caller, so a
+/// rename between rendering the page and saving it cannot store a name the list never had.
+///
+/// `do update set list_id` adopts an orphan — a refusal of an earlier list of this name, whose own
+/// list was deleted — rather than leaving the insert to do nothing. The two denote the same list,
+/// because the name is what "the same list" means here.
+///
+/// **Call this before writing any `list_memberships` row in the same transaction**, for exactly
+/// the reason [`unsubscribe_all`] gives: it takes [`lock_address`], and the erase path takes that
+/// lock first and only then deletes the contact, which cascades to the membership rows.
+pub async fn unsubscribe_list(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    list_id: Uuid,
+    email: &str,
+) -> ApiResult<()> {
+    // Not fail-closed, for the reason [`unsubscribe_all`] records: refusing would abort the
+    // transaction and take the subscriber's membership changes with it. The address is not logged.
+    let Ok(email) = normalize_email(email) else {
+        tracing::error!(
+            "a stored address does not normalise, so a per-list unsubscribe could not be made \
+             durable; the membership row still records it"
+        );
+        return Ok(());
+    };
+    let hmac = suppression_hmac(secrets, &email);
+    lock_address(db, &hmac).await?;
+    sqlx::query!(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source, \
+         list_id, list_name) \
+         select $1, $2, 'list', $3, $4, 'unsubscribed_list', 'preference_center', l.id, l.name \
+           from lists l where l.workspace_id = $2 and l.id = $5 \
+         on conflict (workspace_id, scope, email_hmac, domain, list_name) where lifted_at is null \
+         do update set list_id = excluded.list_id",
+        Uuid::now_v7(),
+        workspace_id,
+        email,
+        hmac.as_slice(),
+        list_id,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Lifts the subscriber's own refusal of one list, and **only** that one — the per-list mirror of
+/// [`lift_unsubscribed_all`], called where that is called and nowhere else. Ticking a box in the
+/// preference center is a genuine re-subscribe, and leaving the refusal standing would show them a
+/// box that ticks and changes nothing a send would honour.
+///
+/// `scope = 'list'` and `list_id = $3` are the whole of what this may touch. An import must never
+/// reach it: `tests/import.rs` pins that direction, because getting it backwards turns a consent
+/// feature into a trap.
+pub async fn lift_unsubscribed_list(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    list_id: Uuid,
+    email: &str,
+) -> ApiResult<()> {
+    let Ok(email) = normalize_email(email) else {
+        return Ok(());
+    };
+    let hmac = suppression_hmac(secrets, &email);
+    sqlx::query!(
+        "update suppressions set lifted_at = now() \
+          where workspace_id = $1 and scope = 'list' and email_hmac = $2 and list_id = $3 \
+            and lifted_at is null",
+        workspace_id,
+        hmac.as_slice(),
+        list_id,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Which of `list_ids` this address has refused: the subset `public::forms` must leave out of a
+/// submission. Matches on `list_id` alone, which `0027`'s two triggers keep filled for every list
+/// that exists.
+///
+/// An address that cannot be normalised refuses every list: fail closed, never guess. That is
+/// unreachable from the one caller, which normalised before it got here.
+pub async fn suppressed_lists(
+    db: impl PgExecutor<'_>,
+    workspace_id: Uuid,
+    email: &str,
+    list_ids: &[Uuid],
+) -> sqlx::Result<Vec<Uuid>> {
+    let Ok(email) = normalize_email(email) else {
+        return Ok(list_ids.to_vec());
+    };
+    sqlx::query_scalar!(
+        r#"select l as "l!" from unnest($3::uuid[]) l
+            where exists (select 1 from suppressions s where s.lifted_at is null
+                            and s.workspace_id = $1 and s.scope = 'list'
+                            and s.email = $2 and s.list_id = l)"#,
+        workspace_id,
+        email,
+        list_ids,
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// The domain of `x@<raw>` under exactly the rules `normalize_email` applies to an address, so a
 /// domain block and an address on that domain can never disagree about the spelling.
 fn normalize_domain(raw: &str) -> Result<String, FieldError> {
@@ -476,6 +597,13 @@ fn validate_note(raw: &str) -> Result<String, FieldError> {
 }
 
 /// The suppression, or `404` if it is not in this scope (`None` is the instance).
+///
+/// `address_suppressions` and not `suppressions`, here and in [`list`] and [`lift`]: a `list`-scope
+/// row is a subscriber's refusal of one list and is no part of the workspace blocklist this API
+/// shows, creates and lifts. The view is what makes that so rather than a predicate repeated three
+/// times — and if one of these were ever pointed back at the table, `Scope` and `Reason` have no
+/// variant to decode a list row into, so it would fail loudly instead of showing a blank block an
+/// operator could lift.
 pub async fn get(
     db: &mut PgConnection,
     workspace_id: Option<Uuid>,
@@ -483,10 +611,10 @@ pub async fn get(
 ) -> ApiResult<Suppression> {
     sqlx::query_as!(
         Suppression,
-        r#"select id, workspace_id, scope as "scope: Scope", email, domain,
-                  reason as "reason: Reason", note, created_at, created_by_user_id,
-                  lifted_at, lifted_by_user_id
-           from suppressions where id = $2 and workspace_id is not distinct from $1"#,
+        r#"select id as "id!", workspace_id, scope as "scope!: Scope", email, domain,
+                  reason as "reason!: Reason", note, created_at as "created_at!",
+                  created_by_user_id, lifted_at, lifted_by_user_id
+           from address_suppressions where id = $2 and workspace_id is not distinct from $1"#,
         workspace_id,
         id,
     )
@@ -506,10 +634,10 @@ pub async fn list(
     let limit = page.limit();
     let rows = sqlx::query_as!(
         Suppression,
-        r#"select id, workspace_id, scope as "scope: Scope", email, domain,
-                  reason as "reason: Reason", note, created_at, created_by_user_id,
-                  lifted_at, lifted_by_user_id
-           from suppressions
+        r#"select id as "id!", workspace_id, scope as "scope!: Scope", email, domain,
+                  reason as "reason!: Reason", note, created_at as "created_at!",
+                  created_by_user_id, lifted_at, lifted_by_user_id
+           from address_suppressions
            where (workspace_id = $1 or ($1::uuid is null and workspace_id is null))
              and ($2 or lifted_at is null) and ($3::uuid is null or id < $3)
            order by id desc limit $4"#,
@@ -605,7 +733,7 @@ pub async fn lift(
 ) -> ApiResult<Suppression> {
     // Locked, so two lifts racing cannot both pass the check.
     let row = sqlx::query!(
-        r#"select reason as "reason: Reason", lifted_at from suppressions
+        r#"select reason as "reason!: Reason", lifted_at from address_suppressions
            where id = $2 and workspace_id is not distinct from $1 for update"#,
         workspace_id,
         id,

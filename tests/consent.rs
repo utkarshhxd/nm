@@ -1046,6 +1046,10 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
             "0018_membership_provenance.sql",
             // Widens the `source` check for `preference_center`.
             "0022_membership_source_preference_center.sql",
+            // Replaces `mailable_list_members`, which reads it. It writes no membership: a
+            // `list`-scope suppression is the durable half of an unsubscribe, and the consent row
+            // for that unsubscribe is written beside it by the handler that writes both.
+            "0027_list_scope_suppressions.sql",
         ],
         "a migration now names list_memberships: if it WRITES a status, invariant 8 needs a \
          consent row written with it and this fixture cannot see one — say which it is here"

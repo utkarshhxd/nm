@@ -291,6 +291,40 @@ async fn apply(
     {
         return Ok(());
     }
+
+    // **The lists this address has already refused, left out of the submission in silence.** A
+    // per-list unsubscribe is a `list`-scope suppression (`0027`) precisely so that it survives
+    // the contact row and the list row; honouring it here is what stops a form submission being
+    // the thing that undoes it — spec §8 invariant 1, which already said an unsubscribe is never
+    // reversed by a form submission, and which the membership row alone could not deliver once
+    // the contact had been deleted.
+    //
+    // **The response does not change, and may not** (spec §8.9, invariant 9): a submission for a
+    // refused list renders the identical success page, naming the lists the form offers rather
+    // than the ones it wrote. This is the same silence the `is_suppressed_excluding_bounce`
+    // return above keeps, for the same reason — the page may not answer a question about an
+    // address.
+    //
+    // Before the contact is created, not after: if every list is refused there is nothing left to
+    // write, and a contact with no membership and no consent row is the wrong artefact to leave
+    // behind, exactly as the `lists.is_empty()` return at the top of this function says.
+    let offered: Vec<Uuid> = lists.iter().map(|l| l.0).collect();
+    let refused =
+        suppressions::suppressed_lists(&mut *tx, form.workspace_id, email, &offered).await?;
+    let lists: Vec<(Uuid, bool)> = lists
+        .iter()
+        .copied()
+        .filter(|l| !refused.contains(&l.0))
+        .collect();
+    if lists.is_empty() {
+        // The counter this branch of the tree already has for "a submission was dropped and the
+        // submitter was told nothing" — not a second metric for the same event. Nothing is logged:
+        // a line per refused submission is a rate the log would carry about one address.
+        metrics::counter!("public_form_submissions_dropped_total").increment(1);
+        return Ok(());
+    }
+    let lists = &lists[..];
+
     let contact_id = match contact_id(&mut tx, form.workspace_id, email).await? {
         Some(id) => id,
         None => {
