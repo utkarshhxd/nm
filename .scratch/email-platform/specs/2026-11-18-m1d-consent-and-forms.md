@@ -108,10 +108,19 @@ queue. This is the honest cost of the milestone order in `spec.md` §11, and it 
 One row per consent change, never updated, never deleted:
 
 `id`, `workspace_id`, `contact_id`, `list_id` (nullable: a workspace-wide suppression has no
-list), `action` (`subscribed`, `confirmed`, `unsubscribed`, `resubscribed`, `suppressed`),
+list), `action` (`requested`, `subscribed`, `confirmed`, `unsubscribed`, `resubscribed`, `suppressed`),
 `source` (`form`, `import`, `api`, `operator`, `one_click`, `preference_center`, `bounce`,
 `complaint`), `source_ref` (the form id, the import id, the user id — whatever caused it),
 `ip` (`inet`, nullable), `user_agent` (nullable), `token_jti` (nullable), `created_at`.
+
+**Amended 2026-11-20, during M1d implementation.** This list originally omitted `requested`.
+A membership that lands in `pending` is the subscriber having *asked*, not having *agreed*, and
+without `requested` such a row is written as `subscribed` — byte-identical to a real single
+opt-in. The only thing then distinguishing them is `lists.double_optin`, which is mutable and
+unversioned, so an operator flipping that flag retroactively turns unconfirmed rows into proof of
+consent. That is §4's first anti-goal, reached by the very table built to prevent it. A writer
+emits `requested` when the resulting status is `pending` and `subscribed` when it is `subscribed`,
+so the log answers "did this person agree" without joining anything mutable.
 
 **Every existing writer of `list_memberships.status` gains a consent-log write.** That includes
 the importer, the contacts API and the lists API. A status change with no log row is a defect, and
