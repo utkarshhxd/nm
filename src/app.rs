@@ -126,6 +126,19 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
         Ok(removed) => tracing::info!(removed, "removed the uploads of imports that are over"),
         Err(e) => tracing::warn!(error = ?e, "the orphaned-upload sweep failed"),
     }
+    // The public pages are limited per client IP, and `client_ip` falls back to the peer address
+    // unless this is on. Behind a reverse proxy — which is how NM is meant to run — the peer is
+    // the proxy, so every subscriber in the world shares one window of `PUBLIC_PER_MINUTE`. This
+    // is a warning rather than a default because trusting `X-Forwarded-For` without a proxy in
+    // front is worse: the header is client-controlled, and an attacker would then pick their own
+    // rate-limit key.
+    if !cfg.trust_proxy_headers {
+        tracing::warn!(
+            "trust_proxy_headers is off, so rate limiting keys on the peer address. If NM is \
+             behind a reverse proxy, every public page request (/c/, /u/, /f/) counts against one \
+             shared limit and subscribers will be refused. Set it only if the proxy is yours."
+        );
+    }
     if let Some(addr) = cfg.metrics_listen {
         PrometheusBuilder::new()
             .with_http_listener(addr)

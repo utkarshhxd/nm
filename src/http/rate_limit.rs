@@ -29,10 +29,12 @@
 //! workspace, and it is what keeps one tenant from spending another's quota.
 //!
 //! **The public pages have no workspace until their token is parsed, so they key on the client IP**
-//! ([`PUBLIC_PER_MINUTE`]) — and an IP is not a tenant: it is free to mint, which is why [`check`]
-//! bounds its map rather than trusting the caller to be few. See THE BOUND on `MAX_KEYS`. Each
-//! `RateLimiter` owns its own map, so a flood of IPs fills the public one and cannot touch the
-//! four above.
+//! ([`PUBLIC_PER_MINUTE`]) — and an IP is not a tenant. A single address is free to mint by the
+//! 2^64, so the key is the /64 it sits in (`From<IpAddr> for Key`, via
+//! `auth::rate_limit::bucket_of`) and the map has a ceiling on top of that (`MAX_KEYS`). Both are
+//! needed: bucketing makes a key cost an allocation, and the ceiling bounds the memory of someone
+//! who buys allocations. Each `RateLimiter` owns its own map, so a flood fills the public one and
+//! cannot touch the four above.
 //!
 //! [`check`]: RateLimiter::check
 //!
@@ -115,9 +117,20 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// confirming, unsubscribing and setting their preferences does well under ten in a sitting.
 ///
 /// Sixty, one a second, is that line. It leaves a NAT'd office room to confirm a send and still
-/// stops the thousands a minute a loop would get. It is **not** what bounds this limiter's memory,
-/// because an IP costs an attacker nothing: that is `MAX_KEYS`, and the two are separate
-/// defences. Raising this number does not weaken the bound, and lowering it does not strengthen it.
+/// stops the thousands a minute a loop would get. It is **not** what bounds this limiter's memory:
+/// that is `MAX_KEYS`, and the two are separate defences. Raising this number does not weaken the
+/// bound, and lowering it does not strengthen it.
+///
+/// **The deployment that collapses every client into one key, and it is the documented one.**
+/// `request_meta::client_ip` returns the peer address unless `trust_proxy_headers` is on, and that
+/// flag defaults to `false`. NM is meant to run behind a reverse proxy (see
+/// `http::security_headers`), so on a default configuration behind one, *every* public request
+/// keys on the proxy's address: one window, sixty requests a minute for the whole internet, and
+/// the 61st person to click their confirmation link after a send gets a `429`. `app::serve` warns
+/// at startup for exactly this reason. Sign-in's per-IP limiter survives the same deployment only
+/// because 100 failures per address per 15 minutes is loose enough to absorb it; sixty a minute
+/// across every subscriber is not. **An operator behind a proxy must set `trust_proxy_headers`,
+/// and must only do so when the proxy is theirs** — the header is client-controlled otherwise.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
 const WINDOW: Duration = Duration::from_secs(60);
@@ -125,27 +138,50 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// THE BOUND. How many windows one limiter's map may hold at once.
 ///
 /// The map is keyed by whatever [`RateLimiter::check`] is given, and for the public pages that is
-/// an IP address an unauthenticated caller chooses. One IPv6 /64 is 18 million million million
-/// distinct keys for free, so "how many keys can there be" is not a question the key type answers
-/// any more and the map needs a ceiling of its own. At 100,000 entries of a `Key` and a `Window`
-/// this is single-digit megabytes per limiter, and it is far above the distinct addresses a real
-/// instance sees in a minute, including the burst after a send.
+/// an IP address an unauthenticated caller chooses. Addresses are bucketed to a /64 by
+/// `From<IpAddr> for Key`, so a key costs an attacker an allocation rather than a packet — but
+/// allocations can be bought, so the map still needs a ceiling of its own. At 100,000 entries of a
+/// `Key` and a `Window` this is single-digit megabytes per limiter, and it is far above the
+/// distinct allocations a real instance sees in a minute, including the burst after a send.
 ///
 /// **The eviction rule, in full:** finished windows are swept — and swept *only* — when a key that
-/// is not already in the map arrives and the map is at the ceiling. If that sweep makes room, the
-/// new key is stored as usual. If it does not, because every window is still live, the new key is
-/// **refused and not stored**: the map never grows past the ceiling, and a request that arrives
-/// while 100,000 other addresses are mid-window is answered `429` rather than admitted. Fail
-/// closed is deliberate. The alternative — evicting a live window to make room — would let an
-/// attacker clear their own counter on demand, which is the limiter undone; refusing costs an
-/// unlucky visitor a minute during a flood, which is the limiter working.
+/// is not already in the map arrives, the map is at the ceiling, and the last sweep was at least
+/// `SWEEP_EVERY` ago. If the sweep makes room, the new key is stored as usual. If it does not,
+/// because every window is still live, the new key is **refused and not stored**: the map never
+/// grows past the ceiling.
 ///
-/// The sweep moved here from "every check" in the same change that admitted IP keys. On every
-/// check it was `O(keys)` under a `std::sync::Mutex` held on an async runtime worker, which an
-/// unauthenticated caller could have made arbitrarily expensive by supplying arbitrarily many
-/// keys. Here it costs `O(MAX_KEYS)` at most once per `MAX_KEYS` new keys — amortised `O(1)` —
-/// and every other check is a single hash lookup.
+/// **What that refusal costs, exactly.** Not "one unlucky visitor": while the map holds
+/// `MAX_KEYS` live windows, *every* key not already in it is refused, and a first-time visitor is
+/// by definition not in it. So for as long as someone can keep the map full, the public surface is
+/// closed to everyone new. That is why the /64 bucketing above matters more than this ceiling
+/// does — it is what makes the full-map state expensive to buy — and why `PUBLIC_PER_MINUTE` is
+/// sized to be hard to reach honestly.
+///
+/// Failing closed is still the right direction and stays: the alternative, evicting a live window
+/// to make room, lets an attacker clear their own counter on demand, which is the limiter undone.
+/// What a refusal must never be is an unsubscribe that does not stick (spec M1d §4's second
+/// anti-goal). `GET /c/{token}` may answer `429`; `POST /u/{token}` may not, and the task that
+/// adds it decides how — not by changing this rule, which protects everyone, but by what that
+/// route does with a `Quota` that is over.
+///
+/// The sweep moved here from "every check" in the same change that admitted IP keys, where it was
+/// `O(keys)` on every request under a `std::sync::Mutex` held on an async runtime worker — an
+/// unauthenticated caller could make it arbitrarily expensive by supplying arbitrarily many keys.
+///
+/// **Its cost now, stated so the next reader can check it:** a sweep is `O(MAX_KEYS)` and runs at
+/// most once per `SWEEP_EVERY`, whatever arrives — about 10^5 entry visits a second in the worst
+/// case, against the 10^5 *per request* it would be without the clock. It is deliberately **not**
+/// "amortised `O(1)` per new key": when the map is full the sweep frees nothing and the key is
+/// refused without being stored, so there is no state change to amortise against and every new key
+/// would re-run the scan. The clock, not the arrival pattern, is what bounds this.
 const MAX_KEYS: usize = 100_000;
+
+/// The shortest interval between two sweeps of one limiter's map. A sweep can only free a window
+/// that has ended, and windows last `WINDOW`, so sweeping more often than this frees a handful of
+/// entries for a full scan. The cost of waiting is that a map full of windows that have *ended* is
+/// not reopened for up to a second, which delays an admissible key by up to a second and nothing
+/// else.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 /// What a window is counted against. A workspace for the authenticated endpoints, an IP for the
 /// public pages, and never confusable: a workspace id and an address that happen to collide in
@@ -163,14 +199,24 @@ impl From<Uuid> for Key {
 }
 
 impl From<IpAddr> for Key {
+    /// **The address is bucketed here, not at the call site**, so no route can forget: a limiter
+    /// that counts raw addresses stops nobody who holds an allocation, and a /64 comes free with
+    /// any VPS. `auth::rate_limit::bucket_of` is the product's one answer to that and carries the
+    /// reasoning; sign-in has keyed through it since M0.
     fn from(ip: IpAddr) -> Key {
-        Key::Ip(ip)
+        Key::Ip(crate::auth::rate_limit::bucket_of(ip))
     }
 }
 
 pub struct RateLimiter {
     limit: u32,
-    windows: Mutex<HashMap<Key, Window>>,
+    windows: Mutex<Windows>,
+}
+
+struct Windows {
+    map: HashMap<Key, Window>,
+    /// When `map` was last swept. See `SWEEP_EVERY`.
+    swept: Instant,
 }
 
 struct Window {
@@ -189,7 +235,10 @@ impl RateLimiter {
     pub fn per_minute(limit: u32) -> RateLimiter {
         RateLimiter {
             limit,
-            windows: Mutex::new(HashMap::new()),
+            windows: Mutex::new(Windows {
+                map: HashMap::new(),
+                swept: Instant::now(),
+            }),
         }
     }
 
@@ -205,15 +254,21 @@ impl RateLimiter {
         // A poisoned lock here would mean a panic while holding it, which the block below cannot
         // do; recovering beats turning every later preview into a 500.
         let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
-        let known = windows.contains_key(&key);
-        // The sweep, and the only place it happens. Everything about why it is here and not on
-        // every check, and what happens when it frees nothing, is on `MAX_KEYS`.
-        if !known && windows.len() >= MAX_KEYS {
-            windows.retain(|_, w| w.ends > now);
+        let known = windows.map.contains_key(&key);
+        // The sweep, and the only place it happens. The clock is what keeps it off the hot path:
+        // when the map is full the sweep frees nothing and the key is refused without being
+        // stored, so without this check every new key would re-run the whole scan under the lock.
+        // Everything about the cost and the eviction rule is on `MAX_KEYS`.
+        if !known
+            && windows.map.len() >= MAX_KEYS
+            && now.saturating_duration_since(windows.swept) >= SWEEP_EVERY
+        {
+            windows.map.retain(|_, w| w.ends > now);
+            windows.swept = now;
         }
         // `None`: the map is full of live windows, so this key is refused and never stored.
-        let counted = if known || windows.len() < MAX_KEYS {
-            let window = windows.entry(key).or_insert(Window {
+        let counted = if known || windows.map.len() < MAX_KEYS {
+            let window = windows.map.entry(key).or_insert(Window {
                 ends: now + WINDOW,
                 used: 0,
             });
@@ -289,36 +344,129 @@ mod tests {
         );
     }
 
+    /// The `n`th distinct /64 of the documentation prefix: `2001:db8:<n>::`.
+    fn allocation(n: u64) -> IpAddr {
+        IpAddr::from(Ipv6Addr::from(
+            (0x2001_0db8_u128 << 96) | (u128::from(n) << 64),
+        ))
+    }
+
+    /// An address *inside* `2001:db8:0::/64`, which an attacker gets 2^64 of for one allocation.
+    fn inside_one_allocation(n: u64) -> IpAddr {
+        IpAddr::from(Ipv6Addr::from((0x2001_0db8_u128 << 96) | u128::from(n)))
+    }
+
+    /// The property the /64 bucketing buys, and the one a raw-address key does not have: an
+    /// allocation is one client however many of its addresses it sends from. Without this, sixty
+    /// a minute is sixty per address and the public surface has no limit at all.
+    #[test]
+    fn every_address_in_one_ipv6_allocation_shares_one_window() {
+        let limiter = RateLimiter::per_minute(PUBLIC_PER_MINUTE);
+        let start = Instant::now();
+        for n in 0..u64::from(PUBLIC_PER_MINUTE) {
+            let quota = limiter.check_at(inside_one_allocation(n).into(), start);
+            assert!(quota.over.is_none(), "address {n} is within the limit");
+        }
+        // A sixty-first address in the same /64 is the same client, and is refused.
+        let over = limiter.check_at(inside_one_allocation(9_999).into(), start);
+        assert!(over.over.is_some(), "a new address is not a new budget");
+        assert_eq!(
+            limiter.windows.lock().unwrap().map.len(),
+            1,
+            "one allocation, one window"
+        );
+
+        // A different allocation is a different client and is not charged for the first one.
+        assert!(limiter.check_at(allocation(7).into(), start).over.is_none());
+    }
+
+    /// A dual-stack listener may report an IPv4 client as `::ffff:a.b.c.d`. Two budgets for one
+    /// client would be a second way past the limit, and masking it to a /64 would be far worse:
+    /// every IPv4 address on earth would share one `::` window.
+    #[test]
+    fn an_ipv4_mapped_address_is_the_same_key_as_the_address_it_carries() {
+        let plain: IpAddr = "198.51.100.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
+        let neighbour: IpAddr = "198.51.100.8".parse().unwrap();
+        assert_eq!(Key::from(mapped), Key::from(plain));
+        assert_ne!(Key::from(mapped), Key::from(neighbour));
+    }
+
     /// The public pages are reached without a session, so the key is an address the caller picks.
-    /// A `/64` is more addresses than there are grains of sand; the map must not follow them.
+    /// Bucketing makes a key cost an allocation rather than a packet, but allocations can be
+    /// bought, so the map still must not follow them without end.
     #[test]
     fn the_limiter_map_never_grows_past_its_cap_however_many_ips_arrive() {
         let limiter = RateLimiter::per_minute(PUBLIC_PER_MINUTE);
         let start = Instant::now();
-        // Every window is still live at `start`, so the sweep frees nothing and the ceiling is
-        // the only thing holding the map down.
-        let arrivals = MAX_KEYS + MAX_KEYS / 5;
+        // Distinct /64s, so each is genuinely its own key after bucketing — 120,000 addresses in
+        // one allocation would be one key and would prove nothing about the ceiling.
+        let arrivals = (MAX_KEYS + MAX_KEYS / 5) as u64;
         for n in 0..arrivals {
-            let ip = IpAddr::from(Ipv6Addr::from(0x2001_0db8_0000_0000_u128 << 64 | n as u128));
-            limiter.check_at(Key::Ip(ip), start);
+            limiter.check_at(allocation(n).into(), start);
         }
-        let held = limiter.windows.lock().unwrap().len();
+        let held = limiter.windows.lock().unwrap().map.len();
         assert_eq!(
             held, MAX_KEYS,
-            "{arrivals} addresses arrived; {held} are held"
+            "{arrivals} allocations arrived; {held} are held"
         );
 
         // And the request that found it full was refused rather than admitted untracked.
-        let last = IpAddr::from(Ipv6Addr::from(
-            0x2001_0db8_0000_0000_u128 << 64 | (arrivals - 1) as u128,
-        ));
-        assert!(limiter.check_at(Key::Ip(last), start).over.is_some());
+        assert!(
+            limiter
+                .check_at(allocation(arrivals - 1).into(), start)
+                .over
+                .is_some()
+        );
 
         // A window that has ended is swept when the next new key needs the room, so the map
         // recovers on its own: the cap is a ceiling, not a permanent lockout.
         let next = start + WINDOW + Duration::from_secs(1);
-        let fresh = IpAddr::from(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
-        assert!(limiter.check_at(Key::Ip(fresh), next).over.is_none());
-        assert_eq!(limiter.windows.lock().unwrap().len(), 1, "the sweep ran");
+        assert!(
+            limiter
+                .check_at(allocation(9_999_999).into(), next)
+                .over
+                .is_none()
+        );
+        assert_eq!(
+            limiter.windows.lock().unwrap().map.len(),
+            1,
+            "the sweep ran"
+        );
+    }
+
+    /// The fix for the scan that ran on every request once the map was full. A full map frees
+    /// nothing and stores nothing, so there is no state change to amortise against: only the
+    /// clock stops the next new key from re-running the whole `retain` under the lock.
+    #[test]
+    fn a_full_map_sweeps_at_most_once_per_interval_however_many_new_keys_arrive() {
+        let limiter = RateLimiter::per_minute(PUBLIC_PER_MINUTE);
+        let start = Instant::now();
+        for n in 0..MAX_KEYS as u64 {
+            limiter.check_at(allocation(n).into(), start);
+        }
+        // Full, and every window live. `swept` is the limiter's construction time, so the first
+        // new key here is more than `SWEEP_EVERY` later only if we say so.
+        let full = start + SWEEP_EVERY;
+        limiter.check_at(allocation(10_000_000).into(), full);
+        assert_eq!(limiter.windows.lock().unwrap().swept, full, "it swept once");
+
+        // Every further new key within the interval leaves `swept` alone: no second scan.
+        for n in 0..1_000u64 {
+            limiter.check_at(
+                allocation(20_000_000 + n).into(),
+                full + Duration::from_millis(1),
+            );
+        }
+        assert_eq!(
+            limiter.windows.lock().unwrap().swept,
+            full,
+            "1,000 new keys inside one interval ran the scan again"
+        );
+
+        // Once the interval has passed, a new key may sweep again.
+        let later = full + SWEEP_EVERY;
+        limiter.check_at(allocation(30_000_000).into(), later);
+        assert_eq!(limiter.windows.lock().unwrap().swept, later);
     }
 }
