@@ -137,8 +137,16 @@ export function publicPath(workspaceSlug: string, formSlug: string): string {
   return `/f/${workspaceSlug}/${formSlug}`;
 }
 
+/**
+ * One field the editor offers. `key` is what the editor's state is stored under, and a custom
+ * field's is namespaced: a workspace may legitimately key one `first_name`
+ * (`custom_fields::validate_key` allows it), and sharing a slot with the built-in would tie two
+ * separate inputs' ticks together.
+ */
+type Offer = { key: string; target: FormTarget; label: string };
+
 /** The optional built-in targets, in the order they are offered and rendered. */
-const BUILT_IN: { key: string; target: FormTarget; label: string }[] = [
+const BUILT_IN: Offer[] = [
   { key: "first_name", target: { kind: "first_name" }, label: "First name" },
   { key: "last_name", target: { kind: "last_name" }, label: "Last name" },
   { key: "timezone", target: { kind: "timezone" }, label: "Time zone" },
@@ -146,12 +154,12 @@ const BUILT_IN: { key: string; target: FormTarget; label: string }[] = [
 
 type Collected = { on: boolean; label: string; required: boolean };
 
-/** What the editor holds for one offerable field, keyed by `key` above or a custom field's key. */
-const collected = (fields: FormField[], target: FormTarget, fallback: string): Collected => {
-  const found = fields.find((f) => sameTarget(f.target, target));
+/** What the editor holds for one offered field, read off the form being edited. */
+const collected = (fields: FormField[], offer: Offer): Collected => {
+  const found = fields.find((f) => sameTarget(f.target, offer.target));
   return {
     on: found !== undefined,
-    label: found?.label ?? fallback,
+    label: found?.label ?? offer.label,
     required: found?.required ?? false,
   };
 };
@@ -196,8 +204,10 @@ export function FormEditor({
     fields.find((f) => f.target.kind === "email")?.label ?? "Email address",
   );
   const [lists, setLists] = useState<string[]>(existing?.list_ids ?? []);
+  // Seeded from the built-ins only; a custom field's slot is filled by `state` the first time it
+  // is read, because the definitions arrive after this runs.
   const [picked, setPicked] = useState<Record<string, Collected>>(() =>
-    Object.fromEntries(BUILT_IN.map((b) => [b.key, collected(fields, b.target, b.label)])),
+    Object.fromEntries(BUILT_IN.map((b) => [b.key, collected(fields, b)])),
   );
 
   // The same key and request as the contacts grid's filter and the contact page's picker.
@@ -221,29 +231,31 @@ export function FormEditor({
   });
   // Oldest first, as the contact page shows them. An archived definition is not offered: a form
   // collecting into one collects into nowhere.
-  const custom = [...(customFields.data ?? [])]
-    .reverse()
-    .filter((d) => d.kind === "text" && d.archived_at == null);
+  const offered: Offer[] = [
+    ...BUILT_IN,
+    ...[...(customFields.data ?? [])]
+      .reverse()
+      .filter((d) => d.kind === "text" && d.archived_at == null)
+      .map((d) => ({
+        key: `custom:${d.key}`,
+        target: { kind: "custom" as const, value: d.key },
+        label: d.label,
+      })),
+  ];
 
-  const state = (key: string, fallback: string): Collected =>
-    picked[key] ?? collected(fields, { kind: "custom", value: key }, fallback);
-  const set = (key: string, fallback: string, change: Partial<Collected>) =>
-    setPicked((was) => ({ ...was, [key]: { ...state(key, fallback), ...change } }));
+  const state = (offer: Offer): Collected => picked[offer.key] ?? collected(fields, offer);
+  const set = (offer: Offer, change: Partial<Collected>) =>
+    setPicked((was) => ({ ...was, [offer.key]: { ...state(offer), ...change } }));
 
   const body = () => {
     const chosen: FormField[] = [
       { target: EMAIL, required: true, label: emailLabel.trim() },
-      ...BUILT_IN.filter((b) => state(b.key, b.label).on).map((b) => ({
-        target: b.target,
-        required: state(b.key, b.label).required,
-        label: state(b.key, b.label).label.trim(),
-      })),
-      ...custom
-        .filter((d) => state(d.key, d.label).on)
-        .map((d) => ({
-          target: { kind: "custom" as const, value: d.key },
-          required: state(d.key, d.label).required,
-          label: state(d.key, d.label).label.trim(),
+      ...offered
+        .filter((o) => state(o).on)
+        .map((o) => ({
+          target: o.target,
+          required: state(o).required,
+          label: state(o).label.trim(),
         })),
     ];
     return {
@@ -287,32 +299,32 @@ export function FormEditor({
     save.mutate();
   }
 
-  const row = (key: string, label: string) => {
-    const it = state(key, label);
+  const row = (offer: Offer) => {
+    const it = state(offer);
     return (
-      <li key={key} className="mt-3">
+      <li key={offer.key} className="mt-3">
         <label className="flex w-fit items-center gap-2 font-medium">
           <Checkbox
             checked={it.on}
-            aria-label={`Collect ${label}`}
-            onChange={(e) => set(key, label, { on: e.target.checked })}
+            aria-label={`Collect ${offer.label}`}
+            onChange={(e) => set(offer, { on: e.target.checked })}
           />
-          {label}
+          {offer.label}
         </label>
         {it.on ? (
           <div className="ms-7 mt-1 flex flex-wrap items-center gap-3">
             <input
               className="min-h-(--control-h) rounded-sm border border-border-strong bg-surface px-3 text-fg"
-              aria-label={`${label} label`}
+              aria-label={`${offer.label} label`}
               maxLength={100}
               value={it.label}
-              onChange={(e) => set(key, label, { label: e.target.value })}
+              onChange={(e) => set(offer, { label: e.target.value })}
             />
             <label className="flex items-center gap-2">
               <Checkbox
                 checked={it.required}
-                aria-label={`Require ${label}`}
-                onChange={(e) => set(key, label, { required: e.target.checked })}
+                aria-label={`Require ${offer.label}`}
+                onChange={(e) => set(offer, { required: e.target.checked })}
               />
               Required
             </label>
@@ -419,8 +431,7 @@ export function FormEditor({
               <span className="text-sm text-fg-muted">Always collected, always required.</span>
             </div>
           </li>
-          {BUILT_IN.map((b) => row(b.key, b.label))}
-          {custom.map((d) => row(d.key, d.label))}
+          {offered.map(row)}
         </ul>
       </fieldset>
 
