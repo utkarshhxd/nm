@@ -436,7 +436,7 @@ Honeypot: a field named `website`, hidden in CSS, must be empty.
 
 **Files:** Create `web/src/routes/forms.tsx`, `web/src/routes/form-detail.tsx`; modify `web/src/router.tsx`, `web/src/routes/workspace-layout.tsx`.
 
-Follow `contacts.tsx` and `lists.tsx` for table, dialog and error patterns; use the house components (`Dialog`, `Select`, `Checkbox`, `EmptyState`, `ErrorState`, `TableScroller`). The embed snippet is a read-only `<textarea>` with a copy button, containing a plain HTML `<form>` posting to `/f/{slug}` — no JavaScript required of the embedder.
+Follow `contacts.tsx` and `lists.tsx` for table, dialog and error patterns; use the house components (`Dialog`, `Select`, `Checkbox`, `EmptyState`, `ErrorState`, `TableScroller`). The embed snippet is a read-only `<textarea>` with a copy button, containing a plain HTML `<form>` posting to `/f/{workspace}/{slug}` — no JavaScript required of the embedder. The snippet is generated from the workspace's slug and the form's, so it is correct for the workspace the operator is looking at; a snippet hard-coding the wrong workspace would post to another tenant's form.
 
 - [ ] **Step 1: Write the failing e2e** in `web/e2e/forms.spec.ts`: create a form, see the snippet, edit it, delete it.
 - [ ] **Step 2: Run and watch it fail.** Run: `bash scripts/dev.sh pnpm --dir web e2e -- forms.spec.ts`
