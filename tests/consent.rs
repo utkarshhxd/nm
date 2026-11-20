@@ -161,11 +161,11 @@ async fn a_consent_row_for_another_workspace_cannot_be_written(pool: PgPool) {
         )
         .await
         .expect_err("the database must refuse a cross-workspace row");
-        let db = err
-            .as_database_error()
-            .expect("a database error, not a Rust one");
-        assert_eq!(db.code().as_deref(), Some("23503"), "foreign_key_violation");
-        assert_eq!(db.constraint(), Some(fk));
+        // `record` scrubs its own error, so a caller sees the message and nothing else. This is
+        // also what proves the scrub is applied inside `record` and not at each call site.
+        let shown = format!("{err:?}");
+        assert!(shown.contains("23503"), "foreign_key_violation: {shown}");
+        assert!(shown.contains(fk), "{shown}");
     }
     let n: i64 = sqlx::query_scalar("select count(*) from consent_log")
         .fetch_one(&pool)
@@ -419,11 +419,11 @@ async fn a_workspace_wide_row_for_another_workspaces_contact_cannot_be_written(p
     )
     .await
     .expect_err("the database must refuse it");
-    let db = err.as_database_error().expect("a database error");
-    assert_eq!(db.code().as_deref(), Some("23503"));
-    assert_eq!(
-        db.constraint(),
-        Some("consent_log_workspace_id_contact_id_fkey")
+    let shown = format!("{err:?}");
+    assert!(shown.contains("23503"), "{shown}");
+    assert!(
+        shown.contains("consent_log_workspace_id_contact_id_fkey"),
+        "{shown}"
     );
 }
 
@@ -476,7 +476,7 @@ async fn every_action_and_source_round_trips_through_the_database(pool: PgPool) 
         for s in sources {
             record(&mut conn, ws, c, None, a, s, &Context::default())
                 .await
-                .unwrap_or_else(|e| panic!("{a:?} / {s:?}: {e}"));
+                .unwrap_or_else(|e| panic!("{a:?} / {s:?}: {e:?}"));
         }
     }
     let total: i64 = sqlx::query_scalar("select count(*) from consent_log")
@@ -512,15 +512,15 @@ use nm::contacts::import::{
 use nm::{config::SecretKey, crypto::secrets::Secrets, workspaces::roles::Role};
 use serde_json::{Value, json};
 
-/// A workspace and a signed-in editor of it.
-async fn editor(pool: &PgPool, slug: &str) -> (Uuid, TestApp) {
+/// A workspace, a signed-in editor of it, and that editor's user id.
+async fn editor(pool: &PgPool, slug: &str) -> (Uuid, Uuid, TestApp) {
     let ws = workspace(pool, slug).await;
     let email = format!("editor-{slug}@example.com");
     let id = create_user(pool, &email, PW, false).await;
     add_member(pool, ws, id, Role::Editor).await;
     let mut app = TestApp::new(pool.clone()).await;
     app.login(&email, PW).await;
-    (ws, app)
+    (ws, id, app)
 }
 
 fn id_of(r: &axum_test::TestResponse) -> Uuid {
@@ -556,6 +556,17 @@ async fn consent_rows(pool: &PgPool) -> Vec<(String, String, Option<String>)> {
     rows
 }
 
+/// Consent rows carrying an IP or a user agent. An operator's request is not the subscriber's
+/// evidence, so an operator-driven path must leave both null rather than invent them.
+async fn with_evidence(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from consent_log where ip is not null or user_agent is not null",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 async fn count(pool: &PgPool, table: &str) -> i64 {
     let sql = sqlx::AssertSqlSafe(format!("select count(*) from {table}"));
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
@@ -563,7 +574,7 @@ async fn count(pool: &PgPool, table: &str) -> i64 {
 
 #[sqlx::test]
 async fn subscribing_through_the_lists_api_writes_a_consent_row(pool: PgPool) {
-    let (ws, app) = editor(&pool, "acme").await;
+    let (ws, operator, app) = editor(&pool, "acme").await;
     let list = api_list(&app, ws, "news", false).await;
     let c = api_contact(&app, ws, "a@ex.test").await;
     let members = format!("/api/v1/workspaces/{ws}/lists/{list}/members");
@@ -572,16 +583,32 @@ async fn subscribing_through_the_lists_api_writes_a_consent_row(pool: PgPool) {
         .json(&json!({"contact_id": c}))
         .await
         .assert_status_ok();
-    let (who, l, action, source): (Uuid, Option<Uuid>, String, String) =
-        sqlx::query_as("select contact_id, list_id, action, source from consent_log")
-            .fetch_one(&pool)
-            .await
-            .expect("exactly one consent row for one new membership");
+    type LoggedRow = (
+        Uuid,
+        Option<Uuid>,
+        String,
+        String,
+        Option<String>,
+        Option<IpAddr>,
+        Option<String>,
+    );
+    // `fetch_one` takes the first row of however many there are; the count below is what makes
+    // "one" true.
+    let (who, l, action, source, source_ref, ip, agent): LoggedRow = sqlx::query_as(
+        "select contact_id, list_id, action, source, source_ref, ip, user_agent from consent_log",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the add must have written a consent row");
     assert_eq!((who, l), (c, Some(list)));
     assert_eq!(
         (action.as_str(), source.as_str()),
         ("subscribed", "operator")
     );
+    // The operator is named and nothing of the operator's request is kept: `RequestMeta` is in
+    // scope at this route, so an IP landing here is exactly the regression nothing else catches.
+    assert_eq!(source_ref, Some(operator.to_string()));
+    assert_eq!((ip, agent), (None, None));
 
     // Adding someone already on the list changes nothing, so records nothing.
     app.post(&members)
@@ -607,7 +634,7 @@ async fn subscribing_through_the_lists_api_writes_a_consent_row(pool: PgPool) {
 
 #[sqlx::test]
 async fn subscribing_through_the_contacts_api_writes_a_consent_row(pool: PgPool) {
-    let (ws, app) = editor(&pool, "acme").await;
+    let (ws, operator, app) = editor(&pool, "acme").await;
     let list = api_list(&app, ws, "news", false).await;
     let mut ids = vec![];
     for i in 0..3 {
@@ -638,6 +665,13 @@ async fn subscribing_through_the_contacts_api_writes_a_consent_row(pool: PgPool)
     .await
     .unwrap();
     assert_eq!(who, 3);
+    // The consent rows come from a CTE inside the bulk statement: it names the operator and binds
+    // no evidence of its own, for the same reason the single-row writers invent none.
+    assert!(
+        rows.iter().all(|r| r.2 == Some(operator.to_string())),
+        "{rows:?}"
+    );
+    assert_eq!(with_evidence(&pool).await, 0);
 
     // Everyone is on the list already: the statement writes nothing, so records nothing.
     bulk("subscribe").await;
@@ -693,25 +727,23 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
     );
     assert_eq!(rows, [want.clone(), want.clone(), want]);
     // No IP and no user agent: an importing operator is not the subscriber, and none is invented.
-    let evidence: i64 = sqlx::query_scalar(
-        "select count(*) from consent_log where ip is not null or user_agent is not null",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(evidence, 0);
+    assert_eq!(with_evidence(&pool).await, 0);
 
     // The same file again writes no membership, so no consent row.
     import_into(&pool, ws, list, "email\na@ex.test\nb@ex.test\nc@ex.test\n").await;
     assert_eq!(count(&pool, "consent_log").await, 3);
 }
 
-/// The gate. One fixture drives all three writers; memberships and consent rows must match. And a
-/// writer in a file this test has never heard of fails the second half, whether or not any
-/// fixture reaches it.
+/// The gate. One fixture drives all five writers; memberships and consent rows must match.
+///
+/// The source scan below is a **tripwire, not a proof**: it fails when a file that never touched
+/// `list_memberships` starts to, which is where the next writer is most likely to appear. It
+/// cannot see a second writer added to a file already on the list, and the count above only
+/// covers the writers this fixture reaches. Invariant 8 is held by review; this makes the
+/// cheapest way to break it loud.
 #[sqlx::test]
 async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPool) {
-    let (ws, app) = editor(&pool, "acme").await;
+    let (ws, _, app) = editor(&pool, "acme").await;
     let list = api_list(&app, ws, "news", false).await;
     let double = api_list(&app, ws, "digest", true).await;
     let a = api_contact(&app, ws, "a@ex.test").await;
@@ -740,42 +772,46 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
     .unwrap();
     assert_eq!(unlogged, 0);
 
-    // Every file that writes `list_memberships` is one of the three the fixture drives.
+    // Every file that so much as names `list_memberships` — readers included. Matching the table
+    // rather than a write verb is the same size and strictly stronger: `insert into` split over
+    // two lines, `public.list_memberships`, a quoted name, `merge into` and a table name built
+    // with `format!` all evade a verb list, and the first two are ordinary formatting.
     fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
-        const WRITES: [&str; 3] = [
-            "insert into list_memberships",
-            "update list_memberships",
-            "delete from list_memberships",
-        ];
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
                 walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                let src = std::fs::read_to_string(&p).unwrap().to_lowercase();
-                let src = src.split_whitespace().collect::<Vec<_>>().join(" ");
-                if WRITES.iter().any(|w| src.contains(w)) {
-                    out.push(p.to_string_lossy().replace('\\', "/"));
-                }
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && std::fs::read_to_string(&p)
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("list_memberships")
+            {
+                out.push(p.to_string_lossy().replace('\\', "/"));
             }
         }
     }
-    let mut writers = vec![];
+    let mut touching = vec![];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    walk(&src, &mut writers);
-    writers.sort();
-    let writers: Vec<_> = writers
+    walk(&src, &mut touching);
+    touching.sort();
+    let touching: Vec<_> = touching
         .iter()
         .map(|p| p.rsplit_once("/src/").unwrap().1)
         .collect();
     assert_eq!(
-        writers,
+        touching,
         [
+            "contacts/export.rs",
             "contacts/import/staging.rs",
+            "contacts/mod.rs",
             "contacts/selection.rs",
-            "lists/mod.rs"
+            "lists/mod.rs",
+            "lists/routes.rs",
+            "segments/compile.rs",
         ],
-        "a new writer of list_memberships needs a consent row and a place in this fixture"
+        "this file now touches list_memberships: a writer of status needs a consent row in the \
+         same transaction and a place in this fixture"
     );
 }
 

@@ -534,7 +534,10 @@ pub async fn upsert_from_staging(
 /// A tag is the only row this module creates whose count is not known before the statement runs.
 /// Minting these ids in Rust would mean reading every distinct tag name in the file into memory
 /// first, which is the one thing this module refuses to do (see [`MAX_RECORD_BYTES`]).
-const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) * 1000)::bigint), \
+///
+/// `contacts::selection` mints consent-log ids with it for the same reason: the rows are made
+/// inside the statement, so their ids must be too.
+pub(crate) const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) * 1000)::bigint), \
                             12, '0') || '7' || substr(md5(random()::text), 1, 3) \
                             || '8' || substr(md5(random()::text), 1, 15))::uuid";
 
@@ -688,19 +691,12 @@ async fn write_memberships_and_tags(
         source_ref: Some(import.id.to_string()),
         ..consent::Context::default()
     };
-    let (contacts, lists) = (&written_contacts, &written_lists);
+    // The two arrays are aggregated under one `order by contact_id, list_id`, so pairing them is
+    // what keeps each consent row on the membership it belongs to.
+    let rows: Vec<(Uuid, Uuid)> = written_contacts.into_iter().zip(written_lists).collect();
     let source = consent::Source::Import;
     let action = consent::Action::Subscribed;
-    consent::record_many(
-        conn,
-        import.workspace_id,
-        (contacts, lists),
-        action,
-        source,
-        &cx,
-    )
-    .await
-    .map_err(consent::scrub)?;
+    consent::record_many(conn, import.workspace_id, &rows, action, source, &cx).await?;
     Ok((declined, suppressed))
 }
 

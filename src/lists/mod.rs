@@ -211,8 +211,7 @@ pub async fn add_member(
                 source,
                 cx,
             )
-            .await
-            .map_err(consent::scrub)?;
+            .await?;
             Ok(w.status)
         }
         None => Ok(sqlx::query_scalar!(
@@ -238,17 +237,28 @@ pub async fn unsubscribe_member(
     contact_id: Uuid,
     cx: &consent::Context,
 ) -> ApiResult<()> {
+    // One statement, so one snapshot: "did this change anything" and "is there a membership at
+    // all" cannot disagree. Asking separately let a membership another transaction committed in
+    // between turn a 404 into a `204` over a contact who is still subscribed.
     let done = sqlx::query!(
-        "update list_memberships \
-         set status = 'unsubscribed', unsubscribed_at = now() \
-         where workspace_id = $1 and list_id = $2 and contact_id = $3 and status <> 'unsubscribed'",
+        r#"with changed as (
+               update list_memberships
+                  set status = 'unsubscribed', unsubscribed_at = now()
+                where workspace_id = $1 and list_id = $2 and contact_id = $3
+                  and status <> 'unsubscribed'
+               returning 1
+           )
+           select exists (select 1 from changed) as "changed!",
+                  exists (select 1 from list_memberships
+                           where workspace_id = $1 and list_id = $2
+                             and contact_id = $3) as "member!""#,
         workspace_id,
         list_id,
         contact_id,
     )
-    .execute(&mut *db)
+    .fetch_one(&mut *db)
     .await?;
-    if done.rows_affected() == 1 {
+    if done.changed {
         let source = consent::Source::Operator;
         let action = consent::Action::Unsubscribed;
         return consent::record(
@@ -260,19 +270,14 @@ pub async fn unsubscribe_member(
             source,
             cx,
         )
-        .await
-        .map_err(consent::scrub);
+        .await;
     }
     // Nothing changed: it was already unsubscribed (fine) or was never a member (404).
-    let exists = sqlx::query_scalar!(
-        "select true from list_memberships where workspace_id = $1 and list_id = $2 and contact_id = $3",
-        workspace_id,
-        list_id,
-        contact_id,
-    )
-    .fetch_optional(db)
-    .await?;
-    exists.map(|_| ()).ok_or(ApiError::NotFound)
+    if done.member {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 #[cfg(test)]

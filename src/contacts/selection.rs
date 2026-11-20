@@ -25,13 +25,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, QueryBuilder, SqlSafeStr};
 use uuid::Uuid;
 
 use super::{ContactFilter, push_filter};
 use crate::{
     audit::Actor,
     consent,
+    contacts::import::staging::SQL_UUID_V7,
     crypto::{secrets::Secrets, tokens},
     error::{ApiError, ApiResult, FieldError},
     lists::{MembershipSource, MembershipStatus},
@@ -590,26 +591,30 @@ fn statement(
     excluded: &[Uuid],
     action: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> QueryBuilder<Postgres> {
-    statement_returning(sel, excluded, action, "1", "")
+    statement_logging(sel, excluded, action, "1", |_| {})
 }
 
-/// [`statement`] with the action's `returning` column named and `extra` appended to the final
-/// select, for an action whose caller needs to know which rows it changed.
-fn statement_returning(
+/// [`statement`] with the action's `returning` column named, and `log` free to append further
+/// CTEs that read `done` — for an action that has to write something else for every row it
+/// changed, in the one statement that changed them.
+fn statement_logging(
     sel: &Selection,
     excluded: &[Uuid],
     action: impl FnOnce(&mut QueryBuilder<Postgres>),
     returning: &str,
-    extra: &str,
+    log: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> QueryBuilder<Postgres> {
     let mut q = QueryBuilder::<Postgres>::new("with sel as (select id from contacts where ");
     push_selected(&mut q, sel, excluded);
     q.push("), done as (");
     action(&mut q);
-    q.push(format!(
-        " returning {returning}) \
-         select (select count(*) from sel)::bigint, (select count(*) from done)::bigint{extra}"
-    ));
+    // `AssertSqlSafe`: `returning` is one of the two literals this private function is called
+    // with, and nothing a client sent reaches it. `QueryBuilder::push` takes any `Display` and
+    // would not have stopped it either way, which is why the audit is written down here.
+    let tail = AssertSqlSafe(format!(" returning {returning})")).into_sql_str();
+    q.push(tail.as_str());
+    log(&mut q);
+    q.push(" select (select count(*) from sel)::bigint, (select count(*) from done)::bigint");
     q
 }
 
@@ -663,8 +668,16 @@ pub async fn untag(
 }
 
 /// Runs a membership-changing action and records `action` in the consent log for every contact it
-/// changed, in the caller's transaction. The statement returns the changed `contact_id`s, so the
-/// log names exactly the rows that moved.
+/// changed — in the same statement, as a `logged` CTE over the rows the change returned. The log
+/// names exactly the rows that moved, is in the caller's transaction by construction rather than
+/// by convention, and a bulk action over `MAX_SELECTION` contacts sends no id back to Rust and
+/// none out again.
+///
+/// **The `logged` insert binds no `ip` and no `user_agent` — and must never be made to.** An
+/// request address and browser are not the subscriber's evidence (`Context::of_principal` makes
+/// the same choice for the single-row writers), so both columns are left null. That is also why
+/// [`consent::scrub`] has no work here: with no evidence bound, a failing row's DETAIL echoes no
+/// personal data. Do not "fix" either half.
 async fn run_recorded(
     db: &mut PgConnection,
     sel: &Selection,
@@ -673,27 +686,28 @@ async fn run_recorded(
     (action, cx): (consent::Action, &consent::Context),
     change: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> ApiResult<Counts> {
-    let mut q = statement_returning(
-        sel,
-        excluded,
-        change,
-        "contact_id",
-        ", coalesce((select array_agg(contact_id) from done), '{}')",
-    );
-    let (selected, affected, changed): (i64, i64, Vec<Uuid>) =
-        q.build_query_as().fetch_one(&mut *db).await?;
-    let lists = vec![list_id; changed.len()];
-    let source = consent::Source::Api;
-    consent::record_many(
-        db,
-        sel.workspace_id(),
-        (&changed, &lists),
-        action,
-        source,
-        cx,
-    )
-    .await
-    .map_err(consent::scrub)?;
+    let mut q = statement_logging(sel, excluded, change, "contact_id", |q| {
+        // `Source::Api` is the code path, not the actor: a session-authenticated operator using
+        // bulk subscribe is logged `api` while the same operator adding one member is logged
+        // `operator`. `consent_log.source` says how a change arrived, never who made it.
+        q.push(
+            ", logged as (insert into consent_log \
+               (id, workspace_id, contact_id, list_id, action, source, source_ref) select ",
+        )
+        .push(SQL_UUID_V7)
+        .push(", ")
+        .push_bind(sel.workspace_id())
+        .push(", contact_id, ")
+        .push_bind(list_id)
+        .push(", ")
+        .push_bind(action)
+        .push(", ")
+        .push_bind(consent::Source::Api)
+        .push(", ")
+        .push_bind(cx.source_ref.clone())
+        .push(" from done)");
+    });
+    let (selected, affected): (i64, i64) = q.build_query_as().fetch_one(&mut *db).await?;
     Ok(Counts {
         selected: selected.unsigned_abs(),
         affected: affected.unsigned_abs(),
