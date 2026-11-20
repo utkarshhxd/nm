@@ -884,11 +884,17 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
 /// Said plainly because the next person to add a writer will read this comment to decide where it
 /// belongs, and an out-of-date census here is worse than none.
 ///
-/// The source scan below is a **tripwire, not a proof**: it fails when a file that never touched
-/// `list_memberships` starts to, which is where the next writer is most likely to appear. It
-/// cannot see a second writer added to a file already on the list, and the count above only
+/// The two scans below are a **tripwire, not a proof**: they fail when a file that never touched
+/// `list_memberships` starts to, which is where the next writer is most likely to appear. They
+/// cannot see a second writer added to a file already on a list, and the count above only
 /// covers the writers this fixture reaches. Invariant 8 is held by review; this makes the
 /// cheapest way to break it loud.
+///
+/// **Two walks, Rust and SQL.** The Rust walk used to be the whole of it, under a name claiming
+/// the tree — so a status-fixing migration, or a trigger a migration installs, wrote memberships
+/// with no consent row and tripped nothing. `migrations/*.sql` is now walked with the same needle
+/// and the same idiom. What is still outside both: a write made by hand against a production
+/// database, and one made by a `/* */`-commented or string-built statement.
 #[sqlx::test]
 async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPool) {
     let (ws, _, app) = editor(&pool, "acme").await;
@@ -940,31 +946,37 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
     // Limit: only `//` line comments are recognised, which is all this codebase uses. A `/* */`
     // block would hide a real writer, and a string literal holding the name is a false positive —
     // neither has happened, and a Rust parser does not belong in a test fixture.
-    fn walk(dir: &std::path::Path, out: &mut Vec<String>, scanned: &mut usize) {
+    fn walk(
+        dir: &std::path::Path,
+        ext: &str,
+        comment: &str,
+        out: &mut Vec<String>,
+        scanned: &mut usize,
+    ) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
             if p.is_dir() {
-                walk(&p, out, scanned);
+                walk(&p, ext, comment, out, scanned);
                 continue;
             }
-            if p.extension().is_none_or(|x| x != "rs") {
+            if p.extension().is_none_or(|x| x != ext) {
                 continue;
             }
             *scanned += 1;
             if std::fs::read_to_string(&p)
                 .unwrap()
                 .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| !l.trim_start().starts_with(comment))
                 .any(|l| l.to_lowercase().contains("list_memberships"))
             {
                 out.push(p.to_string_lossy().replace('\\', "/"));
             }
         }
     }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut touching = vec![];
     let mut scanned = 0;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    walk(&src, &mut touching, &mut scanned);
+    walk(&root.join("src"), "rs", "//", &mut touching, &mut scanned);
     touching.sort();
     // A mis-globbed or empty scan must not read as success. The list below would already catch it
     // — an empty `touching` fails that `assert_eq` — but only by accident of the list being
@@ -990,6 +1002,53 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
         ],
         "this file now touches list_memberships: a writer of status needs a consent row in the \
          same transaction and a place in this fixture"
+    );
+
+    // **And the migrations, because `src/**/*.rs` is not "the tree".** The walk above reads Rust
+    // only, so a data-fixing `update list_memberships set status = …` in a migration wrote
+    // memberships with no consent row and tripped nothing — and `0022` already shows migrations
+    // touching this table, so the shape is not hypothetical. A trigger is caught here too: a
+    // trigger that writes memberships has to be created by a migration, and its body names the
+    // table.
+    //
+    // The same needle and the same idiom as above, deliberately: the table name on any
+    // non-comment line, not a list of write verbs, because `update\n  list_memberships`,
+    // `public.list_memberships` and a quoted name all evade a verb list and are ordinary SQL
+    // formatting. So a migration that only reads or alters the table lands on this list too, and
+    // adding it is the point — the next person to put this table in a migration has to come here
+    // and say which it is.
+    let mut sql_touching = vec![];
+    let mut sql_scanned = 0;
+    walk(
+        &root.join("migrations"),
+        "sql",
+        "--",
+        &mut sql_touching,
+        &mut sql_scanned,
+    );
+    sql_touching.sort();
+    assert!(
+        sql_scanned >= 20,
+        "the walk read only {sql_scanned} migrations"
+    );
+    let sql_touching: Vec<_> = sql_touching
+        .iter()
+        .map(|p| p.rsplit_once("/migrations/").unwrap().1)
+        .collect();
+    assert_eq!(
+        sql_touching,
+        [
+            // Creates the table and its indexes.
+            "0012_lists.sql",
+            // `mailable_contacts` reads it.
+            "0015_mailable_view.sql",
+            // Adds `source`.
+            "0018_membership_provenance.sql",
+            // Widens the `source` check for `preference_center`.
+            "0022_membership_source_preference_center.sql",
+        ],
+        "a migration now names list_memberships: if it WRITES a status, invariant 8 needs a \
+         consent row written with it and this fixture cannot see one — say which it is here"
     );
 }
 

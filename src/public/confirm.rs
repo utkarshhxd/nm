@@ -135,6 +135,21 @@ async fn confirm(
             // The subscriber's own request, so the IP and the user agent really are theirs and are
             // kept as evidence — the one place in the product where that is true. `token_jti` is
             // the nonce, which says *which* link was followed and not merely that one was.
+            //
+            // **`Source::Form` is an assumption, and this is where it is made.** It says where the
+            // *request to subscribe* came from, not where the confirmation did, and it is true
+            // only because `public::forms::enqueue_confirmation` is the sole issuer of a
+            // `Purpose::Confirm` token in the tree. A `pending` membership can also be written by
+            // `lists::add_member`, by `selection::subscribe` and by the importer, which record
+            // `requested` with `operator`, `api` or `import`; the moment M2 or an admin "resend
+            // confirmation" issues a confirm token for one of those, this row will say the person
+            // signed up through a hosted form and the log will be wrong about the how — which is
+            // spec §4's first anti-goal, in the one table that is append-only and cannot be
+            // corrected afterwards. There is no `Source` meaning "a confirmation link", so the
+            // honest fix when that day comes is to read the source off the membership row this
+            // statement just promoted (`list_memberships.source`, `0018`) and map it, or to add a
+            // source value. Whoever issues the second kind of confirm token owns this line.
+
             consent::record(
                 &mut tx,
                 token.workspace_id,

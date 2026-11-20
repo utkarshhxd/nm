@@ -288,10 +288,22 @@ mod tests {
             .1;
         let list = &list[..list.find("))").expect("the list is closed with `))`")];
         let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        // **Split on the comma, not on the newline.** One registration per line is a hand
+        // convention and nothing enforces it: `components(schemas(…))` is an attribute token tree
+        // and rustfmt does not reformat it. Parsing by line, two paths written on one line —
+        // `crate::consent::Action, crate::audit::Action,` — collapsed into a single entry whose
+        // `rsplit("::")` yields `Action`, so the pair recorded as one name, no duplicate was seen,
+        // and the collision this test exists to catch shipped. The cross-check below did not
+        // catch it either: the collapsed key `Action` *is* a published schema name — the
+        // surviving one of the two — so the one case it was written for is the one case it
+        // passed. Comments are cut at `//` first, whole-line and trailing alike, because a type
+        // path never contains one.
         for path in list
             .lines()
-            .map(|line| line.trim().trim_end_matches(',').trim())
-            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .flat_map(|line| line.split(','))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
         {
             seen.entry(path.rsplit("::").next().expect("rsplit yields one part"))
                 .or_default()

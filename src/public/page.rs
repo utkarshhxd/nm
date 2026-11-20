@@ -102,12 +102,19 @@ background:var(--surface);color:var(--fg);cursor:pointer}";
 /// Wraps `body` in the page. `title` is escaped here; **`body` is not** — it is HTML the caller
 /// built, and every value it interpolated is the caller's to put through [`esc`] first.
 ///
-/// `Cache-Control: no-store` is set here rather than left to `http::security_headers`, which
-/// applies it to `/api*`, `/healthz` and `/readyz` only. These paths get nothing from it, and NM
-/// is documented as running behind a reverse proxy: a preference center page naming which lists a
-/// named person is on is exactly the 200 `text/html` with no `Set-Cookie` and no `Vary` that an
-/// nginx `proxy_cache` will keep and hand to the next caller. Setting it in the shell means a page
-/// added by a later task cannot forget it.
+/// `Cache-Control: no-store` is set here because NM is documented as running behind a reverse
+/// proxy: a preference center page naming which lists a named person is on is exactly the 200
+/// `text/html` with no `Set-Cookie` and no `Vary` that an nginx `proxy_cache` will keep and hand
+/// to the next caller.
+///
+/// **It is no longer the pin, and the comment that said it was is corrected here.** This line
+/// used to claim that setting the header in the shell is what stops a page added later from
+/// forgetting it. `http::security_headers::uncacheable` now delegates to `public::owns_path`,
+/// which matches every path under `/c`, `/u` and `/f` — every path this function can be reached
+/// on — and it **overwrites** the header rather than deferring to it. So deleting this tuple reds
+/// nothing: the property is pinned, twice, and neither pin is this one. It stays because a header
+/// set at the source is the right default for a handler that may one day be served some other
+/// way, not because anything depends on it.
 ///
 /// **`title` and `heading` are separate, and on one page they differ.** They are the same sentence
 /// on every page here but the saved preference centre, where the `<title>` has to announce the
