@@ -57,10 +57,26 @@ are pinned by at least one test that was individually verified to be able to fai
 eight were fixed in fix wave 2 (the schema-collision guard, the resend-window test, `page::shell`'s
 `Cache-Control` claim); the rest are comments that overstate, not tests that fail to discriminate.
 
+## 7. A membership can read `subscribed` while nothing will ever be sent to it
+
+A `list`-scope suppression (M1d's C-1/C-4 fix) makes an address unmailable **on that list only**.
+That is the point. But it surfaces nowhere: `blocking_suppression` returns `None` for it
+deliberately — a per-list refusal is not a block on the address, and reporting it as one would be
+the bug — and the Suppressions screen reads `address_suppressions`, which excludes list rows.
+
+So an operator who re-adds a contact whose membership row was destroyed sees the member listed as
+`subscribed`, sees no block anywhere, and no mail is ever sent to them for that list.
+
+**The behaviour is correct and the invisibility is not.** The analogous `unsubscribed_all` state
+*does* surface on the contact detail screen. Whatever shows a list refusal should make clear it is
+scoped to that list, or an operator will read it as a full block and lift it.
+
 ## Not in this issue
 
 - `issues/30` — the consent log loses which list when a list is deleted.
 - `issues/32` — `enable always` will stall a logical replica.
 - `issues/33` — what still bounds the connection pool.
+- `issues/35` — an operator-driven unsubscribe is still lost to a deletion.
+- `issues/36` — the list-refusal invariant is load-bearing and enforced by nothing.
 - **The per-list unsubscribe not surviving a contact or list deletion** is a product decision, not
   a finding. It went to the product owner with the merge decision.
