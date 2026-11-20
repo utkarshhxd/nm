@@ -49,7 +49,7 @@ Five failure modes the spec implies that no task's happy path exercises. Each ha
 | `src/public/forms.rs` | `GET /f/{slug}`, `POST /f/{slug}` |
 | `src/public/page.rs` | shared server-rendered page shell: `shell`, `esc`, `Cache-Control: no-store` |
 | `src/http/rate_limit.rs` | the limiter, keyed on `Workspace(Uuid)` or `Ip(IpAddr)` and bounded (Task 4b) |
-| `src/consent/mod.rs` | `Action`, `Source`, `Context`, `record()`, `record_many()`, `scrub()` |
+| `src/consent/mod.rs` | `Action`, `Source`, `Context`, `record()`, `scrub()` |
 | `src/consent/routes.rs` | `GET …/contacts/{id}/consent` (Task 11) |
 | `src/forms/mod.rs`, `src/forms/routes.rs` | form model and authenticated CRUD |
 | `web/src/routes/forms.tsx`, `form-detail.tsx` | admin UI |
@@ -118,10 +118,9 @@ Refusals are `ApiError::Unprocessable("link-invalid")` and `ApiError::Unprocessa
   - `pub enum Source { Form, Import, Api, Operator, OneClick, PreferenceCenter, Bounce, Complaint }`
   - `pub struct Context { pub ip: Option<IpAddr>, pub user_agent: Option<String>, pub source_ref: Option<String> }` — no `Debug`: `ip` and `user_agent` are personal data
   - `pub async fn record(tx: &mut PgConnection, workspace_id: Uuid, contact_id: Uuid, list_id: Option<Uuid>, action: Action, source: Source, cx: &Context) -> ApiResult<()>`
-  - `pub async fn record_many(tx: &mut PgConnection, workspace_id: Uuid, rows: &[(Uuid, Uuid)], action: Action, source: Source, cx: &Context) -> ApiResult<()>` — one row per `(contact_id, list_id)`, one `action` for the whole batch
   - `pub fn scrub(e: sqlx::Error) -> ApiError` — applied inside both writers, so a failed insert never logs the evidence columns
 
-These are the signatures in the tree while Task 3's fix round lands: `record` and `record_many` return `ApiResult` and scrub their own errors, and `record_many` takes `rows`. Task 4a adds `Action::Requested` and `Context.token_jti`, and settles `record_many`'s final shape against what that round commits.
+`record` returns `ApiResult` and scrubs its own error inside, so no call site adds a `.map_err`. Task 4a added `Action::Requested` and `Context.token_jti`, folded the last bulk writer's consent insert into its own statement, and **deleted `record_many`**: with it gone, no caller can pass one action for rows that do not share one.
 
 Columns exactly as spec §7.1. Append-only: no `updated_at`, and the table gets a comment saying rows are never updated or deleted. Index `(workspace_id, contact_id, created_at desc)`.
 
@@ -177,16 +176,16 @@ The last one is the real gate: count `list_memberships` rows written by a fixtur
 - Test: `tests/consent.rs`
 
 **Interfaces:**
-- Consumes: Task 2's `record()` and `record_many()`.
+- Consumes: Task 2's `record()`.
 - Produces:
   - `Action::Requested` — a membership written `pending`: the person was asked, and has not agreed.
-  - `Context.token_jti: Option<String>` — the nonce of the public token that authorised the change. `record` and `record_many` write the `consent_log.token_jti` column; operator and API paths pass `None`. Tasks 4b, 5 and 6 pass the parsed token's `nonce`.
+  - `Context.token_jti: Option<String>` — the nonce of the public token that authorised the change. `record` writes the `consent_log.token_jti` column; operator and API paths pass `None`. Tasks 4b, 5 and 6 pass the parsed token's `nonce`.
 
 A log that records `pending` as `subscribed` cannot prove consent, and a log that records *that* someone confirmed but not *which link they clicked* loses the how (spec §4, first anti-goal). Both are fixed here so every public route after this task only fills the field.
 
 Each writer decides its action from the status it wrote: `pending` records `Requested`, `subscribed` records `Subscribed`. `selection::subscribe` takes one `status`, so it maps that to one `Action` in Rust. `lists::add_member` already knows its status from `double_optin`.
 
-**Open item — `record_many`'s per-row action.** The importer's status is per row (a `case` over `w.double_optin` in `staging.rs`), and `record_many` takes one `Action` for the batch. Whether the importer decides in its own SQL or `record_many` gains a per-row action array depends on what Task 3's fix round actually landed in `record_many`'s signature. **This task's brief is written after that round's report is read, and the shape is fixed then, not here.**
+**Resolved.** The importer decides its action in its own SQL (`case` over the status it wrote) with its consent insert folded into its statement, and `record_many` is deleted. That is the only shape that can express a per-row action, and it removes the last UUID round-trip.
 
 - [ ] **Step 1: Write the failing tests** in `tests/consent.rs`
 
@@ -196,7 +195,6 @@ Each writer decides its action from the status it wrote: `pending` records `Requ
 #[test] fn an_import_records_requested_for_a_double_optin_list_and_subscribed_for_a_single_optin_one()  // one import, both kinds: the per-row case
 #[test] fn adding_to_a_single_optin_list_still_records_subscribed()
 #[test] fn record_writes_the_token_jti_it_was_given()
-#[test] fn record_many_writes_the_token_jti_it_was_given()
 #[test] fn an_operator_or_api_write_leaves_token_jti_null()
 ```
 
@@ -204,7 +202,7 @@ Any existing assertion in `tests/consent.rs` that expects `subscribed` for a mem
 
 - [ ] **Step 2: Run and watch each fail.** Run: `bash scripts/dev.sh cargo test --test consent`
 - [ ] **Step 3: Write `0021_consent_requested_action.sql`** widening the `consent_log.action` check to admit `requested`. Do not amend `0020`.
-- [ ] **Step 4: Add `Action::Requested` and `Context.token_jti`**, and write the column in `record` and `record_many`.
+- [ ] **Step 4: Add `Action::Requested` and `Context.token_jti`**, and write the column in `record`.
 - [ ] **Step 5: Decide each writer's action** as above, and settle the open item against Task 3's landed code.
 - [ ] **Step 6: Run and watch pass.**
 - [ ] **Step 7: Mutation check** — make the importer record `Subscribed` for its `pending` rows and confirm the mixed-import test reds; restore.
@@ -305,6 +303,8 @@ Shares no file with Task 4a; the two may run in parallel. Task 5 onward depends 
 
 `GET /u/{token}` parses `Purpose::Unsubscribe` and renders the page: the workspace's `visibility = 'public'` lists, **plus any non-public list this contact is already on**, each with a checkbox reflecting `status = 'subscribed'`. `POST /u/{token}` with a non-one-click body applies the checkboxes. Both methods are rate-limited per IP and record `token_jti` as the token's nonce. The preference center is `Action::Resubscribed`'s writer: here the subscriber is the one acting, through their own token.
 
+**Ticking a box here subscribes, even on a double-opt-in list — it does not go to `pending`.** Double opt-in exists to prove the address belongs to the person using it, and a valid token delivered to that address is that proof. Asking them to confirm again would be asking them to prove the same thing twice, and would leave a `pending` row for someone who has plainly agreed. So the row written is `subscribed` and the action recorded is `Resubscribed` (or `Subscribed` for a list they were never on), never `Requested`. One test asserts this for a double-opt-in list.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
@@ -313,7 +313,7 @@ Shares no file with Task 4a; the two may run in parallel. Task 5 onward depends 
 #[test] fn a_list_flipped_to_private_still_shows_for_a_contact_already_on_it()     // Review Focus 3
 #[test] fn unticking_a_box_unsubscribes_and_records_preference_center_as_the_source()
 #[test] fn ticking_a_box_for_a_list_the_contact_left_records_resubscribed()
-#[test] fn ticking_a_box_on_a_double_optin_list_sets_pending_not_subscribed()
+#[test] fn ticking_a_box_on_a_double_optin_list_subscribes_outright_and_never_writes_pending()
 #[test] fn a_preference_center_change_carries_the_token_nonce_as_its_jti()
 #[test] fn the_preference_center_is_refused_past_the_per_ip_limit()
 #[test] fn the_page_renders_in_under_200ms_for_a_contact_on_50_lists()   // spec §9
@@ -322,7 +322,7 @@ Shares no file with Task 4a; the two may run in parallel. Task 5 onward depends 
 The latency test is a floor, not a benchmark: assert elapsed on one warm request against a seeded
 50-list fixture. It exists to catch an N+1 across lists, which is the only way this page gets slow.
 
-The double-opt-in test is the subtle one: re-subscribing through the preference center to a `double_optin` list must go back through confirmation.
+The double-opt-in test is the subtle one, and it asserts the **opposite** of what the rest of this milestone does: everywhere else a `double_optin` list produces `pending`, and here it must not. Assert both halves — the membership is `subscribed`, and no `consent_log` row for that contact and list has action `requested`. Asserting only the first would pass if a stray `requested` row were also written.
 
 - [ ] **Step 2: Run and watch each fail.**
 - [ ] **Step 3: Implement.** The writes are in `src/public/unsubscribe.rs`, which Task 5 already added to the writer array in `tests/consent.rs`; confirm it is there and add nothing.
@@ -450,7 +450,7 @@ Follow `contacts.tsx` and `lists.tsx` for table, dialog and error patterns; use 
 
 `GET /api/v1/workspaces/{ws}/contacts/{id}/consent` — `Role::Viewer`, cursor-paginated as `src/pagination/` does — and a panel on the contact detail screen. The list editor gains a `visibility` control; `description` is already shipped end to end.
 
-The route orders by `id desc`, not `created_at`: a membership write and its consent row share a transaction, and `record_many` writes a batch in one statement, so `created_at` ties and cannot page stably. UUID v7 is time-ordered, so `id desc` is also newest-first. Migration `0023` adds `(workspace_id, contact_id, id desc)` to serve it.
+The route orders by `id desc`, not `created_at`: a membership write and its consent row share a transaction, and both set-based writers insert a whole batch in one statement, so `created_at` ties and cannot page stably. UUID v7 is time-ordered, so `id desc` is also newest-first. Migration `0023` adds `(workspace_id, contact_id, id desc)` to serve it.
 
 - [ ] **Step 1: Write the failing tests:** `another_workspaces_consent_history_is_404`, `consent_history_pages_without_skipping_or_repeating_rows_that_share_a_timestamp`, and an e2e asserting a confirmed contact shows "confirmed" with its source.
 - [ ] **Step 2: Run and watch fail.**
