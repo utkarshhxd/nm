@@ -439,7 +439,7 @@ Honeypot: a field named `website`, hidden in CSS, must be empty.
 Follow `contacts.tsx` and `lists.tsx` for table, dialog and error patterns; use the house components (`Dialog`, `Select`, `Checkbox`, `EmptyState`, `ErrorState`, `TableScroller`). The embed snippet is a read-only `<textarea>` with a copy button, containing a plain HTML `<form>` posting to `/f/{workspace}/{slug}` — no JavaScript required of the embedder. The snippet is generated from the workspace's slug and the form's, so it is correct for the workspace the operator is looking at; a snippet hard-coding the wrong workspace would post to another tenant's form.
 
 - [ ] **Step 1: Write the failing e2e** in `web/e2e/forms.spec.ts`: create a form, see the snippet, edit it, delete it.
-- [ ] **Step 2: Run and watch it fail.** Run: `bash scripts/dev.sh pnpm --dir web e2e -- forms.spec.ts`
+- [ ] **Step 2: Run and watch it fail.** Run: `bash scripts/dev.sh pnpm --dir web e2e forms.spec.ts`
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run and watch pass, and check the log for `did not run`** — a serial-mode failure prints it for every test after the first, which reads as a pass in a summary.
 - [ ] **Step 5: Commit** `feat: the forms admin screens`
@@ -463,6 +463,19 @@ The route orders by `id desc`, not `created_at`: a membership write and its cons
 ---
 
 ## Task 12: The public pages are accessible and survive the harness
+
+**Ruled 2026-11-20, before this task starts: the e2e harness gets a Postgres client.**
+Task 11 found that the confirm flow cannot be driven from a browser — `token::issue` is called
+from one place, into a `jobs` payload, and nothing in the API or the CLI reads `jobs`, so the
+harness has no way to obtain a confirmation link. The same wall stands in front of this task's
+first step.
+
+Add a test-only Postgres client to `web`'s dev dependencies and read the `jobs` payload from the
+harness. **Do not add a CLI command to the product for a test's convenience** — an operator-facing
+queue inspector may well be worth building, but it should be built because operators need it and
+designed for them, not shaped by what a Playwright spec happens to want. A dev dependency does not
+ship in the bundle and does not touch `check:bundle`.
+
 
 **Files:** Create `web/e2e/preference-center.spec.ts`; modify `src/public/page.rs`.
 
