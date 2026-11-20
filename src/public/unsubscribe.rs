@@ -240,6 +240,13 @@ async fn topics(
 /// happened. The region is kept for the reader that does announce one at load and for the day this
 /// page is enhanced with script; the sentence inside it names the lists, because "your preferences
 /// are saved" does not tell somebody who unticked one topic which one stopped.
+///
+/// **The `<h1>` does not follow the title, and that is why this calls `page::shell` rather than
+/// `page::notice`.** A heading describes what is under it (WCAG 2.4.6), and what is under this one
+/// is a form for changing preferences, not a receipt — so it stays "Your email preferences"
+/// whichever way the page was reached. Letting it track the title would make the saved page say
+/// "Your preferences are saved" twice in a row to a screen reader, once as the document's name and
+/// once as the heading of a form that has saved nothing yet.
 fn render(topics: &[Topic], saved: Option<&str>) -> Response {
     let mut body = String::new();
     if let Some(summary) = saved {
@@ -276,7 +283,7 @@ fn render(topics: &[Topic], saved: Option<&str>) -> Response {
     } else {
         "Your email preferences"
     };
-    notice(StatusCode::OK, title, &body)
+    page::shell(title, "Your email preferences", body)
 }
 
 /// Applies the form. The candidate set is **recomputed from the database inside the transaction**,

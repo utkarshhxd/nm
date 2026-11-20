@@ -108,13 +108,23 @@ background:var(--surface);color:var(--fg);cursor:pointer}";
 /// named person is on is exactly the 200 `text/html` with no `Set-Cookie` and no `Vary` that an
 /// nginx `proxy_cache` will keep and hand to the next caller. Setting it in the shell means a page
 /// added by a later task cannot forget it.
-pub fn shell(title: &str, body: String) -> Response {
+///
+/// **`title` and `heading` are separate, and on one page they differ.** They are the same sentence
+/// on every page here but the saved preference centre, where the `<title>` has to announce the
+/// result — it is what a screen reader reads on arrival, there being no script to update a region
+/// in place — while the `<h1>` still has to describe what is under it, which is a form for
+/// changing preferences (WCAG 2.4.6). Folding the two back together would make that page say
+/// "Your preferences are saved" twice in a row, once as the document's name and once as the
+/// heading of a form that saves nothing until it is submitted again. [`notice`] is the ordinary
+/// case and passes one string for both.
+pub fn shell(title: &str, heading: &str, body: String) -> Response {
     let title = esc(title);
+    let heading = esc(heading);
     let html = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"robots\" content=\"noindex\">\n<title>{title}</title>\n\
-         <style>{STYLE}</style>\n</head>\n<body>\n<main>\n<h1>{title}</h1>\n{body}\n\
+         <style>{STYLE}</style>\n</head>\n<body>\n<main>\n<h1>{heading}</h1>\n{body}\n\
          </main>\n</body>\n</html>\n"
     );
     (
@@ -129,10 +139,11 @@ pub fn shell(title: &str, body: String) -> Response {
 /// bucket for that case limits them together rather than letting them past the limiter.
 pub const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-/// A page with a status: every answer a public route gives a browser is HTML, including the
-/// refusals. A subscriber who clicks a dead link gets a sentence, not an RFC 9457 document.
+/// A page with a status, whose heading is its title: every answer a public route gives a browser
+/// is HTML, including the refusals. A subscriber who clicks a dead link gets a sentence, not an
+/// RFC 9457 document. A page that needs the two to differ calls [`shell`].
 pub fn notice(status: StatusCode, title: &str, body: &str) -> Response {
-    (status, shell(title, body.to_owned())).into_response()
+    (status, shell(title, title, body.to_owned())).into_response()
 }
 
 /// Puts the `RateLimit` headers on an answer. Every answer carries them, refusals included, as the
@@ -162,21 +173,29 @@ mod tests {
 
     /// `esc` being correct is worth nothing if `shell` stops calling it. Every title today is a
     /// literal, so only this test stands between Task 6 — which renders operator-typed list names
-    /// through this shell — and an injected tag. Deleting `let title = esc(title);` reds it.
+    /// through this shell — and an injected tag. Deleting either `esc` call reds it.
+    ///
+    /// Two different strings, so the test also pins which one lands where: one argument used for
+    /// both would pass whichever way round `shell` put them.
     #[tokio::test]
-    async fn shell_escapes_its_title_in_both_places_it_puts_it() {
-        let res = shell("<script>alert(1)</script>", "<p>body</p>".to_owned());
+    async fn shell_escapes_the_title_and_the_heading_and_keeps_them_apart() {
+        let res = shell(
+            "<script>alert(1)</script>",
+            "Bob & Co's <em>page</em>",
+            "<p>body</p>".to_owned(),
+        );
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(!html.contains("<script>"), "the title opened a tag: {html}");
+        assert!(!html.contains("<em>"), "the heading opened a tag: {html}");
         assert!(
             html.contains("<title>&lt;script&gt;alert(1)&lt;/script&gt;</title>"),
             "{html}"
         );
         assert!(
-            html.contains("<h1>&lt;script&gt;alert(1)&lt;/script&gt;</h1>"),
+            html.contains("<h1>Bob &amp; Co&#39;s &lt;em&gt;page&lt;/em&gt;</h1>"),
             "{html}"
         );
         // The body is the caller's HTML and is deliberately not escaped here.

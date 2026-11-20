@@ -71,8 +71,18 @@ const SLUG = "access";
 const SUBSCRIBER = "reader@example.test";
 /** A second address, so the JavaScript-off signup is a signup and not a repeat submission. */
 const QUIET_SUBSCRIBER = "quiet-reader@example.test";
-/** The widest letter and nowhere to break it: an operator-typed name is what reflows these pages. */
+/**
+ * The widest letter and nowhere to break it, at each ceiling the product allows: an operator-typed
+ * string is the only thing on these pages long enough to reflow them.
+ *
+ * All three, because `page::STYLE`'s reflow rule claims to protect all three and a claim with one
+ * case tested is a claim with two cases assumed. `lists::validate_name` caps a list name at 100,
+ * `forms::routes::HEADLINE_MAX` a headline at 200 and `LABEL_MAX` a field label at 100 — so every
+ * one of these is a string an operator can really type today.
+ */
 const LONG_LIST = "W".repeat(100);
+const LONG_HEADLINE = "W".repeat(200);
+const LONG_LABEL = "W".repeat(100);
 
 /**
  * 1280 is the suite's ordinary window. 640 is 200 % zoom in it. 320 is what WCAG 2.2 AA 1.4.10
@@ -347,9 +357,9 @@ test.beforeAll(async ({ playwright, browser }) => {
     list_ids: [ids.digest],
     fields: [
       { target: { kind: "email" }, required: true, label: "Email address" },
-      { target: { kind: "first_name" }, required: false, label: "First name" },
+      { target: { kind: "first_name" }, required: false, label: LONG_LABEL },
     ],
-    headline: "Join the list",
+    headline: LONG_HEADLINE,
     button_label: "Join",
   });
 
@@ -379,18 +389,37 @@ test.afterAll(async () => {
 test("the_signup_form_is_sound_and_its_decoy_is_not_in_the_tab_order", async () => {
   const found = await page.goto(`/f/${SLUG}/join`);
   expect(found?.status()).toBe(200);
-  await expect(page.getByRole("heading", { name: "Join the list", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: LONG_HEADLINE, exact: true })).toBeVisible();
   const problems = await sweep(page, "signup form");
 
-  // The decoy is in the page for a script to fill in, and a keyboard never reaches it. Both
-  // halves: a `display:none` field is the first thing a script skips, and a field a person can
-  // tab into is one they will fill in and have their signup silently discarded.
-  await expect(page.getByLabel("Leave this field empty", { exact: true })).toHaveCount(1);
+  // The decoy, and both halves of what it depends on.
+  //
+  // It is laid out off-screen rather than hidden, because `display: none` is the first thing a
+  // script skips and a skipped decoy catches nothing. So the assertion is where the browser
+  // actually put it — a real box, a long way to the left — and not `toBeHidden()`, which a 1px
+  // off-screen box does not satisfy. `public-form.spec.ts` measures the same thing for the same
+  // reason; it is repeated here because this file's claim about the decoy is an accessibility
+  // claim, and because nothing in Rust pins what `class="hp"` does, only that it is emitted.
+  //
+  // The other half is that a keyboard never reaches it: a tabbable decoy is one a person fills in
+  // and has their signup silently discarded, and it would show up below as a fourth stop.
+  const decoy = page.getByLabel("Leave this field empty", { exact: true });
+  await expect(decoy).toHaveCount(1);
+  const box = await decoy.boundingBox();
+  expect(box, "the decoy must be laid out, so a script finds it").not.toBeNull();
+  expect(box?.x ?? 0, `the decoy is on screen at ${JSON.stringify(box)}`).toBeLessThan(-1000);
+
   const order = await walk(page, 3);
-  expect(order.map((stop) => stop.what)).toEqual(["Email address", "First name", "Join"]);
+  expect(order.map((stop) => stop.what)).toEqual(["Email address", LONG_LABEL, "Join"]);
   problems.push(...dimRings(order, "signup form (light)"));
   await page.emulateMedia({ colorScheme: "dark" });
-  problems.push(...dimRings(await walk(page, 3), "signup form (dark)"));
+  // Names as well as count: `walk` asserting its length alone would be satisfied by three presses
+  // that never left the first control.
+  const dark = await walk(page, 3);
+  expect(dark.map((stop) => stop.what).sort()).toEqual(
+    ["Email address", LONG_LABEL, "Join"].sort(),
+  );
+  problems.push(...dimRings(dark, "signup form (dark)"));
   await page.emulateMedia({ colorScheme: "light" });
 
   // And the signup itself, whose answer is a public page too.
@@ -422,18 +451,23 @@ test("the_preference_centre_is_sound_and_reachable_by_keyboard_alone", async () 
 
   // Reading order and tab order are the same order, and it ends on the two things a person came
   // here to press. A checkbox nobody can reach is a list nobody can leave.
-  const order = await walk(page, 4);
-  expect(order.map((stop) => stop.what)).toEqual([
+  const controls = [
     "Weekly digest",
     LONG_LIST,
     "Save preferences",
     "Unsubscribe from everything",
-  ]);
+  ];
+  const order = await walk(page, 4);
+  expect(order.map((stop) => stop.what)).toEqual(controls);
   problems.push(...dimRings(order, "preference centre (light)"));
   await page.emulateMedia({ colorScheme: "dark" });
-  // Rotated, because the tab walk above left the focus at the end of the page: this pass is about
-  // every ring being visible in the dark scheme, which does not depend on where it starts.
-  problems.push(...dimRings(await walk(page, 4), "preference centre (dark)"));
+  // Sorted, not ordered: the walk above left the focus at the end of the page, so this one starts
+  // in the middle and comes back round. It is still asserted by name — `walk` asserting only that
+  // it took four stops would be satisfied by four presses that never left the first checkbox, and
+  // `dimRings` would then report four clean rings on one control.
+  const dark = await walk(page, 4);
+  expect(dark.map((stop) => stop.what).sort()).toEqual([...controls].sort());
+  problems.push(...dimRings(dark, "preference centre (dark)"));
   await page.emulateMedia({ colorScheme: "light" });
 
   expect(problems).toEqual([]);
@@ -451,6 +485,14 @@ test("unticking_a_list_stops_it_and_the_page_says_which_one", async () => {
   // preferences" would announce the page the person just left — the same words, as though nothing
   // had happened — so the title is the result, and the region names the lists.
   await expect(page).toHaveTitle("Your preferences are saved");
+  // AND THE HEADING DOES NOT FOLLOW IT. A heading describes what is under it (WCAG 2.4.6), and
+  // what is under this one is a form for changing preferences, not a receipt. If `page::shell`
+  // ever goes back to rendering one string into both, a screen reader hears "Your preferences are
+  // saved" twice in a row — as the document's name, then as the heading of a form that has saved
+  // nothing yet — and this is what says so.
+  await expect(
+    page.getByRole("heading", { name: "Your email preferences", exact: true }),
+  ).toBeVisible();
   await expect(page.getByRole("status")).toHaveText(
     `You will now get ${LONG_LIST}. You have unsubscribed from Weekly digest.`,
   );
@@ -547,7 +589,7 @@ test("the_preference_centre_still_works_with_javascript_switched_off", async () 
  */
 test("the_signup_form_still_submits_with_javascript_switched_off", async () => {
   await quiet.goto(`/f/${SLUG}/join`);
-  await expect(quiet.getByRole("heading", { name: "Join the list", exact: true })).toBeVisible();
+  await expect(quiet.getByRole("heading", { name: LONG_HEADLINE, exact: true })).toBeVisible();
   await quiet.getByLabel("Email address", { exact: true }).fill(QUIET_SUBSCRIBER);
   await quiet.getByRole("button", { name: "Join", exact: true }).click();
   await expect(quiet.getByRole("heading", { name: "Check your email", exact: true })).toBeVisible();
