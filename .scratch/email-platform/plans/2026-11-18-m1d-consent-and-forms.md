@@ -40,8 +40,9 @@ Five failure modes the spec implies that no task's happy path exercises. Each ha
 |---|---|
 | `migrations/0020_consent_log.sql` | `consent_log`, append-only |
 | `migrations/0021_consent_requested_action.sql` | widens `consent_log.action` to admit `requested` (Task 4a) |
-| `migrations/0022_forms_and_jobs.sql` | `forms`, `form_lists`, `jobs` (Task 8) |
-| `migrations/0023_consent_log_paging_index.sql` | `(workspace_id, contact_id, id desc)` on `consent_log` (Task 11) |
+| `migrations/0022_membership_source_preference_center.sql` | widens `list_memberships.source` to admit `preference_center` (Task 6) |
+| `migrations/0023_forms_and_jobs.sql` | `forms`, `form_lists`, `jobs` (Task 8) |
+| `migrations/0024_consent_log_paging_index.sql` | `(workspace_id, contact_id, id desc)` on `consent_log` (Task 11) |
 | `src/public/mod.rs` | module root, `routes()` |
 | `src/public/token.rs` | `Purpose`, `Token`, `issue`, `parse(secrets, raw, expected: Purpose)` |
 | `src/public/confirm.rs` | `GET /c/{token}` |
@@ -360,7 +361,7 @@ Of the five membership writers exactly one breaks this: `lists::add_member` revi
 
 ## Task 8: Forms — the model and the authenticated API
 
-**Files:** Create `migrations/0022_forms_and_jobs.sql`, `src/forms/mod.rs`, `src/forms/routes.rs`, `tests/forms.rs`; modify `src/http/mod.rs`, `src/openapi.rs`, `src/lib.rs`.
+**Files:** Create `migrations/0023_forms_and_jobs.sql`, `src/forms/mod.rs`, `src/forms/routes.rs`, `tests/forms.rs`; modify `src/http/mod.rs`, `src/openapi.rs`, `src/lib.rs`.
 
 **Interfaces:**
 - Produces: `GET/POST /api/v1/workspaces/{ws}/forms`, `GET/PATCH/DELETE …/forms/{id}`, all `Role::Editor` except `GET` which is `Role::Viewer`.
@@ -447,11 +448,11 @@ Follow `contacts.tsx` and `lists.tsx` for table, dialog and error patterns; use 
 
 ## Task 11: Admin UI — consent history and list visibility
 
-**Files:** Create `migrations/0023_consent_log_paging_index.sql`, `src/consent/routes.rs`; modify `web/src/routes/contact-detail.tsx`, `web/src/routes/lists.tsx`, `src/http/mod.rs`, `src/openapi.rs`.
+**Files:** Create `migrations/0024_consent_log_paging_index.sql`, `src/consent/routes.rs`; modify `web/src/routes/contact-detail.tsx`, `web/src/routes/lists.tsx`, `src/http/mod.rs`, `src/openapi.rs`.
 
 `GET /api/v1/workspaces/{ws}/contacts/{id}/consent` — `Role::Viewer`, cursor-paginated as `src/pagination/` does — and a panel on the contact detail screen. The list editor gains a `visibility` control; `description` is already shipped end to end.
 
-The route orders by `id desc`, not `created_at`: a membership write and its consent row share a transaction, and both set-based writers insert a whole batch in one statement, so `created_at` ties and cannot page stably. UUID v7 is time-ordered, so `id desc` is also newest-first. Migration `0023` adds `(workspace_id, contact_id, id desc)` to serve it.
+The route orders by `id desc`, not `created_at`: a membership write and its consent row share a transaction, and both set-based writers insert a whole batch in one statement, so `created_at` ties and cannot page stably. UUID v7 is time-ordered, so `id desc` is also newest-first. Migration `0024` adds `(workspace_id, contact_id, id desc)` to serve it.
 
 - [ ] **Step 1: Write the failing tests:** `another_workspaces_consent_history_is_404`, `consent_history_pages_without_skipping_or_repeating_rows_that_share_a_timestamp`, and an e2e asserting a confirmed contact shows "confirmed" with its source.
 - [ ] **Step 2: Run and watch fail.**
