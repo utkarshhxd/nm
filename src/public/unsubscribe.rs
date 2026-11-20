@@ -102,7 +102,7 @@ async fn preferences(
         return Ok(with(quota.headers, no_longer_valid()));
     }
     let topics = topics(&mut db, token.workspace_id, token.contact_id).await?;
-    Ok(with(quota.headers, render(&topics, false)))
+    Ok(with(quota.headers, render(&topics, None)))
 }
 
 /// `POST /u/{token}` — two doors behind one method, told apart by the body.
@@ -230,10 +230,20 @@ async fn topics(
 /// way: a `title="{}"` added later is fine, a `href="{}"` is not without a scheme check.
 ///
 /// No JavaScript, so the form works from an email client's browser with scripting off (spec §7.1).
-fn render(topics: &[Topic], saved: bool) -> Response {
+///
+/// **`saved` carries what changed, and the page says it in two places, because one of them is not
+/// heard.** This form posts and the browser navigates: there is no script to update a region in
+/// place, and a live region that is already in the document when it loads is not an update, so a
+/// screen reader announces the new document — its `<title>` — and not the `role="status"` below.
+/// So the title is the announcement: "Your preferences are saved" rather than the same "Your email
+/// preferences" the page had before the submission, which is a page that reads as though nothing
+/// happened. The region is kept for the reader that does announce one at load and for the day this
+/// page is enhanced with script; the sentence inside it names the lists, because "your preferences
+/// are saved" does not tell somebody who unticked one topic which one stopped.
+fn render(topics: &[Topic], saved: Option<&str>) -> Response {
     let mut body = String::new();
-    if saved {
-        body.push_str("<p>Your preferences are saved.</p>\n");
+    if let Some(summary) = saved {
+        body.push_str(&format!("<p role=\"status\">{}</p>\n", page::esc(summary)));
     }
     if topics.is_empty() {
         body.push_str("<p>There are no lists here for you to choose from.</p>\n");
@@ -261,7 +271,12 @@ fn render(topics: &[Topic], saved: bool) -> Response {
         "<form method=\"post\">\n<button type=\"submit\" name=\"List-Unsubscribe\" \
          value=\"One-Click\">Unsubscribe from everything</button>\n</form>\n",
     );
-    notice(StatusCode::OK, "Your email preferences", &body)
+    let title = if saved.is_some() {
+        "Your preferences are saved"
+    } else {
+        "Your email preferences"
+    };
+    notice(StatusCode::OK, title, &body)
 }
 
 /// Applies the form. The candidate set is **recomputed from the database inside the transaction**,
@@ -370,6 +385,13 @@ async fn save(
     .fetch_all(&mut *tx)
     .await?;
 
+    // What the saved page will say, built here because the two `Vec<Uuid>`s below are consumed by
+    // the consent loops and because `before` is the only place the names are. They are the lists
+    // the two statements actually changed, not the lists the body asked for: a box that was
+    // already ticked is not news, and saying it is would make the page agree with the request
+    // rather than with the database.
+    let summary = summarise(&named(&before, &subscribed), &named(&before, &unsubscribed));
+
     // The subscriber's own request, so the IP and the user agent really are theirs and are kept as
     // evidence. `token_jti` is the nonce: *which* link was followed, not merely that one was.
     let cx = consent::Context {
@@ -392,7 +414,35 @@ async fn save(
 
     let after = topics(&mut tx, token.workspace_id, token.contact_id).await?;
     tx.commit().await?;
-    Ok(render(&after, true))
+    Ok(render(&after, Some(&summary)))
+}
+
+/// The names, in the order the page shows them, of the lists in `ids`.
+fn named<'a>(topics: &'a [Topic], ids: &[Uuid]) -> Vec<&'a str> {
+    topics
+        .iter()
+        .filter(|t| ids.contains(&t.id))
+        .map(|t| t.name.as_str())
+        .collect()
+}
+
+/// What the saved page says happened, as a sentence about lists rather than about a form.
+///
+/// Plain text: [`render`] puts it through `page::esc`, because these are names an operator typed.
+fn summarise(on: &[&str], off: &[&str]) -> String {
+    let mut parts = Vec::new();
+    if !on.is_empty() {
+        parts.push(format!("You will now get {}.", on.join(", ")));
+    }
+    if !off.is_empty() {
+        parts.push(format!("You have unsubscribed from {}.", off.join(", ")));
+    }
+    if parts.is_empty() {
+        // A save that changed nothing — the same boxes posted back, or a second submission of the
+        // same form. "Your preferences are saved" on its own reads as though something happened.
+        parts.push("Nothing changed.".to_owned());
+    }
+    parts.join(" ")
 }
 
 /// One consent row for one list this route changed, `Source::PreferenceCenter`.
@@ -513,4 +563,43 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
         .await?;
     }
     tx.commit().await.map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sentence the saved page announces. Every branch, because the empty one is the one a
+    /// reader is most likely to meet — posting the same boxes back — and the one that would
+    /// otherwise print "You will now get ." with nothing after it.
+    #[test]
+    fn summarise_names_what_changed_and_says_so_when_nothing_did() {
+        assert_eq!(
+            summarise(&["Weekly digest"], &[]),
+            "You will now get Weekly digest."
+        );
+        assert_eq!(
+            summarise(&[], &["News", "Offers"]),
+            "You have unsubscribed from News, Offers."
+        );
+        assert_eq!(
+            summarise(&["News"], &["Offers"]),
+            "You will now get News. You have unsubscribed from Offers."
+        );
+        assert_eq!(summarise(&[], &[]), "Nothing changed.");
+    }
+
+    /// `named` follows the page's order and not the order the two statements returned rows in,
+    /// which is the server's choice and not the reader's.
+    #[test]
+    fn named_keeps_the_order_the_page_shows() {
+        let topic = |name: &str| Topic {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            status: None,
+        };
+        let topics = vec![topic("Alpha"), topic("Beta"), topic("Gamma")];
+        let ids = vec![topics[2].id, topics[0].id];
+        assert_eq!(named(&topics, &ids), ["Alpha", "Gamma"]);
+    }
 }

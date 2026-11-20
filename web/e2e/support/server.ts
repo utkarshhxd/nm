@@ -22,6 +22,26 @@ export const ADMIN_EMAIL = "admin@example.com";
 /** Only ever exists inside the per-run database that teardown drops. */
 export const ADMIN_PASSWORD = "e2e-admin-password";
 
+/** Where global setup leaves this run's `NM_SECRET_KEY` for the workers. */
+const SIGNING_KEY = "NM_E2E_SIGNING_KEY";
+
+/**
+ * This run's `NM_SECRET_KEY`, for a spec that has to mint a public link (`support/public-link.ts`
+ * says why one has to be minted at all).
+ *
+ * It is a fresh 32 bytes per run and the server that honours it is killed by teardown, so it is
+ * worth nothing outside the run — but it is still the key every token in it is signed under, and
+ * `playwright.config.ts` records no trace, video or screenshot for the same kind of reason. Keep
+ * it out of test output.
+ */
+export function signingKey(): string {
+  const key = process.env[SIGNING_KEY];
+  if (!key) {
+    throw new Error(`${SIGNING_KEY} is not set: global setup has not run in this process`);
+  }
+  return key;
+}
+
 const NM = resolve(import.meta.dirname, "../../..", "target/release/nm");
 
 /**
@@ -150,13 +170,20 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   database.pathname = `/${name}`;
   const url = database.toString();
 
+  // Named rather than inlined because `support/public-link.ts` has to sign with the same key.
+  // Playwright forks its workers with a copy of this process's environment after global setup has
+  // run (`runner/index.js`: `fork(..., { env: { ...process.env, ... } })`), so an assignment to
+  // `process.env` here is how a worker is told anything. `signingKey()` below is the read.
+  const secret = randomBytes(32).toString("base64");
+  process.env[SIGNING_KEY] = secret;
+
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     DATABASE_URL: url,
     NM_DATABASE_URL: url,
     NM_LISTEN: `127.0.0.1:${PORT}`,
     NM_PUBLIC_URL: BASE_URL,
-    NM_SECRET_KEY: randomBytes(32).toString("base64"),
+    NM_SECRET_KEY: secret,
     // The migration is an explicit step below, so a failure there is not hidden inside boot.
     NM_AUTO_MIGRATE: "false",
     NM_LOG: "warn",

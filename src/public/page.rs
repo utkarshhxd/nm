@@ -63,6 +63,14 @@ pub fn esc(s: &str) -> String {
 /// token file deliberately reads no `prefers-color-scheme` because two mechanisms would disagree
 /// and flash. Here there is no script and so no second mechanism: the media query is the only one,
 /// and it cannot disagree with anything.
+///
+/// `overflow-wrap:anywhere` on `body` is the reflow rule (WCAG 2.2 AA 1.4.10, 320 CSS pixels of
+/// width, which 200 % zoom on a laptop reaches). Every long string on these pages is one an
+/// operator typed — a list name on the preference center, a field label or a headline on a signup
+/// form — and one without a space in it is wider than the 224 px of text column left at 320 px.
+/// Without this the page scrolls sideways, which is the criterion failing; `anywhere` rather than
+/// `break-word` because only `anywhere` shrinks the box's min-content width, and the box is what
+/// forces the scrollbar.
 const STYLE: &str = "\
 :root{color-scheme:light;--canvas:oklch(0.985 0.003 265);--surface:oklch(1 0 0);\
 --fg:oklch(0.23 0.018 265);--fg-muted:oklch(0.5 0.016 265);--border:oklch(0.905 0.006 265);\
@@ -71,7 +79,7 @@ const STYLE: &str = "\
 --surface:oklch(0.205 0.011 265);--fg:oklch(0.95 0.004 265);--fg-muted:oklch(0.735 0.012 265);\
 --border:oklch(0.305 0.013 265);--accent-text:oklch(0.8 0.105 295);--ring:oklch(0.72 0.155 295)}}\
 body{margin:0;padding:2rem 1rem;background:var(--canvas);color:var(--fg);\
-font:16px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}\
+font:16px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;overflow-wrap:anywhere}\
 main{max-width:34rem;margin:0 auto;padding:2rem;background:var(--surface);\
 border:1px solid var(--border);border-radius:12px}\
 h1{margin:0 0 1rem;font-size:1.5rem;line-height:1.3}\

@@ -140,7 +140,7 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// counts refusals, so once tripped it stays tripped for the minute. `web/e2e/support/server.ts`
 /// therefore sets `NM_TRUST_PROXY_HEADERS`, and each spec that touches a public page claims an
 /// `X-Forwarded-For` of its own, so the budget is per spec file rather than per run.
-/// Three specs do today, each on an address of its own:
+/// Four specs do today, each on an address of its own:
 ///
 /// * `web/e2e/public-form.spec.ts` — **4** of the 60 on `198.51.100.9`: two page views and two
 ///   submissions.
@@ -148,11 +148,17 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 ///   prove the snippet's field names are the ones the route reads.
 /// * `web/e2e/contact-detail.spec.ts` — **1** on `198.51.100.11`: one submission, so that the
 ///   consent panel has a row carrying the subscriber's own IP and user agent to show.
+/// * `web/e2e/preference-center.spec.ts` — **8** on `198.51.100.12`, the heaviest spender on the
+///   branch: all three public pages, a signup, a confirmation, a saved preference form and the
+///   same form again with JavaScript off. It is not 36 because an axe and reflow sweep of a page
+///   loops over two colour schemes and three widths **without reloading** — `prefers-color-scheme`
+///   and the viewport are live. That file asserts its own total, so this entry cannot drift
+///   quietly.
 ///
-/// The budget is per address, so the margin is the worst spec's: **15×**. A spec added under
-/// `/c/`, `/u/` or `/f/` picks a fresh address from RFC 5737's range and counts its own cost
-/// here; one that reuses another spec's address inherits its spending, and the failure looks
-/// exactly like a product bug.
+/// The budget is per address, so the margin is the worst spec's: **7.5×** (was 15× before
+/// `preference-center.spec.ts`). A spec added under `/c/`, `/u/` or `/f/` picks a fresh address
+/// from RFC 5737's range and counts its own cost here; one that reuses another spec's address
+/// inherits its spending, and the failure looks exactly like a product bug.
 ///
 /// **A spec that claims an address asserts that the server saw it**, rather than trusting that
 /// it went out. `test.use({ extraHTTPHeaders })` does reach a context built by
@@ -161,7 +167,8 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// 127.0.0.1 window with nothing failing. A limiter counter cannot catch that: a fresh window
 /// reads the same whichever address it belongs to. What can is the consent row a public route
 /// writes, which carries the client address — `forms.spec.ts` reads it back over the API,
-/// `contact-detail.spec.ts` off the consent panel.
+/// `contact-detail.spec.ts` off the consent panel, `preference-center.spec.ts` off the two rows
+/// the preference form writes.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
 const WINDOW: Duration = Duration::from_secs(60);
