@@ -127,7 +127,9 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// `http::security_headers`), so on a default configuration behind one, *every* public request
 /// keys on the proxy's address: one window, sixty requests a minute for the whole internet, and
 /// the 61st person to click their confirmation link after a send gets a `429`. `app::serve` warns
-/// at startup for exactly this reason. Sign-in's per-IP limiter survives the same deployment only
+/// at startup for exactly this reason — and only when `public_url` is not localhost, so the
+/// warning stays something a reader has not been trained to scroll past. Sign-in's per-IP limiter
+/// survives the same deployment only
 /// because 100 failures per address per 15 minutes is loose enough to absorb it; sixty a minute
 /// across every subscriber is not. **An operator behind a proxy must set `trust_proxy_headers`,
 /// and must only do so when the proxy is theirs** — the header is client-controlled otherwise.

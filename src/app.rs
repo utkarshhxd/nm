@@ -132,7 +132,15 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     // is a warning rather than a default because trusting `X-Forwarded-For` without a proxy in
     // front is worse: the header is client-controlled, and an attacker would then pick their own
     // rate-limit key.
-    if !cfg.trust_proxy_headers {
+    //
+    // ONLY ON AN INSTANCE SOMEONE CAN REACH, and that is the whole point of the condition. A
+    // warning a developer sees on every run is one nobody reads by the end of the week, and then
+    // it is worse than no warning: it looks like a safety net while the misconfiguration it exists
+    // to catch goes past someone trained to scroll over that line. `log_format` cannot gate it —
+    // it defaults to `Json`, so a dev run is already the production format — and `public_url` asks
+    // the same question the warning does, because a reverse proxy is how an instance gets a
+    // hostname that is not localhost.
+    if !cfg.trust_proxy_headers && !is_local_url(&cfg.public_url) {
         tracing::warn!(
             "trust_proxy_headers is off, so rate limiting keys on the peer address. If NM is \
              behind a reverse proxy, every public page request (/c/, /u/, /f/) counts against one \
@@ -166,6 +174,20 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `public_url` names this machine — a developer's instance rather than one subscribers
+/// reach. `.localhost` is included because RFC 6761 reserves the whole suffix for loopback, which
+/// is how a local reverse-proxy setup is usually named. A URL with no host at all reads as local:
+/// the consequence of being wrong here is only whether a warning is printed, and a warning nobody
+/// can act on is the thing being avoided.
+fn is_local_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => true,
+    }
+}
+
 /// Resolves on Ctrl-C or, on Unix, SIGTERM (what container runtimes send).
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -184,4 +206,44 @@ async fn shutdown_signal() {
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_url;
+
+    fn local(url: &str) -> bool {
+        is_local_url(&url.parse().expect("a valid url"))
+    }
+
+    /// The proxy warning in `serve` is printed only when this is false, so a mistake here either
+    /// nags every dev run — which is how a warning stops being read — or stays silent on the one
+    /// deployment it exists for.
+    #[test]
+    fn only_an_instance_someone_else_can_reach_is_not_local() {
+        // The config default, what `.env.example` leads to, and the loopback spellings.
+        for url in [
+            "http://localhost:8080",
+            "http://localhost",
+            "https://nm.localhost",
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://[::1]:8080",
+        ] {
+            assert!(local(url), "{url}");
+        }
+        for url in [
+            "https://mail.example.com",
+            "https://example.com:8443",
+            "http://203.0.113.10",
+            "http://[2001:db8::1]",
+            // A private address is still an instance other people reach: an office install
+            // behind a proxy is exactly the deployment the warning is for.
+            "http://10.0.0.5:8080",
+            // Not loopback, however much it reads like it.
+            "https://localhost.example.com",
+        ] {
+            assert!(!local(url), "{url}");
+        }
+    }
 }
