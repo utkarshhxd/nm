@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source)          values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click')          on conflict (workspace_id, scope, email_hmac, domain) where lifted_at is null          do nothing returning id",
+  "query": "update suppressions set lifted_at = now() where workspace_id = $1 and scope = 'address' and email_hmac = $2 and reason = 'unsubscribed_all' and lifted_at is null returning id",
   "describe": {
     "columns": [
       {
@@ -18,8 +18,6 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Text",
         "Bytea"
       ]
     },
@@ -27,5 +25,5 @@
       false
     ]
   },
-  "hash": "6150399d4ad03482391287bce92872f92ae12208efda7efa3f2c7e6af1406cbf"
+  "hash": "923e4c566e55b3bed1be474f818526680a466f0ac8689ec9b31b93af0e878aff"
 }

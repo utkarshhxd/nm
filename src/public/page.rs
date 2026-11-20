@@ -79,7 +79,13 @@ p{margin:0 0 1rem}p:last-child{margin-bottom:0}\
 .muted{color:var(--fg-muted);font-size:0.9375rem}\
 a{color:var(--accent-text)}\
 :focus-visible{outline:2px solid var(--ring);outline-offset:2px}\
-button,input{font:inherit}";
+button,input{font:inherit}\
+ul.topics{list-style:none;margin:0 0 1.5rem;padding:0}\
+ul.topics li{margin:0 0 0.5rem}\
+ul.topics label{display:flex;gap:0.6rem;align-items:center;min-height:1.75rem}\
+form{margin:0 0 1rem}form:last-child{margin-bottom:0}\
+button{padding:0.5rem 0.9rem;border:1px solid var(--border);border-radius:8px;\
+background:var(--surface);color:var(--fg);cursor:pointer}";
 
 /// Wraps `body` in the page. `title` is escaped here; **`body` is not** — it is HTML the caller
 /// built, and every value it interpolated is the caller's to put through [`esc`] first.

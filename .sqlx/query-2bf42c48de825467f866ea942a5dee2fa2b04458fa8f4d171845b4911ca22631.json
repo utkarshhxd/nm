@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into list_memberships\n               (workspace_id, contact_id, list_id, status, subscribed_at, source)\n           select $1, $2, l, 'subscribed', now(), $4::text\n             from unnest($3::uuid[]) l\n           on conflict (contact_id, list_id) do update\n              set status = 'subscribed', subscribed_at = now(), unsubscribed_at = null,\n                  source = excluded.source\n            where list_memberships.status <> 'subscribed'\n           returning list_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "list_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "list_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "UuidArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2bf42c48de825467f866ea942a5dee2fa2b04458fa8f4d171845b4911ca22631"
+}

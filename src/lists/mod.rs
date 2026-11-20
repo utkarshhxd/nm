@@ -44,9 +44,15 @@ impl MembershipStatus {
     }
 }
 
-/// How a membership was created, for the consent log. `form` has no writer yet (M1d) and is
-/// therefore not a variant; the table's `check` already admits it. A row written before the column
-/// existed reads as NULL, never as one of these.
+/// How a membership was created, for the consent log. `form` has no writer yet (Task 9's hosted
+/// signup pages) and is therefore not a variant; the table's `check` already admits it. A row
+/// written before the column existed reads as NULL, never as one of these.
+///
+/// `PreferenceCenter` was added by `0022`, with the reasoning in that migration: the subscriber
+/// changing their own preferences is not `ui` (nobody signed in), not `api`, and not a NULL,
+/// which would assert the row predates `0018`. It is deliberately not `form` either — a form
+/// follows the list's `double_optin` and may write `pending`, where the preference center never
+/// does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum MembershipSource {
@@ -54,6 +60,7 @@ pub enum MembershipSource {
     Api,
     Bulk,
     Import,
+    PreferenceCenter,
 }
 
 impl MembershipSource {

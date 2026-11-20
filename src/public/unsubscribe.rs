@@ -8,13 +8,17 @@
 //! Nothing here reads the session; `tests/public_pages.rs` walks this directory to keep it that
 //! way.
 
+use std::collections::{HashMap, HashSet};
+
 use axum::{
     Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::get,
 };
+use sqlx::PgConnection;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
@@ -22,15 +26,16 @@ use crate::{
     consent,
     error::ApiResult,
     http::request_meta::RequestMeta,
+    lists::{MembershipSource, MembershipStatus},
     public::{
-        page::{UNKNOWN_IP, notice, with},
+        page::{self, UNKNOWN_IP, notice, with},
         token::{self, Purpose, Token},
     },
     suppressions,
 };
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/u/{token}", post(apply))
+    Router::new().route("/u/{token}", get(preferences).post(apply))
 }
 
 /// An unsubscribe token never expires (spec §6.2), so there is no "this link is old" page here:
@@ -46,31 +51,350 @@ fn no_longer_valid() -> Response {
     )
 }
 
-/// `POST /u/{token}` — RFC 8058 one-click. The mail client sends it without asking the person
-/// anything further, so it must be the whole of the act: every list in the workspace, not the one
-/// the email came from.
+/// The refusal this route gives a human who is over the per-IP limit.
 ///
-/// **The rate limiter's verdict is read and deliberately not obeyed here.** `check` returns the
-/// `RateLimit` headers and an `over` flag, and the flag is advisory — the handler decides. For
-/// this route the decision is to count the request, carry the headers, and unsubscribe anyway: an
-/// unsubscribe that does not stick is spec §4's second anti-goal, and a `429` from a mail client's
-/// one-click button is exactly that, with nobody to retry it. That is safe because the route is
-/// token-authenticated and idempotent — `status <> 'unsubscribed'` means a repeat writes no
-/// consent row and no second `unsubscribed_at`. See `http::rate_limit::MAX_KEYS`, which names this
-/// route as the one that may not answer `429`.
-async fn apply(
+/// **Written out here rather than shared with `confirm.rs`, and not to be shared with Task 9.**
+/// Each public route decides for itself what a tripped limit means: `GET /c/{token}` and this GET
+/// answer `429`, the one-click POST below ignores the verdict entirely, and spec §8.9 requires
+/// `POST /f/{slug}` to answer a rate-limited submission exactly as a successful one. A
+/// `page::too_many_requests()` helper would be a refusal those last two could inherit by reaching
+/// for the obvious name.
+fn too_many_requests(headers: HeaderMap, retry_after_secs: u64) -> Response {
+    let mut headers = headers;
+    headers.insert(header::RETRY_AFTER, retry_after_secs.into());
+    (
+        headers,
+        notice(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "<p>Too many requests have come from your network in the last minute.</p>\n\
+             <p class=\"muted\">Wait a minute and open the link again.</p>",
+        ),
+    )
+        .into_response()
+}
+
+/// `GET /u/{token}` — the preference center. Spec §6.3: the unsubscribe link offers "or just
+/// change what you get", which is the highest-leverage retention surface an email product has.
+///
+/// Unlike the one-click POST, this is a person at a browser who can read a refusal and open the
+/// link again, so a tripped limit is answered `429` the way `GET /c/{token}` answers it.
+async fn preferences(
     State(state): State<AppState>,
     meta: RequestMeta,
     Path(raw): Path<String>,
 ) -> ApiResult<Response> {
     let quota = state.public_limit.check(meta.ip.unwrap_or(UNKNOWN_IP));
+    if let Some(retry_after_secs) = quota.over {
+        return Ok(too_many_requests(quota.headers, retry_after_secs));
+    }
     let Ok(token) = token::parse(&state.secrets, &raw, Purpose::Unsubscribe) else {
         return Ok(with(quota.headers, no_longer_valid()));
     };
-    one_click(&state, &meta, &token).await?;
-    // RFC 8058 §3.2: a 200 and nothing to read. The mail client is not a browser and shows the
-    // person nothing, so there is no page to render.
-    Ok(with(quota.headers, StatusCode::OK.into_response()))
+    let mut db = state.pool.acquire().await?;
+    // A contact deleted since the link was issued: the token still verifies and the foreign key
+    // is gone. A sentence, not a 500, and not an empty page that would read as "you are on
+    // nothing" (Review Focus 2).
+    if contact_email(&mut db, token.workspace_id, token.contact_id)
+        .await?
+        .is_none()
+    {
+        return Ok(with(quota.headers, no_longer_valid()));
+    }
+    let topics = topics(&mut db, token.workspace_id, token.contact_id).await?;
+    Ok(with(quota.headers, render(&topics, false)))
+}
+
+/// `POST /u/{token}` — two doors behind one method, told apart by the body.
+///
+/// `List-Unsubscribe=One-Click` (RFC 8058 §3.1) is the mail client's button: it sends it without
+/// asking the person anything further, so it must be the whole of the act — every list in the
+/// workspace, not the one the email came from. Anything else is the preference form, whose
+/// checkboxes say what the person wants.
+///
+/// **The rate limiter's verdict is read and deliberately not obeyed for one-click.** `check`
+/// returns the `RateLimit` headers and an `over` flag, and the flag is advisory — the handler
+/// decides. For one-click the decision is to count the request, carry the headers, and unsubscribe
+/// anyway: an unsubscribe that does not stick is spec §4's second anti-goal, and a `429` from a
+/// mail client's one-click button is exactly that, with nobody to retry it. That is safe because
+/// the route is token-authenticated and idempotent — `status <> 'unsubscribed'` means a repeat
+/// writes no consent row and no second `unsubscribed_at`. See `http::rate_limit::MAX_KEYS`, which
+/// names this route as the one that may not answer `429`. **The preference form is refused**, like
+/// the GET: it is a person who can try again, and one who did not ask for everything to stop.
+async fn apply(
+    State(state): State<AppState>,
+    meta: RequestMeta,
+    Path(raw): Path<String>,
+    body: String,
+) -> ApiResult<Response> {
+    let quota = state.public_limit.check(meta.ip.unwrap_or(UNKNOWN_IP));
+    let one_click_asked = is_one_click(&body);
+    if !one_click_asked && let Some(retry_after_secs) = quota.over {
+        return Ok(too_many_requests(quota.headers, retry_after_secs));
+    }
+    let Ok(token) = token::parse(&state.secrets, &raw, Purpose::Unsubscribe) else {
+        return Ok(with(quota.headers, no_longer_valid()));
+    };
+    if one_click_asked {
+        one_click(&state, &meta, &token).await?;
+        // RFC 8058 §3.2: a 200 and nothing to read. The mail client is not a browser and shows
+        // the person nothing, so there is no page to render.
+        return Ok(with(quota.headers, StatusCode::OK.into_response()));
+    }
+    let answer = save(&state, &meta, &token, &body).await?;
+    Ok(with(quota.headers, answer))
+}
+
+/// RFC 8058 §3.1 names the pair exactly. Case-insensitively on both halves, because the field name
+/// comes from a header name and clients are not consistent about either.
+///
+/// An empty or unparseable body has no such pair, so it is treated as a preference form with every
+/// box unticked. That is the safe way round: it unsubscribes from the lists the page would have
+/// shown rather than silently doing nothing.
+fn is_one_click(body: &str) -> bool {
+    form_urlencoded::parse(body.as_bytes()).any(|(name, value)| {
+        name.eq_ignore_ascii_case("list-unsubscribe") && value.eq_ignore_ascii_case("one-click")
+    })
+}
+
+/// One list as the preference center shows it.
+struct Topic {
+    id: Uuid,
+    name: String,
+    status: Option<MembershipStatus>,
+}
+
+/// The address of the contact the token names, or `None` if it is no longer a contact here.
+async fn contact_email(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    contact_id: Uuid,
+) -> ApiResult<Option<String>> {
+    sqlx::query_scalar!(
+        "select email from contacts where workspace_id = $1 and id = $2",
+        workspace_id,
+        contact_id,
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(Into::into)
+}
+
+/// Spec invariant 10, and the whole of it: the workspace's `public` lists, **plus** any non-public
+/// list this contact already has a membership row on, **and nothing else**.
+///
+/// Both halves of that are failure modes the spec names as anti-goals. Showing a list somebody was
+/// never on discloses the workspace's private lists to whoever holds the link; hiding one they are
+/// on leaves them no way to leave it. A membership row of any status counts as "already on" — an
+/// `unsubscribed` row is a list they knew about and may want back, and leaving it off the page
+/// would make leaving a private list a one-way door.
+///
+/// **One query, not one per list.** The latency floor in spec §9 exists to catch an N+1 here,
+/// which is the only way this page gets slow.
+async fn topics(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    contact_id: Uuid,
+) -> ApiResult<Vec<Topic>> {
+    sqlx::query_as!(
+        Topic,
+        r#"select l.id, l.name, m.status as "status?: MembershipStatus"
+             from lists l
+             left join list_memberships m
+               on m.workspace_id = l.workspace_id and m.list_id = l.id and m.contact_id = $2
+            where l.workspace_id = $1 and (l.visibility = 'public' or m.contact_id is not null)
+            order by lower(l.name), l.id"#,
+        workspace_id,
+        contact_id,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(Into::into)
+}
+
+/// The page: a checkbox per list, ticked where the membership is `subscribed`, and a second form
+/// that is the RFC 8058 body a mail client would have sent — so the "unsubscribe from everything"
+/// button and the one-click POST are the same door, not two implementations of it.
+///
+/// **Where the escaping is, and what it is correct for.** `page::esc` is applied to the list name,
+/// which an operator typed and which reaches element text only. The one attribute value on this
+/// page is a list's `Uuid`, rendered from a `Uuid` and not from anything a person can type, and it
+/// is quoted. `esc` is correct for both of those contexts; it would **not** be enough for an
+/// unquoted attribute or for a value that becomes a URL, and neither exists here. Keep it that
+/// way: a `title="{}"` added later is fine, a `href="{}"` is not without a scheme check.
+///
+/// No JavaScript, so the form works from an email client's browser with scripting off (spec §7.1).
+fn render(topics: &[Topic], saved: bool) -> Response {
+    let mut body = String::new();
+    if saved {
+        body.push_str("<p>Your preferences are saved.</p>\n");
+    }
+    if topics.is_empty() {
+        body.push_str("<p>There are no lists here for you to choose from.</p>\n");
+    } else {
+        body.push_str(
+            "<p>Tick the emails you want. Anything you untick stops.</p>\n\
+             <form method=\"post\">\n<ul class=\"topics\">\n",
+        );
+        for topic in topics {
+            let checked = if topic.status == Some(MembershipStatus::Subscribed) {
+                " checked"
+            } else {
+                ""
+            };
+            body.push_str(&format!(
+                "<li><label><input type=\"checkbox\" name=\"list\" value=\"{}\"{checked}> {}\
+                 </label></li>\n",
+                topic.id,
+                page::esc(&topic.name),
+            ));
+        }
+        body.push_str("</ul>\n<button type=\"submit\">Save preferences</button>\n</form>\n");
+    }
+    body.push_str(
+        "<form method=\"post\">\n<button type=\"submit\" name=\"List-Unsubscribe\" \
+         value=\"One-Click\">Unsubscribe from everything</button>\n</form>\n",
+    );
+    notice(StatusCode::OK, "Your email preferences", &body)
+}
+
+/// Applies the form. The candidate set is **recomputed from the database inside the transaction**,
+/// never taken from the body: a list id the page would not have shown — a private list this
+/// contact was never on, or one deleted since the page was rendered — is simply not among the
+/// candidates and is ignored. That is what makes Review Focus 3 a non-event in both directions,
+/// and what stops invariant 10 being bypassed by posting an id.
+///
+/// **A tick subscribes outright, even on a double-opt-in list.** Everywhere else in M1d a
+/// `double_optin` list produces a `pending` membership and a `requested` consent row. Here it must
+/// not: double opt-in exists to prove the address belongs to the person using it, and a valid
+/// token delivered to that address already is that proof. Asking them to confirm again asks them
+/// to prove the same thing twice and leaves a `pending` row for somebody who has plainly agreed.
+/// So nothing here reads `lists.double_optin`, and `Action::Requested` is unreachable from this
+/// function.
+///
+/// The action is read off the status the row had **before** the write, which is why the candidate
+/// query runs inside the transaction: a row that was not there is `Subscribed`, one that was
+/// `pending` is `Confirmed` — the same word `GET /c/{token}` records for the identical transition
+/// under the identical evidence — and one that was `unsubscribed` is `Resubscribed`. The SQL
+/// guards (`status <> 'subscribed'`, `status <> 'unsubscribed'`) decide *whether* a row is
+/// recorded, so a concurrent writer cannot produce a consent row for a change that did not happen.
+async fn save(
+    state: &AppState,
+    meta: &RequestMeta,
+    token: &Token,
+    body: &str,
+) -> ApiResult<Response> {
+    let wanted: HashSet<Uuid> = form_urlencoded::parse(body.as_bytes())
+        .filter(|(name, _)| name == "list")
+        .filter_map(|(_, value)| value.parse().ok())
+        .collect();
+
+    let mut tx = state.pool.begin().await?;
+    let Some(email) = contact_email(&mut tx, token.workspace_id, token.contact_id).await? else {
+        return Ok(no_longer_valid());
+    };
+    let before = topics(&mut tx, token.workspace_id, token.contact_id).await?;
+    let prior: HashMap<Uuid, Option<MembershipStatus>> =
+        before.iter().map(|t| (t.id, t.status)).collect();
+    let mut on = vec![];
+    let mut off = vec![];
+    for topic in &before {
+        if wanted.contains(&topic.id) {
+            if topic.status != Some(MembershipStatus::Subscribed) {
+                on.push(topic.id);
+            }
+        } else if matches!(
+            topic.status,
+            Some(MembershipStatus::Pending | MembershipStatus::Subscribed)
+        ) {
+            off.push(topic.id);
+        }
+    }
+    // Asked for at least one of the lists the page offered, whether or not it changed anything.
+    let asked_for_any = before.iter().any(|topic| wanted.contains(&topic.id));
+
+    let subscribed: Vec<Uuid> = sqlx::query_scalar!(
+        r#"insert into list_memberships
+               (workspace_id, contact_id, list_id, status, subscribed_at, source)
+           select $1, $2, l, 'subscribed', now(), $4::text
+             from unnest($3::uuid[]) l
+           on conflict (contact_id, list_id) do update
+              set status = 'subscribed', subscribed_at = now(), unsubscribed_at = null,
+                  source = excluded.source
+            where list_memberships.status <> 'subscribed'
+           returning list_id"#,
+        token.workspace_id,
+        token.contact_id,
+        &on[..],
+        MembershipSource::PreferenceCenter as MembershipSource,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let unsubscribed: Vec<Uuid> = sqlx::query_scalar!(
+        r#"update list_memberships set status = 'unsubscribed', unsubscribed_at = now()
+            where workspace_id = $1 and contact_id = $2 and list_id = any($3)
+              and status <> 'unsubscribed'
+           returning list_id"#,
+        token.workspace_id,
+        token.contact_id,
+        &off[..],
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // The subscriber's own request, so the IP and the user agent really are theirs and are kept as
+    // evidence. `token_jti` is the nonce: *which* link was followed, not merely that one was.
+    let cx = consent::Context {
+        ip: meta.ip,
+        user_agent: meta.user_agent.clone(),
+        source_ref: None,
+        token_jti: Some(token.nonce.clone()),
+    };
+    for list_id in subscribed {
+        let action = match prior.get(&list_id).copied().flatten() {
+            None => consent::Action::Subscribed,
+            Some(MembershipStatus::Pending) => consent::Action::Confirmed,
+            Some(_) => consent::Action::Resubscribed,
+        };
+        record(&mut tx, token, list_id, action, &cx).await?;
+    }
+    for list_id in unsubscribed {
+        record(&mut tx, token, list_id, consent::Action::Unsubscribed, &cx).await?;
+    }
+    // The workspace-wide opt-out was theirs to set through one-click, so it is theirs to clear by
+    // asking for a list again — otherwise this page shows boxes that tick and change nothing a
+    // send would honour. Only `unsubscribed_all` is lifted; a bounce, a complaint, an operator's
+    // block and an erasure tombstone are not a subscriber's to overturn. No consent row: the
+    // per-list rows above are the record of what they asked for, and there is no action in spec
+    // §7.1's list that means "a block was lifted".
+    if asked_for_any {
+        suppressions::lift_unsubscribed_all(&mut tx, &state.secrets, token.workspace_id, &email)
+            .await?;
+    }
+
+    let after = topics(&mut tx, token.workspace_id, token.contact_id).await?;
+    tx.commit().await?;
+    Ok(render(&after, true))
+}
+
+/// One consent row for one list this route changed, `Source::PreferenceCenter`.
+async fn record(
+    tx: &mut PgConnection,
+    token: &Token,
+    list_id: Uuid,
+    action: consent::Action,
+    cx: &consent::Context,
+) -> ApiResult<()> {
+    consent::record(
+        tx,
+        token.workspace_id,
+        token.contact_id,
+        Some(list_id),
+        action,
+        consent::Source::PreferenceCenter,
+        cx,
+    )
+    .await
 }
 
 /// Unsubscribes the contact from every list in the workspace the token names, writes the

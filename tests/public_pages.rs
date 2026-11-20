@@ -181,7 +181,8 @@ async fn live_suppressions(
     workspace: Uuid,
 ) -> Vec<(String, String, Option<String>)> {
     sqlx::query_as(
-        "select reason, source, email from suppressions           where workspace_id = $1 and lifted_at is null order by id",
+        "select reason, source, email from suppressions \
+          where workspace_id = $1 and lifted_at is null order by id",
     )
     .bind(workspace)
     .fetch_all(pool)
@@ -433,6 +434,15 @@ async fn every_public_page_is_no_store(pool: PgPool) {
         bad.header("content-type"),
         "text/html; charset=utf-8",
         "unsubscribe invalid"
+    );
+
+    // The preference center is a page too, and is the one that names which lists a person is on.
+    let prefs = p.app.get(&format!("/u/{}", p.unsub("n9", 0))).await;
+    assert_eq!(prefs.header("cache-control"), "no-store", "preferences");
+    assert_eq!(
+        prefs.header("content-type"),
+        "text/html; charset=utf-8",
+        "preferences"
     );
 
     // And the bare prefixes, which reach no handler at all: `public::owns_path` keeps them off
@@ -730,4 +740,433 @@ async fn one_click_for_a_deleted_contact_does_not_fail(pool: PgPool) {
     p.post_unsub(&link, ONE_CLICK).await.assert_status_ok();
     assert_eq!(consent_rows(&pool).await.len(), 0);
     assert_eq!(live_suppressions(&pool, p.workspace).await, []);
+}
+
+// ---- Task 6: the preference center -------------------------------------------------------------
+
+/// Spec invariant 10, both halves and the "and nothing else": the workspace's `public` lists, plus
+/// any non-public list this contact already has a membership row on, and no other list.
+#[sqlx::test]
+async fn the_page_shows_public_lists_and_the_private_ones_this_contact_is_on(pool: PgPool) {
+    let p = pending(&pool, "acme").await; // `news`, private, pending — a list they are on
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    let offers = make_list(&pool, p.workspace, "Offers", "public", true).await;
+    let secret = make_list(&pool, p.workspace, "Insiders only", "private", true).await;
+
+    let r = p.app.get(&format!("/u/{}", p.unsub("n1", 0))).await;
+    r.assert_status_ok();
+    let html = r.text();
+    for (what, list) in [("news", p.list), ("weekly", weekly), ("offers", offers)] {
+        assert!(
+            html.contains(&list.to_string()),
+            "{what} is missing: {html}"
+        );
+    }
+    assert!(
+        !html.contains(&secret.to_string()),
+        "a private list this contact was never on is shown: {html}"
+    );
+    assert!(!html.contains("Insiders only"), "{html}");
+
+    // The box reflects `status = 'subscribed'`, so the confirmed list is ticked and the pending
+    // one is not. A `pending` row is somebody who was asked, not somebody who agreed.
+    assert!(
+        html.contains(&format!("value=\"{weekly}\" checked")),
+        "the subscribed list is not ticked: {html}"
+    );
+    assert!(
+        html.contains(&format!("value=\"{}\">", p.list)),
+        "the pending list is ticked: {html}"
+    );
+    assert!(
+        html.contains(&format!("value=\"{offers}\">")),
+        "a list they are not on is ticked: {html}"
+    );
+}
+
+/// Review Focus 3. The page was rendered, the operator deleted the list, and the POST arrives
+/// naming it. The candidate set is recomputed from the database at POST time, so the vanished id
+/// is simply not among it — no error, and the rest of the form still applies.
+#[sqlx::test]
+async fn a_list_deleted_between_the_page_and_the_post_does_not_fail_the_post(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let doomed = p.on_list("Doomed", "public", "subscribed").await;
+    let weekly = p.on_list("Weekly", "public", "unsubscribed").await;
+    p.app
+        .get(&format!("/u/{}", p.unsub("n1", 0)))
+        .await
+        .assert_status_ok();
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(doomed)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = p
+        .post_unsub(&p.unsub("n1", 0), &format!("list={doomed}&list={weekly}"))
+        .await;
+    r.assert_status_ok();
+    let got: Vec<_> = p.statuses().await;
+    assert!(
+        got.contains(&(weekly, "subscribed".to_owned())),
+        "the rest of the form did not apply: {got:?}"
+    );
+}
+
+/// Review Focus 3, the other way round: an operator makes a list private while somebody holds a
+/// preference-center link. They are on it, so it stays on their page — hiding it would be the
+/// anti-goal's other half, a page that hides a list somebody is on.
+#[sqlx::test]
+async fn a_list_flipped_to_private_still_shows_for_a_contact_already_on_it(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    sqlx::query("update lists set visibility = 'private' where id = $1")
+        .bind(weekly)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = p.app.get(&format!("/u/{}", p.unsub("n1", 0))).await;
+    r.assert_status_ok();
+    assert!(r.text().contains(&weekly.to_string()), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn unticking_a_box_unsubscribes_and_records_preference_center_as_the_source(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    let keep = p.on_list("Keep", "public", "subscribed").await;
+
+    // `keep` is ticked, `weekly` is not, and the pending `news` is not.
+    p.post_unsub(&p.unsub("n1", 0), &format!("list={keep}"))
+        .await
+        .assert_status_ok();
+
+    let got = p.statuses().await;
+    assert!(
+        got.contains(&(weekly, "unsubscribed".to_owned())),
+        "{got:?}"
+    );
+    assert!(got.contains(&(keep, "subscribed".to_owned())), "{got:?}");
+    // The pending one was unticked too, so it goes as well.
+    assert!(
+        got.contains(&(p.list, "unsubscribed".to_owned())),
+        "{got:?}"
+    );
+
+    let rows = consent_by_list(&pool).await;
+    assert_eq!(
+        rows.iter().filter(|(_, a, _)| a == "unsubscribed").count(),
+        2,
+        "one row per list that changed, and `keep` did not: {rows:?}"
+    );
+    for (_, _, source) in &rows {
+        assert_eq!(source, "preference_center");
+    }
+    // Nothing was written for the list that was already subscribed and stayed subscribed.
+    assert!(!rows.iter().any(|(l, _, _)| *l == Some(keep)), "{rows:?}");
+}
+
+#[sqlx::test]
+async fn ticking_a_box_for_a_list_the_contact_left_records_resubscribed(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "unsubscribed").await;
+
+    p.post_unsub(&p.unsub("n1", 0), &format!("list={weekly}"))
+        .await
+        .assert_status_ok();
+
+    let got = p.statuses().await;
+    assert!(got.contains(&(weekly, "subscribed".to_owned())), "{got:?}");
+    let rows = consent_by_list(&pool).await;
+    assert!(
+        rows.contains(&(
+            Some(weekly),
+            "resubscribed".to_owned(),
+            "preference_center".to_owned()
+        )),
+        "{rows:?}"
+    );
+    // `unsubscribed_at` is cleared, because this is a live membership again.
+    let cleared: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "select unsubscribed_at from list_memberships where contact_id = $1 and list_id = $2",
+    )
+    .bind(p.contact)
+    .bind(weekly)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cleared, None);
+}
+
+/// **The ruling that reverses this milestone's usual rule.** Everywhere else a `double_optin` list
+/// produces a `pending` membership and a `requested` consent row. Here it must not: double opt-in
+/// exists to prove the address belongs to the person using it, and a valid token delivered to that
+/// address already is that proof. Asking again would be asking them to prove the same thing twice
+/// and would leave a `pending` row for somebody who has plainly agreed.
+///
+/// Both halves are asserted. The membership alone would still pass with a stray `requested` row
+/// also written.
+#[sqlx::test]
+async fn ticking_a_box_on_a_double_optin_list_subscribes_outright_and_never_writes_pending(
+    pool: PgPool,
+) {
+    let p = pending(&pool, "acme").await;
+    let fresh = make_list(&pool, p.workspace, "Digest", "public", true).await;
+    let double: bool = sqlx::query_scalar("select double_optin from lists where id = $1")
+        .bind(fresh)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(double, "the premise: this list is double opt-in");
+
+    // Both the list they were never on and the one they are `pending` on.
+    p.post_unsub(&p.unsub("n1", 0), &format!("list={fresh}&list={}", p.list))
+        .await
+        .assert_status_ok();
+
+    let got = p.statuses().await;
+    assert!(got.contains(&(fresh, "subscribed".to_owned())), "{got:?}");
+    assert!(
+        got.contains(&(p.list, "subscribed".to_owned())),
+        "a pending membership was not promoted: {got:?}"
+    );
+    let rows = consent_by_list(&pool).await;
+    assert!(
+        !rows.iter().any(|(_, action, _)| action == "requested"),
+        "a `requested` row was written for somebody who has plainly agreed: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(
+            Some(fresh),
+            "subscribed".to_owned(),
+            "preference_center".to_owned()
+        )),
+        "{rows:?}"
+    );
+    // A `pending` row promoted by the subscriber's own token is a confirmation, which is exactly
+    // what `GET /c/{token}` records for the identical transition.
+    assert!(
+        rows.contains(&(
+            Some(p.list),
+            "confirmed".to_owned(),
+            "preference_center".to_owned()
+        )),
+        "{rows:?}"
+    );
+}
+
+#[sqlx::test]
+async fn a_preference_center_change_carries_the_token_nonce_as_its_jti(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    let nonce = Uuid::now_v7().to_string();
+
+    p.post_unsub(&p.unsub(&nonce, 0), &format!("list={}", p.list))
+        .await
+        .assert_status_ok();
+
+    let rows = consent_rows(&pool).await;
+    assert!(!rows.is_empty(), "nothing was recorded at all");
+    for row in &rows {
+        assert_eq!(row.3, Some(nonce.clone()), "which link was followed");
+        assert_eq!(row.2, Some("127.0.0.1".parse().unwrap()), "the IP");
+        assert_eq!(row.4, None, "no operator id");
+    }
+    // The premise: this request really did change something, so the rows above are not an empty
+    // set being asserted over.
+    let got = p.statuses().await;
+    assert!(
+        got.contains(&(weekly, "unsubscribed".to_owned())),
+        "{got:?}"
+    );
+}
+
+/// Unlike the one-click POST, a human at a browser can read a refusal and try again, so the
+/// preference center answers a tripped limit the way `GET /c/{token}` does.
+#[sqlx::test]
+async fn the_preference_center_is_refused_past_the_per_ip_limit(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let link = p.unsub("n1", 0);
+    for _ in 0..PUBLIC_PER_MINUTE {
+        p.app.get(&format!("/u/{link}")).await;
+    }
+    let over = p.app.get(&format!("/u/{link}")).await;
+    assert_eq!(over.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(over.maybe_header("retry-after").is_some());
+    assert_eq!(over.header("content-type"), "text/html; charset=utf-8");
+    assert_eq!(over.header("cache-control"), "no-store");
+
+    // And the form POST too — it is not the RFC 8058 one-click, which is the only answer on this
+    // route that ignores the verdict.
+    let post = p.post_unsub(&link, &format!("list={}", p.list)).await;
+    assert_eq!(post.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        p.status().await.as_deref(),
+        Some("pending"),
+        "nothing moved"
+    );
+}
+
+/// Adds `count` public lists to the workspace, all subscribed, in one statement.
+async fn seed_lists(pool: &PgPool, workspace: Uuid, contact: Uuid, count: i32, prefix: &str) {
+    sqlx::query(
+        "with l as (insert into lists (id, workspace_id, name, visibility)                     select gen_random_uuid(), $1, $4 || n, 'public'                       from generate_series(1, $2) n returning id)          insert into list_memberships (workspace_id, contact_id, list_id, status)          select $1, $3, l.id, 'subscribed' from l",
+    )
+    .bind(workspace)
+    .bind(count)
+    .bind(contact)
+    .bind(prefix)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The fastest of `runs` warm requests, which damps the noise a single sample carries.
+async fn fastest(app: &TestApp, url: &str, runs: u32) -> std::time::Duration {
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..runs {
+        let started = Instant::now();
+        let r = app.get(url).await;
+        best = best.min(started.elapsed());
+        r.assert_status_ok();
+    }
+    best
+}
+
+/// Spec §9's 200 ms floor, **and the assertion that actually holds the thing the floor is for**.
+///
+/// The floor is not a benchmark: it exists to catch an N+1 across lists, which is the only way
+/// this page gets slow. **It does not catch one on its own, and that was measured rather than
+/// assumed.** `topics` was rewritten as a genuine query-per-list; the page still answered in about
+/// 50 ms at 51 lists and about 106 ms at 501, because a round trip over a loopback socket costs
+/// roughly 0.2 ms. Fifty lists is nowhere near the fixture that a 200 ms wall-clock bound would
+/// separate, and the fixture that would separate it — a few thousand lists — would make this a
+/// test of how fast the machine is.
+///
+/// So the N+1 is caught by how the page's cost **scales**, which is self-calibrating: the same
+/// page, the same machine, the same moment, at ten times the list count. One query does not care
+/// (measured: 2 ms at 51 lists, 6 ms at 501). A query per list cares linearly (11 ms and 106 ms),
+/// and no allowance that a constant-cost page can meet covers a tenfold rise.
+#[sqlx::test]
+async fn the_page_renders_in_under_200ms_for_a_contact_on_50_lists(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    seed_lists(&pool, p.workspace, p.contact, 50, "List ").await;
+    let url = format!("/u/{}", p.unsub("n1", 0));
+    // Warm: the first request pays for the connection and the statements being prepared.
+    p.app.get(&url).await.assert_status_ok();
+
+    let at_50 = fastest(&p.app, &url, 3).await;
+    assert!(at_50.as_millis() < 200, "the page took {at_50:?}");
+    let rendered = p.app.get(&url).await;
+    assert_eq!(
+        rendered.text().matches("type=\"checkbox\"").count(),
+        51,
+        "the fixture must actually render 51 lists"
+    );
+
+    seed_lists(&pool, p.workspace, p.contact, 450, "More ").await;
+    p.app.get(&url).await.assert_status_ok();
+    let at_500 = fastest(&p.app, &url, 3).await;
+    assert!(at_500.as_millis() < 200, "the page took {at_500:?} at 501");
+    // Ten times the lists for no more than three times the time, plus a flat allowance for the
+    // extra rows this page really does have to render. A query per list spends ten times as long.
+    let allowed = at_50 * 3 + std::time::Duration::from_millis(25);
+    assert!(
+        at_500 <= allowed,
+        "501 lists took {at_500:?} against {at_50:?} for 51 (allowed {allowed:?}): the page's          cost grows with the list count, which means a query per list"
+    );
+}
+
+/// `page::esc` is the only thing between an operator-typed list name and an injected tag, and the
+/// preference center is the first page that renders one. The names reach element text only; the
+/// one attribute value on the page is a list's `Uuid`, which this test also pins by asserting the
+/// name never lands inside a quoted attribute.
+#[sqlx::test]
+async fn an_operator_supplied_list_name_is_escaped_on_the_page(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let nasty = "<script>alert(1)</script> \"Bob & Co\"";
+    let list = make_list(&pool, p.workspace, nasty, "public", true).await;
+    assert!(list != Uuid::nil());
+
+    let r = p.app.get(&format!("/u/{}", p.unsub("n1", 0))).await;
+    r.assert_status_ok();
+    let html = r.text();
+    assert!(!html.contains("<script>"), "the name opened a tag: {html}");
+    assert!(
+        html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &quot;Bob &amp; Co&quot;"),
+        "{html}"
+    );
+}
+
+/// Finding 10 of the prior-milestone hazards, both directions. The workspace-wide opt-out was the
+/// subscriber's to set through one-click, so it is theirs to clear by asking for a list again —
+/// otherwise the page shows boxes that tick and change nothing a send would honour. **Only
+/// `unsubscribed_all` is liftable here:** a bounce, a complaint, an operator's block and an
+/// erasure tombstone are facts about the address that a checkbox has no standing to overturn.
+#[sqlx::test]
+async fn ticking_a_box_lifts_the_subscribers_own_opt_out_and_no_other_block(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    p.post_unsub(&p.unsub("n1", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    assert_eq!(live_suppressions(&pool, p.workspace).await.len(), 1);
+
+    p.post_unsub(&p.unsub("n2", 0), &format!("list={weekly}"))
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        live_suppressions(&pool, p.workspace).await,
+        [],
+        "the subscriber's own opt-out survived them asking for a list again"
+    );
+
+    // A block that is not theirs to clear stays, however many boxes they tick. The hash is the
+    // real one: `lift_unsubscribed_all` finds a row by `email_hmac`, so a fabricated hash would
+    // make this half of the test pass whatever the `reason` filter said — which it did, until a
+    // mutation check caught it.
+    let hmac = nm::crypto::suppression_hmac(&p.app.state.secrets, "subscriber-acme@ex.test");
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
+         select $1, $2, 'address', c.email, $4, 'bounced' from contacts c where c.id = $3",
+    )
+    .bind(Uuid::now_v7())
+    .bind(p.workspace)
+    .bind(p.contact)
+    .bind(hmac.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    p.post_unsub(&p.unsub("n3", 0), &format!("list={weekly}"))
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        live_suppressions(&pool, p.workspace)
+            .await
+            .iter()
+            .map(|(reason, _, _)| reason.clone())
+            .collect::<Vec<_>>(),
+        ["bounced".to_owned()],
+        "a bounce is not a subscriber's to lift"
+    );
+}
+
+/// Invariant 10's teeth on the write side. The candidate set is recomputed server-side, so a list
+/// the page would never have shown cannot be joined by posting its id.
+#[sqlx::test]
+async fn a_private_list_the_contact_is_not_on_cannot_be_joined_by_posting_its_id(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let secret = make_list(&pool, p.workspace, "Insiders", "private", true).await;
+
+    p.post_unsub(&p.unsub("n1", 0), &format!("list={secret}"))
+        .await
+        .assert_status_ok();
+
+    assert!(
+        !p.statuses().await.iter().any(|(l, _)| *l == secret),
+        "a private list was joined by posting its id"
+    );
+    assert_eq!(consent_by_list(&pool).await.len(), 1, "only `news` moved");
 }

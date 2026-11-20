@@ -297,7 +297,10 @@ pub async fn unsubscribe_all(
     // is being erased cannot interleave into two live rows for one address.
     lock_address(db, &hmac).await?;
     let written = sqlx::query_scalar!(
-        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source)          values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click')          on conflict (workspace_id, scope, email_hmac, domain) where lifted_at is null          do nothing returning id",
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source) \
+         values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click') \
+         on conflict (workspace_id, scope, email_hmac, domain) where lifted_at is null \
+         do nothing returning id",
         Uuid::now_v7(),
         workspace_id,
         email,
@@ -306,6 +309,42 @@ pub async fn unsubscribe_all(
     .fetch_optional(db)
     .await?;
     Ok(written.is_some())
+}
+
+/// Lifts the subscriber's own workspace-wide opt-out, and **only** that one. `true` if a row was
+/// lifted. Called by the preference center when the subscriber asks for a list again: the opt-out
+/// was theirs to set, so it is theirs to clear, and leaving it would show them boxes that tick
+/// and change nothing a send would honour.
+///
+/// **`reason = 'unsubscribed_all'` is the whole of what this may touch, and that is the point.**
+/// `blocking` is the one definition of "may this address be mailed" (`m1a-decisions.md`), and a
+/// bounce, a complaint, an operator's manual block and an erasure tombstone are all facts about
+/// the address that a subscriber ticking a checkbox has no standing to overturn — an erasure
+/// tombstone is unliftable by anyone, including [`lift`]. Widening this predicate would turn an
+/// unauthenticated page into a way to clear any block in the workspace.
+///
+/// `lifted_by_user_id` stays null, which already means "no signed-in user did this".
+pub async fn lift_unsubscribed_all(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> ApiResult<bool> {
+    let Ok(email) = normalize_email(email) else {
+        return Ok(false);
+    };
+    let hmac = suppression_hmac(secrets, &email);
+    let lifted = sqlx::query_scalar!(
+        "update suppressions set lifted_at = now() \
+          where workspace_id = $1 and scope = 'address' and email_hmac = $2 \
+            and reason = 'unsubscribed_all' and lifted_at is null \
+         returning id",
+        workspace_id,
+        hmac.as_slice(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(lifted.is_some())
 }
 
 /// The domain of `x@<raw>` under exactly the rules `normalize_email` applies to an address, so a
