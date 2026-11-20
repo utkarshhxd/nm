@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into form_lists (workspace_id, form_id, list_id) select $1, $2, unnest($3::uuid[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "11d5ea96ee0c86fcf683eb5a29fa7485c110e0380d65b0c074781c257c6e9972"
+}

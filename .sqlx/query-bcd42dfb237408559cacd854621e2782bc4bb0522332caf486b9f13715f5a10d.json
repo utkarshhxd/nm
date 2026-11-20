@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update forms set slug = coalesce($3::text, slug), name = coalesce($4::text, name), fields = coalesce($5::jsonb, fields), headline = coalesce($6::text, headline), button_label = coalesce($7::text, button_label), redirect_url = case when $8::boolean then $9::text else redirect_url end, updated_at = now() where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bcd42dfb237408559cacd854621e2782bc4bb0522332caf486b9f13715f5a10d"
+}

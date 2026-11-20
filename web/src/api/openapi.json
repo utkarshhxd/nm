@@ -2766,6 +2766,260 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/forms": {
+      "get": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "list_forms",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Form"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "create_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Form"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a form takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "form-slug-taken"
+          },
+          "422": {
+            "description": "invalid input, an unknown field, or an unknown list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/forms/{id}": {
+      "get": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "get_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Form id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Form"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such form in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "summary": "A hard delete. The form's `form_lists` rows go with it; the lists and their members stay.",
+        "operationId": "delete_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Form id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, with its list links; the lists and their members stay"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a form takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such form in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "update_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Form id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Form"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a form takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such form in this workspace"
+          },
+          "409": {
+            "description": "form-slug-taken"
+          },
+          "422": {
+            "description": "invalid input, an unknown field, or an unknown list"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/imports": {
       "get": {
         "tags": [
@@ -5096,6 +5350,177 @@
           }
         }
       },
+      "Form": {
+        "type": "object",
+        "required": [
+          "id",
+          "workspace_id",
+          "slug",
+          "name",
+          "list_ids",
+          "fields",
+          "headline",
+          "button_label",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "button_label": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FormField"
+            }
+          },
+          "headline": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The lists one submission subscribes to, ascending. The Rust-side projection of the\n`form_lists` rows, so it is a set: the order a client sent is not kept."
+          },
+          "name": {
+            "type": "string",
+            "description": "The operator's own name for it; never shown to a submitter."
+          },
+          "redirect_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where a successful submission is to be sent. Absolute `http`/`https` only; see\n[`validate_redirect_url`]."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Unique in the workspace. It is what names the form in its public URL."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "FormField": {
+        "type": "object",
+        "description": "One input on the page.",
+        "required": [
+          "target",
+          "required",
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "What the page prints beside the input."
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "target": {
+            "$ref": "#/components/schemas/FormTarget"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FormTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "email"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "first_name"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "last_name"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "timezone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A custom field, by its `custom_fields.key`. Checked against the workspace's live\ndefinitions at write time: a form collecting into a field that is not there collects into\nnowhere, and the operator would find out only once the submissions had happened.",
+            "required": [
+              "value",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "custom"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "description": "A custom field, by its `custom_fields.key`. Checked against the workspace's live\ndefinitions at write time: a form collecting into a field that is not there collects into\nnowhere, and the operator would find out only once the submissions had happened."
+              }
+            }
+          }
+        ],
+        "description": "What one field of a form collects.\n\nThis is deliberately **not** `contacts::import::ContactField`, which the CSV importer uses.\nThat enum carries `Lists`, and a public form field targeting it would let whoever fills the\nform in name the lists they join — the form's lists are the operator's decision, not the\nsubmitter's. It also has no custom-field case, which spec §7.3 requires.\n\nThere is therefore no `Lists` variant here and there must never be one. Serde refuses an\nunknown tag, so a hand-written body naming `\"lists\"` fails to deserialise and the request is\nrefused before any handler sees it; `tests/forms.rs` pins that through the API, because no\nRust-level test can exercise a variant that does not exist."
+      },
       "ImportErrorRow": {
         "type": "object",
         "description": "One rejected row, as the operator has to read it: which row, which column, why, and the cell\nthat did it.",
@@ -5649,6 +6074,56 @@
         },
         "additionalProperties": false
       },
+      "NewForm": {
+        "type": "object",
+        "required": [
+          "slug",
+          "name",
+          "list_ids",
+          "fields",
+          "headline",
+          "button_label"
+        ],
+        "properties": {
+          "button_label": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FormField"
+            },
+            "description": "The page's inputs. Exactly one must target `email`."
+          },
+          "headline": {
+            "type": "string"
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "At least one, at most 25. Each must be a list of this workspace."
+          },
+          "name": {
+            "type": "string",
+            "description": "The operator's name for it."
+          },
+          "redirect_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute `http`/`https` only. Absent or `null` means the form has no redirect."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Unique in the workspace. It is what names the form in its public URL."
+          }
+        },
+        "additionalProperties": false
+      },
       "NewImport": {
         "type": "object",
         "description": "The request body, for the document: the one part, named `file`.",
@@ -6186,6 +6661,91 @@
                     "type": "string"
                   },
                   "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Form": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "workspace_id",
+                "slug",
+                "name",
+                "list_ids",
+                "fields",
+                "headline",
+                "button_label",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "button_label": {
+                  "type": "string"
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "fields": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FormField"
+                  }
+                },
+                "headline": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "list_ids": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "description": "The lists one submission subscribes to, ascending. The Rust-side projection of the\n`form_lists` rows, so it is a set: the order a client sent is not kept."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "The operator's own name for it; never shown to a submitter."
+                },
+                "redirect_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Where a successful submission is to be sent. Absolute `http`/`https` only; see\n[`validate_redirect_url`]."
+                },
+                "slug": {
+                  "type": "string",
+                  "description": "Unique in the workspace. It is what names the form in its public URL."
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "format": "uuid"
                 }
               }
             }
@@ -7313,6 +7873,50 @@
             "items": {
               "type": "string"
             }
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateForm": {
+        "type": "object",
+        "properties": {
+          "button_label": {
+            "type": "string",
+            "description": "Cannot be `null`."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FormField"
+            },
+            "description": "Replaces the fields outright. Cannot be `null`."
+          },
+          "headline": {
+            "type": "string",
+            "description": "Cannot be `null`."
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Replaces the lists outright. Cannot be `null` or empty."
+          },
+          "name": {
+            "type": "string",
+            "description": "Cannot be `null`."
+          },
+          "redirect_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears it, leaving the form with no redirect."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Cannot be `null`."
           }
         },
         "additionalProperties": false

@@ -794,6 +794,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/forms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_forms"];
+        put?: never;
+        post: operations["create_form"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/forms/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_form"];
+        put?: never;
+        post?: never;
+        /** A hard delete. The form's `form_lists` rows go with it; the lists and their members stay. */
+        delete: operations["delete_form"];
+        options?: never;
+        head?: never;
+        patch: operations["update_form"];
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/imports": {
         parameters: {
             query?: never;
@@ -1463,6 +1496,75 @@ export interface components {
             /** @description The browser's `PublicKeyCredential`, in WebAuthn JSON form. */
             credential: Record<string, never>;
         };
+        Form: {
+            button_label: string;
+            /** Format: date-time */
+            created_at: string;
+            fields: components["schemas"]["FormField"][];
+            headline: string;
+            /** Format: uuid */
+            id: string;
+            /**
+             * @description The lists one submission subscribes to, ascending. The Rust-side projection of the
+             *     `form_lists` rows, so it is a set: the order a client sent is not kept.
+             */
+            list_ids: string[];
+            /** @description The operator's own name for it; never shown to a submitter. */
+            name: string;
+            /**
+             * @description Where a successful submission is to be sent. Absolute `http`/`https` only; see
+             *     [`validate_redirect_url`].
+             */
+            redirect_url?: string | null;
+            /** @description Unique in the workspace. It is what names the form in its public URL. */
+            slug: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: uuid */
+            workspace_id: string;
+        };
+        /** @description One input on the page. */
+        FormField: {
+            /** @description What the page prints beside the input. */
+            label: string;
+            required: boolean;
+            target: components["schemas"]["FormTarget"];
+        };
+        /**
+         * @description What one field of a form collects.
+         *
+         *     This is deliberately **not** `contacts::import::ContactField`, which the CSV importer uses.
+         *     That enum carries `Lists`, and a public form field targeting it would let whoever fills the
+         *     form in name the lists they join — the form's lists are the operator's decision, not the
+         *     submitter's. It also has no custom-field case, which spec §7.3 requires.
+         *
+         *     There is therefore no `Lists` variant here and there must never be one. Serde refuses an
+         *     unknown tag, so a hand-written body naming `"lists"` fails to deserialise and the request is
+         *     refused before any handler sees it; `tests/forms.rs` pins that through the API, because no
+         *     Rust-level test can exercise a variant that does not exist.
+         */
+        FormTarget: {
+            /** @enum {string} */
+            kind: "email";
+        } | {
+            /** @enum {string} */
+            kind: "first_name";
+        } | {
+            /** @enum {string} */
+            kind: "last_name";
+        } | {
+            /** @enum {string} */
+            kind: "timezone";
+        } | {
+            /** @enum {string} */
+            kind: "custom";
+            /**
+             * @description A custom field, by its `custom_fields.key`. Checked against the workspace's live
+             *     definitions at write time: a form collecting into a field that is not there collects into
+             *     nowhere, and the operator would find out only once the submissions had happened.
+             */
+            value: string;
+        };
         /**
          * @description One rejected row, as the operator has to read it: which row, which column, why, and the cell
          *     that did it.
@@ -1734,6 +1836,20 @@ export interface components {
             /** @description Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind. */
             options?: string[] | null;
         };
+        NewForm: {
+            button_label: string;
+            /** @description The page's inputs. Exactly one must target `email`. */
+            fields: components["schemas"]["FormField"][];
+            headline: string;
+            /** @description At least one, at most 25. Each must be a list of this workspace. */
+            list_ids: string[];
+            /** @description The operator's name for it. */
+            name: string;
+            /** @description Absolute `http`/`https` only. Absent or `null` means the form has no redirect. */
+            redirect_url?: string | null;
+            /** @description Unique in the workspace. It is what names the form in its public URL. */
+            slug: string;
+        };
         /** @description The request body, for the document: the one part, named `file`. */
         NewImport: {
             /**
@@ -1900,6 +2016,36 @@ export interface components {
                 label: string;
                 /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
                 options: string[];
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Form: {
+            data: {
+                button_label: string;
+                /** Format: date-time */
+                created_at: string;
+                fields: components["schemas"]["FormField"][];
+                headline: string;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * @description The lists one submission subscribes to, ascending. The Rust-side projection of the
+                 *     `form_lists` rows, so it is a set: the order a client sent is not kept.
+                 */
+                list_ids: string[];
+                /** @description The operator's own name for it; never shown to a submitter. */
+                name: string;
+                /**
+                 * @description Where a successful submission is to be sent. Absolute `http`/`https` only; see
+                 *     [`validate_redirect_url`].
+                 */
+                redirect_url?: string | null;
+                /** @description Unique in the workspace. It is what names the form in its public URL. */
+                slug: string;
+                /** Format: date-time */
+                updated_at: string;
+                /** Format: uuid */
+                workspace_id: string;
             }[];
             next_cursor?: string | null;
         };
@@ -2373,6 +2519,22 @@ export interface components {
             kind?: components["schemas"]["FieldKind"] | null;
             label?: string | null;
             options?: string[] | null;
+        };
+        UpdateForm: {
+            /** @description Cannot be `null`. */
+            button_label?: string;
+            /** @description Replaces the fields outright. Cannot be `null`. */
+            fields?: components["schemas"]["FormField"][];
+            /** @description Cannot be `null`. */
+            headline?: string;
+            /** @description Replaces the lists outright. Cannot be `null` or empty. */
+            list_ids?: string[];
+            /** @description Cannot be `null`. */
+            name?: string;
+            /** @description `null` clears it, leaving the form with no redirect. */
+            redirect_url?: string | null;
+            /** @description Cannot be `null`. */
+            slug?: string;
         };
         /**
          * @description A field left out is left alone. `null` clears `description` to an empty string; on any other
@@ -4933,6 +5095,226 @@ export interface operations {
             };
             /** @description field-not-archived, or field-in-use: a segment still names it, and the problem lists which */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_forms: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Form"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewForm"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Form"];
+                };
+            };
+            /** @description insufficient-role: creating a form takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description form-slug-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid input, an unknown field, or an unknown list */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Form id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Form"];
+                };
+            };
+            /** @description not a member, or no such form in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Form id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, with its list links; the lists and their members stay */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a form takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such form in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Form id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateForm"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Form"];
+                };
+            };
+            /** @description insufficient-role: editing a form takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such form in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description form-slug-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid input, an unknown field, or an unknown list */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

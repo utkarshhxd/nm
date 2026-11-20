@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod custom_fields;
 pub mod db;
 pub mod error;
+pub mod forms;
 pub mod http;
 pub mod lists;
 pub mod openapi;
