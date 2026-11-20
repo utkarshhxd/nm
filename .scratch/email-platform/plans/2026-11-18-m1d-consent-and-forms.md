@@ -477,13 +477,16 @@ designed for them, not shaped by what a Playwright spec happens to want. A dev d
 ship in the bundle and does not touch `check:bundle`.
 
 
-**Files:** Create `web/e2e/preference-center.spec.ts`; modify `src/public/page.rs`.
+**Files:** Create `web/e2e/preference-center.spec.ts` and `web/e2e/support/public-link.ts`; modify
+`src/public/page.rs`, `src/public/unsubscribe.rs` (the markup that needs fixing is here, not in
+`page.rs`), `web/e2e/support/server.ts` and `src/http/rate_limit.rs` (the recorded margin).
 
 - [ ] **Step 1: Write the failing e2e:** confirm a pending membership, open the preference center, untick a list, assert the change; run the axe pass on all three public pages at 100% and 200% zoom, in both themes.
 - [ ] **Step 2: Run and watch fail.**
 - [ ] **Step 3: Fix the markup** until axe is clean: a `<label>` per checkbox, a visible focus ring, a live region for the result, and a `<title>` per page.
 - [ ] **Step 4: Run and watch pass**, checking for `did not run`.
-- [ ] **Step 5: Verify with JavaScript disabled** — `page.context().setJavaScriptEnabled(false)` — that the preference center still submits. This is the spec's constraint and nothing else tests it.
+- [ ] **Step 5: Verify with JavaScript disabled** — a context built with the `javaScriptEnabled: false`
+option (`page.context().setJavaScriptEnabled()` is Puppeteer's, not Playwright's) — that the preference center still submits. This is the spec's constraint and nothing else tests it.
 - [ ] **Step 6: Commit** `feat: the public pages meet WCAG 2.2 AA and work without JavaScript`
 
 ---
