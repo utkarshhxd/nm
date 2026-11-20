@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import AxeBuilder from "@axe-core/playwright";
-import { type BrowserContext, type Page, expect, test } from "@playwright/test";
+import { type BrowserContext, type Locator, type Page, expect, test } from "@playwright/test";
 
 import { expectNoViolations } from "./support/axe";
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
@@ -134,7 +134,10 @@ test.afterAll(async () => {
 const contactsPath = `/w/${SLUG}/contacts`;
 const contactPath = (id: string) => `${contactsPath}/${id}`;
 const listsPath = `/w/${SLUG}/lists`;
-const row = (p: Page, text: string) => p.getByRole("row").filter({ hasText: text });
+// Takes a Locator as well as a Page, because the contact page has more than one table that
+// names a list: the memberships and, since M1d, the consent history. A page-wide row filter
+// there matches both and fails in strict mode.
+const row = (p: Page | Locator, text: string) => p.getByRole("row").filter({ hasText: text });
 const dialog = (p: Page, name: string) => p.getByRole("dialog", { name, exact: true });
 
 test("create_a_contact_then_find_it_in_the_grid", async () => {
@@ -325,7 +328,7 @@ test("create_a_list_then_add_a_contact_to_it", async () => {
   const lists = page.getByRole("region", { name: "Lists", exact: true });
   await lists.getByLabel("List to add", { exact: true }).selectOption({ label: "Product news" });
   await lists.getByRole("button", { name: "Add to list", exact: true }).click();
-  await expect(row(page, "Product news")).toContainText("Subscribed");
+  await expect(row(lists, "Product news")).toContainText("Subscribed");
   const joined = await memberships(ids.created);
   expect(joined).toMatchObject([{ name: "Product news", status: "subscribed" }]);
   ids.list = joined[0]?.list_id ?? "";
@@ -343,7 +346,7 @@ test("remove_a_membership_leaves_it_unsubscribed_not_deleted", async () => {
   await lists.getByRole("button", { name: "Confirm unsubscribe Product news", exact: true }).click();
 
   // Still there, as unsubscribed — on the screen and in the database.
-  await expect(row(page, "Product news")).toContainText("Unsubscribed");
+  await expect(row(lists, "Product news")).toContainText("Unsubscribed");
   expect(await memberships(ids.created)).toMatchObject([
     { name: "Product news", status: "unsubscribed" },
   ]);
