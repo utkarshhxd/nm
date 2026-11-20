@@ -164,7 +164,7 @@ on the operator's own site. When M2 ships tracking domains with on-demand TLS, a
 the operator's own host can drop the segment, because there the host already names the workspace.
 
 All five are unauthenticated, CSRF-exempt by design (they are token-authenticated), rate-limited
-per IP, and **must not disclose whether an address exists**: `POST /f/{slug}` answers identically
+per IP, and **must not disclose whether an address exists**: `POST /f/{workspace}/{slug}` answers identically
 for a new address, an existing subscriber, and a suppressed address.
 
 ### 7.3 Forms
@@ -177,7 +177,7 @@ Double opt-in follows **the list's** `double_optin`, not the form's. A form targ
 where one is double opt-in and one is not produces a `pending` membership on the first and
 `subscribed` on the second, from one submission.
 
-Embedding is a plain HTML `<form>` snippet the operator copies, posting to `/f/{slug}`. No
+Embedding is a plain HTML `<form>` snippet the operator copies, posting to `/f/{workspace}/{slug}`. No
 JavaScript is required for it to work.
 
 ### 7.4 Admin UI
@@ -199,7 +199,7 @@ contact detail screen; the public name/description/visibility fields on the list
 5. A confirmation token used twice confirms once and reports "already confirmed".
 6. An expired confirmation token refuses and offers to re-send, without disclosing whether the
    address exists.
-7. `POST /f/{slug}` is byte-identical in response for a new, existing and suppressed address.
+7. `POST /f/{workspace}/{slug}` is byte-identical in response for a new, existing and suppressed address.
 8. Every `list_memberships.status` write in the tree has a matching `consent_log` row.
 9. A form submission that trips the honeypot or the per-IP rate limit answers exactly as a
    successful one does.
