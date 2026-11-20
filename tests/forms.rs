@@ -285,9 +285,16 @@ async fn a_redirect_url_must_be_an_absolute_http_url(pool: PgPool) {
     for bad in [
         "javascript:alert(1)",
         "JavaScript:alert(1)",
+        // Has a host, and a path that is a newline followed by code. Nothing about its shape is
+        // wrong; the scheme is the only thing refusing it, which is why the two entries below it
+        // are not interchangeable with a host check.
+        "javascript://example.test/%0Aalert(1)",
         "data:text/html,<script>alert(1)</script>",
         "/thanks",
         "thanks",
+        // LOAD-BEARING, do not delete as redundant: `ftp:` parses, has a host and is perfectly
+        // well-formed, so this is the API-level case that exercises the scheme check and nothing
+        // else. Every other entry here is also caught by the parser or by its obvious shape.
         "ftp://example.test/thanks",
         "",
     ] {
@@ -586,9 +593,12 @@ async fn deleting_a_list_leaves_the_form_without_it(pool: PgPool) {
 /// asked for at the moment the person agreed — and the consent log is append-only precisely so
 /// that evidence survives.
 ///
-/// The load-bearing assertion is the last one: the `form.created` row still names the list the
-/// form had at creation, **after** a later edit has moved the form to another list. A
-/// metadata-is-the-key-names implementation passes every other assertion here and fails that one.
+/// The load-bearing assertion is `created["list_ids"] == [news]`, made **after** a later edit has
+/// moved the form to another list: the edit did not rewrite history, so the row still names what
+/// the people who submitted before the edit actually agreed to. A metadata-is-the-key-names
+/// implementation fails exactly that line. The last assertion in the test pins a second property
+/// the first one does not reach — that the row is the *whole* definition and not only the keys
+/// this test happens to read.
 #[sqlx::test]
 async fn form_writes_are_audited_with_the_definition_in_force(pool: PgPool) {
     let (ws, app) = workspace(&pool, "acme").await;
@@ -603,6 +613,7 @@ async fn form_writes_are_audited_with_the_definition_in_force(pool: PgPool) {
         .await;
     r.assert_status(StatusCode::CREATED);
     let id = id_of(&r);
+    let created_body = r.json::<Value>();
 
     // An edit that changes both what the form collects into and what it says.
     let r = app
@@ -622,8 +633,12 @@ async fn form_writes_are_audited_with_the_definition_in_force(pool: PgPool) {
     }
 
     let (created, updated, deleted) = (&rows[0].2, &rows[1].2, &rows[2].2);
-    // Each row carries the definition as it stood when that write happened.
+    // THE LOAD-BEARING LINE. The form has since been moved to `offers` and then deleted outright,
+    // and the `form.created` row still names `news` — which is what everyone who submitted before
+    // the edit agreed to. An implementation that recorded only the keys a request named has
+    // nothing here at all.
     assert_eq!(created["list_ids"], json!([news]));
+    // Each row carries the definition as it stood when that write happened.
     assert_eq!(created["headline"], "Join the list");
     assert_eq!(updated["list_ids"], json!([offers]));
     assert_eq!(updated["headline"], "Different words");
@@ -639,10 +654,18 @@ async fn form_writes_are_audited_with_the_definition_in_force(pool: PgPool) {
         );
     }
 
-    // The point of the whole exercise: the edit did not rewrite history. `form.created` still
-    // names `news`, which is what the people who submitted before the edit actually agreed to.
-    assert_ne!(created["list_ids"], updated["list_ids"]);
-    assert_eq!(created["list_ids"], json!([news]));
+    // A second property, which the assertions above cannot reach because they each name a key:
+    // the row is the WHOLE definition, so its key set is the API's own `Form` body. A row
+    // carrying a well-chosen subset — the three keys this test reads, say — passes everything
+    // above and fails here, and a reader coming back to it years from now gets the whole form
+    // without this test having had to enumerate it.
+    let keys = |v: &Value| {
+        let mut k: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(keys(created), keys(&created_body));
+    assert!(keys(created).len() > 5, "a Form has more than five fields");
 }
 
 /// A refused write leaves no audit row: the log records what happened, not what was attempted.
@@ -678,4 +701,101 @@ async fn a_refused_form_write_is_not_audited(pool: PgPool) {
         .await
         .assert_status(StatusCode::CREATED);
     assert_eq!(form_audit(&pool, ws).await.len(), 1);
+}
+
+/// PATCH is the other door into `fields`, and it is the half that can regress: the validator is
+/// shared, but nothing proved the update route actually calls it. Create is covered by
+/// `a_form_field_targeting_an_unknown_custom_field_is_refused`; this is the same refusal arriving
+/// through `PATCH`, with the stored form left exactly as it was.
+#[sqlx::test]
+async fn patching_a_field_onto_an_unknown_custom_field_is_refused(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (other_ws, other) = workspace(&pool, "globex").await;
+    let list = create_list(&app, ws, "news").await;
+    create_custom_field(&app, ws, "mine").await;
+    create_custom_field(&other, other_ws, "theirs").await;
+
+    let r = app
+        .post(&forms_path(ws))
+        .json(&new_form("signup", list))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+
+    let patch = |key: &str| {
+        json!({"fields": [
+            {"target": {"kind": "email"}, "required": true, "label": "Email"},
+            {"target": {"kind": "custom", "value": key}, "required": false, "label": "x"},
+        ]})
+    };
+    // Another workspace's custom field, and one that exists nowhere: the same answer.
+    let theirs = app
+        .patch(&format!("{}/{id}", forms_path(ws)))
+        .json(&patch("theirs"))
+        .await;
+    theirs.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let nobodys = app
+        .patch(&format!("{}/{id}", forms_path(ws)))
+        .json(&patch("no_such_field"))
+        .await;
+    nobodys.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The refusal did not half-apply: the form still collects what it did before.
+    let r = app.get(&format!("{}/{id}", forms_path(ws))).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["fields"].as_array().unwrap().len(), 1);
+
+    // The control: this workspace's own field goes on through the same door, so the refusals
+    // above are "not yours" and not "PATCH never accepts a custom target".
+    let r = app
+        .patch(&format!("{}/{id}", forms_path(ws)))
+        .json(&patch("mine"))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(
+        r.json::<Value>()["fields"][1]["target"],
+        json!({"kind": "custom", "value": "mine"})
+    );
+}
+
+/// A PATCH that names nothing changes nothing — not `updated_at`, and not the audit log. A
+/// `form.updated` row for a day nobody edited the form is a false entry in the record that says
+/// what a form looked like when somebody consented to it.
+#[sqlx::test]
+async fn an_empty_patch_writes_nothing(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let list = create_list(&app, ws, "news").await;
+    let r = app
+        .post(&forms_path(ws))
+        .json(&new_form("signup", list))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+    let before = r.json::<Value>();
+
+    let r = app
+        .patch(&format!("{}/{id}", forms_path(ws)))
+        .json(&json!({}))
+        .await;
+    r.assert_status_ok();
+    // Byte for byte, `updated_at` included.
+    assert_eq!(r.json::<Value>(), before);
+    assert_eq!(form_audit(&pool, ws).await.len(), 1, "only the create");
+
+    // The control: a PATCH that does name something bumps `updated_at` and is audited, so the
+    // assertions above are the empty body and not a route that never writes.
+    let r = app
+        .patch(&format!("{}/{id}", forms_path(ws)))
+        .json(&json!({"headline": "New words"}))
+        .await;
+    r.assert_status_ok();
+    assert_ne!(r.json::<Value>()["updated_at"], before["updated_at"]);
+    assert_eq!(form_audit(&pool, ws).await.len(), 2);
+
+    // And an empty PATCH on another workspace's form is still a 404, not a quiet 200.
+    let (other_ws, _other) = workspace(&pool, "globex").await;
+    app.patch(&format!("{}/{id}", forms_path(other_ws)))
+        .json(&json!({}))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
 }

@@ -411,6 +411,22 @@ pub async fn update_form(
         return Err(ApiError::Validation(errors));
     }
 
+    // A PATCH that named nothing changes nothing, and that includes `updated_at` and the audit
+    // log. Writing a `form.updated` row here would put an entry in an append-only record saying
+    // an operator changed a form on a day they did not, which is worse than the missing row
+    // would have been — the whole reason these rows exist is to say what a form looked like when
+    // somebody consented. The 404 for another workspace's id still happens, below.
+    if slug.is_none()
+        && name.is_none()
+        && list_ids.is_none()
+        && fields.is_none()
+        && !sets_redirect
+        && headline.is_none()
+        && button_label.is_none()
+    {
+        return Ok(Json(super::get(&mut tx, workspace_id, id).await?));
+    }
+
     let updated = sqlx::query!(
         "update forms set slug = coalesce($3::text, slug), name = coalesce($4::text, name), \
          fields = coalesce($5::jsonb, fields), headline = coalesce($6::text, headline), \

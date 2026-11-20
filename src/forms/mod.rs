@@ -178,13 +178,25 @@ pub fn validate_redirect_url(raw: &str) -> Result<String, FieldError> {
         return Err(err());
     }
     let url = Url::parse(raw).map_err(|_| err())?;
+    // THE SCHEME CHECK IS THE ONE THAT MATTERS, and a host check is not a substitute for it.
+    // `javascript://host/%0Aalert(1)` parses with a perfectly respectable host and a path that is
+    // a newline followed by code: everything about it is well-formed except the scheme.
+    //
+    // There is deliberately no host check beside it. `http` and `https` are "special" schemes in
+    // the URL standard, so `Url::parse` has already refused an empty host before this line — a
+    // host check here would be unreachable, and an unreachable guard reads as protection that is
+    // not there. Adding a non-special scheme to this list (`file:`, say, which permits an empty
+    // host) removes that guarantee and would need its own check.
     if !matches!(url.scheme(), "http" | "https") {
         return Err(err());
     }
-    if url.host_str().is_none_or(|h| h.is_empty()) {
+    // Measured again on the way out, not only on the way in: percent-encoding can make the
+    // serialisation longer than what was sent, and `MAX_URL` is a bound on what gets STORED.
+    let out = url.to_string();
+    if out.len() > MAX_URL {
         return Err(err());
     }
-    Ok(url.to_string())
+    Ok(out)
 }
 
 /// A form may name at most this many lists. One submission writes a membership, a consent row and
@@ -313,26 +325,58 @@ mod tests {
     }
 
     /// The scheme check is the whole point: markup escaping downstream does not touch a scheme.
+    /// The two groups below are refused by different things, and the distinction is the point.
     #[test]
     fn redirect_urls() {
         assert_eq!(
             validate_redirect_url("https://example.test/thanks").unwrap(),
             "https://example.test/thanks"
         );
+
+        // REFUSED BY THE SCHEME CHECK. Each of these parses: it is a well-formed URL and the only
+        // thing wrong with it is what it would do. `javascript://host/%0Aalert(1)` is the case
+        // that matters most — it has a host, so nothing about its shape is suspicious, and the
+        // scheme is the sole reason it is refused. Do not delete this group as redundant with the
+        // parse-error group below; they prove different lines.
         for bad in [
             "javascript:alert(1)",
             "JAVASCRIPT:alert(1)",
             "  javascript:alert(1)",
+            "javascript://example.test/%0Aalert(1)",
             "data:text/html,<script>alert(1)</script>",
             "vbscript:msgbox(1)",
             "file:///etc/passwd",
+            "ftp://example.test/thanks",
+        ] {
+            let url = Url::parse(bad.trim()).expect("parses: only its scheme is wrong");
+            assert!(!matches!(url.scheme(), "http" | "https"), "{bad:?}");
+            assert!(validate_redirect_url(bad).is_err(), "{bad:?}");
+        }
+
+        // REFUSED BY THE PARSER, before any check of ours runs. `http://` is here and not above:
+        // it has no host, and `http` being a special scheme is exactly why `Url::parse` rejects
+        // it rather than our code.
+        for bad in [
             "//example.test/thanks",
             "/thanks",
             "",
             "http://",
+            "https://",
         ] {
+            assert!(Url::parse(bad).is_err(), "{bad:?}");
             assert!(validate_redirect_url(bad).is_err(), "{bad:?}");
         }
+
+        // The cap is on what is stored, so it is measured after percent-encoding: this raw string
+        // is under `MAX_URL` and its serialisation is over it.
+        // The trailing `x` matters: the URL standard strips leading and trailing spaces from the
+        // input, so spaces at the end would never reach the encoder.
+        let spaces = format!("https://e.test/{}x", " ".repeat(MAX_URL / 2));
+        assert!(spaces.len() <= MAX_URL, "the raw string is under the cap");
+        assert!(
+            validate_redirect_url(&spaces).unwrap_err().field == "redirect_url",
+            "a URL that only exceeds the cap once encoded is still refused"
+        );
         assert!(validate_redirect_url(&format!("https://e.test/{}", "a".repeat(MAX_URL))).is_err());
     }
 

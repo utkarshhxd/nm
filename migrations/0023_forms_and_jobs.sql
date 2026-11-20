@@ -70,16 +70,72 @@ create index form_lists_by_list on form_lists (workspace_id, list_id);
 -- One row per (contact, list): a `Confirm` token carries exactly one `list_id`, so a submission
 -- naming several double-opt-in lists enqueues several rows.
 --
--- `attempts` is the worker's retry counter, `run_after` its earliest run time; both have defaults
--- so an enqueue names only `workspace_id`, `kind` and `payload`.
+-- HOW A ROW IS CLAIMED. This is a REQUIREMENT ON THE CONSUMER, not a description of one possible
+-- worker. M2 must claim with a single statement of this shape:
+--
+--     update jobs set attempts = attempts + 1, run_after = now() + <lease>
+--     where id in (select id from jobs
+--                  where run_after <= now() and failed_at is null
+--                  order by run_after, id
+--                  for update skip locked
+--                  limit $batch)
+--     returning *;
+--
+-- Two things in it are load-bearing and neither is optional:
+--
+--  * `for update skip locked`. Without it, two pollers select the same row and both run it.
+--  * `run_after` advanced in the SAME statement. It is the LEASE, not merely a schedule. A claim
+--    that leaves `run_after` in the past re-offers the row at the next poll, before the first
+--    worker has finished with it.
+--
+-- A plain `select ... where run_after <= now()` followed by a separate update is NOT a claim:
+-- between the two statements another worker reads the same row. For `confirmation_email` that is
+-- one person receiving the same confirmation twice, and nothing here will catch it — there is no
+-- unique constraint to lean on, because the same job may legitimately be enqueued twice (a
+-- subscriber who submits the form again before confirming).
+--
+-- A worker that dies mid-job leaves the row claimed until its lease expires, at which point the
+-- row becomes runnable again and `attempts` has already counted the dead attempt. That is the
+-- intended behaviour: at-least-once delivery, with the duplicate bounded by the lease.
+--
+-- `kind` is a stable string, not an enum: M2 adds kinds without a migration here. The one kind
+-- M1d enqueues is `confirmation_email`, whose `payload` M2 parses as
+--
+--     {"contact_id": uuid, "list_id": uuid, "email": "…", "token": "<public confirm token>"}
+--
+-- `token` is the ALREADY-ISSUED token string from `public::token::issue`, carried verbatim. It is
+-- not a new field inside the token: `src/public/token.rs` documents that the token's field list
+-- is frozen once the first unsubscribe link ships (`deny_unknown_fields`, no TTL on
+-- `Purpose::Unsubscribe`), so anything a job needs travels beside the token, never inside it.
+-- One row per (contact, list): a `Confirm` token carries exactly one `list_id`, so a submission
+-- naming several double-opt-in lists enqueues several rows.
+--
+-- GIVING UP. `attempts` counts claims, `max_attempts` is where the worker stops: on the attempt
+-- that reaches it, set `failed_at = now()` and `last_error` and leave the row for an operator to
+-- read. A failed row is skipped by the claim above (`failed_at is null`) rather than deleted,
+-- because "this confirmation was never sent" is the question someone will ask months later, and a
+-- deleted row cannot answer it. These three columns follow `imports`, which keeps `error_reason`
+-- beside its `failed` status for the same reason. They are here now because `jobs` is empty
+-- today: adding them in M2 is a migration on a table that by then holds every email the product
+-- has queued.
+--
+-- `run_after` is the earliest run time, and `created_at` is when it was enqueued — they diverge
+-- the moment a row is claimed, so neither substitutes for the other. Every column but
+-- `workspace_id`, `kind` and `payload` has a default, so an enqueue names only those three.
 create table jobs (id uuid primary key,
   workspace_id uuid not null references workspaces(id) on delete cascade,
   kind text not null,
   payload jsonb not null,
   run_after timestamptz not null default now(),
   attempts int not null default 0,
+  max_attempts int not null default 5,
+  last_error text,
+  failed_at timestamptz,
   created_at timestamptz not null default now());
 
--- The worker's claim query: oldest runnable row first. `id` is a v7 uuid, so it breaks ties by
--- insertion order.
-create index jobs_runnable on jobs (run_after, id);
+-- The claim query's index, and it carries that query's own predicate: a partial index on the
+-- rows still worth looking at. Rows that have given up stay in the table (see GIVING UP above)
+-- and would otherwise sit in this index forever, read on every poll and never claimed.
+-- `(run_after, id)` is the claim's `order by`; `id` is a v7 uuid, so it breaks ties by enqueue
+-- order.
+create index jobs_runnable on jobs (run_after, id) where failed_at is null;
