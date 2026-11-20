@@ -681,16 +681,13 @@ async fn a_rename_that_commits_mid_save_does_not_leave_the_old_name_on_the_refus
         }
     });
 
-    // The premise, not the assertion: the two really do overlap, so the check below is about a
-    // rename that landed mid-save and not about one that was over before the save began. It holds
-    // either way — without `for key share` the save still blocks, but only at the foreign key's
-    // own check, which runs after the row has been built from the stale read and so cannot change
-    // what it stored. That is why the stored name below is the assertion and this is not.
+    // What makes the two overlap, so the check below is about a rename that landed mid-save and
+    // not about one that was over before the save began. There is no assertion here: the save
+    // blocks under both the fixed and the broken statement — at `for key share`, or later at the
+    // foreign key's own check, which runs after the row has been built from the stale read and so
+    // cannot change what it stored. The stored name is the only thing that tells them apart, which
+    // is what the mutation check shows.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !saving.is_finished(),
-        "the save finished before the rename committed, so this proves nothing about the overlap"
-    );
 
     renaming.commit().await.expect("commit the rename");
     saving.await.expect("the save");
@@ -702,16 +699,18 @@ async fn a_rename_that_commits_mid_save_does_not_leave_the_old_name_on_the_refus
     );
 }
 
-/// **The rename's carve-out tests the live-uniqueness key, not one special case of it.** It used
-/// to ask only whether an *orphaned* refusal already held the new name. A live refusal that still
-/// carries a `list_id` and a stale `list_name` collides on `suppressions_live` exactly as hard, and
-/// the operator's rename failed with a duplicate key and rolled back.
+/// **A rename cannot collide with anything, whatever else the address has refused.** No unique
+/// index covering a live list refusal mentions `list_name`, so moving a snapshot is not a key
+/// update and the trigger has no case to carve out. It used to: the live key was the name, so a
+/// rename onto a name another live refusal by that address already held failed the operator with
+/// `duplicate key value violates unique constraint "suppressions_live"`, and every attempt to
+/// guard that left stale names behind that the next rename choked on.
 ///
-/// The stale row is written here directly, because the race that used to produce it is closed by
-/// the test above — and a guard is still a guard against the state, not against one way of
-/// reaching it.
+/// The second refusal is made to hold the incoming name directly, because keying on the list means
+/// nothing in the product produces that state any more — and the property is about the state, not
+/// about one route to it.
 #[sqlx::test]
-async fn a_rename_onto_a_name_a_live_refusal_already_holds_does_not_fail(pool: PgPool) {
+async fn a_rename_cannot_collide_with_the_addresss_other_refusals(pool: PgPool) {
     let w = workspace(&pool, "acme").await;
     let mut conn = pool.acquire().await.unwrap();
     let news = make_list(&mut conn, w.id, "news").await;
@@ -735,22 +734,141 @@ async fn a_rename_onto_a_name_a_live_refusal_already_holds_does_not_fail(pool: P
         .await
         .expect("the operator's rename must not fail");
 
-    // The skipped row keeps its old name and its `list_id`, which is the only thing any reader
-    // matches on, so no refusal is lost: both lists are still refused.
+    // The refusal follows its list — no skipping, no stale snapshot left behind — and the other
+    // refusal keeps its own `list_id`, which is the only thing any reader matches on, so neither
+    // list stops being refused.
     assert_eq!(
         refusals(&pool, w.id).await,
         [
-            (Some(news), Some("news".to_owned())),
+            (Some(news), Some("bulletin".to_owned())),
             (Some(other), Some("bulletin".to_owned()))
         ],
+        "the renamed list's refusal must carry the name that list now has"
     );
 }
 
-/// **Two renames over an orphaned refusal, which is where the carve-out used to leave debris that
-/// the next rename choked on.** The first rename is skipped because the orphan already holds the
-/// new name; if the orphan were then adopted onto the same list, the address would have two live
-/// refusals on one list under two names, and the second rename would move both to one name at once
-/// and violate `suppressions_live` from inside the trigger.
+/// **Important 2's sequence: a second untick after a rename must not steal the orphan that holds
+/// the new name.** `unsubscribe_list` used to conflict on `list_name`, which cannot see the live
+/// refusal already sitting on this list under a different name, so it conflicted with the ORPHAN
+/// instead and re-pointed it. Two harms in one statement: two live refusals on one list, after
+/// which every later rename of it failed permanently — and the address's refusal of the *deleted*
+/// list of that name silently gone, so recreating one no longer restored it. That last part is the
+/// delete-and-recreate resurrection this whole scope exists to close.
+///
+/// Step 4 is a second untick with the first refusal still live, which is what a re-subscribe by any
+/// path that does not lift leaves behind — an operator adding the member, an import, a form
+/// submission. The subscriber's own re-tick lifts, which is why this needs an operator to reach.
+#[sqlx::test]
+async fn a_second_untick_after_a_rename_does_not_steal_the_orphan_of_the_new_name(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let news = make_list(&mut conn, w.id, "News").await;
+    let newsletter = make_list(&mut conn, w.id, "Newsletter").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse News");
+    unsubscribe_list(&mut conn, &secrets(), w.id, newsletter, ADA)
+        .await
+        .expect("refuse Newsletter");
+    drop(conn);
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(newsletter)
+        .execute(&pool)
+        .await
+        .expect("delete Newsletter");
+    sqlx::query("update lists set name = 'Newsletter' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("rename News");
+
+    let mut conn = pool.acquire().await.unwrap();
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("untick it again");
+    drop(conn);
+
+    let rows = refusals(&pool, w.id).await;
+    assert_eq!(
+        rows.iter().filter(|(l, _)| *l == Some(news)).count(),
+        1,
+        "two live refusals on one list: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(None, Some("Newsletter".to_owned()))),
+        "the refusal of the DELETED list of that name was taken over: {rows:?}"
+    );
+
+    // Both harms, from the other side: the list is still renamable, and recreating a list of the
+    // orphan's name still restores the refusal that was waiting for it.
+    sqlx::query("update lists set name = 'Digest' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("the list must still be renamable");
+    let mut conn = pool.acquire().await.unwrap();
+    let reborn = make_list(&mut conn, w.id, "Newsletter").await;
+    drop(conn);
+    assert!(
+        refusals(&pool, w.id)
+            .await
+            .contains(&(Some(reborn), Some("Newsletter".to_owned()))),
+        "a list recreated under the orphan's name must adopt the refusal waiting for it"
+    );
+}
+
+/// **The re-subscribe half of the preference centre has to take the `lists` row before the refusal
+/// it lifts.** The membership insert that follows takes `FOR KEY SHARE` on that row through its own
+/// foreign key, so a lift that touched `suppressions` first would run the two in the opposite order
+/// from a rename, which goes `lists` then `suppressions` through its trigger — and the two
+/// deadlock. Reproduced against Postgres 16 before this: `deadlock detected` while locking a tuple
+/// in `lists`, victim chosen by Postgres, so either a `500` on the public page or a failed rename.
+///
+/// The order is the requirement here, so the order is what is asserted: another session asking for
+/// the same `lists` row must find it already held.
+#[sqlx::test]
+async fn a_re_tick_takes_the_list_row_before_the_refusal_it_lifts(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let list = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, list, ADA)
+        .await
+        .expect("refuse news");
+    drop(conn);
+
+    let mut ticking = pool.begin().await.unwrap();
+    lift_unsubscribed_list(&mut ticking, &secrets(), w.id, list, ADA)
+        .await
+        .expect("the subscriber comes back");
+
+    // `for update` conflicts with the `for key share` the lift must be holding, and touches
+    // nothing else, so the refusal row this transaction also holds cannot be what blocks it.
+    let mut probe = pool.begin().await.unwrap();
+    sqlx::query("set local lock_timeout = '250ms'")
+        .execute(&mut *probe)
+        .await
+        .unwrap();
+    let err = sqlx::query("select 1 from lists where id = $1 for update")
+        .bind(list)
+        .fetch_all(&mut *probe)
+        .await
+        .expect_err("the lift must already hold the list row");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|e| e.code())
+            .as_deref()
+            .map(ToOwned::to_owned),
+        Some("55P03".to_owned()),
+        "expected the probe to time out waiting for the list row, got {err}"
+    );
+}
+
+/// **Two renames over an orphaned refusal, which is where this used to leave debris that the next
+/// rename choked on.** The first rename moves the refusal onto the name the orphan already holds;
+/// if the orphan were then adopted onto the same list, the address would have two live refusals on
+/// one list, which is what `suppressions_live_list` forbids and what the adoption's `not exists`
+/// is there to keep satisfiable. The second rename is the one that used to fail.
 #[sqlx::test]
 async fn renaming_a_list_twice_over_an_orphaned_refusal_does_not_fail(pool: PgPool) {
     let w = workspace(&pool, "acme").await;
@@ -826,4 +944,67 @@ async fn a_rename_does_not_rewrite_a_refusal_the_subscriber_already_lifted(pool:
         [("news".to_owned(),)],
         "the lifted row says which named list was refused, and a later rename is not that history"
     );
+}
+
+/// **Two orphans of one name for one address are allowed, and exactly one of them is adopted.**
+/// They arise honestly: an address holding both a refusal of a dead list called X and a refusal of
+/// a live list later renamed to X orphans into two rows named X when that list is deleted too.
+/// Making that a unique violation would fail the operator's deletion from inside
+/// `on delete set null`; adopting both would put two refusals on one list and violate
+/// `suppressions_live_list` from inside the creation trigger. Neither may happen.
+#[sqlx::test]
+async fn a_list_born_over_two_orphans_of_its_name_adopts_one_of_them(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let gone = make_list(&mut conn, w.id, "bulletin").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, gone, ADA)
+        .await
+        .expect("refuse bulletin");
+    let news = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse news");
+    drop(conn);
+    sqlx::query("delete from lists where id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("delete bulletin");
+    // The pair: a live refusal of `news`, now also called bulletin, beside the orphan of the dead
+    // bulletin. The adoption declines here, which is what leaves two refusals naming one thing.
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("rename news to bulletin");
+    sqlx::query("delete from lists where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("deleting the list must not fail over two orphans of one name");
+
+    let orphans = refusals(&pool, w.id).await;
+    assert_eq!(
+        orphans.len(),
+        2,
+        "the premise: two live orphans of one name for one address: {orphans:?}"
+    );
+    assert!(
+        orphans
+            .iter()
+            .all(|(l, n)| l.is_none() && n.as_deref() == Some("bulletin")),
+        "{orphans:?}"
+    );
+
+    let mut conn = pool.acquire().await.unwrap();
+    let reborn = make_list(&mut conn, w.id, "bulletin").await;
+    drop(conn);
+
+    let rows = refusals(&pool, w.id).await;
+    assert_eq!(
+        rows.iter().filter(|(l, _)| *l == Some(reborn)).count(),
+        1,
+        "exactly one orphan is adopted, or the list could not have been created: {rows:?}"
+    );
+    assert_eq!(rows.len(), 2, "and the other keeps waiting: {rows:?}");
 }

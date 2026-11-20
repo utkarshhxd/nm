@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "with locked as materialized ( select id from lists where workspace_id = $1 and id = $3 for key share ) update suppressions s set lifted_at = now() from locked l where s.workspace_id = $1 and s.scope = 'list' and s.email_hmac = $2 and s.list_id = l.id and s.lifted_at is null",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b928407d37f29af2cab384cdc227b3156dec5c55bf99f93df407852bbb9f24e4"
+}

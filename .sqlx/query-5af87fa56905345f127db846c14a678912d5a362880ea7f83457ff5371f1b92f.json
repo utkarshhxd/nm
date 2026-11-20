@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source) values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click') on conflict (workspace_id, scope, email_hmac, domain, list_name) where lifted_at is null do nothing returning id",
+  "query": "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source) values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click') on conflict (workspace_id, scope, email_hmac, domain) where lifted_at is null and scope <> 'list' do nothing returning id",
   "describe": {
     "columns": [
       {
@@ -27,5 +27,5 @@
       false
     ]
   },
-  "hash": "7efbbe818bba373367c4b7eabaf8c2e256dec221476c9d03aa8d519ee44f23eb"
+  "hash": "5af87fa56905345f127db846c14a678912d5a362880ea7f83457ff5371f1b92f"
 }

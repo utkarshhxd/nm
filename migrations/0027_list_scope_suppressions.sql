@@ -71,13 +71,35 @@ alter table suppressions add constraint suppressions_list_columns
   check (scope = 'list' or (list_id is null and list_name is null));
 
 -- `list_name` joins the live-uniqueness key, or two refusals by one address on different lists
--- collide. Existing address and domain rows have a null `list_name` and `nulls not distinct`
--- keeps treating two of them as equal, so their behaviour is unchanged.
+-- collide. **The key for a live list row is the LIST, not the name**, and that is the whole of why
+-- `list_name` is not in it: the name is a snapshot that a rename moves, so keying live rows on it
+-- means every rename is a key update that can collide with another refusal by the same address —
+-- and the trigger below would then fail the operator's rename from inside itself. Keying on
+-- `list_id` makes `update … set list_name` touch no unique index at all, so a rename cannot
+-- collide with anything, ever, and needs no carve-out and no exception.
+--
+-- `suppressions_live` therefore keeps exactly the four columns `0014` gave it and stops at the two
+-- scopes it was written for. Address and domain rows are untouched by any of this.
 drop index suppressions_live;
 create unique index suppressions_live on suppressions
-  (workspace_id, scope, email_hmac, domain, list_name)
-  nulls not distinct where lifted_at is null;
+  (workspace_id, scope, email_hmac, domain)
+  nulls not distinct where lifted_at is null and scope <> 'list';
 
+-- One live refusal per address per live list. This is the identity of a list-scope refusal while
+-- its list exists, and the invariant every statement below rests on: two live rows on one list
+-- would make the next rename move both to one name, and before this index that was maintained by
+-- hand and already broken by `unsubscribe_list`'s conflict target.
+create unique index suppressions_live_list on suppressions
+  (workspace_id, email_hmac, list_id)
+  where lifted_at is null and scope = 'list' and list_id is not null;
+
+-- **Orphans are deliberately NOT unique.** A refusal whose list was deleted is keyed on its name,
+-- and two of them for one address can arise honestly: an address holding both a refusal of a dead
+-- list called X and a refusal of a live list that was later renamed to X orphans into two rows
+-- named X when that list is deleted too. Making that a unique violation would fail the operator's
+-- list deletion from inside `on delete set null`, which is a far worse place to put it than a
+-- duplicate nobody reads — no reader matches an orphan, and the adoption below takes exactly one.
+--
 -- Keyed on `list_id`: the only thing a reader matches on. It is also what the foreign key above
 -- walks when a list is deleted and what the rename trigger walks. Partial, because every address
 -- and domain row has a null `list_id` and belongs in neither.
@@ -95,33 +117,24 @@ create index suppressions_orphaned_by_name on suppressions (workspace_id, list_n
 -- of `lists.name` added later would not know to call it. This is the same "make it impossible"
 -- shape `consent_log`'s append-only triggers use.
 --
--- Adoption is what lets every reader match on `list_id` alone. On the insert path it cannot
--- collide: `new.id` is fresh, and two live orphans cannot share one `(workspace, address, name)`
--- because `suppressions_live` forbids it.
+-- **The rename has no carve-out and needs none.** `list_name` appears in no unique index that
+-- covers a live list row, so `update … set list_name` cannot violate one however many refusals the
+-- address holds. Every exception that used to live here — skip the row whose new name is taken,
+-- leave it stale, then handle the debris — existed only because the key was the name. Keying the
+-- live rows on the list deleted the whole family.
 --
--- **Its `not exists` is for the rename path only, and it holds an invariant the rename statement
--- below depends on: at most one live list-scope row per address per list.** A rename that the
--- carve-out skipped leaves a row on `new.id` under its old name; adopting an orphan onto the same
--- list beside it would make two, under different names — and the NEXT rename of that list then
--- moves both to the same name at once and violates `suppressions_live` from inside the trigger,
--- failing the operator's rename. Nothing is lost by declining: the row already on `new.id` refuses
--- that list, which is all any reader asks, and the orphan keeps waiting for a list of its name,
--- which cannot exist while this one holds it. On the insert path the clause is always true, so the
--- adoption that makes delete-and-recreate work is untouched.
+-- Adoption is what lets every reader match on `list_id` alone, and it is the one statement here
+-- that CAN collide, because it is the one that writes `list_id`. Its `not exists` is therefore not
+-- a carve-out but the precondition of `suppressions_live_list`, in two halves:
 --
--- **The `not exists` on the rename tests the live-uniqueness key, not a special case of it.** A
--- rename moves a row to a `list_name` another live row for the same address may already hold, and
--- `suppressions_live` is `(workspace_id, scope, email_hmac, domain, list_name) where lifted_at is
--- null` — so the test has to be "does this address already have a LIVE list-scope row under
--- `new.name`", with no clause about what that row's `list_id` happens to be. It was once written
--- `and o.list_id is null`, which read the obvious source (an orphan left by an earlier list of
--- that name) as the only one; a live row with a `list_id` and a stale `list_name` collides exactly
--- as hard, and an operator's rename failed with `duplicate key value violates unique constraint
--- "suppressions_live"` and rolled back.
---
--- The row that is skipped keeps its old name, which costs no refusal: it still carries `list_id`,
--- which is the only thing any reader matches on, and the row that already holds `new.name` covers
--- the name. `lift_unsubscribed_list` matches on `list_id` too, so the subscriber clears both.
+--   * `v.list_id = new.id` — this address already refuses this list, so there is nothing to adopt.
+--     Declining loses nothing: the row already on the list is what every reader matches, and the
+--     orphan keeps waiting for a list of its own name, which cannot exist while this one holds it.
+--     On the insert path `new.id` is fresh, so this half is always true and the adoption that makes
+--     delete-and-recreate work is untouched.
+--   * the older-orphan half — two orphans of one name for one address are allowed (see the index
+--     comment above), and adopting both would put two rows on one list. The lowest `id` wins and
+--     the rest keep waiting, which is the same answer whichever order the rows are visited in.
 --
 -- **`s.lifted_at is null`, so a rename never rewrites history.** `0014` keeps a lifted row rather
 -- than deleting it so the blocklist can say what was once blocked, and for a list-scope row that
@@ -146,19 +159,16 @@ create function suppressions_follow_list_name() returns trigger
 begin
   if tg_op = 'UPDATE' then
     update suppressions s set list_name = new.name
-     where s.list_id = new.id and s.lifted_at is null
-       and not exists (select 1 from suppressions o
-                        where o.workspace_id = s.workspace_id and o.scope = 'list'
-                          and o.lifted_at is null
-                          and o.list_name = new.name and o.email_hmac = s.email_hmac);
+     where s.list_id = new.id and s.lifted_at is null;
   end if;
   update suppressions s set list_id = new.id
    where s.workspace_id = new.workspace_id and s.scope = 'list' and s.lifted_at is null
      and s.list_id is null and s.list_name = new.name
-     and not exists (select 1 from suppressions o
-                      where o.workspace_id = new.workspace_id and o.scope = 'list'
-                        and o.lifted_at is null and o.list_id = new.id
-                        and o.email_hmac = s.email_hmac);
+     and not exists (select 1 from suppressions v
+                      where v.workspace_id = new.workspace_id and v.scope = 'list'
+                        and v.lifted_at is null and v.email_hmac = s.email_hmac
+                        and (v.list_id = new.id
+                             or (v.list_id is null and v.list_name = new.name and v.id < s.id)));
   return null;
 end;
 $$;

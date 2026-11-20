@@ -406,8 +406,8 @@ pub async fn unsubscribe_all(
     let written = sqlx::query_scalar!(
         "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source) \
          values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click') \
-         on conflict (workspace_id, scope, email_hmac, domain, list_name) \
-         where lifted_at is null do nothing returning id",
+         on conflict (workspace_id, scope, email_hmac, domain) \
+         where lifted_at is null and scope <> 'list' do nothing returning id",
         Uuid::now_v7(),
         workspace_id,
         email,
@@ -486,23 +486,46 @@ pub async fn lift_unsubscribed_all(
 /// Postgres 16: plain `select` stores the stale name and does not block; `for key share` blocks
 /// for the writer's lifetime and stores the new one.
 ///
-/// `do update set list_id` adopts an orphan — a refusal of an earlier list of this name, whose own
-/// list was deleted — rather than leaving the insert to do nothing. The two denote the same list,
-/// because the name is what "the same list" means here.
+/// **The conflict target is the LIST, and it does not adopt anything.** It used to conflict on
+/// `list_name` and `do update set list_id`, which could not see a live row already on this list
+/// under a different name — the state the rename trigger used to manufacture — so it inserted a
+/// second refusal on one list, after which every later rename of that list failed. Worse, the
+/// `do update` silently re-pointed the ORPHAN it had conflicted with, so the address's refusal of
+/// the *deleted* list of that name was gone and recreating one no longer restored it: the
+/// delete-and-recreate resurrection this whole scope exists to close. Adopting an orphan is the
+/// trigger's job, where the guard that keeps `suppressions_live_list` satisfiable lives; this
+/// statement's only question is whether this address already refuses this list, and `do nothing`
+/// is the whole of the answer.
 ///
 /// **Call this before writing any `list_memberships` row in the same transaction**, for exactly
 /// the reason [`unsubscribe_all`] gives: it takes [`lock_address`], and the erase path takes that
 /// lock first and only then deletes the contact, which cascades to the membership rows.
 ///
 /// **`for key share` also fixes the lock order rather than disturbing it, which is why it is safe
-/// to add here.** The membership insert that follows takes `FOR KEY SHARE` on the same `lists` row
-/// through its own foreign key, so without this line the order was `suppressions` then `lists`,
+/// to add here.** The membership writes that follow take `FOR KEY SHARE` on the same `lists` row
+/// through their own foreign key, so without this line the order was `suppressions` then `lists`,
 /// while a rename and a list deletion both take `lists` and then `suppressions` — an ABBA cycle
 /// that Postgres breaks with `40P01`. Reproduced against Postgres 16: a concurrent rename and
 /// preference-center save deadlocked, and the victim was the operator's rename. Reading the `lists`
 /// row first puts this path in the same order as both of those. The erase path never touches
 /// `lists`, and the rename and deletion paths never take the address advisory lock, so no other
-/// pair is affected.
+/// pair is affected. [`lift_unsubscribed_list`] takes the same row for the same reason.
+///
+/// **What that wait costs, measured in what holds the row.** A rename holds it for one `UPDATE`
+/// and its trigger. A **list deletion** holds it for its whole cascade — `list_memberships`,
+/// `jobs`, `form_lists`, and the `set null` sweeps over `suppressions` and `consent_log` — because
+/// deleting the row conflicts with `FOR KEY SHARE` exactly as a key update does. Every untick of
+/// that list now queues behind that, where before this line an untick-only save took no `lists`
+/// lock at all. It is a short wait on a small workspace and an unbounded one on a large list, and
+/// it is the price of the row not storing a name the list has already lost.
+///
+/// **And if the list is deleted while the untick waits, the refusal is dropped.** The select then
+/// matches nothing, the insert writes nothing, and this returns `Ok(())`. Mostly that is right —
+/// there is no list left to refuse, and the membership rows went with it — but if a list of that
+/// name is later recreated, nothing refuses it, which is the one case this scope exists for. It is
+/// logged rather than fixed: writing the refusal anyway needs a name, and the only name left is
+/// the caller's, which is the stale read this `for key share` was added to stop trusting.
+/// `issues/37`.
 pub async fn unsubscribe_list(
     db: &mut PgConnection,
     secrets: &Secrets,
@@ -521,25 +544,49 @@ pub async fn unsubscribe_list(
     };
     let hmac = suppression_hmac(secrets, &email);
     lock_address(db, &hmac).await?;
-    sqlx::query!(
-        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source, \
-         list_id, list_name) \
-         select $1, $2, 'list', $3, $4, 'unsubscribed_list', 'preference_center', l.id, l.name \
-           from lists l where l.workspace_id = $2 and l.id = $5 for key share \
-         on conflict (workspace_id, scope, email_hmac, domain, list_name) where lifted_at is null \
-         do update set list_id = excluded.list_id",
+    // The `lists` row is read once, in a materialised CTE, so that "was there a list at all" is
+    // answered by the same locked read the row is built from. `rows_affected` cannot answer it:
+    // the insert also writes nothing when this address already refuses this list, which is the
+    // ordinary idempotent case and not a deletion.
+    let list_exists = sqlx::query_scalar!(
+        r#"with l as materialized (
+               select id, name from lists where workspace_id = $2 and id = $5 for key share
+           ), written as (
+               insert into suppressions (id, workspace_id, scope, email, email_hmac, reason,
+                                         source, list_id, list_name)
+               select $1, $2, 'list', $3, $4, 'unsubscribed_list', 'preference_center', l.id,
+                      l.name
+                 from l
+               on conflict (workspace_id, email_hmac, list_id)
+                 where lifted_at is null and scope = 'list' and list_id is not null
+               do nothing
+               returning id
+           )
+           select exists (select 1 from l) as "list_exists!""#,
         Uuid::now_v7(),
         workspace_id,
         email,
         hmac.as_slice(),
         list_id,
     )
-    .execute(db)
+    .fetch_one(db)
     .await?;
+    // No `lists` row means it was gone by the time the lock was granted: an operator deleted the
+    // list while this untick waited behind the deletion's own lock on that row. There is nothing
+    // left to refuse and nothing was written, which is why this is a warning and not an error —
+    // but a list of that name recreated later is refused by nothing, so it is said out loud rather
+    // than discovered at send time. No address is logged. `issues/37`.
+    if !list_exists {
+        tracing::warn!(
+            %list_id,
+            "a per-list unsubscribe was not recorded because the list was deleted while the \
+             request waited for it; nothing refuses a list of that name if one is recreated"
+        );
+    }
     Ok(())
 }
 
-/// Lifts the subscriber's own refusal of one list, and **only** that one — the per-list mirror of
+/// Lifts the subscriber's own refusal of one list, and **only** that one. The per-list mirror of
 /// [`lift_unsubscribed_all`], called where that is called and nowhere else. Ticking a box in the
 /// preference center is a genuine re-subscribe, and leaving the refusal standing would show them a
 /// box that ticks and changes nothing a send would honour.
@@ -547,6 +594,17 @@ pub async fn unsubscribe_list(
 /// `scope = 'list'` and `list_id = $3` are the whole of what this may touch. An import must never
 /// reach it: `tests/import.rs` pins that direction, because getting it backwards turns a consent
 /// feature into a trap.
+///
+/// **It reads the `lists` row `for key share` before it touches the refusal, and that ordering is
+/// the point of the CTE.** `save` re-ticks a box by calling this and then inserting the membership,
+/// and that insert takes `FOR KEY SHARE` on the same `lists` row through
+/// `list_memberships_workspace_id_list_id_fkey`. Without the CTE the order is `suppressions` then
+/// `lists`, while a rename and a list deletion both run `lists` then `suppressions` — an ABBA
+/// cycle. Reproduced against Postgres 16: a subscriber re-ticking a list while an operator renamed
+/// it deadlocked, and Postgres chose the victim, so it was a `500` on the public preference centre
+/// or a failed rename depending on timing. The `unsubscribe_list` half took the `lists` row first
+/// already; this is the other half, and the two sets are disjoint by construction in `save`, which
+/// is why fixing one did not reach the other.
 pub async fn lift_unsubscribed_list(
     db: &mut PgConnection,
     secrets: &Secrets,
@@ -559,9 +617,18 @@ pub async fn lift_unsubscribed_list(
     };
     let hmac = suppression_hmac(secrets, &email);
     sqlx::query!(
-        "update suppressions set lifted_at = now() \
-          where workspace_id = $1 and scope = 'list' and email_hmac = $2 and list_id = $3 \
-            and lifted_at is null",
+        // The `lists` row is taken FIRST, and the CTE is what makes that inseparable from the
+        // lift rather than a second statement somebody could drop. See the ordering paragraph on
+        // the doc comment: without it this path runs `suppressions` then `lists` — the membership
+        // insert that follows takes `FOR KEY SHARE` on the same row through its own foreign key —
+        // while a rename runs `lists` then `suppressions`, and the two deadlock.
+        "with locked as materialized ( \
+             select id from lists where workspace_id = $1 and id = $3 for key share \
+         ) \
+         update suppressions s set lifted_at = now() \
+           from locked l \
+          where s.workspace_id = $1 and s.scope = 'list' and s.email_hmac = $2 \
+            and s.list_id = l.id and s.lifted_at is null",
         workspace_id,
         hmac.as_slice(),
         list_id,
