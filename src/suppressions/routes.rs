@@ -7,17 +7,80 @@ use sqlx::PgConnection;
 use utoipa::IntoParams;
 use uuid::Uuid;
 
-use super::{NewSuppression, Suppression, create, lift, list};
+use super::{NewSuppression, Reason, Scope, Suppression, create, lift, list};
 use crate::{
     app::AppState,
     audit::{self, Actor, AuditEvent, actions},
     auth::{CurrentUser, Principal, authorize},
+    consent,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult},
     http::request_meta::RequestMeta,
     pagination::{Page, PageParams},
     users,
     workspaces::roles::Role,
 };
+
+/// Writes the `consent_log` row for a workspace-wide opt-out an **operator** set or ended, so that
+/// the log answers "is this person opted out of everything, and since when" in both directions.
+///
+/// Until this existed it could only answer in one. `public::unsubscribe::one_click` writes
+/// `suppressed` with a null `list_id` when a subscriber opts out of everything; the identical
+/// fact arriving through this API wrote an `audit_log` row and no consent row, and *ending* it —
+/// here, or through the preference center — wrote nothing at all in either log. So the consent
+/// log could say somebody had opted out of everything and could never say that it ended, which is
+/// spec §4's "a consent log that loses the when" applied to the lift. `Resubscribed` with a null
+/// `list_id` is §7.1's word for it and is already in the table's check constraint.
+///
+/// **No IP and no user agent.** An operator is not the subscriber, and a row carrying the
+/// operator's address reads in court as the subscriber's (`0020_consent_log.sql`). `source_ref`
+/// carries the suppression's id instead, which ties this row to the `audit_log` row that names
+/// who did it; `audit::record` at the call site is still the record of the actor.
+///
+/// **What it deliberately does not record**, because `consent_log` is keyed on a contact in a
+/// workspace and these are not:
+///
+/// * an **instance-wide** suppression (`workspace_id` is null) — it is a fact about an address in
+///   every workspace at once, and there is no one contact it belongs to;
+/// * a **domain**-scope suppression, for the same reason, multiplied by the domain;
+/// * an address with **no contact** in the workspace — nothing to hang the row on. The
+///   suppression still stands and still blocks; `audit_log` is where it is recorded.
+async fn record_workspace_optout(
+    tx: &mut PgConnection,
+    s: &Suppression,
+    action: consent::Action,
+) -> ApiResult<()> {
+    if s.reason != Reason::UnsubscribedAll || s.scope != Scope::Address {
+        return Ok(());
+    }
+    let (Some(workspace_id), Some(email)) = (s.workspace_id, s.email.as_deref()) else {
+        return Ok(());
+    };
+    // Both are normalised — `contacts::create` and `suppressions::create` apply the same
+    // `normalize_email` — so this is the equality the unique index is on.
+    let found = sqlx::query_scalar!(
+        "select id from contacts where workspace_id = $1 and email = $2",
+        workspace_id,
+        email,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(contact_id) = found else {
+        return Ok(());
+    };
+    consent::record(
+        tx,
+        workspace_id,
+        contact_id,
+        None,
+        action,
+        consent::Source::Operator,
+        &consent::Context {
+            source_ref: Some(s.id.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -175,6 +238,7 @@ pub async fn create_suppression(
         &s,
     )
     .await?;
+    record_workspace_optout(&mut tx, &s, consent::Action::Suppressed).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(s)))
 }
@@ -213,6 +277,7 @@ pub async fn lift_suppression(
         &s,
     )
     .await?;
+    record_workspace_optout(&mut tx, &s, consent::Action::Resubscribed).await?;
     tx.commit().await?;
     Ok(Json(s))
 }

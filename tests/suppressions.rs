@@ -536,3 +536,67 @@ async fn create_validates_its_input(pool: PgPool) {
         .unwrap();
     assert_eq!(rows, 0);
 }
+
+/// **The consent log could say that somebody opted out of everything and could never say that it
+/// ended.** `public::unsubscribe::one_click` writes `suppressed` with a null `list_id` when a
+/// subscriber opts out of everything; the identical fact set through this API wrote an `audit_log`
+/// row and no consent row, and ending it wrote nothing in either log — the public routes write no
+/// audit rows by design, and this route wrote no consent row. Both directions are recorded now,
+/// `Resubscribed` with a null `list_id` being spec §7.1's word for the end of one.
+///
+/// Three negatives in the same fixture, because each is a reason the row must NOT be written and
+/// each would otherwise be a silent over-reach: a reason that is not a workspace-wide opt-out, an
+/// address that is nobody's contact here, and a domain-scope block, which is about no one person.
+#[sqlx::test]
+async fn an_operator_setting_or_ending_a_workspace_wide_opt_out_writes_a_consent_row(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let contact: Uuid = sqlx::query_scalar(
+        "insert into contacts (id, workspace_id, email) values ($1, $2, 'a@ex.test') returning id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(w.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let rows = |action: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from consent_log where contact_id = $1 and list_id is null \
+                 and action = $2 and source = 'operator'",
+            )
+            .bind(contact)
+            .bind(action)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let id = add_address(&w.editor, &path(w.id), "a@ex.test", "unsubscribed_all").await;
+    assert_eq!(rows("suppressed").await, 1, "the opt-out was set");
+    w.admin.post(&lift_path(w.id, id)).await.assert_status_ok();
+    assert_eq!(rows("resubscribed").await, 1, "and the log says it ended");
+
+    // Not every suppression is a consent decision about one person in one workspace.
+    let bounced = add_address(&w.editor, &path(w.id), "a@ex.test", "bounced").await;
+    w.admin
+        .post(&lift_path(w.id, bounced))
+        .await
+        .assert_status_ok();
+    add_address(&w.editor, &path(w.id), "nobody@ex.test", "unsubscribed_all").await;
+    w.editor
+        .post(&path(w.id))
+        .json(&json!({"scope": "domain", "domain": "ex.test", "reason": "unsubscribed_all"}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let total: i64 = sqlx::query_scalar("select count(*) from consent_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 2,
+        "a bounce, an address with no contact and a domain block write no consent row"
+    );
+}
