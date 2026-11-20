@@ -284,6 +284,34 @@ mod tests {
         }
     }
 
+    /// The subscriber's token-authenticated pages are server-rendered territory, bare prefix
+    /// included: `/u` with the token lost must be a 404, not a sign-in app with a `200`.
+    ///
+    /// **Written as its own list rather than against `public::owns_path`.**
+    /// `security_headers::uncacheable_and_is_reserved_agree` compares the two predicates, and both
+    /// of them now delegate to `owns_path` for these paths, so for this half that test compares a
+    /// function with itself. This is the independent pin: change `owns_path` and this fails.
+    #[test]
+    fn the_subscribers_pages_are_never_the_spa() {
+        let src = Map::new(&[("index.html", INDEX)]);
+        for path in ["/c", "/c/", "/c/abc.def", "/u", "/u/", "/f", "/f/signup"] {
+            assert_eq!(
+                serve_web(&src, path, None).status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        // Near misses, which are the SPA's and must stay the SPA's: the character after a prefix
+        // has to be a `/` or nothing at all.
+        for path in ["/contacts", "/forms", "/customers"] {
+            assert_eq!(
+                serve_web(&src, path, None).status(),
+                StatusCode::OK,
+                "{path}"
+            );
+        }
+    }
+
     /// Ruling: bare `/api` is not under `/api/`, so the API's wildcard 404 route misses it.
     /// It must not be answered with `index.html`. Nor may a doubled slash smuggle one past
     /// `is_reserved`.

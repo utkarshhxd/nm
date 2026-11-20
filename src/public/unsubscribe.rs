@@ -121,6 +121,11 @@ async fn preferences(
 /// writes no consent row and no second `unsubscribed_at`. See `http::rate_limit::MAX_KEYS`, which
 /// names this route as the one that may not answer `429`. **The preference form is refused**, like
 /// the GET: it is a person who can try again, and one who did not ask for everything to stop.
+///
+/// **The exemption is granted to a genuine link, not to a string in a body.** The token is
+/// verified *before* the verdict is applied, so only a one-click POST that this instance actually
+/// signed is let past a tripped limit. Deciding it from `is_one_click` alone would have made the
+/// whole route unlimitable by anyone willing to type the RFC's field name.
 async fn apply(
     State(state): State<AppState>,
     meta: RequestMeta,
@@ -128,11 +133,12 @@ async fn apply(
     body: String,
 ) -> ApiResult<Response> {
     let quota = state.public_limit.check(meta.ip.unwrap_or(UNKNOWN_IP));
-    let one_click_asked = is_one_click(&body);
+    let parsed = token::parse(&state.secrets, &raw, Purpose::Unsubscribe);
+    let one_click_asked = is_one_click(&body) && parsed.is_ok();
     if !one_click_asked && let Some(retry_after_secs) = quota.over {
         return Ok(too_many_requests(quota.headers, retry_after_secs));
     }
-    let Ok(token) = token::parse(&state.secrets, &raw, Purpose::Unsubscribe) else {
+    let Ok(token) = parsed else {
         return Ok(with(quota.headers, no_longer_valid()));
     };
     if one_click_asked {
@@ -313,6 +319,28 @@ async fn save(
     // Asked for at least one of the lists the page offered, whether or not it changed anything.
     let asked_for_any = before.iter().any(|topic| wanted.contains(&topic.id));
 
+    // The workspace-wide opt-out was theirs to set through one-click, so it is theirs to clear by
+    // asking for a list again — otherwise this page shows boxes that tick and change nothing a
+    // send would honour. Only `unsubscribed_all` is lifted; a bounce, a complaint, an operator's
+    // block and an erasure tombstone are not a subscriber's to overturn. No consent row: the
+    // per-list rows below are the record of what they asked for, and there is no action in spec
+    // §7.1's list that means "a block was lifted".
+    //
+    // **Before the membership writes, for the reason `one_click` sets out in full**: the erase
+    // path takes the suppressions row and then the membership rows, so this has to take them in
+    // that order too or the two deadlock.
+    if asked_for_any {
+        suppressions::lift_unsubscribed_all(&mut tx, &state.secrets, token.workspace_id, &email)
+            .await?;
+    }
+
+    // **Unticking every box is not a workspace-wide opt-out, and that is a decision.** Unticking
+    // means what it says: not these lists. Somebody who unticks four topics may well intend to
+    // come back, and a `suppressions` row is permanent, survives erasure and covers lists that do
+    // not exist yet — more than they said. Somebody who does want out entirely says so with the
+    // "Unsubscribe from everything" button `render` puts on this page, which posts the RFC 8058
+    // body and so goes through `one_click`, suppression and all. One door for "not this", one for
+    // "none of it", and the durable one is the one that was asked for explicitly.
     let subscribed: Vec<Uuid> = sqlx::query_scalar!(
         r#"insert into list_memberships
                (workspace_id, contact_id, list_id, status, subscribed_at, source)
@@ -361,16 +389,6 @@ async fn save(
     for list_id in unsubscribed {
         record(&mut tx, token, list_id, consent::Action::Unsubscribed, &cx).await?;
     }
-    // The workspace-wide opt-out was theirs to set through one-click, so it is theirs to clear by
-    // asking for a list again — otherwise this page shows boxes that tick and change nothing a
-    // send would honour. Only `unsubscribed_all` is lifted; a bounce, a complaint, an operator's
-    // block and an erasure tombstone are not a subscriber's to overturn. No consent row: the
-    // per-list rows above are the record of what they asked for, and there is no action in spec
-    // §7.1's list that means "a block was lifted".
-    if asked_for_any {
-        suppressions::lift_unsubscribed_all(&mut tx, &state.secrets, token.workspace_id, &email)
-            .await?;
-    }
 
     let after = topics(&mut tx, token.workspace_id, token.contact_id).await?;
     tx.commit().await?;
@@ -417,8 +435,33 @@ async fn record(
 /// re-reads the row the first one committed and finds it no longer matches. Without the guard the
 /// same person would appear to have unsubscribed twice. The suppression insert is idempotent the
 /// same way, by the table's live-uniqueness index.
+///
+/// **The order of the two writes is load-bearing: the address first, the memberships second.**
+/// `contacts::routes::erase_contact` takes `suppressions::lock_address`, writes the tombstone, and
+/// only then deletes the contact — which cascades to `list_memberships` and takes those row locks.
+/// Doing it the other way round here would be an ABBA cycle with that path, and Postgres resolves
+/// one by aborting a side with `40P01`. If the victim were this POST the handler would answer
+/// `500` and roll the sweep back, which is an RFC 8058 one-click that silently failed with nobody
+/// to retry it — the one failure this route is least allowed to have. Taking the same locks in the
+/// same order as the erase path costs nothing, because the suppression does not depend on what the
+/// sweep returned.
 async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
+    let email = sqlx::query_scalar!(
+        "select email from contacts where workspace_id = $1 and id = $2",
+        token.workspace_id,
+        token.contact_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    // First, and before any membership row is locked: see the ordering paragraph above.
+    let suppressed = match &email {
+        Some(email) => {
+            suppressions::unsubscribe_all(&mut tx, &state.secrets, token.workspace_id, email)
+                .await?
+        }
+        None => false,
+    };
     let changed: Vec<Uuid> = sqlx::query_scalar!(
         "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
           where workspace_id = $1 and contact_id = $2 and status <> 'unsubscribed' \
@@ -427,13 +470,6 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
         token.contact_id,
     )
     .fetch_all(&mut *tx)
-    .await?;
-    let email = sqlx::query_scalar!(
-        "select email from contacts where workspace_id = $1 and id = $2",
-        token.workspace_id,
-        token.contact_id,
-    )
-    .fetch_optional(&mut *tx)
     .await?;
     // The subscriber's own request, so the IP and the user agent really are theirs and are kept as
     // evidence — with `GET /c/{token}` and the preference center, the only places in the product
@@ -461,11 +497,10 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
     }
     // `list_id` null: a workspace-wide opt-out has no list, which is what `0020` reserved the
     // nullable column for. Recorded only when a row was actually written, so a second click
-    // records nothing — the same rule the memberships follow.
-    if let Some(email) = email
-        && suppressions::unsubscribe_all(&mut tx, &state.secrets, token.workspace_id, &email)
-            .await?
-    {
+    // records nothing — the same rule the memberships follow. The row goes in here, after the
+    // sweep, although the write it records happened before it: `created_at` is transaction-start
+    // time for every row in this transaction, so the order they are inserted in says nothing.
+    if suppressed {
         consent::record(
             &mut tx,
             token.workspace_id,

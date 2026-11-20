@@ -121,6 +121,14 @@ mod tests {
     /// The two predicates are separate ideas, but they must stay in step: a path that is reserved
     /// from the SPA is server-generated, and a server-generated response is one a shared cache
     /// must not keep. Adding one to only one of them should fail here, not in production.
+    ///
+    /// **Its scope shrank when `/c`, `/u` and `/f` arrived, and the shrinkage is the point to
+    /// notice.** For those both predicates delegate to `public::owns_path`, so this test compares
+    /// a function with itself and cannot detect drift it has no way to have. They are pinned
+    /// independently instead — `no_store_covers_the_api_and_the_probes_but_not_the_assets` below
+    /// lists them for `uncacheable`, and `web_ui::tests::the_subscribers_pages_are_never_the_spa`
+    /// drives the real handler for `is_reserved`. This test remains the drift check for the
+    /// `/api`, `/healthz` and `/readyz` half, which really is two independent spellings.
     #[test]
     fn uncacheable_and_is_reserved_agree() {
         for path in PATHS {

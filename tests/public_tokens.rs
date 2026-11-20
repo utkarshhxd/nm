@@ -107,10 +107,23 @@ fn the_purpose_is_part_of_what_is_signed() {
     let s = secrets(7);
     let raw = issue(&s, &token(Purpose::Unsubscribe, 0));
     let (payload, mac) = raw.split_once('.').unwrap();
-    let json = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
-    let swapped = json.replace("unsubscribe", "confirm");
-    assert_ne!(swapped, json, "the purpose must appear in the payload");
-    let forged = format!("{}.{mac}", URL_SAFE_NO_PAD.encode(swapped));
+    let original = URL_SAFE_NO_PAD.decode(payload).unwrap();
+    // **`list_id` moves with the purpose, so the forgery is structurally valid.** `parse` checks
+    // the MAC and then checks that `list_id` is present exactly for `Confirm`. A payload that said
+    // `confirm` while keeping `list_id: null` would be refused by that second check too, and this
+    // test would pass with the signature verification deleted — which it did, until a review
+    // caught it. Only the signature may be what refuses the payload below.
+    let mut json: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    json["purpose"] = serde_json::json!("confirm");
+    json["list_id"] = serde_json::json!(Uuid::now_v7());
+    let swapped = serde_json::to_vec(&json).unwrap();
+    assert_ne!(swapped, original, "the purpose must appear in the payload");
+
+    // The premise, asserted rather than assumed: this payload parses when it is honestly signed.
+    let honest = issue(&s, &serde_json::from_slice::<Token>(&swapped).unwrap());
+    assert!(parse(&s, &honest, Purpose::Confirm).is_ok());
+
+    let forged = format!("{}.{mac}", URL_SAFE_NO_PAD.encode(&swapped));
     assert!(matches!(
         parse(&s, &forged, Purpose::Confirm),
         Err(ApiError::Unprocessable("link-invalid"))

@@ -275,26 +275,43 @@ pub async fn erase_address(
 ///
 /// `created_by_user_id` is null and `source` is `one_click`: nobody signed in did this.
 ///
+/// **Call this before writing any membership row in the same transaction.** It takes
+/// [`lock_address`], and `contacts::routes::erase_contact` takes that lock *first* and then
+/// deletes the contact, which cascades to the membership rows. A caller that locked membership
+/// rows first would form an ABBA cycle with the erase path, and Postgres breaks one by aborting a
+/// side with `40P01` — for the one-click route that is a `500` and a rolled-back unsubscribe.
+/// The lock being *shared* with the erase path is what keeps two live rows from appearing; the
+/// *order* is what keeps the two transactions from deadlocking, and only the caller can get that
+/// right.
+///
 /// shortcut: `suppressions_live` is unique per (workspace, scope, address) **whatever the
 /// reason**, so an address already blocked as `bounced` or `complained` keeps that row and gets
 /// no `unsubscribed_all` one — the address is blocked either way, but lifting the bounce would
-/// then unblock it. Give this table a per-reason live index if that case ever needs separating.
+/// then unblock it. Give this table a per-reason live index if that case ever needs separating;
+/// `issues/27-lifting-a-bounce-can-lose-a-one-click-unsubscribe.md` carries the argument.
+/// `tests/public_pages.rs::one_click_on_an_already_blocked_address_keeps_the_block_it_has` pins
+/// the behaviour so that change cannot happen unnoticed.
 pub async fn unsubscribe_all(
     db: &mut PgConnection,
     secrets: &Secrets,
     workspace_id: Uuid,
     email: &str,
 ) -> ApiResult<bool> {
-    // Fails closed, as `blocking_suppression` does: an address that will not normalise cannot be
-    // blocked by hash, and silently not blocking it is the one outcome this route may not have.
+    // **Not fail-closed, unlike `blocking_suppression`, and the difference is which way "closed"
+    // points.** There, refusing to answer means refusing to mail, which is safe. Here, refusing
+    // would abort the transaction and take the caller's membership sweep with it — an RFC 8058
+    // one-click that did not stick, which is spec M1d §4's second anti-goal. So the opt-out is
+    // skipped, loudly, and the per-list unsubscribes still apply. `contacts::create` normalises,
+    // so a stored address that will not normalise should be unreachable; if it is reachable the
+    // log is where it surfaces. The address is not logged.
     let Ok(email) = normalize_email(email) else {
-        return Err(ApiError::Internal(anyhow::anyhow!(
-            "a stored address does not normalise, so a one-click opt-out cannot be recorded"
-        )));
+        tracing::error!(
+            "a stored address does not normalise, so a one-click workspace-wide opt-out could \
+             not be recorded; the per-list unsubscribes still applied"
+        );
+        return Ok(false);
     };
     let hmac = suppression_hmac(secrets, &email);
-    // The same lock `erase_address` and `is_erased` take, so a one-click arriving while a contact
-    // is being erased cannot interleave into two live rows for one address.
     lock_address(db, &hmac).await?;
     let written = sqlx::query_scalar!(
         "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source) \
@@ -324,6 +341,15 @@ pub async fn unsubscribe_all(
 /// unauthenticated page into a way to clear any block in the workspace.
 ///
 /// `lifted_by_user_id` stays null, which already means "no signed-in user did this".
+///
+/// **Call this before writing any membership row in the same transaction**, for the reason
+/// [`unsubscribe_all`] gives: `erase_address` deletes this row and only then deletes the contact,
+/// so a caller that locked the membership rows first would deadlock with an erase of the same
+/// address.
+///
+/// (The membership table is named in neither of these two comments on purpose: `tests/consent.rs`
+/// keeps a census of every file that mentions it, as a tripwire for a new writer of membership
+/// status, and this file is not one — it would be a false entry on that list.)
 pub async fn lift_unsubscribed_all(
     db: &mut PgConnection,
     secrets: &Secrets,

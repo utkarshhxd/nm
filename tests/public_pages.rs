@@ -752,6 +752,11 @@ async fn the_page_shows_public_lists_and_the_private_ones_this_contact_is_on(poo
     let weekly = p.on_list("Weekly", "public", "subscribed").await;
     let offers = make_list(&pool, p.workspace, "Offers", "public", true).await;
     let secret = make_list(&pool, p.workspace, "Insiders only", "private", true).await;
+    // Invariant 10's tenancy half: a *public* list of another workspace is the one that would slip
+    // through a query missing its `workspace_id`, because visibility alone admits it.
+    let other_owner = create_user(&pool, "owner-other@example.com", PW, false).await;
+    let other = create_workspace(&pool, other_owner, "other").await;
+    let theirs = make_list(&pool, other, "Their public list", "public", true).await;
 
     let r = p.app.get(&format!("/u/{}", p.unsub("n1", 0))).await;
     r.assert_status_ok();
@@ -767,6 +772,10 @@ async fn the_page_shows_public_lists_and_the_private_ones_this_contact_is_on(poo
         "a private list this contact was never on is shown: {html}"
     );
     assert!(!html.contains("Insiders only"), "{html}");
+    assert!(
+        !html.contains(&theirs.to_string()) && !html.contains("Their public list"),
+        "another workspace's public list is shown: {html}"
+    );
 
     // The box reflects `status = 'subscribed'`, so the confirmed list is ticked and the pending
     // one is not. A `pending` row is somebody who was asked, not somebody who agreed.
@@ -1070,25 +1079,36 @@ async fn the_page_renders_in_under_200ms_for_a_contact_on_50_lists(pool: PgPool)
     p.app.get(&url).await.assert_status_ok();
     let at_500 = fastest(&p.app, &url, 3).await;
     assert!(at_500.as_millis() < 200, "the page took {at_500:?} at 501");
+    // **The baseline is a premise, not just a scale.** The allowance below is computed from
+    // `at_50`, so a slow or loaded machine would widen it until the measured N+1 (106 ms at 501)
+    // fitted underneath — the assertion's power would shrink exactly when the box is busy, which
+    // is the property a self-calibrating ratio was meant to remove. 2 ms is the measured figure
+    // for one query at 51 lists; 20 ms is ten times that, and a machine slower than this fails
+    // here, loudly, instead of quietly passing a page that scales.
+    assert!(
+        at_50.as_millis() < 20,
+        "the baseline is {at_50:?}; the scaling assertion below would be too loose to mean \
+         anything. This is the machine being slow, not the page being wrong"
+    );
     // Ten times the lists for no more than three times the time, plus a flat allowance for the
     // extra rows this page really does have to render. A query per list spends ten times as long.
     let allowed = at_50 * 3 + std::time::Duration::from_millis(25);
     assert!(
         at_500 <= allowed,
-        "501 lists took {at_500:?} against {at_50:?} for 51 (allowed {allowed:?}): the page's          cost grows with the list count, which means a query per list"
+        "501 lists took {at_500:?} against {at_50:?} for 51 (allowed {allowed:?}): the page's \
+         cost grows with the list count, which means a query per list"
     );
 }
 
 /// `page::esc` is the only thing between an operator-typed list name and an injected tag, and the
-/// preference center is the first page that renders one. The names reach element text only; the
-/// one attribute value on the page is a list's `Uuid`, which this test also pins by asserting the
-/// name never lands inside a quoted attribute.
+/// preference center is the first page that renders one. The names reach element text only, and
+/// the loop at the end pins that: every quoted attribute value on the page is a list's `Uuid` or
+/// the RFC 8058 body, so an operator-supplied name cannot be in an attribute context at all.
 #[sqlx::test]
 async fn an_operator_supplied_list_name_is_escaped_on_the_page(pool: PgPool) {
     let p = pending(&pool, "acme").await;
     let nasty = "<script>alert(1)</script> \"Bob & Co\"";
     let list = make_list(&pool, p.workspace, nasty, "public", true).await;
-    assert!(list != Uuid::nil());
 
     let r = p.app.get(&format!("/u/{}", p.unsub("n1", 0))).await;
     r.assert_status_ok();
@@ -1098,6 +1118,17 @@ async fn an_operator_supplied_list_name_is_escaped_on_the_page(pool: PgPool) {
         html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &quot;Bob &amp; Co&quot;"),
         "{html}"
     );
+    // The contexts really are the two the doc comment claims: the id is what sits in the quoted
+    // attribute, and every attribute value on the page is a `Uuid`. A name interpolated into one
+    // would show up here as a `value="` that is not followed by a uuid.
+    assert!(html.contains(&format!("value=\"{list}\"")), "{html}");
+    for value in html.split("value=\"").skip(1) {
+        let value = value.split('"').next().unwrap();
+        assert!(
+            value == "One-Click" || value.parse::<Uuid>().is_ok(),
+            "an attribute value that is neither a list id nor the RFC 8058 body: {value:?}"
+        );
+    }
 }
 
 /// Finding 10 of the prior-milestone hazards, both directions. The workspace-wide opt-out was the
@@ -1169,4 +1200,156 @@ async fn a_private_list_the_contact_is_not_on_cannot_be_joined_by_posting_its_id
         "a private list was joined by posting its id"
     );
     assert_eq!(consent_by_list(&pool).await.len(), 1, "only `news` moved");
+}
+
+// ---- Fix round 1 -------------------------------------------------------------------------------
+
+/// M2. The two ways to say "stop" on this page are deliberately not the same act, and the
+/// difference is durable rather than cosmetic, so it is pinned here.
+///
+/// Unticking every box means "not these lists": the memberships go, and nothing is written that
+/// outlives the contact row. Somebody who unticks four topics may well intend to come back, and a
+/// `suppressions` row is permanent, survives an erase-and-re-import and covers lists that do not
+/// exist yet — more than they said.
+///
+/// Saying "all of it" is an explicit control on the page, which posts the same RFC 8058 body a
+/// mail client's button does and so takes the same path, suppression and all. The page is not
+/// complete without it: spec §6.3 makes `/u/{token}` the unsubscribe confirmation as well as the
+/// preference center.
+#[sqlx::test]
+async fn unticking_every_box_is_not_the_workspace_wide_opt_out_but_the_page_offers_one(
+    pool: PgPool,
+) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+
+    // The explicit control is really on the page, and really is the RFC 8058 body.
+    let page = p.app.get(&format!("/u/{}", p.unsub("n0", 0))).await;
+    page.assert_status_ok();
+    assert!(
+        page.text()
+            .contains("name=\"List-Unsubscribe\" value=\"One-Click\""),
+        "the page offers no way to leave everything: {}",
+        page.text()
+    );
+
+    // Every box unticked: an empty `list` set, which is what a browser posts for a form whose
+    // checkboxes are all clear.
+    p.post_unsub(&p.unsub("n1", 0), "").await.assert_status_ok();
+    let got = p.statuses().await;
+    assert!(got.iter().all(|(_, s)| s == "unsubscribed"), "{got:?}");
+    assert_eq!(
+        live_suppressions(&pool, p.workspace).await,
+        [],
+        "unticking the boxes wrote a permanent workspace-wide opt-out nobody asked for"
+    );
+    assert_eq!(
+        consent_by_list(&pool)
+            .await
+            .iter()
+            .filter(|(_, action, _)| action == "suppressed")
+            .count(),
+        0
+    );
+
+    // The explicit control, from the same page, on a contact who is now on nothing: it still
+    // writes the opt-out, because it is about the address and not about the memberships.
+    p.post_unsub(&p.unsub("n2", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        live_suppressions(&pool, p.workspace).await,
+        [(
+            "unsubscribed_all".to_owned(),
+            "one_click".to_owned(),
+            Some("subscriber-acme@ex.test".to_owned()),
+        )],
+    );
+    assert!(
+        p.statuses()
+            .await
+            .contains(&(weekly, "unsubscribed".into()))
+    );
+}
+
+/// L7. The documented limit on `suppressions::unsubscribe_all`: `suppressions_live` is unique per
+/// address per workspace **whatever the reason**, so an address already blocked keeps the block it
+/// has and gets no `unsubscribed_all` row. Pinned so that the change the comment proposes — a
+/// per-reason live index — cannot happen without a test noticing.
+///
+/// The second half is the worst case the comment does not state: when there is also no membership
+/// to change, a one-click writes nothing anywhere, so the append-only record holds no evidence
+/// that the person exercised their RFC 8058 right. That is the behaviour today; this records it.
+#[sqlx::test]
+async fn one_click_on_an_already_blocked_address_keeps_the_block_it_has(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("Weekly", "public", "subscribed").await;
+    let hmac = nm::crypto::suppression_hmac(&p.app.state.secrets, "subscriber-acme@ex.test");
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
+         select $1, $2, 'address', c.email, $4, 'bounced' from contacts c where c.id = $3",
+    )
+    .bind(Uuid::now_v7())
+    .bind(p.workspace)
+    .bind(p.contact)
+    .bind(hmac.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    p.post_unsub(&p.unsub("n1", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+
+    // The memberships still move, and each one that changed is still recorded.
+    let got = p.statuses().await;
+    assert!(got.iter().all(|(_, s)| s == "unsubscribed"), "{got:?}");
+    let rows = consent_by_list(&pool).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|(l, _, _)| *l == Some(weekly) || *l == Some(p.list))
+            .count(),
+        2
+    );
+    // The block that was there is untouched, and no second live row was written.
+    assert_eq!(
+        live_suppressions(&pool, p.workspace).await,
+        [(
+            "bounced".to_owned(),
+            String::new(),
+            Some("subscriber-acme@ex.test".to_owned()),
+        )],
+    );
+    // And so no `suppressed` consent row: it is written only when a row really was.
+    assert!(!rows.iter().any(|(_, action, _)| action == "suppressed"));
+
+    // The worst case: blocked already, and nothing left to change. The act leaves no trace.
+    let before = consent_by_list(&pool).await.len();
+    p.post_unsub(&p.unsub("n2", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        consent_by_list(&pool).await.len(),
+        before,
+        "a repeat on an already-blocked address writes nothing, which is the documented limit"
+    );
+}
+
+/// L1. The no-`429` exemption belongs to a genuine RFC 8058 link, not to anyone who can type the
+/// field name. A forged token carrying the one-click body is refused like any other request past
+/// the limit, so the route cannot be made unlimitable by a string in a body.
+#[sqlx::test]
+async fn the_one_click_exemption_needs_a_valid_token_not_just_the_body(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    for _ in 0..PUBLIC_PER_MINUTE {
+        p.app.get("/c/not-a-token").await;
+    }
+
+    let forged = p.post_unsub("not-a-token", ONE_CLICK).await;
+    assert_eq!(forged.status_code(), StatusCode::TOO_MANY_REQUESTS);
+
+    // The genuine link from the same address is still honoured, which is the ruling.
+    let real = p.post_unsub(&p.unsub("n1", 0), ONE_CLICK).await;
+    real.assert_status_ok();
+    assert_eq!(p.status().await.as_deref(), Some("unsubscribed"));
 }
