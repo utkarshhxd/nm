@@ -30,7 +30,7 @@
 //!
 //! **The public pages have no workspace until their token is parsed, so they key on the client IP**
 //! ([`PUBLIC_PER_MINUTE`]) — and an IP is not a tenant: it is free to mint, which is why [`check`]
-//! bounds its map rather than trusting the caller to be few. See THE BOUND on [`MAX_KEYS`]. Each
+//! bounds its map rather than trusting the caller to be few. See THE BOUND on `MAX_KEYS`. Each
 //! `RateLimiter` owns its own map, so a flood of IPs fills the public one and cannot touch the
 //! four above.
 //!
@@ -116,7 +116,7 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 ///
 /// Sixty, one a second, is that line. It leaves a NAT'd office room to confirm a send and still
 /// stops the thousands a minute a loop would get. It is **not** what bounds this limiter's memory,
-/// because an IP costs an attacker nothing: that is [`MAX_KEYS`], and the two are separate
+/// because an IP costs an attacker nothing: that is `MAX_KEYS`, and the two are separate
 /// defences. Raising this number does not weaken the bound, and lowering it does not strengthen it.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 

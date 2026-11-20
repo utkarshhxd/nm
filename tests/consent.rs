@@ -808,6 +808,7 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
             "contacts/selection.rs",
             "lists/mod.rs",
             "lists/routes.rs",
+            "public/confirm.rs",
             "segments/compile.rs",
         ],
         "this file now touches list_memberships: a writer of status needs a consent row in the \

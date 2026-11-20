@@ -18,7 +18,8 @@ use crate::{
     http,
     http::csrf,
     http::rate_limit::{
-        EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE,
+        EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE, PUBLIC_PER_MINUTE, RateLimiter,
+        SELECTION_PER_MINUTE,
     },
     http::security_headers::security_headers,
     telemetry,
@@ -49,6 +50,10 @@ pub struct AppState {
     /// Per-workspace cap on `POST /imports`, the heaviest write the product takes: up to 512 MB
     /// streamed to disk per call, kept there until the import is run or swept.
     pub import_limit: Arc<RateLimiter>,
+    /// Per-**IP** cap on the public pages, which have no workspace to count against until their
+    /// token is parsed. Its own limiter and so its own map: a flood of addresses fills this one
+    /// and cannot reach the four above. See `http::rate_limit::MAX_KEYS`.
+    pub public_limit: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -65,6 +70,7 @@ impl AppState {
             export_limit: Arc::new(RateLimiter::per_minute(EXPORT_PER_MINUTE)),
             export_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
             import_limit: Arc::new(RateLimiter::per_minute(IMPORT_PER_MINUTE)),
+            public_limit: Arc::new(RateLimiter::per_minute(PUBLIC_PER_MINUTE)),
         })
     }
 
