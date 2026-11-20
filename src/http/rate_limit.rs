@@ -140,11 +140,14 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// counts refusals, so once tripped it stays tripped for the minute. `web/e2e/support/server.ts`
 /// therefore sets `NM_TRUST_PROXY_HEADERS`, and each spec that touches a public page claims an
 /// `X-Forwarded-For` of its own, so the budget is per spec file rather than per run.
-/// `web/e2e/public-form.spec.ts` is the only one today and spends **4** of the 60 on its address:
-/// two page views and two submissions. **The margin over the harness is 15×.** A spec added under
-/// `/c/`, `/u/` or `/f/` picks a fresh address from RFC 5737's range and counts its own cost
-/// here; one that reuses another spec's address inherits its spending, and the failure looks
-/// exactly like a product bug.
+/// Two specs do today, each on an address of its own: `web/e2e/public-form.spec.ts` spends **4**
+/// of the 60 on `198.51.100.9` (two page views and two submissions), and
+/// `web/e2e/forms.spec.ts` spends **1** on `198.51.100.10` (it posts a generated embed snippet to
+/// `POST /f/…` to prove the snippet's field names are the ones the route reads). The budget is
+/// per address, so the margin is the worst spec's: **15×**. A spec added under `/c/`, `/u/` or
+/// `/f/` picks a fresh address from RFC 5737's range and counts its own cost here; one that
+/// reuses another spec's address inherits its spending, and the failure looks exactly like a
+/// product bug.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
 const WINDOW: Duration = Duration::from_secs(60);

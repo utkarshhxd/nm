@@ -101,6 +101,18 @@ const listRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/lists"), "ListDetail"),
 });
 
+const formsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "forms",
+  component: lazyRouteComponent(() => import("./routes/forms")),
+});
+
+const formRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "forms/$formId",
+  component: lazyRouteComponent(() => import("./routes/form-detail")),
+});
+
 const segmentsRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "segments",
@@ -177,6 +189,8 @@ export const router = createRouter({
       contactRoute,
       listsRoute,
       listRoute,
+      formsRoute,
+      formRoute,
       segmentsRoute,
       tagsRoute,
       customFieldsRoute,
