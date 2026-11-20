@@ -6,16 +6,24 @@
 
 mod common;
 
-use std::{future::IntoFuture, net::IpAddr, path::Path, time::Instant};
+use std::{
+    future::IntoFuture,
+    net::IpAddr,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use axum::http::StatusCode;
 use chrono::Utc;
 use common::{PW, TestApp, create_user, create_workspace};
 use nm::{
-    http::rate_limit::PUBLIC_PER_MINUTE,
-    public::token::{Purpose, Token, issue},
+    http::rate_limit::{PUBLIC_PER_MINUTE, SUBMIT_PER_MINUTE},
+    public::{
+        token::{Purpose, Token, issue},
+        unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
+    },
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 const DAY: i64 = 24 * 60 * 60;
@@ -685,6 +693,118 @@ async fn two_overlapping_one_click_posts_write_consent_rows_only_for_real_change
     assert_eq!(live_suppressions(&pool, p.workspace).await.len(), 1);
 }
 
+/// **One genuine unsubscribe link, twenty concurrent clicks, and the whole instance was down.**
+///
+/// `POST /u/{token}` may never answer `429` — a refusal from a mail client's button is spec §4's
+/// second anti-goal, with nobody to retry it — so the limiter cannot bound this route, and for a
+/// while nothing else did. `one_click` opens a transaction and takes `pg_advisory_xact_lock` on
+/// the address, so repeats of **one** link all queue on **one** lock, each holding a pooled
+/// connection while it waits. `db::connect` builds a pool of twenty with no acquire timeout, and
+/// `/readyz` acquires from that same pool, as does every authenticated call in the product. The
+/// token never expires, so the attacker needs one link from any email the instance ever sent.
+///
+/// The pool here is built small, explicitly, rather than taken from `#[sqlx::test]`: the property
+/// is "one-click holds at most `MAX_CONCURRENT_ONE_CLICKS` connections of whatever pool it is
+/// given", and a test of it must not depend on a size sqlx chose. The blocking transaction runs
+/// on the *other* pool for the same reason.
+///
+/// Not vacuous: drop the semaphore from `one_click` and the twelve requests take all eight
+/// connections, `/readyz` cannot acquire one inside its two-second budget, and the last assertion
+/// — every one-click still answered `200` — is what proves the bound refuses nobody.
+#[sqlx::test]
+async fn concurrent_one_clicks_on_one_token_leave_the_pool_alive(pool: PgPool) {
+    const POOL: u32 = 8;
+    const CLICKS: usize = 12;
+    assert!(
+        MAX_CONCURRENT_ONE_CLICKS < POOL as usize && (POOL as usize) < CLICKS,
+        "the fixture only discriminates when the clicks outnumber the pool and the pool outnumbers \
+         the slots"
+    );
+
+    let small = PgPoolOptions::new()
+        .max_connections(POOL)
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a second pool on the test database");
+    // The fixture is written out rather than taken from `pending`, because every request here has
+    // to go through **one** app: the semaphore being tested is that app's, and so is the pool
+    // `/readyz` reports on.
+    let app = std::sync::Arc::new(TestApp::new(small.clone()).await);
+    let owner = create_user(&small, "owner-oneclick@example.com", PW, false).await;
+    let workspace = create_workspace(&small, owner, "oneclick").await;
+    let contact = make_contact(&small, workspace, "subscriber-oneclick@ex.test").await;
+    let list = make_list(&small, workspace, "news", "private", true).await;
+    make_member(&small, workspace, contact, list, "subscribed").await;
+    let token = issue(
+        &app.state.secrets,
+        &Token {
+            workspace_id: workspace,
+            contact_id: contact,
+            purpose: Purpose::Unsubscribe,
+            list_id: None,
+            issued_at: Utc::now().timestamp(),
+            nonce: "n1".to_owned(),
+            kid: None,
+            ref_id: None,
+        },
+    );
+    let path = format!("/u/{token}");
+
+    // Every one-click's last statement is this update, so holding these rows holds every request
+    // in the database at once — which is the state the pool is being asked to survive.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("select 1 from list_memberships where contact_id = $1 for update")
+        .bind(contact)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let mut clicks = tokio::task::JoinSet::new();
+    for _ in 0..CLICKS {
+        let app = std::sync::Arc::clone(&app);
+        let path = path.clone();
+        clicks.spawn(async move { app.post(&path).text(ONE_CLICK).await.status_code() });
+    }
+
+    // Wait until the slots are actually full, then a moment longer: with the bound in place
+    // nothing can exceed them however long this waits, and without it the excess arrives in
+    // milliseconds. A bare sleep would pass trivially if the requests had not reached Postgres.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (small.size() as usize - small.num_idle()) < MAX_CONCURRENT_ONE_CLICKS {
+        assert!(
+            Instant::now() < deadline,
+            "the one-clicks never reached the pool"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let in_use = small.size() as usize - small.num_idle();
+    assert_eq!(
+        in_use, MAX_CONCURRENT_ONE_CLICKS,
+        "{CLICKS} one-clicks on one token hold {in_use} of {POOL} connections"
+    );
+    // The product's own readiness probe, which is what an operator and a load balancer see.
+    app.get("/readyz").await.assert_status_ok();
+
+    drop(blocker);
+    while let Some(r) = clicks.join_next().await {
+        assert_eq!(
+            r.unwrap(),
+            StatusCode::OK,
+            "the bound waits for a slot and never refuses a one-click"
+        );
+    }
+    let left: Vec<String> =
+        sqlx::query_scalar("select status from list_memberships where contact_id = $1")
+            .bind(contact)
+            .fetch_all(&small)
+            .await
+            .unwrap();
+    assert_eq!(left, ["unsubscribed"], "and the work still happened");
+}
+
 /// Spec invariant 4. The token names its workspace, and nothing else does.
 #[sqlx::test]
 async fn one_click_never_touches_another_workspaces_membership(pool: PgPool) {
@@ -1228,7 +1348,11 @@ async fn ticking_a_box_lifts_the_subscribers_own_opt_out_and_no_other_block(pool
     .execute(&pool)
     .await
     .unwrap();
-    p.post_unsub(&p.unsub("n3", 0), &format!("list={weekly}"))
+    // Weekly is subscribed after the save above, and the lift is driven by the lists this save
+    // actually turns ON — so it has to be unticked first or the lift below is never attempted and
+    // the `reason` filter is never asked anything.
+    p.post_unsub(&p.unsub("n3", 0), "").await.assert_status_ok();
+    p.post_unsub(&p.unsub("n4", 0), &format!("list={weekly}"))
         .await
         .assert_status_ok();
     assert_eq!(
@@ -1239,6 +1363,73 @@ async fn ticking_a_box_lifts_the_subscribers_own_opt_out_and_no_other_block(pool
             .collect::<Vec<_>>(),
         ["bounced".to_owned()],
         "a bounce is not a subscriber's to lift"
+    );
+}
+
+/// **A Save that changes nothing must not lift the workspace-wide opt-out, and a Save that lifts
+/// it must say so in the log.**
+///
+/// The predicate used to be "the posted body names any list the page shows", read off the body
+/// and not off the two membership statements. A browser posts the boxes the page pre-ticked, so
+/// opening the link and pressing Save without touching anything satisfied it: no membership
+/// changed, no consent row was written, the page printed "Nothing changed." — and the person's
+/// workspace-wide opt-out was gone, with nothing anywhere recording that it had ended. Reachable
+/// as soon as an operator or an import puts a globally-opted-out contact on a new list, since
+/// neither consults `suppressions`.
+///
+/// Both halves here, in order, against one fixture: the untouched Save keeps the block, and the
+/// Save that really asks for a list clears it **and** writes the `resubscribed` row with a null
+/// `list_id` — the mirror of the `suppressed` row one-click writes, and spec §7.1's word for a
+/// workspace-wide opt-out ending.
+#[sqlx::test]
+async fn an_untouched_save_keeps_the_workspace_wide_opt_out_and_a_real_one_logs_lifting_it(
+    pool: PgPool,
+) {
+    let p = pending(&pool, "acme").await;
+    p.post_unsub(&p.unsub("n1", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    // What an operator or an import does: a membership on a list the page will pre-tick, written
+    // without consulting `suppressions`, while the opt-out is still live.
+    let added = p.on_list("Weekly", "public", "subscribed").await;
+    assert_eq!(live_suppressions(&pool, p.workspace).await.len(), 1);
+    let before = consent_by_list(&pool).await.len();
+
+    // The browser posts the box the page ticked for it. Nothing was touched.
+    let saved = p
+        .post_unsub(&p.unsub("n2", 0), &format!("list={added}"))
+        .await;
+    saved.assert_status_ok();
+    assert!(
+        saved.text().contains("Nothing changed."),
+        "{}",
+        saved.text()
+    );
+    assert_eq!(
+        live_suppressions(&pool, p.workspace).await.len(),
+        1,
+        "a Save that changed nothing lifted the workspace-wide opt-out"
+    );
+    assert_eq!(
+        consent_by_list(&pool).await.len(),
+        before,
+        "and recorded nothing, which is how it stayed invisible"
+    );
+
+    // Now a real one: `news` is unsubscribed, so ticking it is a change.
+    p.post_unsub(&p.unsub("n3", 0), &format!("list={added}&list={}", p.list))
+        .await
+        .assert_status_ok();
+    assert_eq!(live_suppressions(&pool, p.workspace).await, []);
+    let rows = consent_by_list(&pool).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|(list, action, source)| list.is_none()
+                && action == "resubscribed"
+                && source == "preference_center")
+            .count(),
+        1,
+        "the end of a workspace-wide opt-out is one row with no list: {rows:?}"
     );
 }
 
@@ -1551,7 +1742,9 @@ async fn contact_count(pool: &PgPool) -> i64 {
 /// which changes whenever two requests straddle a whole second. Comparing either would only ever
 /// assert that time passed, and neither says anything about the address that was submitted, which
 /// is what invariant 7 is about. That the `POST` route carries no `RateLimit-*` headers at all is
-/// asserted where it belongs, in `a_rate_limited_submission_answers_exactly_as_a_real_one`.
+/// asserted where it belongs, in `a_rate_limited_submission_answers_exactly_as_a_real_one` —
+/// **on the successful response as well as the refused one**, because an absence this function
+/// filters out is an absence this function cannot be the proof of.
 fn answer(r: &axum_test::TestResponse) -> (StatusCode, String, Vec<(String, String)>) {
     let mut headers: Vec<(String, String)> = r
         .headers()
@@ -1849,6 +2042,50 @@ async fn a_honeypot_submission_answers_exactly_as_a_real_one(pool: PgPool) {
     assert!(page.text().contains("class=\"hp\""), "{}", page.text());
 }
 
+/// **A submission has a budget of its own, far below a page view's, and it is reached first.**
+/// `RESEND_AFTER_MINUTES` bounds repeats at one address and says nothing about the number of
+/// addresses, so until this budget existed one key could aim `PUBLIC_PER_MINUTE` confirmation
+/// emails a minute — 3,600 an hour — at addresses of the submitter's choosing, each a fresh
+/// `(contact, list)` pair. The honeypot costs a line to defeat and CAPTCHA is a spec non-goal.
+///
+/// Not vacuous in either direction: the submissions **under** the budget all write their contact,
+/// and the page views that follow are still served, which is what makes this a second budget
+/// rather than a smaller first one.
+#[sqlx::test]
+async fn a_submission_spends_a_much_smaller_budget_than_a_page_view(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", false).await;
+    s.form("newsletter", &[list], None).await;
+
+    for i in 0..SUBMIT_PER_MINUTE {
+        s.submit("newsletter", &format!("email=real{i}@ex.test"))
+            .await
+            .assert_status_ok();
+    }
+    assert_eq!(
+        contact_count(&pool).await,
+        i64::from(SUBMIT_PER_MINUTE),
+        "every submission inside the budget is written"
+    );
+
+    // One past it, and well inside `PUBLIC_PER_MINUTE`: the success page, and nothing written.
+    let over = s.submit("newsletter", "email=past@ex.test").await;
+    assert_eq!(over.status_code(), StatusCode::OK, "never a 429 here");
+    assert_eq!(
+        contact_count(&pool).await,
+        i64::from(SUBMIT_PER_MINUTE),
+        "a submission past the submission budget writes nothing"
+    );
+    // The shared budget is a separate budget and still has room, so the pages are still served.
+    const {
+        assert!(
+            SUBMIT_PER_MINUTE < PUBLIC_PER_MINUTE,
+            "the point of the two"
+        )
+    };
+    s.app.get(&s.url("newsletter")).await.assert_status_ok();
+}
+
 /// Invariant 9, second half, and the one that looks exactly like a bug: the success page, not a
 /// `429`. Every other limited route in this tree refuses with a status and `RateLimit-*` headers;
 /// this one must not, because a distinguishable refusal tells a scraper it has been seen
@@ -1877,11 +2114,21 @@ async fn a_rate_limited_submission_answers_exactly_as_a_real_one(pool: PgPool) {
     let refused = s.submit("newsletter", "email=later@ex.test").await;
     assert_eq!(refused.status_code(), StatusCode::OK, "never a 429 here");
     assert_eq!(answer(&real), answer(&refused));
-    assert!(
-        refused.maybe_header("retry-after").is_none()
-            && refused.maybe_header("ratelimit-remaining").is_none(),
-        "the RateLimit headers are the refusal's last tell and this route does not carry them"
-    );
+    // **Both sides, and the successful one is the side that matters.** `answer()` filters
+    // `ratelimit-remaining` and `ratelimit-reset` out of the comparison because they are clocks,
+    // so the equality above cannot see them on either response — and they are precisely the "you
+    // have been counted" tell this route drops them to avoid. Asserting their absence on the
+    // refusal alone left the blind spot inside the filter: a change that attached only those two
+    // to the success path would have passed everything on this branch.
+    for (which, r) in [("the refusal", &refused), ("the real one", &real)] {
+        assert!(
+            r.maybe_header("retry-after").is_none()
+                && r.maybe_header("ratelimit-remaining").is_none()
+                && r.maybe_header("ratelimit-reset").is_none(),
+            "{which} carries a RateLimit header: they are the refusal's last tell and this route \
+             does not carry them"
+        );
+    }
     // It was genuinely refused: the second address got nothing.
     assert_eq!(contact_count(&pool).await, 1);
     assert_eq!(jobs(&pool).await.len(), 1);
@@ -2274,6 +2521,35 @@ async fn a_second_submission_resends_the_confirmation_only_after_the_window(pool
         1,
         "a repeat inside the window must not queue a second email"
     );
+
+    // **The window counts the row whatever state it is in, and this is the only place that is
+    // pinned.** `0025_jobs_completed_at.sql` exists because a worker that removes a drained row
+    // makes the throttle's question answer "no" every time and turns this unauthenticated route
+    // into a mailer aimed at any address — with nothing going red. `forms.rs` says the predicate
+    // names no `completed_at` and no `failed_at` "precisely so that adding one later is a visible
+    // decision rather than a silent narrowing"; until this block, it was silent. Nothing else on
+    // the branch writes either column, so adding `and completed_at is null` to the predicate
+    // reddened no test.
+    for drained in [
+        "update jobs set completed_at = now(), failed_at = null",
+        "update jobs set completed_at = null, failed_at = now()",
+    ] {
+        sqlx::query(drained).execute(&pool).await.unwrap();
+        s.submit("newsletter", "email=lost@ex.test")
+            .await
+            .assert_status_ok();
+        assert_eq!(
+            jobs(&pool).await.len(),
+            1,
+            "the row is still inside the window after `{drained}`: narrowing the predicate past a \
+             terminal state is what 0025 was written to forbid"
+        );
+    }
+    // Back to queued, so the window test below is about `created_at` and nothing else.
+    sqlx::query("update jobs set completed_at = null, failed_at = null")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Fifteen minutes later, without waiting fifteen minutes. `created_at` is what the throttle
     // reads, and since `0026` it reads it from an index on (workspace, contact, list, created_at)

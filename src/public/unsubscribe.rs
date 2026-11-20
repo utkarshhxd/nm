@@ -38,6 +38,38 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/u/{token}", get(preferences).post(apply))
 }
 
+/// THE BOUND ON ONE-CLICK. How many RFC 8058 one-click unsubscribes may be **in the database at
+/// once**, instance-wide, every workspace together.
+///
+/// It exists because this route is the one the limiter may not refuse. A `429` from a mail
+/// client's button is spec §4's second anti-goal with nobody to retry it, so [`apply`] reads the
+/// limiter's verdict and ignores it for a signed one-click — and nothing else bounded what one
+/// genuine link could then cost. [`one_click`] opens a transaction and takes
+/// `pg_advisory_xact_lock` on the address, so **repeats of one link queue on one lock, each
+/// holding one of `db::connect`'s twenty pooled connections while it waits**. About twenty
+/// concurrent POSTs with a single valid link held every connection in the pool; `/readyz` acquires
+/// from that pool and so does every authenticated call in the product, so one old unsubscribe
+/// link took the whole instance down. The attacker needed no credentials and no budget, and an
+/// unsubscribe token never expires.
+///
+/// **A semaphore and not a counter, because a one-click may not be refused and may not be
+/// dropped.** A request that finds no slot waits for one and is then served normally: it is
+/// counted by the limiter, answered `200`, and its writes are the idempotent no-op a repeat
+/// always was. Nothing is shed, so the ruling survives intact; what is bounded is how much of the
+/// pool the exempt route may hold.
+///
+/// **Four, the same number and the same reasoning as [`MAX_CONCURRENT_EXPORTS`].** Both are
+/// instance-wide ceilings on a pool of twenty, sized to leave the authenticated API the rest. The
+/// difference is how long a slot is held: an export holds one for as long as a client takes to
+/// read the book, a one-click for one short transaction — measured at under five seconds end to
+/// end in `tests/public_pages.rs`, and in the single-digit milliseconds when it is not contended.
+/// So four slots are hundreds of distinct addresses a second, far above the burst a campaign
+/// produces, while repeats of **one** address serialise on the advisory lock whatever this number
+/// is. Raising it buys no throughput for the case that motivated it and spends the pool.
+///
+/// [`MAX_CONCURRENT_EXPORTS`]: crate::contacts::export::MAX_CONCURRENT_EXPORTS
+pub const MAX_CONCURRENT_ONE_CLICKS: usize = 4;
+
 /// An unsubscribe token never expires (spec §6.2), so there is no "this link is old" page here:
 /// a token this instance did not issue, or one issued for another door, is the only refusal.
 /// It names no address, so it is the same page whether or not the contact still exists.
@@ -121,6 +153,12 @@ async fn preferences(
 /// writes no consent row and no second `unsubscribed_at`. See `http::rate_limit::MAX_KEYS`, which
 /// names this route as the one that may not answer `429`. **The preference form is refused**, like
 /// the GET: it is a person who can try again, and one who did not ask for everything to stop.
+///
+/// **Idempotent writes are not a bound on cost, and the bound is [`MAX_CONCURRENT_ONE_CLICKS`].**
+/// A repeat writes nothing and still opens a transaction and queues on an address advisory lock,
+/// holding a pooled connection throughout, so the exemption alone made one genuine link enough to
+/// starve the pool the whole product shares. The semaphore is where that is bounded, because it
+/// is the one place a bound can go without refusing the request.
 ///
 /// **The exemption is granted to a genuine link, not to a string in a body.** The token is
 /// verified *before* the verdict is applied, so only a one-click POST that this instance actually
@@ -300,12 +338,24 @@ fn render(topics: &[Topic], saved: Option<&str>) -> Response {
 /// So nothing here reads `lists.double_optin`, and `Action::Requested` is unreachable from this
 /// function.
 ///
-/// The action is read off the status the row had **before** the write, which is why the candidate
-/// query runs inside the transaction: a row that was not there is `Subscribed`, one that was
-/// `pending` is `Confirmed` — the same word `GET /c/{token}` records for the identical transition
-/// under the identical evidence — and one that was `unsubscribed` is `Resubscribed`. The SQL
-/// guards (`status <> 'subscribed'`, `status <> 'unsubscribed'`) decide *whether* a row is
-/// recorded, so a concurrent writer cannot produce a consent row for a change that did not happen.
+/// The action is read off the status the candidate query saw: a row that was not there is
+/// `Subscribed`, one that was `pending` is `Confirmed` — the same word `GET /c/{token}` records
+/// for the identical transition under the identical evidence — and one that was `unsubscribed` is
+/// `Resubscribed`. The SQL guards (`status <> 'subscribed'`, `status <> 'unsubscribed'`) decide
+/// *whether* a row is recorded, so a concurrent writer cannot produce a consent row for a change
+/// that did not happen.
+///
+/// **What running inside the transaction does not buy, corrected.** This comment used to say the
+/// candidate query runs inside the transaction so that the action is exact. It is not: under READ
+/// COMMITTED the `insert … on conflict do update` below re-reads the latest *committed* row, so a
+/// writer that commits between the two statements leaves the word describing a transition that
+/// did not happen — a row another request created as `pending` in that window is promoted here
+/// and recorded `subscribed` rather than `confirmed`. The guards keep the row count honest; they
+/// do not keep the word exact, and nothing short of `select … for update` on the candidates or a
+/// `returning` that carries the old status would. It is left as it is: the window is one
+/// statement wide, it needs a concurrent writer on the same `(contact, list)`, every outcome is
+/// one neighbouring word for a change that really happened, and buying exactness costs a row lock
+/// on every candidate of every save. Recorded here rather than claimed away.
 async fn save(
     state: &AppState,
     meta: &RequestMeta,
@@ -338,23 +388,32 @@ async fn save(
             off.push(topic.id);
         }
     }
-    // Asked for at least one of the lists the page offered, whether or not it changed anything.
-    let asked_for_any = before.iter().any(|topic| wanted.contains(&topic.id));
-
     // The workspace-wide opt-out was theirs to set through one-click, so it is theirs to clear by
     // asking for a list again — otherwise this page shows boxes that tick and change nothing a
     // send would honour. Only `unsubscribed_all` is lifted; a bounce, a complaint, an operator's
-    // block and an erasure tombstone are not a subscriber's to overturn. No consent row: the
-    // per-list rows below are the record of what they asked for, and there is no action in spec
-    // §7.1's list that means "a block was lifted".
+    // block and an erasure tombstone are not a subscriber's to overturn.
+    //
+    // **`on` and not "the body asked for a list", and the difference is a silent lift.** The
+    // predicate here used to be "the body names any list the page shows", computed from the
+    // posted body independently of the two statements below. A browser posts the boxes the page
+    // pre-ticked, so pressing Save without touching anything satisfied it: both change sets
+    // empty, no membership written, no consent row, "Nothing changed." printed on the page — and
+    // the subscriber's workspace-wide opt-out silently gone. It was reachable the moment an
+    // operator or an import put a globally-opted-out contact on a new list, since neither
+    // consults `suppressions`. `on` is the lists this save is about to turn on *because they were
+    // not on already*, which is the only reading under which a tick means "mail me again".
     //
     // **Before the membership writes, for the reason `one_click` sets out in full**: the erase
     // path takes the suppressions row and then the membership rows, so this has to take them in
-    // that order too or the two deadlock.
-    if asked_for_any {
+    // that order too or the two deadlock. That is why the predicate is `on` — computed above from
+    // the candidates read in this transaction — and not the `returning` of a statement that has
+    // not run yet.
+    let lifted = if on.is_empty() {
+        false
+    } else {
         suppressions::lift_unsubscribed_all(&mut tx, &state.secrets, token.workspace_id, &email)
-            .await?;
-    }
+            .await?
+    };
 
     // **Unticking every box is not a workspace-wide opt-out, and that is a decision.** Unticking
     // means what it says: not these lists. Somebody who unticks four topics may well intend to
@@ -420,6 +479,27 @@ async fn save(
     }
     for list_id in unsubscribed {
         record(&mut tx, token, list_id, consent::Action::Unsubscribed, &cx).await?;
+    }
+    // **The end of a workspace-wide opt-out, with a null `list_id`, the mirror of the `suppressed`
+    // row `one_click` writes for its beginning.** Without it the log could say that somebody
+    // opted out of everything and could never say that it ended: the public routes write no
+    // `audit_log` row by design, so this lift was in neither log. `Resubscribed` with no list is
+    // spec §7.1's word for exactly this and is already in the table's check constraint — the row
+    // shape `0020` reserved the nullable column for.
+    //
+    // Recorded only when a row was actually lifted, the same rule every write on this page
+    // follows: a save by somebody who was never globally opted out records nothing.
+    if lifted {
+        consent::record(
+            &mut tx,
+            token.workspace_id,
+            token.contact_id,
+            None,
+            consent::Action::Resubscribed,
+            consent::Source::PreferenceCenter,
+            &cx,
+        )
+        .await?;
     }
 
     let after = topics(&mut tx, token.workspace_id, token.contact_id).await?;
@@ -506,6 +586,13 @@ async fn record(
 /// same order as the erase path costs nothing, because the suppression does not depend on what the
 /// sweep returned.
 async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiResult<()> {
+    // **Before the connection, never after.** The slot is what keeps this route's share of the
+    // pool bounded, so a request must not be holding a connection while it waits for one. Held to
+    // the end of the function, which is the end of the transaction. See
+    // [`MAX_CONCURRENT_ONE_CLICKS`]. `ok()` rather than `expect`: nothing closes this semaphore,
+    // and if something ever did, running unbounded beats a panic that answers a stranger `500` on
+    // the one route that may not fail.
+    let _slot = state.one_click_slots.acquire().await.ok();
     let mut tx = state.pool.begin().await?;
     let email = sqlx::query_scalar!(
         "select email from contacts where workspace_id = $1 and id = $2",

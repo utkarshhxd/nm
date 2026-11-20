@@ -19,9 +19,10 @@ use crate::{
     http::csrf,
     http::rate_limit::{
         EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE, PUBLIC_PER_MINUTE, RateLimiter,
-        SELECTION_PER_MINUTE,
+        SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
     },
     http::security_headers::security_headers,
+    public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
     telemetry,
 };
 
@@ -54,6 +55,18 @@ pub struct AppState {
     /// token is parsed. Its own limiter and so its own map: a flood of addresses fills this one
     /// and cannot reach the four above. See `http::rate_limit::MAX_KEYS`.
     pub public_limit: Arc<RateLimiter>,
+    /// Per-**IP** cap on `POST /f/{workspace}/{slug}` alone, spent on top of `public_limit`. A
+    /// submission is not a page view: it writes rows and queues mail at an address the submitter
+    /// need not own, so it gets a much smaller allowance of its own.
+    /// See `http::rate_limit::SUBMIT_PER_MINUTE`.
+    pub submit_limit: Arc<RateLimiter>,
+    /// Instance-wide cap on one-click unsubscribes *in the database at once*. `POST /u/{token}`
+    /// with an RFC 8058 body may never answer `429` (spec §4's second anti-goal), so the limiter
+    /// above cannot bound it and something else has to: without this, repeats of one genuine link
+    /// queue on one address advisory lock, each holding a pooled connection while it waits, and
+    /// twenty of them take `/readyz` and the authenticated API down with them. It refuses nobody —
+    /// a request without a slot waits for one. See `public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS`.
+    pub one_click_slots: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -71,6 +84,8 @@ impl AppState {
             export_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
             import_limit: Arc::new(RateLimiter::per_minute(IMPORT_PER_MINUTE)),
             public_limit: Arc::new(RateLimiter::per_minute(PUBLIC_PER_MINUTE)),
+            submit_limit: Arc::new(RateLimiter::per_minute(SUBMIT_PER_MINUTE)),
+            one_click_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ONE_CLICKS)),
         })
     }
 

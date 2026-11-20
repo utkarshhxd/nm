@@ -252,6 +252,32 @@ async fn lock_address(db: &mut PgConnection, hmac: &[u8; 32]) -> sqlx::Result<()
     Ok(())
 }
 
+/// Takes [`lock_address`] for a caller that is about to branch on what it finds about an address
+/// and must not let the branch be timed.
+///
+/// `is_erased` and `unsubscribe_all` take this lock as part of doing their own work, so a caller
+/// that reaches neither — a submission for an address that is already a contact, or one that is
+/// suppressed — took no lock at all and ran in parallel with every other request naming that
+/// address, while a submission for a *new* address serialised with them. That difference is
+/// visible in one concurrent burst with no statistics at all, and it answers spec §4's third
+/// anti-goal: whether an address exists in a workspace. Taking the lock first, on every path,
+/// makes every submission for one address serialise whatever is true about it.
+///
+/// An address that does not normalise takes no lock and is not an error: there is nothing to
+/// collide on, and every writer past this point refuses it anyway (`is_erased` counts it as
+/// erased). The lock is held to the end of the transaction, like every other caller's, so the
+/// SHORTCUT on `lock_address` applies here too — this is for a path writing one address.
+pub async fn lock_address_for(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    email: &str,
+) -> sqlx::Result<()> {
+    let Ok(email) = normalize_email(email) else {
+        return Ok(());
+    };
+    lock_address(db, &suppression_hmac(secrets, &email)).await
+}
+
 /// `true` if `email` was erased in `workspace_id` (or instance-wide). Narrower than
 /// `is_suppressed`, on purpose: a bounced or unsubscribed address may still be a contact (the
 /// eligibility view keeps it from being mailed), an erased one may not. Takes a lock held to the

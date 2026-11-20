@@ -174,6 +174,38 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// browser's own save and signup write.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
+/// How many **signup submissions** one IP address may make per window. Spent on top of
+/// [`PUBLIC_PER_MINUTE`], not instead of it: a submission is still a public request and still
+/// costs the pool, so it counts against the shared budget as well and is refused by whichever
+/// bound it crosses first.
+///
+/// **A submission is not a page view, and that is why it does not share a page view's
+/// allowance.** `GET /c/{token}`, `GET /u/{token}` and `GET /f/…` are a person reading something
+/// that was sent to them. `POST /f/…` creates a contact, a membership, an append-only consent row
+/// and a `confirmation_email` job — and the address in the box need not belong to whoever typed
+/// it. `RESEND_AFTER_MINUTES` bounds repeats at **one** address; it does nothing about the number
+/// of addresses, because each distinct one is a fresh `(contact, list)` pair. So the number of
+/// *distinct victims per key per minute* was `PUBLIC_PER_MINUTE`, which is 3,600 confirmation
+/// emails an hour per key aimed wherever the submitter liked. This is the bound on that.
+///
+/// **Ten, and what ten is measured against.** Nobody fills a signup form ten times a minute: one
+/// submission, or two when the first came back "Check the details", is the whole of honest use.
+/// The number is kept well above that for the deployments `PUBLIC_PER_MINUTE` describes — an
+/// office NAT, a carrier's CGNAT and a link-scanning proxy all arrive as one key, and issue 25
+/// means an IPv4 address is a key on its own rather than a block — so a handful of real people
+/// signing up from one address in the same minute are not refused. The heaviest e2e spec makes
+/// **2** submissions on one address (`web/e2e/public-form.spec.ts`), so the harness margin is 5×;
+/// a spec that submits more counts its cost here, as it already does for the budget above.
+///
+/// **What it does not fix, said plainly.** A hosted form with no challenge is a mailer, and
+/// CAPTCHA is a spec non-goal (§3) while the honeypot costs one line to defeat. This takes the
+/// per-key rate from 3,600 an hour to 600 and leaves the residual untouched: an attacker's
+/// capacity is set by how many addresses they hold, not by this constant. Issue 25 accepts that
+/// asymmetry for the public budget and it is accepted here for the same reason. The irreducible
+/// part is what is left after this, and it is bounded only by a challenge or by a per-workspace
+/// ceiling on confirmations, neither of which M1d has.
+pub const SUBMIT_PER_MINUTE: u32 = 10;
+
 const WINDOW: Duration = Duration::from_secs(60);
 
 /// THE BOUND. How many windows one limiter's map may hold at once.

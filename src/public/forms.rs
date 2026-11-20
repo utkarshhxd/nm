@@ -125,13 +125,35 @@ async fn show(
 /// not by this limiter, and the pool is what would feel it. Shedding earlier would mean answering
 /// a refusal with something that is not this form's page, which is the one thing spec §8.9
 /// forbids.
+///
+/// **Two budgets, both spent, refused by whichever is crossed first.** A submission is a public
+/// request, so it counts against `PUBLIC_PER_MINUTE` like every page under `/c`, `/u` and `/f`;
+/// it is also the one public request that queues mail at an address its sender need not own, so
+/// it counts against the much smaller `SUBMIT_PER_MINUTE` as well. Both `check` calls run on
+/// every submission — a budget that is only spent when the other one has room is not a budget.
+///
+/// **A refused submission is written nowhere, so it is counted and logged instead.** Spec §8.9
+/// forbids this route from saying it was refused, which means the operator cannot be told by the
+/// response either: the submitter gets the success page and no contact, no membership, no consent
+/// row and no job are written. That is invisible from outside and it is also what the limiter's
+/// full-map state does to **every first-time visitor at once** (`rate_limit::MAX_KEYS`: while the
+/// map holds `MAX_KEYS` live windows, every key not already in it is refused), so the symptom an
+/// operator would otherwise meet is "the signup form works and nobody ever signs up". The metric
+/// and the log line below are the only place that fact exists. They name no address and no form,
+/// only that a submission was dropped: this route may not answer a question about an address, and
+/// a log it writes is not a place to start.
 async fn submit(
     State(state): State<AppState>,
     meta: RequestMeta,
     Path((workspace, slug)): Path<(String, String)>,
     body: String,
 ) -> ApiResult<Response> {
-    let over = state.public_limit.check(meta.ip.unwrap_or(UNKNOWN_IP)).over;
+    let ip = meta.ip.unwrap_or(UNKNOWN_IP);
+    // Both, in two statements, so that neither can become conditional on the other: a budget that
+    // is only spent when the other one has room is not a budget.
+    let public_over = state.public_limit.check(ip).over;
+    let submit_over = state.submit_limit.check(ip).over;
+    let over = public_over.or(submit_over);
     let mut db = state.pool.acquire().await?;
     let Some(form) = forms::by_slug(&mut db, &workspace, &slug).await? else {
         return Ok(not_found());
@@ -170,6 +192,17 @@ async fn submit(
     let honeypot = !first(&submitted, HONEYPOT).is_empty();
     if over.is_none() && !honeypot {
         apply(&state, &meta, &form, &lists, &checked).await?;
+    } else if over.is_some() {
+        // The refusal nobody downstream can see. A honeypot trip is not counted here: that one is
+        // the decoy working, it is bounded by nothing an operator needs to act on, and counting it
+        // would bury the signal this metric exists to carry under bot traffic.
+        metrics::counter!("public_form_submissions_dropped_total").increment(1);
+        tracing::warn!(
+            "a signup submission was dropped by the rate limiter: nothing was written and the \
+             submitter was answered with the success page, because spec §8.9 forbids this route \
+             from saying otherwise. If this is constant, the limiter's key map may be full and \
+             every first-time visitor is being dropped: see http::rate_limit::MAX_KEYS"
+        );
     }
     Ok(accepted(&form, &lists))
 }
@@ -182,11 +215,12 @@ async fn submit(
 /// the honeypot, so by the time this runs the only questions left are ones about the address —
 /// and every answer to one of those is the same page.
 ///
-/// **The order of the writes matters.** `suppressions::is_erased`, inside `contacts::create`,
-/// takes an advisory lock on the address; `contacts::routes::erase_contact` takes the same lock,
-/// writes the tombstone, and only then deletes the contact — which cascades to
-/// `list_memberships`. Taking the address before the membership rows, as this does, is taking
-/// them in the same order as the erase path, so the two cannot deadlock.
+/// **The order of the writes matters.** The address advisory lock is taken first, on every path
+/// (`suppressions::lock_address_for`, and again inside `contacts::create`'s `is_erased`);
+/// `contacts::routes::erase_contact` takes the same lock, writes the tombstone, and only then
+/// deletes the contact — which cascades to `list_memberships`. Taking the address before the
+/// membership rows, as this does, is taking them in the same order as the erase path, so the two
+/// cannot deadlock.
 async fn apply(
     state: &AppState,
     meta: &RequestMeta,
@@ -206,6 +240,19 @@ async fn apply(
 
     let email = checked.email();
     let mut tx = state.pool.begin().await?;
+    // **First, before anything is read about the address.** Everything below branches on what the
+    // workspace knows about this address, and until this line the branches took different locks:
+    // a new address reached `is_erased` and its advisory lock, an address that was already a
+    // contact reached neither. K concurrent submissions of one address then serialised when it
+    // was new and ran in parallel when it was not — one burst, no statistics, and an answer to
+    // the question spec §4's third anti-goal forbids. Byte-identity cannot see that, which is why
+    // it is closed here rather than asserted there. Now every submission for one address
+    // serialises whatever is true about it, and the cost on the paths that did not lock is one
+    // `pg_advisory_xact_lock`.
+    //
+    // It is also the first lock the erase path takes, so taking it here keeps the ordering the
+    // paragraph above requires rather than disturbing it.
+    suppressions::lock_address_for(&mut tx, &state.secrets, email).await?;
     // **A bounce is let through; every other block refuses.** A workspace-wide opt-out
     // (`docs/adr/0001`), a complaint, an operator's manual block and an erasure tombstone are all
     // consent decisions, and a public form is the one caller with no operator behind it to
@@ -222,7 +269,10 @@ async fn apply(
     // slot. `is_suppressed_excluding_bounce` tests every row instead, and a reason this build has
     // never seen counts as blocking.
     //
-    // shortcut: this early return is a **timing** oracle, and byte-identity does not close it.
+    // shortcut: this early return is a **single-shot timing** oracle, and byte-identity does not
+    // close it. Its concurrent half — K requests naming one address, serialised or not depending
+    // on what the workspace knows — is closed by the unconditional lock above; what is left is
+    // the wall-clock difference between one submission and another, measured below.
     // Measured on the dev container, fastest of five, warm: a new address 8.1-9.1 ms, a
     // suppressed one 2.7-3.0 ms — the suppressed path skips the contact insert, two membership
     // statements, the consent row and the `jobs` row. About 5 ms and a factor of three: not
