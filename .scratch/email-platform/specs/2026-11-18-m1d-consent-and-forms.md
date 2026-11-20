@@ -213,8 +213,19 @@ contact detail screen; the public name/description/visibility fields on the list
    contact row or the list row surviving.** A per-list unsubscribe is recorded as a `list`-scope
    suppression keyed on `(workspace_id, email_hmac, list_name)` — address-keyed, like every other
    suppression, and like `gdpr_erasure` it outlives the thing it protects. Only the person, acting
-   through a token, lifts it. One test per writer still stands, and each now has a sibling that
-   deletes the contact or the list first.
+   through a token, lifts it.
+
+   **Closed for the subscriber's own acts, open for the operator's.** `POST /u/{token}` one-click
+   already wrote the address-keyed `unsubscribed_all`, which outlives both rows; the preference
+   centre now writes a `list`-scope suppression; and the import and form paths honour both. An
+   **operator-driven** unsubscribe — `lists::unsubscribe_member` and the bulk
+   `selection::unsubscribe` — still lives only in the membership row and is still lost to a
+   deletion. That is not an oversight: `contacts` has no `email_hmac` column, and the bulk path
+   writes up to `MAX_SELECTION` rows set-based in one statement, so a durable write there means
+   either sending the HMAC key into SQL (the suppressions table's own one-way door) or a million
+   round-trips. Closing it is a separate change and is tracked. Until then **this invariant holds
+   for what the person does and not for what an operator does on their behalf**, and nothing in
+   the product should claim otherwise.
 2. A `pending` membership is never mailable, and `confirmed` is the only transition that makes it
    so. (`is_mailable` already refuses `pending`; the test proves the transition.)
 3. One-click unsubscribe takes effect in **under five seconds**, measured end to end, and is
