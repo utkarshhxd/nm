@@ -1127,8 +1127,8 @@ pub async fn bulk_subscribe_contacts(
         MembershipStatus::Subscribed
     };
     let excluded = &target.excluded_ids;
-    let cx = consent::Context::of_principal(&principal);
-    let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status, &cx).await?;
+    let who = consent::principal_ref(&principal);
+    let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status, Some(&who)).await?;
     refuse_if_widened(&sel, n, ("nobody was added to the list", "adding"))?;
     let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_SUBSCRIBED;
@@ -1173,8 +1173,8 @@ pub async fn bulk_unsubscribe_contacts(
     let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &target).await?;
     lists::get(&mut tx, workspace_id, list_id).await?;
     let excluded = &target.excluded_ids;
-    let cx = consent::Context::of_principal(&principal);
-    let n = selection::unsubscribe(&mut tx, &sel, excluded, list_id, &cx).await?;
+    let who = consent::principal_ref(&principal);
+    let n = selection::unsubscribe(&mut tx, &sel, excluded, list_id, Some(&who)).await?;
     let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_UNSUBSCRIBED;
     finish_bulk(

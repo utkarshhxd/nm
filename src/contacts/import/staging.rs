@@ -589,6 +589,10 @@ pub(crate) const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_tim
 ///   import can reach a double-opt-in list and a single-opt-in one at once (the job's list and a
 ///   list the file names). The `case` over the status it just wrote is the only place that
 ///   distinction survives; a Rust-side helper taking one action for the batch cannot carry it.
+///   **That `case` has no `else`, deliberately.** Its value is a legal claim about a person, so a
+///   status this code has not been taught yields NULL and is refused by `action not null` — the
+///   same refusal `selection::subscribe`'s exhaustive match gets from the compiler. An `else
+///   'subscribed'` would log "they agreed" for a status nobody checked.
 /// - **No id crosses the process boundary.** The previous shape sent both id arrays back to Rust
 ///   and in again — a per-row cost on a million-row import, for rows Postgres already had.
 ///
@@ -662,7 +666,8 @@ async fn write_memberships_and_tags(
              insert into consent_log \
                  (id, workspace_id, contact_id, list_id, action, source, source_ref) \
              select {SQL_UUID_V7}, $1, a.contact_id, a.list_id, \
-                    case when a.status = 'pending' then 'requested' else 'subscribed' end, \
+                    case when a.status = 'pending' then 'requested' \
+                         when a.status = 'subscribed' then 'subscribed' end, \
                     $4, $5 \
                from added a \
          ), \

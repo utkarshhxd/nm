@@ -119,16 +119,24 @@ pub fn scrub(e: sqlx::Error) -> ApiError {
     ))
 }
 
+/// The `source_ref` an operator's or an API key's change is recorded under: who made it. It is
+/// the whole of what an operator path may put in a consent row, which is why the set-based
+/// writers take this and not a [`Context`] — there is nothing else of theirs to pass.
+pub fn principal_ref(principal: &crate::auth::Principal) -> String {
+    match principal {
+        crate::auth::Principal::User { user_id, .. } => user_id,
+        crate::auth::Principal::ApiKey { key_id, .. } => key_id,
+    }
+    .to_string()
+}
+
 impl Context {
-    /// An operator's own change through the API: who made it, and no IP or user agent, because
-    /// the request's belong to the operator and not to the person whose consent this is.
+    /// An operator's own change through the API: who made it, and no IP, user agent or token
+    /// nonce, because the request's belong to the operator and not to the person whose consent
+    /// this is.
     pub fn of_principal(principal: &crate::auth::Principal) -> Self {
-        let id = match principal {
-            crate::auth::Principal::User { user_id, .. } => user_id,
-            crate::auth::Principal::ApiKey { key_id, .. } => key_id,
-        };
         Context {
-            source_ref: Some(id.to_string()),
+            source_ref: Some(principal_ref(principal)),
             ..Context::default()
         }
     }

@@ -735,13 +735,19 @@ async fn run_recorded(
 ///
 /// Each contact it adds gets a consent row, `Source::Api`, in the same transaction — `requested`
 /// when `status` is `pending`, `subscribed` otherwise; a contact it skips gets none.
+///
+/// `source_ref` and not a [`consent::Context`], for the reason [`run_recorded`] gives: this writes
+/// one row per contact in a selection of up to `MAX_SELECTION`, and no request's IP, user agent or
+/// token nonce is evidence about all of them. A `Context` parameter here would accept all three
+/// and drop them. A subscriber recording their own evidence does it one contact at a time, through
+/// `lists::add_member` and `lists::unsubscribe_member`, which do take a whole `Context`.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
     status: MembershipStatus,
-    cx: &consent::Context,
+    source_ref: Option<&str>,
 ) -> ApiResult<Counts> {
     // One `status` for the whole statement, so one action for the whole statement — read off what
     // is about to be written, never off the list's `double_optin` flag, which is mutable.
@@ -752,8 +758,7 @@ pub async fn subscribe(
         MembershipStatus::Subscribed => consent::Action::Subscribed,
         MembershipStatus::Unsubscribed => consent::Action::Unsubscribed,
     };
-    let recorded = (action, cx.source_ref.as_deref());
-    run_recorded(db, sel, excluded, list_id, recorded, |q| {
+    run_recorded(db, sel, excluded, list_id, (action, source_ref), |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) \
                 select ")
             .push_bind(sel.workspace_id())
@@ -773,14 +778,16 @@ pub async fn subscribe(
 /// Marks every selected member of the list `unsubscribed`; a contact not on the list, or already
 /// unsubscribed, is not counted in `affected` and keeps its first `unsubscribed_at`. Each one it
 /// changes gets an `unsubscribed` consent row, `Source::Api`, in the same transaction.
+///
+/// `source_ref` and not a [`consent::Context`], for the reason [`subscribe`] gives.
 pub async fn unsubscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
-    cx: &consent::Context,
+    source_ref: Option<&str>,
 ) -> ApiResult<Counts> {
-    let recorded = (consent::Action::Unsubscribed, cx.source_ref.as_deref());
+    let recorded = (consent::Action::Unsubscribed, source_ref);
     run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push(
             "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \

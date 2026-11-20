@@ -62,6 +62,7 @@ type Row = (
     Option<String>,
     Option<IpAddr>,
     Option<String>,
+    Option<String>,
 );
 
 #[sqlx::test]
@@ -73,8 +74,7 @@ async fn a_recorded_consent_row_carries_every_column_it_was_given(pool: PgPool) 
         ip: Some("203.0.113.9".parse().unwrap()),
         user_agent: Some("Mozilla/5.0 (test)".into()),
         source_ref: Some("form-42".into()),
-        // Not an operator path's business: `record_writes_the_token_jti_it_was_given` has it.
-        token_jti: None,
+        token_jti: Some("01HQ0000000000000000000000".into()),
     };
     let mut conn = pool.acquire().await.unwrap();
     record(
@@ -90,8 +90,8 @@ async fn a_recorded_consent_row_carries_every_column_it_was_given(pool: PgPool) 
     .unwrap();
 
     let row: Row = sqlx::query_as(
-        "select workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent \
-         from consent_log",
+        "select workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent, \
+         token_jti from consent_log",
     )
     .fetch_one(&pool)
     .await
@@ -107,6 +107,7 @@ async fn a_recorded_consent_row_carries_every_column_it_was_given(pool: PgPool) 
             Some("form-42".into()),
             Some("203.0.113.9".parse().unwrap()),
             Some("Mozilla/5.0 (test)".into()),
+            Some("01HQ0000000000000000000000".into()),
         )
     );
 
@@ -122,13 +123,21 @@ async fn a_recorded_consent_row_carries_every_column_it_was_given(pool: PgPool) 
     )
     .await
     .unwrap();
-    let bare: (Option<Uuid>, Option<IpAddr>, Option<String>, Option<String>) = sqlx::query_as(
-        "select list_id, ip, user_agent, source_ref from consent_log where action = 'suppressed'",
+    type Bare = (
+        Option<Uuid>,
+        Option<IpAddr>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let bare: Bare = sqlx::query_as(
+        "select list_id, ip, user_agent, source_ref, token_jti from consent_log \
+         where action = 'suppressed'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(bare, (None, None, None, None));
+    assert_eq!(bare, (None, None, None, None, None));
 }
 
 /// The database must refuse, not Rust: `record` checks nothing, so the only thing standing between
@@ -221,8 +230,7 @@ async fn one_row(pool: &PgPool, ws: Uuid, c: Uuid, l: Uuid) {
         ip: Some("203.0.113.9".parse().unwrap()),
         user_agent: Some("Mozilla/5.0 (test)".into()),
         source_ref: Some("form-42".into()),
-        // Not an operator path's business: `record_writes_the_token_jti_it_was_given` has it.
-        token_jti: None,
+        token_jti: Some("01HQ0000000000000000000000".into()),
     };
     let mut conn = pool.acquire().await.unwrap();
     record(
@@ -252,12 +260,13 @@ async fn deleting_a_list_keeps_the_consent_rows_and_only_clears_the_pointer(pool
         .unwrap();
 
     let row: Row = sqlx::query_as(
-        "select workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent \
-         from consent_log",
+        "select workspace_id, contact_id, list_id, action, source, source_ref, ip, user_agent, \
+         token_jti from consent_log",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
+    // Everything but `list_id` survives the referential `set null`, the token nonce included.
     assert_eq!(
         row,
         (
@@ -269,6 +278,7 @@ async fn deleting_a_list_keeps_the_consent_rows_and_only_clears_the_pointer(pool
             Some("form-42".into()),
             Some("203.0.113.9".parse().unwrap()),
             Some("Mozilla/5.0 (test)".into()),
+            Some("01HQ0000000000000000000000".into()),
         )
     );
 }
@@ -783,11 +793,18 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
 /// `selection::subscribe` and the importer — over both a single-opt-in and a double-opt-in list;
 /// memberships and consent rows must match one for one.
 ///
-/// It does **not** reach `lists::unsubscribe_member` or `selection::unsubscribe`. Those two are
-/// covered by `subscribing_through_the_lists_api_writes_a_consent_row` and
-/// `subscribing_through_the_contacts_api_writes_a_consent_row` above, which also prove that a
-/// repeat unsubscribe changes nothing and so records nothing. Said plainly because the next
-/// person to add a writer will read this comment to decide where it belongs.
+/// It does **not** reach three of the writers in the list below:
+///
+/// - `lists::unsubscribe_member` and `selection::unsubscribe` are covered by
+///   `subscribing_through_the_lists_api_writes_a_consent_row` and
+///   `subscribing_through_the_contacts_api_writes_a_consent_row` above, which also prove that a
+///   repeat unsubscribe changes nothing and so records nothing.
+/// - `public::confirm` promotes `pending` to `subscribed` on the double opt-in link, and is
+///   covered by `tests/public_pages.rs`, which asserts the `confirmed` row and its `token_jti`.
+///   It needs a token to reach, which is why it is not in this fixture.
+///
+/// Said plainly because the next person to add a writer will read this comment to decide where it
+/// belongs, and an out-of-date census here is worse than none.
 ///
 /// The source scan below is a **tripwire, not a proof**: it fails when a file that never touched
 /// `list_memberships` starts to, which is where the next writer is most likely to appear. It
