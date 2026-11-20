@@ -10,12 +10,13 @@ use axum::Router;
 use crate::app::AppState;
 
 pub mod confirm;
+pub mod forms;
 pub mod page;
 pub mod token;
 pub mod unsubscribe;
 
 /// The three top-level path prefixes this module owns: `/c/` confirm, `/u/` unsubscribe and the
-/// preference center, `/f/` the signup forms Task 9 adds.
+/// preference center, `/f/` the hosted signup forms.
 const PREFIXES: [&str; 3] = ["/c", "/u", "/f"];
 
 /// True for those prefixes and everything under them, **including the bare prefix with no token**.
@@ -50,6 +51,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(confirm::routes())
         .merge(unsubscribe::routes())
+        .merge(forms::routes())
 }
 
 #[cfg(test)]

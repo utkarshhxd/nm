@@ -133,6 +133,18 @@ pub const IMPORT_PER_MINUTE: u32 = 60;
 /// because 100 failures per address per 15 minutes is loose enough to absorb it; sixty a minute
 /// across every subscriber is not. **An operator behind a proxy must set `trust_proxy_headers`,
 /// and must only do so when the proxy is theirs** — the header is client-controlled otherwise.
+///
+/// **What the e2e harness spends against it, which is the other thing this number has to clear.**
+/// `web/playwright.config.ts` runs `workers: 1` against one `nm serve`, so without help every
+/// request in the whole run would key on `127.0.0.1` and share one window of sixty — and `check`
+/// counts refusals, so once tripped it stays tripped for the minute. `web/e2e/support/server.ts`
+/// therefore sets `NM_TRUST_PROXY_HEADERS`, and each spec that touches a public page claims an
+/// `X-Forwarded-For` of its own, so the budget is per spec file rather than per run.
+/// `web/e2e/public-form.spec.ts` is the only one today and spends **4** of the 60 on its address:
+/// two page views and two submissions. **The margin over the harness is 15×.** A spec added under
+/// `/c/`, `/u/` or `/f/` picks a fresh address from RFC 5737's range and counts its own cost
+/// here; one that reuses another spec's address inherits its spending, and the failure looks
+/// exactly like a product bug.
 pub const PUBLIC_PER_MINUTE: u32 = 60;
 
 const WINDOW: Duration = Duration::from_secs(60);

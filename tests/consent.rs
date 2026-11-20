@@ -795,7 +795,7 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
 /// `selection::subscribe` and the importer — over both a single-opt-in and a double-opt-in list;
 /// memberships and consent rows must match one for one.
 ///
-/// It does **not** reach three of the writers in the list below:
+/// It does **not** reach four of the writers in the list below:
 ///
 /// - `lists::unsubscribe_member` and `selection::unsubscribe` are covered by
 ///   `subscribing_through_the_lists_api_writes_a_consent_row` and
@@ -804,6 +804,9 @@ async fn an_import_that_subscribes_writes_one_consent_row_per_contact(pool: PgPo
 /// - `public::confirm` promotes `pending` to `subscribed` on the double opt-in link, and is
 ///   covered by `tests/public_pages.rs`, which asserts the `confirmed` row and its `token_jti`.
 ///   It needs a token to reach, which is why it is not in this fixture.
+/// - `public::forms` writes `pending` or `subscribed` from a public signup page, and is covered
+///   by `tests/public_pages.rs` — one `requested` or `subscribed` row per membership it writes,
+///   and none for the writes invariant 1 refuses. It needs a form and a public URL to reach.
 ///
 /// Said plainly because the next person to add a writer will read this comment to decide where it
 /// belongs, and an out-of-date census here is worse than none.
@@ -908,6 +911,7 @@ async fn every_membership_status_write_in_the_tree_has_a_consent_row(pool: PgPoo
             "lists/mod.rs",
             "lists/routes.rs",
             "public/confirm.rs",
+            "public/forms.rs",
             "public/unsubscribe.rs",
             "segments/compile.rs",
         ],

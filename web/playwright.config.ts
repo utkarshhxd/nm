@@ -22,5 +22,11 @@ export default defineConfig({
     // The dev container runs as root and has a small /dev/shm.
     launchOptions: { args: ["--no-sandbox", "--disable-dev-shm-usage"] },
   },
+  // Chromium only, because `docker/dev.Dockerfile` bakes in Chromium only: the dev container runs
+  // with `--rm`, so a browser installed during a run is gone when it exits. M1d Task 9 needed
+  // Chromium **and** Firefox to settle whether a redirect after a form POST is checked against
+  // `form-action 'self'`; Chromium refused it, which settled the question on its own
+  // (`e2e/public-form.spec.ts`), but the next cross-browser question will need a second browser
+  // in the image and a rebuild, not a line here.
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
 });

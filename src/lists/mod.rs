@@ -44,9 +44,11 @@ impl MembershipStatus {
     }
 }
 
-/// How a membership was created, for the consent log. `form` has no writer yet (Task 9's hosted
-/// signup pages) and is therefore not a variant; the table's `check` already admits it. A row
-/// written before the column existed reads as NULL, never as one of these.
+/// How a membership was created, for the consent log. A row written before the column existed
+/// reads as NULL, never as one of these.
+///
+/// `Form` is the hosted signup page (`public::forms`), added by Task 9. `0018` reserved the
+/// string from the start, so it needed no migration.
 ///
 /// `PreferenceCenter` was added by `0022`, with the reasoning in that migration: the subscriber
 /// changing their own preferences is not `ui` (nobody signed in), not `api`, and not a NULL,
@@ -61,6 +63,7 @@ pub enum MembershipSource {
     Bulk,
     Import,
     PreferenceCenter,
+    Form,
 }
 
 impl MembershipSource {

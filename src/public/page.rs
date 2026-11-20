@@ -84,6 +84,10 @@ ul.topics{list-style:none;margin:0 0 1.5rem;padding:0}\
 ul.topics li{margin:0 0 0.5rem}\
 ul.topics label{display:flex;gap:0.6rem;align-items:center;min-height:1.75rem}\
 form{margin:0 0 1rem}form:last-child{margin-bottom:0}\
+label{display:inline-block;margin-bottom:0.25rem}\
+input[type=text],input[type=email]{width:100%;box-sizing:border-box;padding:0.5rem;\
+border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--fg)}\
+.hp{position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden}\
 button{padding:0.5rem 0.9rem;border:1px solid var(--border);border-radius:8px;\
 background:var(--surface);color:var(--fg);cursor:pointer}";
 

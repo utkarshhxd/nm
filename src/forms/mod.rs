@@ -132,6 +132,44 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
+/// The form behind a public URL, or `None` if those two slugs name nothing.
+///
+/// **`None` is the whole of what this route may say about a miss.** A workspace that does not
+/// exist, a workspace whose form does not exist, and a form in another workspace are one answer,
+/// because `workspaces.slug` and `forms.slug` are both guessable and the difference between the
+/// three would say which operators are customers here. There is no `ApiError::NotFound` on this
+/// path either: that is an RFC 9457 document, and these routes answer in HTML.
+///
+/// Returns the form **with the lists it has now**, which may be none: `form_lists.list_id`
+/// cascades, so "at least one list" holds when an operator writes a form and not for the row's
+/// lifetime (`0023_forms_and_jobs.sql`). The submission handler is what decides what a form with
+/// no lists does, and `tests/forms.rs` pins the model behaviour.
+pub async fn by_slug(
+    db: &mut PgConnection,
+    workspace_slug: &str,
+    slug: &str,
+) -> ApiResult<Option<Form>> {
+    sqlx::query_as!(
+        Row,
+        r#"select f.id, f.workspace_id, f.slug, f.name,
+                  f.fields as "fields: Jsonb<Vec<FormField>>",
+                  f.redirect_url, f.headline, f.button_label, f.created_at, f.updated_at,
+                  coalesce(array_agg(fl.list_id order by fl.list_id)
+                           filter (where fl.list_id is not null), '{}') as "list_ids!: Vec<Uuid>"
+           from forms f
+           join workspaces w on w.id = f.workspace_id
+           left join form_lists fl on fl.workspace_id = f.workspace_id and fl.form_id = f.id
+           where w.slug = $1 and f.slug = $2
+           group by f.id"#,
+        workspace_slug,
+        slug,
+    )
+    .fetch_optional(db)
+    .await
+    .map(|row| row.map(Form::from))
+    .map_err(Into::into)
+}
+
 /// A form's public URL is `/f/{workspace}/{slug}`, so the slug is a URL path segment and nothing
 /// else: `^[a-z0-9][a-z0-9-]{1,62}$`, written out. No trimming — a slug that needed trimming was
 /// not a slug.

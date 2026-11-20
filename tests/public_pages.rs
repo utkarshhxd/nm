@@ -398,10 +398,10 @@ fn no_handler_under_src_public_names_cookiejar() {
     );
 }
 
-/// **This covers `/c/` only, which is every public page there is today and will not be.** Tasks 5,
-/// 6 and 9 add `/u/` and `/f/`; each must be added here, or the name of this test becomes a claim
-/// it does not check. The `429` page is covered by the per-IP test below, which is the only place
-/// a refusal can be produced.
+/// **Every page under `/c/`, `/u/` and `/f/`, which is every public page there is.** A page added
+/// under any of those prefixes must be added here, or the name of this test becomes a claim it
+/// does not check. The `429` page is covered by the per-IP test below, which is the only place a
+/// refusal can be produced.
 #[sqlx::test]
 async fn every_public_page_is_no_store(pool: PgPool) {
     let p = pending(&pool, "acme").await;
@@ -444,6 +444,26 @@ async fn every_public_page_is_no_store(pool: PgPool) {
         "text/html; charset=utf-8",
         "preferences"
     );
+
+    // The signup form's two pages. It names no person, but it is served from the same shell and
+    // a cached copy of it would be a cached copy of an operator's live copy.
+    let s = signup(&pool, "globex").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    for (what, path) in [
+        ("the form", s.url("newsletter")),
+        ("no such form", s.url("nothing")),
+    ] {
+        let r = s.app.get(&path).await;
+        assert_eq!(r.header("cache-control"), "no-store", "{what}");
+        assert_eq!(
+            r.header("content-type"),
+            "text/html; charset=utf-8",
+            "{what}"
+        );
+    }
+    let submitted = s.submit("newsletter", "email=new@ex.test").await;
+    assert_eq!(submitted.header("cache-control"), "no-store", "submitted");
 
     // And the bare prefixes, which reach no handler at all: `public::owns_path` keeps them off
     // the SPA, and `security_headers::uncacheable` keeps a shared cache off them.
@@ -1352,4 +1372,656 @@ async fn the_one_click_exemption_needs_a_valid_token_not_just_the_body(pool: PgP
     let real = p.post_unsub(&p.unsub("n1", 0), ONE_CLICK).await;
     real.assert_status_ok();
     assert_eq!(p.status().await.as_deref(), Some("unsubscribed"));
+}
+
+// ---- Task 9: the hosted signup form ------------------------------------------------------------
+
+/// A workspace with nothing in it yet, and the slugs that reach its forms from the open internet.
+struct Signup {
+    app: TestApp,
+    workspace: Uuid,
+    slug: String,
+}
+
+async fn signup(pool: &PgPool, slug: &str) -> Signup {
+    let owner = create_user(pool, &format!("owner-{slug}@example.com"), PW, false).await;
+    let workspace = create_workspace(pool, owner, slug).await;
+    Signup {
+        app: TestApp::new(pool.clone()).await,
+        workspace,
+        slug: slug.to_owned(),
+    }
+}
+
+impl Signup {
+    async fn list(&self, name: &str, double_optin: bool) -> Uuid {
+        make_list(&self.app.pool, self.workspace, name, "public", double_optin).await
+    }
+
+    /// A form collecting an address and a first name, naming `lists`. Written straight into the
+    /// table: `tests/forms.rs` is where the authenticated API that writes one is tested, and this
+    /// file is about what a stranger gets from the public page.
+    async fn form(&self, slug: &str, lists: &[Uuid], redirect: Option<&str>) -> Uuid {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "insert into forms (id, workspace_id, slug, name, fields, redirect_url, headline, \
+             button_label) values ($1, $2, $3, 'Signup', $4::jsonb, $5, 'Join the list', 'Join')",
+        )
+        .bind(id)
+        .bind(self.workspace)
+        .bind(slug)
+        .bind(
+            serde_json::json!([
+                {"target": {"kind": "email"}, "required": true, "label": "Email"},
+                {"target": {"kind": "first_name"}, "required": false, "label": "First name"},
+            ])
+            .to_string(),
+        )
+        .bind(redirect)
+        .execute(&self.app.pool)
+        .await
+        .unwrap();
+        for list in lists {
+            sqlx::query(
+                "insert into form_lists (workspace_id, form_id, list_id) values ($1, $2, $3)",
+            )
+            .bind(self.workspace)
+            .bind(id)
+            .bind(list)
+            .execute(&self.app.pool)
+            .await
+            .unwrap();
+        }
+        id
+    }
+
+    fn url(&self, form_slug: &str) -> String {
+        format!("/f/{}/{form_slug}", self.slug)
+    }
+
+    /// A submission, as a browser posts one.
+    async fn submit(&self, form_slug: &str, body: &str) -> axum_test::TestResponse {
+        self.app
+            .post(&self.url(form_slug))
+            .content_type("application/x-www-form-urlencoded")
+            .text(body)
+            .await
+    }
+
+    /// Every membership in this workspace, as `(list_id, status, source)`, ordered by list.
+    async fn memberships(&self) -> Vec<(Uuid, String, Option<String>)> {
+        sqlx::query_as(
+            "select list_id, status, source from list_memberships where workspace_id = $1 \
+             order by list_id",
+        )
+        .bind(self.workspace)
+        .fetch_all(&self.app.pool)
+        .await
+        .unwrap()
+    }
+}
+
+/// Every queued job, as `(kind, payload)`, oldest first.
+async fn jobs(pool: &PgPool) -> Vec<(String, serde_json::Value)> {
+    sqlx::query_as("select kind, payload from jobs order by id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+async fn contact_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("select count(*) from contacts")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A response as the invariant compares them: the status, the body, and every header but `date`,
+/// which the HTTP server stamps with the wall clock and which no handler chooses.
+fn answer(r: &axum_test::TestResponse) -> (StatusCode, String, Vec<(String, String)>) {
+    let mut headers: Vec<(String, String)> = r
+        .headers()
+        .iter()
+        .filter(|(name, _)| name.as_str() != "date")
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    (r.status_code(), r.text(), headers)
+}
+
+#[sqlx::test]
+async fn a_new_address_on_a_double_optin_list_is_pending_and_enqueues_a_job(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    let form = s.form("newsletter", &[list], None).await;
+
+    let r = s
+        .submit("newsletter", "email=new@ex.test&first_name=Ada")
+        .await;
+    r.assert_status_ok();
+    assert!(r.text().contains("Check your email"), "{}", r.text());
+
+    assert_eq!(
+        s.memberships().await,
+        [(list, "pending".to_owned(), Some("form".to_owned()))]
+    );
+    // Spec 7.1 as amended: a membership landing in `pending` records `requested`, not
+    // `subscribed`. The subscriber's own IP and user agent are the evidence, `source_ref` is the
+    // form - and `token_jti` is empty, because no link was followed to get here.
+    let rows = consent_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "requested");
+    assert_eq!(rows[0].1, "form");
+    assert_eq!(rows[0].2, Some("127.0.0.1".parse().unwrap()));
+    assert_eq!(rows[0].3, None, "no link was followed");
+    assert_eq!(
+        rows[0].4,
+        Some(form.to_string()),
+        "which form was submitted"
+    );
+
+    // The name it collected really did land on the contact, so the fields are wired and not
+    // merely accepted.
+    let first: String = sqlx::query_scalar("select first_name from contacts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first, "Ada");
+
+    let queued = jobs(&pool).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0, "confirmation_email");
+    assert_eq!(queued[0].1["list_id"], serde_json::json!(list));
+    assert_eq!(queued[0].1["email"], "new@ex.test");
+    assert!(
+        queued[0].1["token"]
+            .as_str()
+            .is_some_and(|t| t.contains('.')),
+        "the payload carries the issued token string: {:?}",
+        queued[0].1
+    );
+}
+
+#[sqlx::test]
+async fn a_new_address_on_a_single_optin_list_is_subscribed_with_no_job(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", false).await;
+    s.form("newsletter", &[list], None).await;
+
+    let r = s.submit("newsletter", "email=new@ex.test").await;
+    r.assert_status_ok();
+    assert!(r.text().contains("You are signed up"), "{}", r.text());
+
+    assert_eq!(
+        s.memberships().await,
+        [(list, "subscribed".to_owned(), Some("form".to_owned()))]
+    );
+    let rows = consent_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "subscribed");
+    assert_eq!(rows[0].1, "form");
+    // No confirmation to ask for, so no email to send.
+    assert_eq!(jobs(&pool).await.len(), 0);
+}
+
+/// Spec 7.3: double opt-in follows **the list's** flag, not the form's, so one submission can
+/// produce both kinds at once - and one `jobs` row per double-opt-in list, each with its own
+/// token, because `parse` requires a `list_id` on exactly the confirm tokens and one token cannot
+/// cover two lists.
+#[sqlx::test]
+async fn one_submission_to_a_form_naming_both_kinds_does_both(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let news = s.list("News", true).await;
+    let digest = s.list("Digest", true).await;
+    let offers = s.list("Offers", false).await;
+    s.form("newsletter", &[news, digest, offers], None).await;
+
+    s.submit("newsletter", "email=new@ex.test")
+        .await
+        .assert_status_ok();
+
+    let mut got: Vec<(Uuid, String)> = s
+        .memberships()
+        .await
+        .into_iter()
+        .map(|(l, status, _)| (l, status))
+        .collect();
+    got.sort();
+    let mut want = vec![
+        (news, "pending".to_owned()),
+        (digest, "pending".to_owned()),
+        (offers, "subscribed".to_owned()),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+
+    let consent = consent_by_list(&pool).await;
+    assert_eq!(consent.len(), 3);
+    for (list, action, source) in &consent {
+        assert_eq!(source, "form");
+        let want = if *list == Some(offers) {
+            "subscribed"
+        } else {
+            "requested"
+        };
+        assert_eq!(action, want, "{list:?}");
+    }
+
+    // Two double-opt-in lists, two emails, two different tokens: they are two consents.
+    let queued = jobs(&pool).await;
+    assert_eq!(queued.len(), 2, "one per double-opt-in list, and no more");
+    let mut lists: Vec<Uuid> = queued
+        .iter()
+        .map(|(_, p)| serde_json::from_value(p["list_id"].clone()).unwrap())
+        .collect();
+    lists.sort();
+    let mut want = vec![news, digest];
+    want.sort();
+    assert_eq!(lists, want);
+    assert_ne!(
+        queued[0].1["token"], queued[1].1["token"],
+        "a confirm token names one list, so two lists cannot share one"
+    );
+}
+
+/// Invariant 7. The three cases differ in everything the database does and in nothing a caller
+/// can see: same status, same bytes, same headers.
+#[sqlx::test]
+async fn the_response_is_identical_for_new_existing_and_suppressed(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+
+    // Suppressed workspace-wide, through the hash the lookup really uses.
+    let blocked = "blocked@ex.test";
+    let hmac = nm::crypto::suppression_hmac(&s.app.state.secrets, blocked);
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
+         values ($1, $2, 'address', $3, $4, 'unsubscribed_all')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s.workspace)
+    .bind(blocked)
+    .bind(hmac.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let new = s.submit("newsletter", "email=new@ex.test").await;
+    // The same address again: now an existing contact with a membership already pending.
+    let existing = s.submit("newsletter", "email=new@ex.test").await;
+    let suppressed = s.submit("newsletter", &format!("email={blocked}")).await;
+
+    assert_eq!(answer(&new), answer(&existing));
+    assert_eq!(answer(&new), answer(&suppressed));
+    // Not vacuous: the three really did do different things underneath.
+    assert_eq!(
+        contact_count(&pool).await,
+        1,
+        "only the first wrote a contact"
+    );
+    assert_eq!(consent_rows(&pool).await.len(), 1);
+    assert_eq!(jobs(&pool).await.len(), 1);
+}
+
+/// Review Focus 5. The address is blocked workspace-wide, so nothing is written - and the second
+/// half of this test is what proves the block is what did it rather than a fixture that never
+/// matched: lift it and the identical submission subscribes.
+#[sqlx::test]
+async fn a_suppressed_address_gets_no_membership_and_no_job(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    let blocked = "blocked@ex.test";
+    let hmac = nm::crypto::suppression_hmac(&s.app.state.secrets, blocked);
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
+         values ($1, $2, 'address', $3, $4, 'unsubscribed_all')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s.workspace)
+    .bind(blocked)
+    .bind(hmac.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    s.submit("newsletter", &format!("email={blocked}"))
+        .await
+        .assert_status_ok();
+    assert_eq!(contact_count(&pool).await, 0, "no contact");
+    assert_eq!(s.memberships().await, [], "no membership");
+    assert_eq!(consent_rows(&pool).await.len(), 0, "no consent row");
+    assert_eq!(jobs(&pool).await.len(), 0, "and no email queued");
+
+    // The control. Without this the test above passes just as well with a fabricated hash that
+    // matched nothing - the failure a Task 5/6 test shipped with.
+    sqlx::query("delete from suppressions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    s.submit("newsletter", &format!("email={blocked}"))
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        s.memberships().await,
+        [(list, "pending".to_owned(), Some("form".to_owned()))],
+        "the suppression was what stopped the first one"
+    );
+}
+
+/// Invariant 9, first half.
+#[sqlx::test]
+async fn a_honeypot_submission_answers_exactly_as_a_real_one(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+
+    let real = s.submit("newsletter", "email=real@ex.test").await;
+    let trapped = s
+        .submit(
+            "newsletter",
+            "email=bot@ex.test&website=http%3A%2F%2Fspam.test",
+        )
+        .await;
+
+    assert_eq!(answer(&real), answer(&trapped));
+    // And the trap caught it: one contact, one membership, one job - the real one's.
+    assert_eq!(contact_count(&pool).await, 1);
+    assert_eq!(jobs(&pool).await.len(), 1);
+    assert_eq!(jobs(&pool).await[0].1["email"], "real@ex.test");
+
+    // The page really does carry the input a script would fill in, hidden from a person.
+    let page = s.app.get(&s.url("newsletter")).await;
+    assert!(page.text().contains("name=\"website\""), "{}", page.text());
+    assert!(page.text().contains("class=\"hp\""), "{}", page.text());
+}
+
+/// Invariant 9, second half, and the one that looks exactly like a bug: the success page, not a
+/// `429`. Every other limited route in this tree refuses with a status and `RateLimit-*` headers;
+/// this one must not, because a distinguishable refusal tells a scraper it has been seen
+/// (spec 8.9).
+#[sqlx::test]
+async fn a_rate_limited_submission_answers_exactly_as_a_real_one(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+
+    let real = s.submit("newsletter", "email=real@ex.test").await;
+    real.assert_status_ok();
+    // The shared public budget, spent from anywhere: Task 4b made `PUBLIC_PER_MINUTE` one budget
+    // for all five pages, and `check` counts refused requests too.
+    for _ in 0..PUBLIC_PER_MINUTE {
+        s.app.get("/c/not-a-token").await;
+    }
+
+    let refused = s.submit("newsletter", "email=later@ex.test").await;
+    assert_eq!(refused.status_code(), StatusCode::OK, "never a 429 here");
+    assert_eq!(answer(&real), answer(&refused));
+    assert!(
+        refused.maybe_header("retry-after").is_none()
+            && refused.maybe_header("ratelimit-remaining").is_none(),
+        "the RateLimit headers are the refusal's last tell and this route does not carry them"
+    );
+    // It was genuinely refused: the second address got nothing.
+    assert_eq!(contact_count(&pool).await, 1);
+    assert_eq!(jobs(&pool).await.len(), 1);
+    assert_eq!(jobs(&pool).await[0].1["email"], "real@ex.test");
+}
+
+/// Spec invariant 1, for the writer that is easiest to reach: anyone may type anyone's address
+/// into a public form. A membership that was unsubscribed stays unsubscribed, records nothing,
+/// and - on a double-opt-in list - is not even asked again by email.
+#[sqlx::test]
+async fn a_form_submission_cannot_resubscribe_an_unsubscribed_contact(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let news = s.list("News", true).await;
+    let offers = s.list("Offers", false).await;
+    s.form("newsletter", &[news, offers], None).await;
+    let contact = make_contact(&pool, s.workspace, "gone@ex.test").await;
+    make_member(&pool, s.workspace, contact, news, "unsubscribed").await;
+    make_member(&pool, s.workspace, contact, offers, "unsubscribed").await;
+
+    s.submit("newsletter", "email=gone@ex.test")
+        .await
+        .assert_status_ok();
+
+    let got = s.memberships().await;
+    assert!(
+        got.iter().all(|(_, status, _)| status == "unsubscribed"),
+        "{got:?}"
+    );
+    assert_eq!(consent_rows(&pool).await.len(), 0, "nothing changed");
+    assert_eq!(
+        jobs(&pool).await.len(),
+        0,
+        "and nobody who left is emailed to ask them back"
+    );
+}
+
+#[sqlx::test]
+async fn the_enqueued_job_carries_a_token_that_the_confirm_route_accepts(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    s.submit("newsletter", "email=new@ex.test")
+        .await
+        .assert_status_ok();
+
+    let queued = jobs(&pool).await;
+    let token = queued[0].1["token"].as_str().unwrap().to_owned();
+    let r = s.app.get(&format!("/c/{token}")).await;
+    r.assert_status_ok();
+    assert!(r.text().contains("subscribed"), "{}", r.text());
+
+    assert_eq!(
+        s.memberships().await,
+        [(list, "subscribed".to_owned(), Some("form".to_owned()))]
+    );
+    // The loop closes: `requested` when the form was submitted, `confirmed` when the link in the
+    // queued email was followed.
+    let actions: Vec<String> = consent_rows(&pool).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(actions, ["requested", "confirmed"]);
+}
+
+/// Spec 9: under 500 ms, excluding the job (which is a row in `jobs`, not a send).
+///
+/// **It also measures the gap byte-identity cannot close.** A suppressed address returns before
+/// the contact, the membership, the consent row and the job a new address writes, so it answers
+/// sooner, and a large enough difference is an existence oracle wearing a different coat. The gap
+/// is not asserted on - a wall-clock difference between two code paths is the flakiest assertion
+/// there is - it is measured and recorded, in `src/public/forms.rs` beside the branch that causes
+/// it. What is asserted is that **both** paths sit inside the budget, which is what stops the
+/// difference growing without anyone noticing.
+#[sqlx::test]
+async fn a_submission_completes_in_under_500ms_excluding_the_job(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    let blocked = "blocked@ex.test";
+    let hmac = nm::crypto::suppression_hmac(&s.app.state.secrets, blocked);
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason) \
+         values ($1, $2, 'address', $3, $4, 'unsubscribed_all')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s.workspace)
+    .bind(blocked)
+    .bind(hmac.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Warm: the first request pays for the connection and the statements being prepared.
+    s.submit("newsletter", "email=warm@ex.test").await;
+
+    let mut writes = std::time::Duration::MAX;
+    let mut refusals = std::time::Duration::MAX;
+    for n in 0..5 {
+        let started = Instant::now();
+        s.submit("newsletter", &format!("email=new{n}@ex.test"))
+            .await
+            .assert_status_ok();
+        writes = writes.min(started.elapsed());
+
+        let started = Instant::now();
+        s.submit("newsletter", &format!("email={blocked}"))
+            .await
+            .assert_status_ok();
+        refusals = refusals.min(started.elapsed());
+    }
+    println!("new address {writes:?}, suppressed address {refusals:?}");
+    assert!(writes.as_millis() < 500, "a new address took {writes:?}");
+    assert!(
+        refusals.as_millis() < 500,
+        "a suppressed address took {refusals:?}"
+    );
+    assert_eq!(
+        jobs(&pool).await.len(),
+        6,
+        "five new addresses and the warm-up"
+    );
+}
+
+/// `form_lists.list_id` cascades, so "at least one list" holds when an operator writes a form and
+/// not for the row's lifetime (`0023_forms_and_jobs.sql`). A form with nothing left to subscribe
+/// to accepts no submission - and says so the way every other refusal here says it, which is not
+/// at all.
+#[sqlx::test]
+async fn a_form_whose_lists_were_all_deleted_accepts_no_submission(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    sqlx::query("delete from lists where id = $1")
+        .bind(list)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = s.submit("newsletter", "email=new@ex.test").await;
+    r.assert_status_ok();
+    assert_eq!(s.memberships().await, []);
+    assert_eq!(consent_rows(&pool).await.len(), 0);
+    assert_eq!(jobs(&pool).await.len(), 0);
+}
+
+/// Two guessable slugs, and one answer for every way of missing. A workspace that does not exist,
+/// a form that does not exist and another workspace's form must not be told apart, or the pair is
+/// an oracle for which operators are customers here.
+#[sqlx::test]
+async fn an_unknown_form_and_another_workspaces_form_are_the_same_page(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let other = signup(&pool, "globex").await;
+    let list = other.list("News", true).await;
+    other.form("newsletter", &[list], None).await;
+
+    let theirs = s.app.get("/f/acme/newsletter").await; // exists, but not in `acme`
+    let no_form = s.app.get("/f/acme/nothing").await;
+    let no_workspace = s.app.get("/f/nobody/newsletter").await;
+    for r in [&theirs, &no_form, &no_workspace] {
+        assert_eq!(r.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(r.text(), theirs.text());
+    }
+    // The premise: that form really is reachable at its own workspace's slug.
+    other
+        .app
+        .get("/f/globex/newsletter")
+        .await
+        .assert_status_ok();
+}
+
+/// Every value an operator typed reaches this page, and `page::esc` is the whole of what stands
+/// between them and an injected tag. The labels and the button sit in element text; the input
+/// names are built from the target and a validated custom-field key, never from a label.
+#[sqlx::test]
+async fn the_form_page_escapes_the_operators_copy(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    let id = s.form("newsletter", &[list], None).await;
+    let nasty = "<script>alert(1)</script> \"Bob & Co\"";
+    sqlx::query(
+        "update forms set headline = $2, button_label = $2, fields = $3::jsonb where id = $1",
+    )
+    .bind(id)
+    .bind(nasty)
+    .bind(
+        serde_json::json!([{"target": {"kind": "email"}, "required": true, "label": nasty}])
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let r = s.app.get(&s.url("newsletter")).await;
+    r.assert_status_ok();
+    let html = r.text();
+    assert!(!html.contains("<script>"), "{html}");
+    assert_eq!(
+        html.matches("&lt;script&gt;alert(1)&lt;/script&gt; &quot;Bob &amp; Co&quot;")
+            .count(),
+        4,
+        "the headline twice (title and h1), the label, and the button: {html}"
+    );
+}
+
+/// `redirect_url` is a **link on the success page, not a `303`**, and the reason is measured
+/// rather than assumed: `security_headers` sends `form-action 'self'`, and Chromium checks the
+/// redirect that follows a form POST against it and blocks the navigation
+/// (`web/e2e/public-form.spec.ts` is the browser that says so). Widening the policy for every
+/// page in the product to fix one route was the alternative, and was not taken.
+#[sqlx::test]
+async fn a_form_with_a_redirect_url_offers_it_as_a_link(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", false).await;
+    s.form(
+        "newsletter",
+        &[list],
+        Some("https://example.test/thanks?a=1&b=2"),
+    )
+    .await;
+
+    let r = s.submit("newsletter", "email=new@ex.test").await;
+    r.assert_status_ok();
+    assert!(
+        r.maybe_header("location").is_none(),
+        "no redirect is issued"
+    );
+    // The `&` is escaped because this is an attribute value in HTML; the URL itself is the one
+    // the parser serialised when an operator stored it.
+    assert!(
+        r.text()
+            .contains("<a href=\"https://example.test/thanks?a=1&amp;b=2\">Continue</a>"),
+        "{}",
+        r.text()
+    );
+    assert_eq!(
+        s.memberships().await,
+        [(list, "subscribed".to_owned(), Some("form".to_owned()))]
+    );
+    // The page is the answer for every case, refusals included, or it would be the tell the page
+    // is not allowed to be. The second submission changes nothing: the row is subscribed.
+    let again = s.submit("newsletter", "email=new@ex.test").await;
+    assert_eq!(answer(&r), answer(&again));
+    assert_eq!(consent_rows(&pool).await.len(), 1);
+}
+
+/// A submission whose own fields do not validate is the one answer that is not the success page,
+/// and it may be: it is decided by the **shape** of what was typed, which the submitter can see,
+/// and never by anything the database knows about the address.
+#[sqlx::test]
+async fn a_submission_with_no_usable_address_asks_for_it_again(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+
+    let r = s.submit("newsletter", "email=not-an-address").await;
+    r.assert_status_ok();
+    assert!(r.text().contains("Check the details"), "{}", r.text());
+    assert!(r.text().contains("<form method=\"post\">"), "{}", r.text());
+    assert_eq!(contact_count(&pool).await, 0);
+    assert_eq!(s.memberships().await, []);
 }

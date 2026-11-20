@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists (select 1 from suppressions where reason = 'gdpr_erasure'\n                            and lifted_at is null\n                            and email_hmac = $2 and (workspace_id = $1 or workspace_id is null))\n           as \"erased!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "erased!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "bfac8ad2c692168ab43507d1070ac1f2355e738a7b55b066af5eb3d51cc1d55b"
+}

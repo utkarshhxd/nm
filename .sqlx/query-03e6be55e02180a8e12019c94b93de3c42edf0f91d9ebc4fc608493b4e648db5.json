@@ -1,0 +1,144 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select f.id, f.workspace_id, f.slug, f.name,\n                  f.fields as \"fields: Jsonb<Vec<FormField>>\",\n                  f.redirect_url, f.headline, f.button_label, f.created_at, f.updated_at,\n                  coalesce(array_agg(fl.list_id order by fl.list_id)\n                           filter (where fl.list_id is not null), '{}') as \"list_ids!: Vec<Uuid>\"\n           from forms f\n           join workspaces w on w.id = f.workspace_id\n           left join form_lists fl on fl.workspace_id = f.workspace_id and fl.form_id = f.id\n           where w.slug = $1 and f.slug = $2\n           group by f.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fields: Jsonb<Vec<FormField>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "fields"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "redirect_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "redirect_url"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "headline",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "headline"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "button_label",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "button_label"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "forms",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "list_ids!: Vec<Uuid>",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "03e6be55e02180a8e12019c94b93de3c42edf0f91d9ebc4fc608493b4e648db5"
+}

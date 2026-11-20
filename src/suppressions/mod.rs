@@ -218,7 +218,18 @@ pub async fn is_erased(
     let hmac = suppression_hmac(secrets, &email);
     lock_address(db, &hmac).await?;
     sqlx::query_scalar!(
+        // `lifted_at is null` is **not** a narrowing: nothing can lift an erasure. `lift` refuses a
+        // `gdpr_erasure` row with `erasure-not-liftable`, and the only other writer of the column
+        // (`lift_unsubscribed_all`) filters on `reason = 'unsubscribed_all'`, so no row this
+        // predicate matches has ever had a `lifted_at`. It is here because it is what makes the
+        // partial index `suppressions_lookup_hmac (email_hmac) where lifted_at is null` usable.
+        // Without it this is a `Seq Scan` of a table that only grows, taken on every contact
+        // insert — including every submission of the unauthenticated public signup form, which
+        // spec §9 budgets at under 500 ms p95. Measured at 20,000 rows: `Seq Scan`, 328 buffers,
+        // 1.5 ms, against `Index Scan`, 4 buffers, 0.04 ms. Recorded in M1c and acted on in M1d
+        // Task 9, the first caller reachable from the open internet.
         r#"select exists (select 1 from suppressions where reason = 'gdpr_erasure'
+                            and lifted_at is null
                             and email_hmac = $2 and (workspace_id = $1 or workspace_id is null))
            as "erased!""#,
         workspace_id,
