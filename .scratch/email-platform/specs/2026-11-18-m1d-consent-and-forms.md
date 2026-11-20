@@ -64,7 +64,9 @@ was given.
 ### 6.1 Topics: a new entity, or `lists.visibility`?
 
 **Decided: `lists.visibility = 'public'` is a topic.** Not because it is cheaper, but because
-`migrations/0012_lists.sql:11-13` already says so in a comment written during M1a. A second entity
+`migrations/0012_lists.sql:11-13` already says so in a comment written during M1a. (That
+comment calls it "the M1c preference center" — it predates this milestone's renumbering, and the
+preference center is M1d's. The comment is in a released migration and is left alone.) A second entity
 would mean a mapping table, a second name to keep in sync, and two answers to "what is this person
 subscribed to". A public list gains nothing but its `description` being shown.
 
@@ -79,7 +81,15 @@ module with the same shape and three new domains. A second scheme would mean two
 
 Tokens carry `(workspace_id, contact_id, purpose, issued_at)` and a nonce; nothing public is a
 sequential id. **Unsubscribe tokens do not expire** — an email sits in an inbox for years and
-RFC 8058 must still work. **Confirmation tokens expire in 14 days**, and preference tokens in 90.
+RFC 8058 must still work. **Confirmation tokens expire in 14 days.**
+
+**Amended 2026-11-20, during M1d implementation.** This paragraph originally added a third,
+90-day preference token. It cannot exist alongside §6.3: that section decides the preference
+center *is* `/u/{token}` and that RFC 8058's one-click POST lands on the same token, and one token
+cannot carry two purposes. A 90-day preference token would also mean the unsubscribe link in a
+two-year-old email either expires — breaking this section's own rule — or is a second token for
+the same page. `/u/{token}` parses `Unsubscribe` for both GET and POST, and no preference purpose
+is issued or accepted.
 
 ### 6.3 One page or three?
 
