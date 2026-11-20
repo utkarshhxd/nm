@@ -51,6 +51,14 @@ pub mod actions {
     // Written as `list.member_removed` until M1b, when it was renamed for what it does. Rows
     // already in the log keep the old string, on purpose: history is not rewritten.
     pub const LIST_MEMBER_UNSUBSCRIBED: &str = "list.member_unsubscribed";
+    // Each of these carries the form's whole definition in its metadata, not just which keys the
+    // request named. `consent_log.source_ref` holds a form id, so a consent row says "this person
+    // submitted form X" and nothing else would record what X asked for at the moment they agreed.
+    // An operator editing X's lists or its copy would otherwise rewrite the meaning of every
+    // consent row already pointing at it, straight through an append-only log.
+    pub const FORM_CREATED: &str = "form.created";
+    pub const FORM_UPDATED: &str = "form.updated";
+    pub const FORM_DELETED: &str = "form.deleted";
     pub const SEGMENT_CREATED: &str = "segment.created";
     pub const SEGMENT_UPDATED: &str = "segment.updated";
     pub const SEGMENT_DELETED: &str = "segment.deleted";

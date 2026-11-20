@@ -18,10 +18,13 @@
 -- `unique (workspace_id, id)` is not redundant with the primary key: `form_lists` takes a
 -- composite foreign key onto it, exactly as `list_memberships` does onto `lists` in `0012`.
 --
--- `slug` is unique per workspace, which is what the M1d plan specifies. NOTE for Task 9: the
--- public route is `/f/{slug}` with no workspace in the path, so two workspaces using the same
--- slug cannot both be served from it. Resolving that needs either a global unique index here or a
--- workspace-scoped public path; it is recorded in the Task 8 report rather than decided here.
+-- `slug` is unique per workspace, not globally, and the public route carries the workspace in
+-- front of it: `/f/{workspace}/{slug}`, where `{workspace}` is `workspaces.slug` (already
+-- `not null unique`, `0005_workspaces.sql:3`). Spec §7.2 was amended to this on 2026-11-20, after
+-- Task 8 found it saying `/f/{slug}` with no workspace in the path, which no per-workspace slug
+-- can serve. A globally unique form slug was rejected: it would hand the first tenant to register
+-- `newsletter` a name no other tenant could ever use, and fixing it after launch would be a
+-- breaking URL change for embed codes already pasted into customers' sites.
 create table forms (id uuid primary key,
   workspace_id uuid not null references workspaces(id) on delete cascade,
   slug text not null,

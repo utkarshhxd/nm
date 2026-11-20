@@ -12,9 +12,11 @@ use super::{
 };
 use crate::{
     app::AppState,
+    audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
     custom_fields::definitions_for,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
+    http::request_meta::RequestMeta,
     pagination::{Page, PageParams},
     workspaces::roles::Role,
 };
@@ -130,6 +132,39 @@ fn unknown_list(e: sqlx::Error) -> ApiError {
     }
 }
 
+/// Appends the audit row for a form write, in the caller's transaction.
+///
+/// The metadata is the form's **whole definition**, not the list of keys the request named.
+/// `consent_log.source_ref` holds a form id, so a consent row says only "this person submitted
+/// form X"; without this, an operator editing X's lists or its copy would silently change what
+/// every consent row already pointing at X appears to say. For a delete it is the definition as
+/// it stood when it was deleted, because the row is about to stop existing.
+///
+/// A form definition carries no personal data — operator-authored copy, list ids and field
+/// targets — so recording all of it is safe under `AuditEvent::metadata`'s rule.
+async fn audit_form(
+    db: &mut PgConnection,
+    meta: &RequestMeta,
+    principal: &Principal,
+    action: &'static str,
+    form: &Form,
+) -> ApiResult<()> {
+    audit::record(
+        db,
+        meta,
+        AuditEvent {
+            workspace_id: Some(form.workspace_id),
+            actor: principal.actor(),
+            action,
+            target_type: Some("form"),
+            target_id: Some(form.id.to_string()),
+            metadata: serde_json::to_value(form).map_err(|e| ApiError::Internal(e.into()))?,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Replaces the form's lists. One statement per side, so the foreign key sees every id.
 async fn set_lists(
     db: &mut PgConnection,
@@ -237,6 +272,7 @@ pub async fn get_form(
 )]
 pub async fn create_form(
     State(state): State<AppState>,
+    meta: RequestMeta,
     principal: Principal,
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiJson(input): ApiJson<NewForm>,
@@ -295,6 +331,7 @@ pub async fn create_form(
     .map_err(slug_taken)?;
     set_lists(&mut tx, workspace_id, id, list_ids).await?;
     let form = super::get(&mut tx, workspace_id, id).await?;
+    audit_form(&mut tx, &meta, &principal, actions::FORM_CREATED, &form).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(form)))
 }
@@ -318,6 +355,7 @@ pub async fn create_form(
 )]
 pub async fn update_form(
     State(state): State<AppState>,
+    meta: RequestMeta,
     principal: Principal,
     ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
     ApiJson(input): ApiJson<UpdateForm>,
@@ -399,6 +437,7 @@ pub async fn update_form(
         set_lists(&mut tx, workspace_id, id, list_ids).await?;
     }
     let form = super::get(&mut tx, workspace_id, id).await?;
+    audit_form(&mut tx, &meta, &principal, actions::FORM_UPDATED, &form).await?;
     tx.commit().await?;
     Ok(Json(form))
 }
@@ -420,11 +459,16 @@ pub async fn update_form(
 )]
 pub async fn delete_form(
     State(state): State<AppState>,
+    meta: RequestMeta,
     principal: Principal,
     ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
+    // Read before the delete, not after: the audit row carries the definition the form had when
+    // it was deleted, and a moment later there is nothing left to read. This is also the 404 for
+    // a form of another workspace, so the statement below cannot reach one.
+    let form = super::get(&mut tx, workspace_id, id).await?;
     let deleted = sqlx::query!(
         "delete from forms where workspace_id = $1 and id = $2",
         workspace_id,
@@ -435,6 +479,7 @@ pub async fn delete_form(
     if deleted.rows_affected() == 0 {
         return Err(ApiError::NotFound);
     }
+    audit_form(&mut tx, &meta, &principal, actions::FORM_DELETED, &form).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

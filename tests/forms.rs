@@ -89,6 +89,18 @@ async fn count_forms(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
+/// `(action, target_id, metadata)` of every `form.*` audit row in the workspace, oldest first.
+async fn form_audit(pool: &PgPool, ws: Uuid) -> Vec<(String, Option<String>, Value)> {
+    sqlx::query_as(
+        "select action, target_id, metadata from audit_log \
+         where workspace_id = $1 and action like 'form.%' order by id",
+    )
+    .bind(ws)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 #[sqlx::test]
 async fn a_form_needs_at_least_one_list(pool: PgPool) {
     let (ws, app) = workspace(&pool, "acme").await;
@@ -563,4 +575,107 @@ async fn deleting_a_list_leaves_the_form_without_it(pool: PgPool) {
     let r = app.get(&format!("{}/{id}", forms_path(ws))).await;
     r.assert_status_ok();
     assert_eq!(r.json::<Value>()["list_ids"], json!([]));
+}
+
+/// Every form write leaves an audit row carrying the form's **whole definition**, not a list of
+/// the keys the request named.
+///
+/// The reason is `consent_log.source_ref`, which holds a form id. A consent row therefore says
+/// "this person submitted form X" and nothing more; if an operator later edits X's lists or its
+/// copy, and the only record of the edit is "list_ids changed", then nothing anywhere says what X
+/// asked for at the moment the person agreed — and the consent log is append-only precisely so
+/// that evidence survives.
+///
+/// The load-bearing assertion is the last one: the `form.created` row still names the list the
+/// form had at creation, **after** a later edit has moved the form to another list. A
+/// metadata-is-the-key-names implementation passes every other assertion here and fails that one.
+#[sqlx::test]
+async fn form_writes_are_audited_with_the_definition_in_force(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let news = create_list(&app, ws, "news").await;
+    let offers = create_list(&app, ws, "offers").await;
+
+    assert!(form_audit(&pool, ws).await.is_empty(), "nothing yet");
+
+    let r = app
+        .post(&forms_path(ws))
+        .json(&new_form("signup", news))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+
+    // An edit that changes both what the form collects into and what it says.
+    let r = app
+        .patch(&format!("{}/{id}", forms_path(ws)))
+        .json(&json!({"list_ids": [offers], "headline": "Different words"}))
+        .await;
+    r.assert_status_ok();
+
+    let r = app.delete(&format!("{}/{id}", forms_path(ws))).await;
+    r.assert_status(StatusCode::NO_CONTENT);
+
+    let rows = form_audit(&pool, ws).await;
+    let actions: Vec<&str> = rows.iter().map(|(a, _, _)| a.as_str()).collect();
+    assert_eq!(actions, ["form.created", "form.updated", "form.deleted"]);
+    for (action, target, _) in &rows {
+        assert_eq!(target.as_deref(), Some(id.to_string().as_str()), "{action}");
+    }
+
+    let (created, updated, deleted) = (&rows[0].2, &rows[1].2, &rows[2].2);
+    // Each row carries the definition as it stood when that write happened.
+    assert_eq!(created["list_ids"], json!([news]));
+    assert_eq!(created["headline"], "Join the list");
+    assert_eq!(updated["list_ids"], json!([offers]));
+    assert_eq!(updated["headline"], "Different words");
+    // The delete row is the last definition, read before the row stopped existing.
+    assert_eq!(deleted["list_ids"], json!([offers]));
+    assert_eq!(deleted["slug"], "signup");
+    // Every row says what the form collected, so a consent row pointing here can be read.
+    for (action, _, meta) in &rows {
+        assert_eq!(
+            meta["fields"][0]["target"],
+            json!({"kind": "email"}),
+            "{action}"
+        );
+    }
+
+    // The point of the whole exercise: the edit did not rewrite history. `form.created` still
+    // names `news`, which is what the people who submitted before the edit actually agreed to.
+    assert_ne!(created["list_ids"], updated["list_ids"]);
+    assert_eq!(created["list_ids"], json!([news]));
+}
+
+/// A refused write leaves no audit row: the log records what happened, not what was attempted.
+#[sqlx::test]
+async fn a_refused_form_write_is_not_audited(pool: PgPool) {
+    let (ws, app) = workspace(&pool, "acme").await;
+    let (other_ws, other) = workspace(&pool, "globex").await;
+    let list = create_list(&app, ws, "news").await;
+    let theirs = create_list(&other, other_ws, "news").await;
+
+    // A cross-workspace list: refused by the foreign key, inside the transaction.
+    let mut body = new_form("signup", list);
+    body["list_ids"] = json!([theirs]);
+    app.post(&forms_path(ws))
+        .json(&body)
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A viewer: refused before anything is written.
+    let viewer = client(&pool, "viewer@example.com", ws, Role::Viewer).await;
+    viewer
+        .post(&forms_path(ws))
+        .json(&new_form("signup", list))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+
+    assert!(form_audit(&pool, ws).await.is_empty());
+
+    // The control: a write that succeeds is audited, so the emptiness above is the refusals and
+    // not a query that never matches anything.
+    app.post(&forms_path(ws))
+        .json(&new_form("signup", list))
+        .await
+        .assert_status(StatusCode::CREATED);
+    assert_eq!(form_audit(&pool, ws).await.len(), 1);
 }

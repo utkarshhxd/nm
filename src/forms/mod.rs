@@ -132,9 +132,14 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
-/// A form's public URL is `/f/{slug}`, so the slug is a URL path segment and nothing else:
-/// `^[a-z0-9][a-z0-9-]{1,62}$`, written out. No trimming — a slug that needed trimming was not a
-/// slug.
+/// A form's public URL is `/f/{workspace}/{slug}`, so the slug is a URL path segment and nothing
+/// else: `^[a-z0-9][a-z0-9-]{1,62}$`, written out. No trimming — a slug that needed trimming was
+/// not a slug.
+///
+/// It is unique per workspace, not globally, and the `{workspace}` segment in front is what makes
+/// that work: `workspaces.slug` is already `not null unique` (`0005_workspaces.sql:3`). Spec §7.2
+/// was amended to this on 2026-11-20 — a globally unique form slug would hand the first tenant to
+/// register `newsletter` a name no other tenant could ever use.
 pub fn validate_slug(raw: &str) -> Result<String, FieldError> {
     let b = raw.as_bytes();
     if (2..=63).contains(&b.len())
