@@ -11,7 +11,7 @@ use nm::{
     config::SecretKey,
     crypto::secrets::Secrets,
     error::ApiError,
-    public::token::{Purpose, Token, issue, parse},
+    public::token::{PUBLIC_DOMAIN, Purpose, Token, issue, parse},
 };
 use uuid::Uuid;
 
@@ -33,7 +33,23 @@ fn token(purpose: Purpose, age_days: i64) -> Token {
         purpose,
         issued_at: now() - age_days * DAY,
         nonce: "n0nce".into(),
+        kid: None,
+        ref_id: None,
     }
+}
+
+/// Signs a payload the way `issue` does, for payloads `Token` cannot produce: an older build's,
+/// and a newer build's. `derive_key` is `hmac_sha256(master, label)`, which is what `secrets`
+/// builds and what this reproduces.
+fn sign(master: u8, payload: &serde_json::Value) -> String {
+    let payload = serde_json::to_vec(payload).unwrap();
+    let key = nm::crypto::tokens::hmac_sha256(&[master; 32], PUBLIC_DOMAIN.as_bytes());
+    let mac = nm::crypto::tokens::hmac_sha256(&key, &payload);
+    format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&payload),
+        URL_SAFE_NO_PAD.encode(mac)
+    )
 }
 
 /// Changes the first character, which is always fully significant in base64.
@@ -183,4 +199,89 @@ fn list_id_is_present_exactly_when_the_purpose_is_confirm() {
             Err(ApiError::Unprocessable("link-invalid"))
         ));
     }
+}
+
+/// **The compatibility guarantee, and the only one that matters.** `kid` and `ref_id` were added
+/// in M1d's final wave; every unsubscribe link already in an inbox was issued without them and
+/// never expires. The payload below is that link's — six fields, signed, built by hand rather
+/// than by today's `issue`, which would only prove this build agrees with itself. It parses, and
+/// the two absent fields read as `None`.
+#[test]
+fn a_link_issued_before_kid_and_ref_id_existed_still_parses() {
+    let s = secrets(7);
+    let want = token(Purpose::Unsubscribe, 2 * 365);
+    let old = serde_json::json!({
+        "workspace_id": want.workspace_id,
+        "contact_id": want.contact_id,
+        "purpose": "unsubscribe",
+        "list_id": serde_json::Value::Null,
+        "issued_at": want.issued_at,
+        "nonce": want.nonce,
+    });
+    assert_eq!(
+        parse(&s, &sign(7, &old), Purpose::Unsubscribe).unwrap(),
+        want
+    );
+}
+
+/// The other half of it: a link issued **today** carries neither key, so its bytes are what an
+/// older build can still read. `skip_serializing_if` is what holds this, and nothing else would
+/// notice if it went.
+#[test]
+fn an_issued_link_carries_neither_new_field_until_one_is_set() {
+    let raw = issue(&secrets(7), &token(Purpose::Unsubscribe, 0));
+    let payload = URL_SAFE_NO_PAD
+        .decode(raw.split_once('.').unwrap().0)
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "contact_id",
+            "issued_at",
+            "list_id",
+            "nonce",
+            "purpose",
+            "workspace_id"
+        ]
+    );
+}
+
+/// What M2 will issue: a key id to verify under after a rotation, and the campaign that sent the
+/// link, which the public routes copy into `consent_log.source_ref`.
+#[test]
+fn a_link_carrying_a_key_id_and_a_ref_round_trips() {
+    let s = secrets(7);
+    let mut t = token(Purpose::Unsubscribe, 0);
+    t.kid = Some(2);
+    t.ref_id = Some(Uuid::now_v7());
+    assert_eq!(parse(&s, &issue(&s, &t), Purpose::Unsubscribe).unwrap(), t);
+}
+
+/// `deny_unknown_fields` stays. `serde(default)` is what lets an old payload through, and the
+/// two are not the same relaxation: a payload naming something this build has never heard of is
+/// still refused, signature or no signature.
+#[test]
+fn a_payload_naming_a_field_this_build_does_not_know_is_refused() {
+    let t = token(Purpose::Unsubscribe, 0);
+    let ahead = serde_json::json!({
+        "workspace_id": t.workspace_id,
+        "contact_id": t.contact_id,
+        "purpose": "unsubscribe",
+        "list_id": serde_json::Value::Null,
+        "issued_at": t.issued_at,
+        "nonce": t.nonce,
+        "sent_by": "a field from a later milestone",
+    });
+    assert!(matches!(
+        parse(&secrets(7), &sign(7, &ahead), Purpose::Unsubscribe),
+        Err(ApiError::Unprocessable("link-invalid"))
+    ));
 }

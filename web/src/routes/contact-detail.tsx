@@ -792,8 +792,10 @@ const CONSENT_PAGE = 50;
  * a disclosure.
  *
  * It is read-only for every role, including an admin: `consent_log` is append-only and nothing in
- * the product can edit or delete a row (`0020_consent_log.sql`). An erasure takes them with the
- * contact, which is why there is no "clear history" here and must never be one.
+ * the product can edit or delete a row. The database enforces both halves of that —
+ * `0020_consent_log.sql` refuses the update, `0026` refuses the delete and the truncate — rather
+ * than this screen being the only thing that declines to offer it. An erasure takes the rows with
+ * the contact, which is why there is no "clear history" here and must never be one.
  */
 function ConsentHistory({ ws, contactId }: { ws: string; contactId: string }) {
   const history = useInfiniteQuery({

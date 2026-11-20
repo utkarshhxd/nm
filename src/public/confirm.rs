@@ -145,7 +145,9 @@ async fn confirm(
                 &consent::Context {
                     ip: meta.ip,
                     user_agent: meta.user_agent,
-                    source_ref: None,
+                    // What sent the link, when the link says so: `ref_id` is M2's campaign or
+                    // message id. M1d issues no token carrying one, so this is `None` today.
+                    source_ref: token.ref_id.map(|id| id.to_string()),
                     token_jti: Some(token.nonce),
                 },
             )

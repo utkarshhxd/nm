@@ -112,6 +112,8 @@ impl Pending {
                 list_id,
                 issued_at: Utc::now().timestamp() - age_days * DAY,
                 nonce: nonce.to_owned(),
+                kid: None,
+                ref_id: None,
             },
         )
     }
@@ -284,6 +286,8 @@ async fn an_expired_confirm_token_offers_to_resend_without_saying_whether_the_ad
             list_id: Some(Uuid::now_v7()),
             issued_at: Utc::now().timestamp() - 15 * DAY,
             nonce: "n2".into(),
+            kid: None,
+            ref_id: None,
         },
     );
     let unknown = p.app.get(&format!("/c/{stranger}")).await;
@@ -555,6 +559,34 @@ async fn one_click_unsubscribes_from_every_list_in_the_workspace(pool: PgPool) {
         assert_eq!(row.2, Some("127.0.0.1".parse().unwrap()), "the IP");
         assert_eq!(row.4, None, "no operator id");
     }
+}
+
+/// `source_ref` is the column `0020` built for "whatever caused the change", and until the token
+/// could carry an id there was nothing for a one-click unsubscribe to put in it: `None` at every
+/// call site, so the column was permanently null for every send M2 will ever make. A token
+/// carrying `ref_id` fills it, and M1d issues none — which is why this test mints its own.
+#[sqlx::test]
+async fn a_one_click_records_what_sent_the_link_when_the_token_carries_it(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let campaign = Uuid::now_v7();
+    let link = issue(
+        &p.app.state.secrets,
+        &Token {
+            workspace_id: p.workspace,
+            contact_id: p.contact,
+            purpose: Purpose::Unsubscribe,
+            list_id: None,
+            issued_at: Utc::now().timestamp(),
+            nonce: "n1".into(),
+            kid: None,
+            ref_id: Some(campaign),
+        },
+    );
+    p.post_unsub(&link, ONE_CLICK).await.assert_status_ok();
+
+    // Both rows: the membership it ended and the workspace-wide opt-out beside it.
+    let refs: Vec<Option<String>> = consent_rows(&pool).await.into_iter().map(|r| r.4).collect();
+    assert_eq!(refs, vec![Some(campaign.to_string()); 2]);
 }
 
 /// `docs/adr/0001-contacts-have-no-status-column.md`: the workspace-wide opt-out is a
@@ -1494,9 +1526,10 @@ const MALFORMED: &str = "email=shape@ex.test&first_name=%01";
 /// What a submitting browser calls itself in these tests.
 const UA: &str = "nm-public-form-test";
 
-/// Every queued job, as `(kind, payload)`, oldest first.
-async fn jobs(pool: &PgPool) -> Vec<(String, serde_json::Value)> {
-    sqlx::query_as("select kind, payload from jobs order by id")
+/// Every queued job, as `(kind, payload, contact_id, list_id)`, oldest first. The two ids are
+/// columns and not payload keys since `0026`, which is what gives them foreign keys.
+async fn jobs(pool: &PgPool) -> Vec<(String, serde_json::Value, Option<Uuid>, Option<Uuid>)> {
+    sqlx::query_as("select kind, payload, contact_id, list_id from jobs order by id")
         .fetch_all(pool)
         .await
         .unwrap()
@@ -1587,7 +1620,7 @@ async fn a_new_address_on_a_double_optin_list_is_pending_and_enqueues_a_job(pool
     let queued = jobs(&pool).await;
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].0, "confirmation_email");
-    assert_eq!(queued[0].1["list_id"], serde_json::json!(list));
+    assert_eq!(queued[0].3, Some(list));
     assert_eq!(queued[0].1["email"], "new@ex.test");
     assert!(
         queued[0].1["token"]
@@ -1666,10 +1699,7 @@ async fn one_submission_to_a_form_naming_both_kinds_does_both(pool: PgPool) {
     // Two double-opt-in lists, two emails, two different tokens: they are two consents.
     let queued = jobs(&pool).await;
     assert_eq!(queued.len(), 2, "one per double-opt-in list, and no more");
-    let mut lists: Vec<Uuid> = queued
-        .iter()
-        .map(|(_, p)| serde_json::from_value(p["list_id"].clone()).unwrap())
-        .collect();
+    let mut lists: Vec<Uuid> = queued.iter().map(|j| j.3.unwrap()).collect();
     lists.sort();
     let mut want = vec![news, digest];
     want.sort();
@@ -2151,6 +2181,71 @@ async fn a_submission_with_no_usable_address_asks_for_it_again(pool: PgPool) {
     assert_eq!(s.memberships().await, []);
 }
 
+/// `0023` told M2 to read `contact_id` out of the payload and said nothing about scoping that
+/// lookup by the row's workspace, where no foreign key could reach it. Since `0026` both keys
+/// are composite and carry `workspace_id`, as `form_lists` and `consent_log` do: the database
+/// refuses the row, not a handler, and no M1d test had to be the thing that noticed.
+#[sqlx::test]
+async fn a_job_cannot_name_a_contact_of_another_workspace(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let owner = create_user(&pool, "owner-beta@example.com", PW, false).await;
+    let other = create_workspace(&pool, owner, "beta").await;
+
+    let err = sqlx::query(
+        "insert into jobs (id, workspace_id, kind, contact_id, list_id, payload)          values ($1, $2, 'confirmation_email', $3, $4, '{}'::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(other)
+    .bind(p.contact)
+    .bind(p.list)
+    .execute(&pool)
+    .await
+    .expect_err("a job of one workspace naming another's contact must be unwritable");
+    assert_eq!(
+        err.as_database_error().unwrap().code().as_deref(),
+        Some("23503"),
+        "{err}"
+    );
+}
+
+/// `0025` wrote the retention rule as prose and said exactly what happens without it: a worker
+/// that deletes a row on success makes the throttle's question answer "no" every time, the
+/// public route becomes a mailer anybody can aim at any address, and **nothing goes red**.
+/// `0026`'s trigger is what goes red. Housekeeping past the window is still allowed, which is
+/// the half that stops this being a rule nobody can live with.
+#[sqlx::test]
+async fn a_queued_job_cannot_be_deleted_while_the_throttle_still_counts_it(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+    s.submit("newsletter", "email=lost@ex.test")
+        .await
+        .assert_status_ok();
+
+    let err = sqlx::query("delete from jobs")
+        .execute(&pool)
+        .await
+        .expect_err("a drained row must not be deleted while the throttle counts it");
+    assert!(
+        err.as_database_error()
+            .unwrap()
+            .message()
+            .contains("resend throttle"),
+        "{err}"
+    );
+    assert_eq!(jobs(&pool).await.len(), 1);
+
+    sqlx::query("update jobs set created_at = now() - interval '2 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("delete from jobs")
+        .execute(&pool)
+        .await
+        .expect("housekeeping past the window is what 0025 permits");
+    assert_eq!(jobs(&pool).await.len(), 0);
+}
+
 /// Re-submitting the form is the only resend this milestone has — `public::confirm`'s expired
 /// page says so, and spec 8.6 requires an expired confirmation to offer one. So a submission that
 /// finds the membership already `pending` enqueues another confirmation email, and the window in
@@ -2181,7 +2276,8 @@ async fn a_second_submission_resends_the_confirmation_only_after_the_window(pool
     );
 
     // Fifteen minutes later, without waiting fifteen minutes. `created_at` is what the throttle
-    // reads; the `id` bound beside it is only there to keep the lookup off a table scan.
+    // reads, and since `0026` it reads it from an index on (workspace, contact, list, created_at)
+    // rather than from a bound on the primary key.
     sqlx::query("update jobs set created_at = now() - interval '16 minutes'")
         .execute(&pool)
         .await

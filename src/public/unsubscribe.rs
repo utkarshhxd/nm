@@ -404,7 +404,10 @@ async fn save(
     let cx = consent::Context {
         ip: meta.ip,
         user_agent: meta.user_agent.clone(),
-        source_ref: None,
+        // What sent the link, when the link says: `ref_id` is M2's campaign or message id. M1d
+        // issues no token carrying one, so this is `None` today and the column it fills is the
+        // one `0020` built for "whatever caused the change".
+        source_ref: token.ref_id.map(|id| id.to_string()),
         token_jti: Some(token.nonce.clone()),
     };
     for list_id in subscribed {
@@ -537,7 +540,8 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
     let cx = consent::Context {
         ip: meta.ip,
         user_agent: meta.user_agent.clone(),
-        source_ref: None,
+        // As above: the token's `ref_id` when it carries one, which M1d never issues and M2 fills.
+        source_ref: token.ref_id.map(|id| id.to_string()),
         token_jti: Some(token.nonce.clone()),
     };
     for list_id in changed {

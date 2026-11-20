@@ -28,7 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::{Map, Value};
 use sqlx::PgConnection;
 use url::form_urlencoded;
@@ -401,7 +401,9 @@ async fn apply(
 /// that bound is a different kind of bound).
 ///
 /// Nothing stores this but the `jobs` rows themselves, so there is no state to expire and nothing
-/// to clean up.
+/// to clean up. That is also why those rows may not be deleted while they are young: `0026`'s
+/// `jobs_throttle_retention` trigger refuses a delete inside a day, which is a superset of this
+/// window. Raising this constant past a day means raising the trigger's interval with it.
 const RESEND_AFTER_MINUTES: i64 = 15;
 
 /// One `jobs` row per double-opt-in list, each carrying **its own** `Purpose::Confirm` token:
@@ -409,10 +411,20 @@ const RESEND_AFTER_MINUTES: i64 = 15;
 /// two lists. A form on two double-opt-in lists honestly sends two emails — they are two
 /// consents.
 ///
-/// The payload carries the already-issued token **string**, beside the token and not inside it.
-/// `public::token::Token`'s field list is frozen once the first unsubscribe link ships
-/// (`deny_unknown_fields`, and `Purpose::Unsubscribe` has no TTL), so anything a job needs travels
-/// alongside. The shape is `0023_forms_and_jobs.sql`'s, which M2's worker parses.
+/// **The contact and the list are columns; the payload carries what is genuinely free-form.**
+/// `0026` promoted them out of the `jsonb` so that the database can see them: composite foreign
+/// keys carrying `workspace_id` make a cross-tenant job unwritable, the contact key cascades so a
+/// GDPR erasure reaches this table, and the throttle below gets an index. The payload is
+/// `{"email", "token"}`, and the table comment on `jobs` is the contract M2 reads.
+///
+/// The payload keeps the already-issued token **string**, beside the token and not inside it:
+/// `public::token::Token` is `deny_unknown_fields` and `Purpose::Unsubscribe` has no TTL, so
+/// anything a job needs travels alongside. Keeping it was re-decided in the `0026` wave against
+/// having M2 re-issue the token at send time: with the contact key cascading, the credential now
+/// dies with the person rather than outliving their erasure; a `Confirm` token is self-expiring
+/// where an unsubscribe token is not, so a backup of this table goes inert in fourteen days; and
+/// it is what lets this milestone prove end to end that a queued row yields a link the confirm
+/// route accepts, which re-issuing elsewhere would replace with a test that mints its own.
 ///
 /// **Enqueues nothing if this `(contact, list)` already had one inside [`RESEND_AFTER_MINUTES`]**,
 /// decided in the same statement as the insert rather than by a read followed by a write, so a
@@ -420,18 +432,31 @@ const RESEND_AFTER_MINUTES: i64 = 15;
 /// both insert, since neither transaction sees the other's uncommitted row; the result is two
 /// emails instead of one, which is the bound being off by one and not the bound being absent.
 ///
-/// **`created_at` is the rule and `id > …` is the index.** `jobs` only grows — M1d writes rows and
-/// nothing drains them until M2 — so a predicate on `payload` and `created_at` alone would be a
-/// sequential scan of that table taken on every submission of a public form, which is the
-/// `is_erased` mistake this same task was sent to fix. `jobs.id` is a UUIDv7, so a lower bound on
-/// the primary key is a lower bound on enqueue time: the scan is the rows from the last fifteen
-/// minutes, and the `payload` comparison runs on those alone. `contacts::create` keeps its ids v7
-/// for the same kind of reason, and says so.
+/// **The question is an index probe, and its cost does not depend on the rest of the instance.**
+/// `jobs_confirmation_resend` is `(workspace_id, contact_id, list_id, created_at desc)` partial on
+/// `kind = 'confirmation_email'` (`0026`), which is this predicate exactly. Until that index
+/// existed the only one serving it was `jobs_pkey` with a UUIDv7 lower bound standing in for
+/// `created_at`, and that bound means "every row enqueued instance-wide in the last fifteen
+/// minutes" — read by an unauthenticated route, so one tenant's campaign send set the cost of
+/// another tenant's signup form. The 50,000-row figure that used to stand here (2 buffers,
+/// 0.045 ms) was measured on M1d's own trickle, where fifteen minutes holds nothing.
 ///
-/// Measured at 50,000 jobs spread over 30 days: with the `id` bound, `Index Scan using jobs_pkey`,
-/// 2 buffers, 0.045 ms. The same lookup without it, `Seq Scan`, 1,786 buffers, 10.6 ms — and that
-/// is the figure that keeps rising. Dropping the bound does not change a single answer, which is
-/// why it needs saying here that it is not redundant.
+/// Re-measured on the shape this route will actually meet: 50,001 rows over 30 days, of which
+/// 20,001 fall in the fifteen-minute window because the tenant next door is sending a campaign.
+/// Both predicates run for the same submitting tenant, and each is measured twice — once where
+/// the window holds a row for this (contact, list), and once where it does not, which is the
+/// ordinary path and the one an attacker takes.
+///
+/// | predicate | plan | buffers | time |
+/// |---|---|---|---|
+/// | this one, resend | index-only on `jobs_confirmation_resend` | 5 | 0.049 ms |
+/// | this one, first signup | index-only on `jobs_confirmation_resend` | 3 | 0.067 ms |
+/// | the old one, resend | bitmap on `jobs_pkey` | 841 | 3.6 ms |
+/// | the old one, first signup | bitmap on `jobs_pkey` | 841 | 4.0 ms |
+///
+/// The old figures are the window, so they rise with the instance's send volume and are paid by
+/// whichever tenant submits a form next. The new ones do not move: the index is entered at this
+/// workspace, this contact and this list.
 ///
 /// **What it counts: every `confirmation_email` row for this pair in the window, whatever state
 /// it is in** — queued, claimed, completed or given up. That is deliberate and it is the reason
@@ -457,51 +482,30 @@ async fn enqueue_confirmation(
             list_id: Some(list_id),
             issued_at: Utc::now().timestamp(),
             nonce: Uuid::now_v7().to_string(),
+            // M1d has one key and nothing to attribute a link to. Both absent, so the payload is
+            // the shape every link issued before these fields existed already had.
+            kid: None,
+            ref_id: None,
         },
     );
     let cutoff = Utc::now() - chrono::Duration::minutes(RESEND_AFTER_MINUTES);
     sqlx::query!(
-        "insert into jobs (id, workspace_id, kind, payload) \
-         select $1, $2, 'confirmation_email', $3 \
+        "insert into jobs (id, workspace_id, kind, contact_id, list_id, payload) \
+         select $1, $2, 'confirmation_email', $4, $5, $3 \
           where not exists (select 1 from jobs \
-                             where id > $4 and created_at > $5 \
-                               and workspace_id = $2 and kind = 'confirmation_email' \
-                               and payload->>'contact_id' = $6 \
-                               and payload->>'list_id' = $7)",
+                             where workspace_id = $2 and kind = 'confirmation_email' \
+                               and contact_id = $4 and list_id = $5 \
+                               and created_at > $6)",
         Uuid::now_v7(),
         workspace_id,
-        serde_json::json!({
-            "contact_id": contact_id,
-            "list_id": list_id,
-            "email": email,
-            "token": token,
-        }),
-        uuid_at(cutoff),
+        serde_json::json!({ "email": email, "token": token }),
+        contact_id,
+        list_id,
         cutoff,
-        contact_id.to_string(),
-        list_id.to_string(),
     )
     .execute(tx)
     .await?;
     Ok(())
-}
-
-/// *A* UUIDv7 bearing `at`'s millisecond, for use as a lower bound on a v7 primary key.
-///
-/// **Not the smallest one.** `uuid` 1.29.1 fills the 74 bits below the timestamp with random
-/// data, not zeros, so ids generated in that same millisecond fall on both sides of this value.
-/// The error is therefore bounded by one millisecond and it falls in the harmless direction: a
-/// row enqueued in that exact millisecond may sit below the bound and be missed, which costs one
-/// extra confirmation email fifteen minutes later. It can never wrongly *block* a resend, because
-/// `created_at` is ANDed with it and is the rule. Zeroing the low bits would remove even that, and
-/// would mean hand-assembling a uuid from bytes to save a millisecond nobody can observe.
-fn uuid_at(at: DateTime<Utc>) -> Uuid {
-    let seconds = at.timestamp().max(0).unsigned_abs();
-    Uuid::new_v7(uuid::Timestamp::from_unix(
-        uuid::NoContext,
-        seconds,
-        at.timestamp_subsec_nanos(),
-    ))
 }
 
 /// The form's lists and each one's `double_optin`, which is **the list's** decision and never the

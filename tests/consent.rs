@@ -347,6 +347,79 @@ async fn a_consent_row_cannot_be_updated(pool: PgPool) {
     }
 }
 
+/// `0020` enforced the first half of its own table comment and left the second as prose: "removed
+/// only when the contact they belong to is erased" was true of nothing, and `web/src/routes/
+/// contact-detail.tsx` repeats the claim to operators. `0026` closes it with `0020`'s own
+/// technique — a referential action runs at trigger depth 2, a statement at depth 1 — and covers
+/// TRUNCATE, which bypasses a row-level trigger entirely.
+#[sqlx::test]
+async fn a_consent_row_cannot_be_deleted_or_truncated_by_a_statement(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    one_row(&pool, ws, c, l).await;
+
+    for sql in [
+        "delete from consent_log",
+        "truncate consent_log",
+        "truncate consent_log cascade",
+    ] {
+        let err = sqlx::query(sql).execute(&pool).await.expect_err(sql);
+        assert!(
+            err.as_database_error()
+                .unwrap()
+                .message()
+                .contains("append-only"),
+            "{sql}: {err}"
+        );
+    }
+    let left: i64 = sqlx::query_scalar("select count(*) from consent_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 1);
+}
+
+/// All three guards are `enable always`. An ordinary trigger does not fire under
+/// `session_replication_role = 'replica'`, which is one `SET` away for anybody who could run the
+/// write in the first place, and is the mode a logical replica's apply worker and
+/// `pg_restore --disable-triggers` run in. For a table whose whole purpose is to be evidence
+/// years later, a guarantee with a one-line bypass is not a guarantee.
+#[sqlx::test]
+async fn the_append_only_guards_fire_in_replica_mode(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let c = contact(&pool, ws, "a@ex.test").await;
+    let l = list(&pool, ws, "news").await;
+    one_row(&pool, ws, c, l).await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql("set session_replication_role = 'replica'")
+        .execute(&mut *conn)
+        .await
+        .expect("the test role must be able to enter replica mode for this to prove anything");
+
+    for sql in [
+        "update consent_log set action = 'subscribed'",
+        "delete from consent_log",
+        "truncate consent_log",
+    ] {
+        let err = sqlx::query(sql).execute(&mut *conn).await.expect_err(sql);
+        assert!(
+            err.as_database_error()
+                .unwrap()
+                .message()
+                .contains("append-only"),
+            "{sql}: {err}"
+        );
+    }
+    let (count, action): (i64, String) =
+        sqlx::query_as("select count(*), max(action) from consent_log")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!((count, action.as_str()), (1, "confirmed"));
+}
+
 /// The trigger lets Postgres's own `set null (list_id)` through, and only if it changes nothing
 /// else. Postgres never changes anything else, so reaching that comparison takes a trigger of the
 /// test's own: a `before delete on lists` one runs an UPDATE at depth 2, like the referential action
@@ -1260,6 +1333,8 @@ async fn the_preference_center_can_resubscribe_because_the_person_asked(pool: Pg
             list_id: None,
             issued_at: Utc::now().timestamp(),
             nonce: "n1".to_owned(),
+            kid: None,
+            ref_id: None,
         },
     );
     app.server
@@ -1304,6 +1379,8 @@ async fn a_confirmation_link_that_predates_an_unsubscribe_does_not_revive_the_me
             list_id: Some(digest),
             issued_at: Utc::now().timestamp(),
             nonce: "n1".to_owned(),
+            kid: None,
+            ref_id: None,
         },
     );
     app.post(&format!("{members}/{c}/unsubscribe"))

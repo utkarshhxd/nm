@@ -50,22 +50,33 @@ impl Purpose {
     }
 }
 
-/// The field names are part of the token format: renaming one invalidates links already sent. No
-/// `serde(default)`, `deny_unknown_fields`: a payload this build did not write is refused, not read.
+/// The field names are part of the token format: renaming one invalidates links already sent.
+/// `deny_unknown_fields`: a payload carrying something this build does not know is refused, not
+/// read.
 ///
-/// **This field list is final once the first unsubscribe link is sent, and there is no mechanism
-/// left to change it.** The two rules above are inherited from the selection token
-/// (`m1a-decisions.md`), where they are safe because that token lives an hour: adding a field
-/// there breaks nothing, and the escape hatch for a payload whose *meaning* changed is to bump
-/// the domain label, invalidating every outstanding token at once. Neither works here.
-/// `Purpose::Unsubscribe` has no TTL, so links sit in inboxes for years; a new field makes every
-/// one of them a hard deserialize error, and bumping `PUBLIC_DOMAIN` kills them all in one go.
-/// Spec §6.2 forbids exactly that: "an email sits in an inbox for years and RFC 8058 must still
-/// work."
+/// **The two fields a later milestone needs are here, and this is the milestone that could add
+/// them.** `kid` and `ref_id` were named in this comment as the things M2 would want — a key
+/// version for rotation, a campaign id for click tracking — by a version of it that then shipped
+/// neither. That was the defect: `Purpose::Unsubscribe` has no TTL, so these links sit in inboxes
+/// for years, every field here was mandatory, and adding a mandatory field would have made every
+/// one of those links a hard deserialize error. The documented escape — bumping `PUBLIC_DOMAIN` —
+/// invalidates them all at once, which spec §6.2 forbids outright: "an email sits in an inbox for
+/// years and RFC 8058 must still work." (2026-11-20)
 ///
-/// So anything a later milestone needs in this payload — a campaign id for M2's click tracking, a
-/// key version for rotation — has to be added **before** the first send, not after. A field that
-/// cannot be added later is not a field that can be deferred. (2026-11-20)
+/// **What the two of them cost an already-issued link: nothing.** `skip_serializing_if` is what
+/// holds that — a link issued today carries neither key, so its bytes are what an older build
+/// already reads, and a test pins the key list. On the way in, being `Option` is what lets a
+/// payload that predates them deserialize: serde reads a missing `Option` field as `None`,
+/// `deny_unknown_fields` or not. `serde(default)` is therefore belt and braces here and is kept
+/// as the explicit statement of intent, because it is what would carry a field that is not an
+/// `Option`.
+///
+/// So the door is narrower than it looked, which is worth writing down rather than leaving as
+/// folklore: a later field added as an `Option` with this same pair of attributes also parses
+/// every link already sent. What `deny_unknown_fields` still refuses is the other direction — an
+/// older build reading a newer link, which a rolling deploy produces for as long as both are
+/// serving, and which a test pins. A new field stays a deliberate act with a cost; it is not the
+/// one-way door this comment used to describe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Token {
@@ -78,6 +89,26 @@ pub struct Token {
     pub issued_at: i64,
     /// Makes two links issued in the same second for the same contact differ.
     pub nonce: String,
+    /// Which key signed this link. `None` means the master key this product has always had —
+    /// `derive_key` takes no key id, so there is nothing else it can mean today, and every link
+    /// M1d issues says it by saying nothing.
+    ///
+    /// It exists so that rotating the master key does not have to invalidate every outstanding
+    /// unsubscribe link, which §6.2 forbids. `crypto::secrets` already carries a `KEY_ID` byte in
+    /// its encrypted-blob header for the same reason; this was the one credential in the product
+    /// that never expires and could not say which key signed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<u8>,
+    /// What sent this link: M2 fills it with a campaign or message id, M1d always leaves it
+    /// `None`. Deliberately generic — a milestone that cannot add a field cannot add a *name*
+    /// either.
+    ///
+    /// The public routes copy it into `consent_log.source_ref`, the column built to hold
+    /// "whatever caused the change". Without it that column is permanently null for every
+    /// one-click unsubscribe M2 will ever send, because the token carries nothing to attribute
+    /// with and no later milestone could add it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<Uuid>,
 }
 
 fn mac(secrets: &Secrets, payload: &[u8]) -> [u8; 32] {

@@ -35,7 +35,13 @@ import { signingKey } from "./server";
 /** `src/public/token.rs::PUBLIC_DOMAIN`. A different label gives an unrelated key. */
 const DOMAIN = "nm:public-token:v1";
 
-/** `src/public/token.rs::Token`, field for field. It is `deny_unknown_fields` on the far side. */
+/**
+ * `src/public/token.rs::Token`, field for field, less the two optional ones it gained in M1d's
+ * final wave: `kid` (which key signed the link) and `ref_id` (what sent it). Both are `Option`
+ * and both are skipped when absent, so a payload without them is exactly what the product itself
+ * issues today — which is the compatibility guarantee this file would notice losing. It is
+ * `deny_unknown_fields` on the far side, so a field invented here is a 422.
+ */
 type Token = {
   workspace_id: string;
   contact_id: string;
