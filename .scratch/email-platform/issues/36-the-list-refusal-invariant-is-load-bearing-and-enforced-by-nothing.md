@@ -1,6 +1,33 @@
-Status: needs-triage — **read before changing either `suppressions` trigger**
+Status: RESOLVED 2026-11-21 — the invariant is now enforced by an index; kept for the reasoning
 
 # "At most one live list-scope refusal per address per list" is load-bearing and enforced by nothing
+
+> **Resolved in fix round 2 (`8cd78aa`), before M1d shipped.** The title describes the state this
+> issue was filed in, and the state is gone. A re-review reproduced a second, worse path to the
+> same violation — one that silently re-pointed an orphan and reopened the delete-and-recreate
+> resurrection the `list` scope exists to close — so the answer was a redesign rather than another
+> clause:
+>
+> ```sql
+> create unique index suppressions_live on suppressions (workspace_id, scope, email_hmac, domain)
+>   nulls not distinct where lifted_at is null and scope <> 'list';
+> create unique index suppressions_live_list on suppressions (workspace_id, email_hmac, list_id)
+>   where lifted_at is null and scope = 'list' and list_id is not null;
+> -- orphans (list_id is null) are deliberately NOT unique, so a list deletion can never raise
+> ```
+>
+> **A live list refusal is keyed on the list, not on a name a rename moves.** No unique index over
+> a live list row mentions `list_name`, so the rename carve-out and every stale name it produced
+> were *deleted* rather than guarded, and `unsubscribe_list` now conflicts on the list index and
+> does nothing. Two live refusals on one list are a `23505` instead of an invariant somebody
+> maintains.
+>
+> The Minor-1 cost recorded below — a `23505` surfacing as a 500 on a public untick — **does not
+> land**, because the arbiter is now the index that would raise, so the conflict resolves to
+> `do nothing`. The prior reviewer had added the index without re-aiming the conflict target.
+> Shipping it inside `0027` also means there is no existing-duplicate repair problem.
+>
+> Everything below is the original issue, kept because the reasoning is why the redesign happened.
 
 Filed from M1d's C-1/C-4 fix round, by the implementer that fixed the defect this invariant's
 absence caused. It is the honest version of "we fixed it" rather than the comfortable one.
