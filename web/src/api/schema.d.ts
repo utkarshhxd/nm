@@ -499,11 +499,10 @@ export interface paths {
          * Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in
          *     list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
          *     promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
-         * @description This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
-         *     back in. One admin re-adding one named person is a considered act they answer for; a bulk
-         *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
-         *     gets a sender blocklisted. Adding someone to a list is what makes them mailable, and an
-         *     unsubscribe afterwards does not un-send. Do not "fix" the asymmetry.
+         * @description `POST /lists/{id}/members` behaves the same way, and so does every other route an operator can
+         *     reach: one admin re-adding one named person is still the operator asserting consent on the
+         *     subscriber's behalf, and being accountable for it does not make it consent. Only the subscriber
+         *     reverses their own unsubscribe, through a link sent to their own address.
          */
         post: operations["bulk_subscribe_contacts"];
         delete?: never;
@@ -970,8 +969,9 @@ export interface paths {
         get: operations["list_list_members"];
         put?: never;
         /**
-         * Adding someone who is already `pending` or `subscribed` changes nothing; adding an
-         *     `unsubscribed` one subscribes them again.
+         * Adding someone who is already on the list changes nothing, whatever their status: a confirmed
+         *     subscriber is not demoted to `pending`, and someone who unsubscribed stays unsubscribed. The
+         *     response carries the status the membership has, which may not be the one the add asked for.
          */
         post: operations["add_list_member"];
         delete?: never;

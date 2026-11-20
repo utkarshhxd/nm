@@ -404,10 +404,12 @@ function Lists({
     onSuccess: refresh,
   });
 
-  // A list the contact is already pending or subscribed on is not offered: adding again does
-  // nothing. An unsubscribed one is, because adding it subscribes them again.
+  // A list the contact already has a membership on is not offered, whatever it says: adding again
+  // does nothing, and an unsubscribed one is not reopened by an operator at all — only by the
+  // subscriber, through the link in their own mail. Offering it would be a button that silently
+  // does nothing.
   const joinable = (all.data ?? []).filter(
-    (l) => !lists.data?.some((m) => m.list_id === l.id && m.status !== "unsubscribed"),
+    (l) => !lists.data?.some((m) => m.list_id === l.id),
   );
 
   return (

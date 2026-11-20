@@ -153,14 +153,16 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
 /// single-opt-in list, `Pending` on a double-opt-in one. The caller passes the transaction and has
 /// already authorised the actor. `404` if either id is not in this workspace.
 ///
-/// A contact who is already `pending` or `subscribed` is left as it is: adding someone twice must
-/// not demote a confirmed subscriber back to `pending`. An `unsubscribed` one is let back in, as a
-/// fresh member (so `unsubscribed_at` is cleared and `source` is the new add's; the audit log keeps
-/// the history).
+/// A membership that already exists is left exactly as it is, whatever it says, and the status it
+/// already has is what comes back. Adding someone twice must not demote a confirmed subscriber
+/// back to `pending`, and an `unsubscribed` one stays `unsubscribed` (spec §8.1, M1d invariant 1):
+/// an operator naming one address is still the operator asserting consent on the subscriber's
+/// behalf, which is the thing consent law exists to forbid. Only the subscriber can undo their own
+/// unsubscribe, through a token delivered to their own address — the preference center.
 ///
-/// A write is a consent row, `Source::Operator`, in the same transaction: `requested` whenever the
-/// status written is `pending`, otherwise `subscribed`, or `resubscribed` for the revival. Leaving
-/// a membership as it is records nothing.
+/// A write is a consent row, `Source::Operator`, in the same transaction: `requested` when the
+/// status written is `pending`, `subscribed` otherwise. Leaving a membership as it is records
+/// nothing.
 pub async fn add_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
@@ -184,11 +186,8 @@ pub async fn add_member(
     let written = sqlx::query!(
         r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source)
            values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end, $5)
-           on conflict (contact_id, list_id) do update
-           set status = excluded.status, subscribed_at = excluded.subscribed_at,
-               unsubscribed_at = null, source = excluded.source
-           where list_memberships.status = 'unsubscribed'
-           returning status as "status: MembershipStatus", (xmax = 0) as "inserted!""#,
+           on conflict (contact_id, list_id) do nothing
+           returning status as "status: MembershipStatus""#,
         workspace_id,
         contact_id,
         list_id,
@@ -205,12 +204,13 @@ pub async fn add_member(
     match written {
         Some(w) => {
             // The action follows the status that was WRITTEN, not the `double_optin` flag it came
-            // from: on a double-opt-in list the person has only been asked, whether this is a
-            // first add or the revival of an unsubscribed membership.
-            let action = match (w.status, w.inserted) {
-                (MembershipStatus::Pending, _) => consent::Action::Requested,
-                (_, true) => consent::Action::Subscribed,
-                (_, false) => consent::Action::Resubscribed,
+            // from: on a double-opt-in list the person has only been asked, not agreed.
+            // Exhaustive on purpose, so a status added later must be given an action here before
+            // this compiles rather than being logged as something it is not.
+            let action = match w.status {
+                MembershipStatus::Pending => consent::Action::Requested,
+                MembershipStatus::Subscribed => consent::Action::Subscribed,
+                MembershipStatus::Unsubscribed => consent::Action::Unsubscribed,
             };
             let source = consent::Source::Operator;
             consent::record(

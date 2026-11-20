@@ -1085,11 +1085,10 @@ pub async fn bulk_untag_contacts(
 /// list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
 /// promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
 ///
-/// This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
-/// back in. One admin re-adding one named person is a considered act they answer for; a bulk
-/// action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
-/// gets a sender blocklisted. Adding someone to a list is what makes them mailable, and an
-/// unsubscribe afterwards does not un-send. Do not "fix" the asymmetry.
+/// `POST /lists/{id}/members` behaves the same way, and so does every other route an operator can
+/// reach: one admin re-adding one named person is still the operator asserting consent on the
+/// subscriber's behalf, and being accountable for it does not make it consent. Only the subscriber
+/// reverses their own unsubscribe, through a link sent to their own address.
 // Deliberately not a doc comment: this is for whoever edits the route, not for a client reading
 // the published document. The `409 selection-widened` this route declares cannot happen over a
 // frozen set; the guard is kept, as `bulk/delete` keeps it, because it costs one comparison and

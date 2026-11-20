@@ -727,10 +727,11 @@ async fn run_recorded(
 /// **Freezing the set is safe here only because this is `on conflict do nothing`** (section 8.3).
 /// Somebody who unsubscribes between the selection and the action is still in the frozen set, so
 /// this statement does run against them; doing nothing to the row they already have is the whole
-/// reason that is harmless. `lists::add_member` is `do update … where status = 'unsubscribed'` —
-/// it revives an unsubscribed membership deliberately, for one named person an admin answers for.
-/// Anyone who later "fixes the asymmetry" by aligning this to that turns freezing into a bulk
-/// re-subscription of people who opted out, with nothing in the tests or the types to object.
+/// reason that is harmless. There is no asymmetry left to "fix": no writer in the tree revives an
+/// unsubscribed membership — `lists::add_member` is `do nothing` too, since Task 7 — and only the
+/// subscriber can reverse their own unsubscribe, through a token delivered to their own address,
+/// in the preference center. Anyone who makes any of these an `on conflict … do update` turns a
+/// bulk action into a re-subscription of people who opted out (M1d invariant 1, spec §8.1).
 /// Section 15.3 carries the same question to the importer.
 ///
 /// Each contact it adds gets a consent row, `Source::Api`, in the same transaction — `requested`

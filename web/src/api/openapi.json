@@ -1598,7 +1598,7 @@
           "crate::contacts::routes"
         ],
         "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
-        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Adding someone to a list is what makes them mailable, and an\nunsubscribe afterwards does not un-send. Do not \"fix\" the asymmetry.",
+        "description": "`POST /lists/{id}/members` behaves the same way, and so does every other route an operator can\nreach: one admin re-adding one named person is still the operator asserting consent on the\nsubscriber's behalf, and being accountable for it does not make it consent. Only the subscriber\nreverses their own unsubscribe, through a link sent to their own address.",
         "operationId": "bulk_subscribe_contacts",
         "parameters": [
           {
@@ -3441,7 +3441,7 @@
         "tags": [
           "crate::lists::routes"
         ],
-        "summary": "Adding someone who is already `pending` or `subscribed` changes nothing; adding an\n`unsubscribed` one subscribes them again.",
+        "summary": "Adding someone who is already on the list changes nothing, whatever their status: a confirmed\nsubscriber is not demoted to `pending`, and someone who unsubscribed stays unsubscribed. The\nresponse carries the status the membership has, which may not be the one the add asked for.",
         "operationId": "add_list_member",
         "parameters": [
           {

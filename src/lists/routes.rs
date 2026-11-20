@@ -493,8 +493,9 @@ pub async fn mailable_count(
     }))
 }
 
-/// Adding someone who is already `pending` or `subscribed` changes nothing; adding an
-/// `unsubscribed` one subscribes them again.
+/// Adding someone who is already on the list changes nothing, whatever their status: a confirmed
+/// subscriber is not demoted to `pending`, and someone who unsubscribed stays unsubscribed. The
+/// response carries the status the membership has, which may not be the one the add asked for.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/lists/{id}/members",

@@ -220,26 +220,30 @@ async fn unsubscribe_sets_status_and_timestamp(pool: PgPool) {
     assert_eq!(count_memberships(&pool).await, 1);
 }
 
+/// M1d invariant 1. This route used to let an admin re-add someone who had unsubscribed, on the
+/// reasoning that an admin answers for one named person; spec §8.1 settled it the other way, and
+/// Task 7 deleted the revival. The request is still allowed and still answers `200` — it simply
+/// does not move the membership, on either kind of list.
 #[sqlx::test]
-async fn resubscribe_after_unsubscribe_is_allowed(pool: PgPool) {
+async fn an_admin_cannot_undo_an_unsubscribe_on_either_kind_of_list(pool: PgPool) {
     let (ws, app) = workspace(&pool, "acme").await;
     let single = create_list(&app, ws, "single", false).await;
     let double = create_list(&app, ws, "double", true).await;
     let contact = create_contact(&app, ws, "a@ex.test").await;
-    for (list, again) in [(single, "subscribed"), (double, "pending")] {
+    for list in [single, double] {
         add(&app, ws, list, contact).await;
         unsubscribe(&app, ws, list, contact)
             .await
             .assert_status(StatusCode::NO_CONTENT);
         assert_eq!(row(&pool, list, contact).await.0, "unsubscribed");
-        // The same rule as a first add: `subscribed` at once on a single-opt-in list, `pending`
-        // on a double-opt-in one.
-        assert_eq!(add(&app, ws, list, contact).await, again);
+
+        // The response is the status the membership has, not the one the add asked for.
+        assert_eq!(add(&app, ws, list, contact).await, "unsubscribed");
         let (status, _, unsubscribed_at_set) = row(&pool, list, contact).await;
-        assert_eq!(status, again);
+        assert_eq!(status, "unsubscribed");
         assert!(
-            !unsubscribed_at_set,
-            "unsubscribed_at is set only while unsubscribed"
+            unsubscribed_at_set,
+            "the add did not clear the stamp either: the row was not touched"
         );
     }
 }
@@ -507,9 +511,11 @@ async fn list_actions_are_audited_without_personal_data(pool: PgPool) {
                 "list.member_unsubscribed",
                 json!({"contact_id": contact_id})
             ),
+            // The add after the unsubscribe is audited — the operator did ask — but the status it
+            // records is the one the membership still has, because nothing moved.
             target(
                 "list.member_added",
-                json!({"contact_id": contact_id, "status": "subscribed"})
+                json!({"contact_id": contact_id, "status": "unsubscribed"})
             ),
             target(
                 "list.member_unsubscribed",
@@ -954,8 +960,8 @@ async fn a_membership_records_how_it_was_created(pool: PgPool) {
         [Some("ui"), Some("ui"), Some("api"), Some("api")].map(|s| s.map(str::to_owned))
     );
 
-    // Letting an unsubscribed contact back in makes a fresh member, so the new add's provenance
-    // replaces the old one; leaving `ui` there would explain a re-subscription by the wrong door.
+    // An add over an unsubscribed membership writes nothing at all, so it does not rewrite the
+    // provenance either: `source` still names the door they really came in by, years later.
     unsubscribe(&ui, ws, news, people[0])
         .await
         .assert_status(StatusCode::NO_CONTENT);
@@ -967,18 +973,24 @@ async fn a_membership_records_how_it_was_created(pool: PgPool) {
         .assert_status_ok();
     assert_eq!(
         source_of(&pool, news, people[0]).await.as_deref(),
-        Some("api")
+        Some("ui")
     );
-    // And a repeat add of a live member is a no-op: it does not rewrite how they first came in.
-    add(&ui, ws, news, people[0]).await;
+    // And a repeat add of a live member is a no-op too: people[1] came in by the UI, so an add
+    // through the API leaving `api` behind is exactly the regression this catches.
+    keyed
+        .post(&members_path(ws, news))
+        .add_header("authorization", key.clone())
+        .json(&json!({"contact_id": people[1]}))
+        .await
+        .assert_status_ok();
     assert_eq!(
-        source_of(&pool, news, people[0]).await.as_deref(),
-        Some("api")
+        source_of(&pool, news, people[1]).await.as_deref(),
+        Some("ui")
     );
 
     // The same for a `pending` member: re-adding one on a double-opt-in list keeps both the status
-    // and how they first came in. It rides the same `where status = 'unsubscribed'` clause, but
-    // `source` is asserted here by name rather than inferred from the status tests.
+    // and how they first came in. It rides the same `on conflict … do nothing`, but `source` is
+    // asserted here by name rather than inferred from the status tests.
     let double = create_list(&ui, ws, "double", true).await;
     assert_eq!(add(&ui, ws, double, people[1]).await, "pending");
     keyed

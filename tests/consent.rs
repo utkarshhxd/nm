@@ -654,12 +654,14 @@ async fn subscribing_through_the_lists_api_writes_a_consent_row(pool: PgPool) {
     app.post(&format!("{members}/{c}/unsubscribe"))
         .await
         .assert_status(StatusCode::NO_CONTENT);
+    // And an add after the unsubscribe changes nothing, so records nothing: the operator cannot
+    // reverse it, only the subscriber can.
     app.post(&members)
         .json(&json!({"contact_id": c}))
         .await
         .assert_status_ok();
     let actions: Vec<_> = consent_rows(&pool).await.into_iter().map(|r| r.0).collect();
-    assert_eq!(actions, ["resubscribed", "subscribed", "unsubscribed"]);
+    assert_eq!(actions, ["subscribed", "unsubscribed"]);
 }
 
 #[sqlx::test]
@@ -962,9 +964,9 @@ async fn adding_to_a_double_optin_list_through_the_lists_api_records_requested(p
     assert_eq!(statuses_for(&pool, digest).await, ["pending"]);
     assert_eq!(actions_for(&pool, digest).await, ["requested"]);
 
-    // The revival of an unsubscribed membership is `requested` too, not `resubscribed`: on a
-    // double-opt-in list it puts the row back in `pending`, so the person has been asked again
-    // and has not agreed again. The action follows the status written, in both branches.
+    // An add after an unsubscribe is not a second `requested`, because the person was not asked
+    // again: the membership is not reopened at all, on a double-opt-in list any more than on a
+    // single-opt-in one. The action still follows the status written, and nothing was written.
     let members = format!("/api/v1/workspaces/{ws}/lists/{digest}/members");
     app.post(&format!("{members}/{c}/unsubscribe"))
         .await
@@ -973,10 +975,10 @@ async fn adding_to_a_double_optin_list_through_the_lists_api_records_requested(p
         .json(&json!({"contact_id": c}))
         .await
         .assert_status_ok();
-    assert_eq!(statuses_for(&pool, digest).await, ["pending"]);
+    assert_eq!(statuses_for(&pool, digest).await, ["unsubscribed"]);
     assert_eq!(
         actions_for(&pool, digest).await,
-        ["requested", "requested", "unsubscribed"]
+        ["requested", "unsubscribed"]
     );
 }
 
@@ -1108,4 +1110,196 @@ async fn an_operator_or_api_write_leaves_token_jti_null(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(named, 0);
+}
+
+// ---- Task 7: an unsubscribe is never silently reversed -----------------------------------------
+
+use nm::public::token::{Purpose, Token, issue};
+
+/// The address every fixture below opts out with, so the import test can name it in a file.
+const LEFT: &str = "a@ex.test";
+
+/// The status of one membership, or `None` when the row is gone. Both answers are asserted on
+/// purpose: "still unsubscribed" and "there is no membership any more" are different outcomes and
+/// only one of them is the invariant.
+async fn membership(pool: &PgPool, contact: Uuid, list: Uuid) -> Option<String> {
+    sqlx::query_scalar("select status from list_memberships where contact_id = $1 and list_id = $2")
+        .bind(contact)
+        .bind(list)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// A workspace whose one contact joined a single-opt-in list and then left it, both through the
+/// product's own routes. The opt-out is written by the writer that really writes it, not inserted
+/// behind the product's back, so a test starting here is testing the real state.
+async fn left_the_list(pool: &PgPool, slug: &str) -> (Uuid, TestApp, Uuid, Uuid) {
+    let (ws, _, app) = editor(pool, slug).await;
+    let list = api_list(&app, ws, "news", false).await;
+    let c = api_contact(&app, ws, LEFT).await;
+    let members = format!("/api/v1/workspaces/{ws}/lists/{list}/members");
+    app.post(&members)
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    app.post(&format!("{members}/{c}/unsubscribe"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        membership(pool, c, list).await.as_deref(),
+        Some("unsubscribed"),
+        "the premise of every test below"
+    );
+    (ws, app, list, c)
+}
+
+#[sqlx::test]
+async fn an_import_naming_an_unsubscribed_contact_leaves_them_unsubscribed(pool: PgPool) {
+    let (ws, _app, list, c) = left_the_list(&pool, "acme").await;
+    let before = count(&pool, "consent_log").await;
+
+    import_into(&pool, ws, list, &format!("email\n{LEFT}\n")).await;
+
+    assert_eq!(
+        membership(&pool, c, list).await.as_deref(),
+        Some("unsubscribed")
+    );
+    assert_eq!(
+        count(&pool, "consent_log").await,
+        before,
+        "nothing changed, so nothing is recorded"
+    );
+}
+
+#[sqlx::test]
+async fn the_contacts_api_cannot_resubscribe_an_unsubscribed_contact(pool: PgPool) {
+    let (ws, app, list, c) = left_the_list(&pool, "acme").await;
+    let before = count(&pool, "consent_log").await;
+
+    app.post(&format!("/api/v1/workspaces/{ws}/contacts/bulk/subscribe"))
+        .json(&json!({"ids": [c], "list_id": list}))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        membership(&pool, c, list).await.as_deref(),
+        Some("unsubscribed")
+    );
+    assert_eq!(count(&pool, "consent_log").await, before);
+}
+
+/// Spec §8.1: an API call naming an address that unsubscribed leaves that membership
+/// `unsubscribed`. The operator is named and accountable, and that is still not the subscriber's
+/// consent — which is the whole reason this is not a 404 or an error: the request is allowed, it
+/// simply does not move the membership.
+#[sqlx::test]
+async fn the_lists_api_cannot_resubscribe_an_unsubscribed_contact(pool: PgPool) {
+    let (ws, app, list, c) = left_the_list(&pool, "acme").await;
+    let before = count(&pool, "consent_log").await;
+
+    let r = app
+        .post(&format!("/api/v1/workspaces/{ws}/lists/{list}/members"))
+        .json(&json!({"contact_id": c}))
+        .await;
+    r.assert_status_ok();
+    // The route answers with the status the membership still has, not the one it was asked for.
+    assert_eq!(r.json::<Value>()["status"], "unsubscribed");
+
+    assert_eq!(
+        membership(&pool, c, list).await.as_deref(),
+        Some("unsubscribed")
+    );
+    assert_eq!(
+        count(&pool, "consent_log").await,
+        before,
+        "an add that changed nothing records nothing"
+    );
+}
+
+/// The one writer that may reverse an unsubscribe, and the reason it may: the subscriber is the
+/// one acting, through a token delivered to their own address.
+#[sqlx::test]
+async fn the_preference_center_can_resubscribe_because_the_person_asked(pool: PgPool) {
+    let (ws, app, list, c) = left_the_list(&pool, "acme").await;
+
+    let link = issue(
+        &app.state.secrets,
+        &Token {
+            workspace_id: ws,
+            contact_id: c,
+            purpose: Purpose::Unsubscribe,
+            list_id: None,
+            issued_at: Utc::now().timestamp(),
+            nonce: "n1".to_owned(),
+        },
+    );
+    app.server
+        .post(&format!("/u/{link}"))
+        .text(format!("list={list}"))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        membership(&pool, c, list).await.as_deref(),
+        Some("subscribed")
+    );
+    let rows = consent_rows(&pool).await;
+    assert!(
+        rows.iter()
+            .any(|(a, s, _)| a == "resubscribed" && s == "preference_center"),
+        "{rows:?}"
+    );
+}
+
+/// `/c/{token}` is a membership writer too. A confirmation link is issued while the membership is
+/// `pending` and stays valid in an inbox afterwards, so the unsubscribe that came later must win.
+#[sqlx::test]
+async fn a_confirmation_link_that_predates_an_unsubscribe_does_not_revive_the_membership(
+    pool: PgPool,
+) {
+    let (ws, _, app) = editor(&pool, "acme").await;
+    let digest = api_list(&app, ws, "digest", true).await;
+    let c = api_contact(&app, ws, LEFT).await;
+    let members = format!("/api/v1/workspaces/{ws}/lists/{digest}/members");
+    app.post(&members)
+        .json(&json!({"contact_id": c}))
+        .await
+        .assert_status_ok();
+    // Issued while the row really is `pending`, which is when a real one is sent.
+    let link = issue(
+        &app.state.secrets,
+        &Token {
+            workspace_id: ws,
+            contact_id: c,
+            purpose: Purpose::Confirm,
+            list_id: Some(digest),
+            issued_at: Utc::now().timestamp(),
+            nonce: "n1".to_owned(),
+        },
+    );
+    app.post(&format!("{members}/{c}/unsubscribe"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    let before = count(&pool, "consent_log").await;
+
+    // The same answer a link for a deleted contact gets, so the page does not disclose that this
+    // address unsubscribed to whoever holds the link.
+    let r = app.server.get(&format!("/c/{link}")).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        r.text().contains("This link is no longer valid"),
+        "{}",
+        r.text()
+    );
+
+    assert_eq!(
+        membership(&pool, c, digest).await.as_deref(),
+        Some("unsubscribed")
+    );
+    assert_eq!(
+        count(&pool, "consent_log").await,
+        before,
+        "no `confirmed` row for a confirmation that did not happen"
+    );
 }
