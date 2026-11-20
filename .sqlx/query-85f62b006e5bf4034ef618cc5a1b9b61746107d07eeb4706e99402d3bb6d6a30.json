@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select (exists (select 1 from suppressions\n                            where lifted_at is null and scope = 'address' and email_hmac = $2\n                              and reason <> 'bounced'\n                              and (workspace_id = $1 or workspace_id is null))\n                or exists (select 1 from suppressions\n                            where lifted_at is null and scope = 'domain' and domain = $3\n                              and reason <> 'bounced'\n                              and (workspace_id = $1 or workspace_id is null)))\n                  as \"blocked!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blocked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "85f62b006e5bf4034ef618cc5a1b9b61746107d07eeb4706e99402d3bb6d6a30"
+}

@@ -143,6 +143,57 @@ pub async fn is_suppressed(
     Ok(blocking(db, secrets, workspace_id, &email).await?.is_some())
 }
 
+/// `true` if **any** live suppression covering `email` has a reason other than `bounced`: this
+/// workspace's or the instance's, on the address or on its domain.
+///
+/// **It is not [`blocking_suppression`] with a reason test on the answer, and the difference is
+/// the whole point of it existing.** That function answers "what is the most specific block on
+/// this address", `order by … limit 1`, workspace before instance and address before domain. A
+/// workspace-scope `bounced` row therefore *masks* an instance-wide complaint and a domain block:
+/// read the reason off the row it returns and an address that once bounced, on a domain the
+/// operator blocked wholesale, reads as "only a bounce". The live-uniqueness index rules out two
+/// rows in one slot, not two rows in different slots, so the masking combination is ordinary.
+///
+/// This asks the other question — "is there a block here that is not a bounce" — of every row at
+/// once. A reason this build has never heard of counts as blocking, because the test is
+/// `<> 'bounced'` and not a list of the five that refuse.
+///
+/// The caller that wants this is `public::forms`: a bounce is a deliverability fact with no door
+/// a subscriber can knock on, and a double opt-in confirmation is itself the deliverability test,
+/// while a complaint, a manual block, an erasure tombstone and a workspace-wide opt-out are all
+/// consent decisions that a public form may not overrule. An address that cannot be normalised
+/// counts as blocked: refuse, never guess.
+pub async fn is_suppressed_excluding_bounce(
+    db: impl PgExecutor<'_>,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> sqlx::Result<bool> {
+    let Ok(email) = normalize_email(email) else {
+        return Ok(true);
+    };
+    let hmac = suppression_hmac(secrets, &email);
+    let domain = email.split_once('@').map_or("", |(_, d)| d);
+    // Two `exists`, not one scan with an `or` across the scopes: each arm reaches its own partial
+    // index, the same way `blocking` below is written.
+    sqlx::query_scalar!(
+        r#"select (exists (select 1 from suppressions
+                            where lifted_at is null and scope = 'address' and email_hmac = $2
+                              and reason <> 'bounced'
+                              and (workspace_id = $1 or workspace_id is null))
+                or exists (select 1 from suppressions
+                            where lifted_at is null and scope = 'domain' and domain = $3
+                              and reason <> 'bounced'
+                              and (workspace_id = $1 or workspace_id is null)))
+                  as "blocked!""#,
+        workspace_id,
+        hmac.as_slice(),
+        domain,
+    )
+    .fetch_one(db)
+    .await
+}
+
 /// The one predicate behind both; `email` is already normalised.
 async fn blocking(
     db: impl PgExecutor<'_>,

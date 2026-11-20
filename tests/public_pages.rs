@@ -1487,6 +1487,10 @@ async fn block_address(s: &Signup, email: &str, reason: &str) {
     .unwrap();
 }
 
+/// A body whose address is fine and whose first name is a control character, so only the fields
+/// `contacts::check` validates can refuse it.
+const MALFORMED: &str = "email=shape@ex.test&first_name=%01";
+
 /// What a submitting browser calls itself in these tests.
 const UA: &str = "nm-public-form-test";
 
@@ -1508,17 +1512,23 @@ async fn contact_count(pool: &PgPool) -> i64 {
 /// A response as the invariant compares them: the status, the body, and every header a handler
 /// chooses.
 ///
-/// Two are dropped. `date` is the HTTP server's wall clock. `ratelimit-remaining` counts **this
-/// address's** budget down by one per request by construction, so two sequential requests can
-/// never carry the same value and comparing it would only ever assert that time passed — it says
-/// nothing about the address that was submitted, which is what invariant 7 is about. That the
-/// `POST` route carries no `RateLimit-*` headers at all is asserted where it belongs, in
-/// `a_rate_limited_submission_answers_exactly_as_a_real_one`.
+/// Three are dropped, all of them clocks. `date` is the HTTP server's. `ratelimit-remaining`
+/// counts **this address's** budget down by one per request by construction, so two sequential
+/// requests can never carry the same value; `ratelimit-reset` is the seconds left in the window,
+/// which changes whenever two requests straddle a whole second. Comparing either would only ever
+/// assert that time passed, and neither says anything about the address that was submitted, which
+/// is what invariant 7 is about. That the `POST` route carries no `RateLimit-*` headers at all is
+/// asserted where it belongs, in `a_rate_limited_submission_answers_exactly_as_a_real_one`.
 fn answer(r: &axum_test::TestResponse) -> (StatusCode, String, Vec<(String, String)>) {
     let mut headers: Vec<(String, String)> = r
         .headers()
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "date" | "ratelimit-remaining"))
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "date" | "ratelimit-remaining" | "ratelimit-reset"
+            )
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
@@ -1821,6 +1831,13 @@ async fn a_rate_limited_submission_answers_exactly_as_a_real_one(pool: PgPool) {
 
     let real = s.submit("newsletter", "email=real@ex.test").await;
     real.assert_status_ok();
+    // The same two bodies are sent again once the budget is gone, and compared with these.
+    let malformed = s.submit("newsletter", MALFORMED).await;
+    assert!(
+        malformed.text().contains("Check the details"),
+        "{}",
+        malformed.text()
+    );
     // The shared public budget, spent from anywhere: Task 4b made `PUBLIC_PER_MINUTE` one budget
     // for all five pages, and `check` counts refused requests too.
     for _ in 0..PUBLIC_PER_MINUTE {
@@ -1839,6 +1856,18 @@ async fn a_rate_limited_submission_answers_exactly_as_a_real_one(pool: PgPool) {
     assert_eq!(contact_count(&pool).await, 1);
     assert_eq!(jobs(&pool).await.len(), 1);
     assert_eq!(jobs(&pool).await[0].1["email"], "real@ex.test");
+
+    // **And a malformed field answers the same over the limit as under it.** Validation used to
+    // be skipped once the limiter had refused, so `first_name=%01` got the error page under the
+    // limit and the success page over it: the same bytes in, two answers out, which is the "you
+    // have been counted" tell this route drops its `RateLimit-*` headers to avoid. `malformed`
+    // was captured before the budget was spent and this one after it.
+    let malformed_over = s.submit("newsletter", MALFORMED).await;
+    assert_eq!(answer(&malformed), answer(&malformed_over));
+    // Not vacuous: the malformed answer is not the success page, so the equality above is a
+    // comparison of two different things being the same, not of one thing with itself.
+    assert_ne!(answer(&real), answer(&malformed));
+    assert_eq!(contact_count(&pool).await, 1, "and still writes nothing");
 }
 
 /// Spec invariant 1, for the writer that is easiest to reach: anyone may type anyone's address
@@ -2288,6 +2317,68 @@ async fn a_bounced_address_may_sign_up_again_and_a_complaint_may_not(pool: PgPoo
     let rows = consent_rows(&pool).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, "requested");
+}
+
+/// **A bounce must not mask a stronger block that sits in a different slot.**
+///
+/// `suppressions::blocking` answers "the most specific block on this address" — `order by … limit
+/// 1`, workspace before instance, address before domain — so reading the reason off its single
+/// row made a workspace-scope `bounced` row hide an instance-wide complaint and a domain block.
+/// The live-uniqueness index forbids two rows in one slot, not two rows in different slots, so
+/// both combinations below are ordinary rather than contrived: an address that bounced here, on a
+/// domain the operator blocked wholesale, or that an instance admin blocked for everyone.
+///
+/// Each half has its own workspace so the two cannot borrow each other's refusal.
+#[sqlx::test]
+async fn a_bounce_does_not_mask_a_block_in_another_scope(pool: PgPool) {
+    let s = signup(&pool, "acme").await;
+    let list = s.list("News", true).await;
+    s.form("newsletter", &[list], None).await;
+
+    // A workspace bounce, and an instance-wide complaint on the same address.
+    let both = "masked@ex.test";
+    block_address(&s, both, "bounced").await;
+    let hmac = nm::crypto::suppression_hmac(&s.app.state.secrets, both);
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason)          values ($1, null, 'address', $2, $3, 'complained')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(both)
+    .bind(hmac.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A workspace bounce, and a block on the whole domain.
+    let on_blocked_domain = "someone@blocked.test";
+    block_address(&s, on_blocked_domain, "bounced").await;
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, domain, reason)          values ($1, $2, 'domain', 'blocked.test', 'manual')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(s.workspace)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for email in [both, on_blocked_domain] {
+        s.submit("newsletter", &format!("email={email}"))
+            .await
+            .assert_status_ok();
+    }
+    assert_eq!(contact_count(&pool).await, 0, "neither may sign up");
+    assert_eq!(jobs(&pool).await.len(), 0);
+    assert_eq!(consent_rows(&pool).await.len(), 0);
+
+    // The control, and it is what makes the two assertions above mean anything: a bounce with
+    // nothing else beside it still signs up, so it is the second block refusing them and not the
+    // bounce.
+    block_address(&s, "only-bounced@ex.test", "bounced").await;
+    s.submit("newsletter", "email=only-bounced@ex.test")
+        .await
+        .assert_status_ok();
+    assert_eq!(contact_count(&pool).await, 1);
+    assert_eq!(jobs(&pool).await.len(), 1);
 }
 
 /// The real proof behind "a public route never writes the subscriber's IP into `audit_log`",

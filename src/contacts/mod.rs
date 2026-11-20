@@ -178,6 +178,15 @@ fn canonical_value(d: &Definition, v: &Value) -> Result<Value, &'static str> {
 /// answers is an address-existence oracle in one request (M1d invariant 7). Validating by
 /// attempting the insert cannot work there, because the oracle's third leg is a suppressed
 /// address, which never reaches an insert at all.
+///
+/// **How much of that the types hold, exactly.** The fields are private and [`check`] is the only
+/// constructor, so the normalised address a caller needs for a suppression or a contact lookup
+/// can only be had by validating first: *moving* the check later in `public::forms` does not
+/// compile, which is worth knowing because that is the mistake that was made once already.
+/// That is the whole of the guarantee. It does **not** stop someone re-deriving the address
+/// another way - `users::normalize_email` is public and one line - and putting a lookup in front
+/// of the check. The type makes the mistake inconvenient and visible in review; it is not a
+/// proof, and `tests/public_pages.rs` is where the property is tested.
 pub struct Checked {
     email: String,
     first: String,

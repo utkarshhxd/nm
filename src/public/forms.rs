@@ -140,36 +140,47 @@ async fn submit(
     // least one list" can have none left (`0023_forms_and_jobs.sql`); that form accepts no
     // submission and answers exactly as every other refusal does.
     let lists = lists_of(&mut db, &form).await?;
-    drop(db);
 
     let submitted = parse(&body);
+    // **The shape is checked here, before the limiter's verdict and the honeypot are allowed to
+    // decide anything.** It is the second half of the same requirement that moved this check
+    // ahead of the address lookups: if a refused submission skipped validation, the same bytes in
+    // would get two answers out — the error page under the limit, the success page over it — and
+    // that is precisely the "you have been counted" tell this route drops its `RateLimit-*`
+    // headers to avoid. Everything the check reads is the submission and the workspace's custom
+    // field definitions, so it can answer differently without answering a question about the
+    // address.
+    //
+    // It costs a refused submission one more indexed read; see the load note above.
+    let checked =
+        match contacts::check(&mut db, form.workspace_id, new_contact(&form, &submitted)).await {
+            Ok(checked) => checked,
+            // A malformed address, a name too long, a custom field that will not take what was typed:
+            // the shape of what was submitted, which the submitter can see and fix.
+            Err(ApiError::Validation(_)) => {
+                return Ok(render(&form, Some("Check the details and try again.")));
+            }
+            Err(e) => return Err(e),
+        };
+    drop(db);
+
     // A script fills in every input it can see. A person cannot see this one, so a value in it
     // means the submission was not made by a person — and the answer is the success page, so the
     // script has nothing to learn and no reason to come back with it empty.
     let honeypot = !first(&submitted, HONEYPOT).is_empty();
-    if over.is_none()
-        && !honeypot
-        && matches!(
-            apply(&state, &meta, &form, &lists, &submitted).await?,
-            Outcome::Invalid
-        )
-    {
-        return Ok(render(&form, Some("Check the details and try again.")));
+    if over.is_none() && !honeypot {
+        apply(&state, &meta, &form, &lists, &checked).await?;
     }
     Ok(accepted(&form, &lists))
 }
 
-/// What a submission did, where the two answers differ. Only [`Outcome::Invalid`] is reachable
-/// from what the submitter typed — and only from its **shape**, never from anything the database
-/// knows about the address, which is what keeps invariant 7 true.
-enum Outcome {
-    Done,
-    Invalid,
-}
-
-/// Writes the submission. Every early return is `Done`: a suppressed address, an erased one and
-/// an address another request created a moment ago all answer as a success, and all write nothing
-/// (the transaction is dropped, so it rolls back).
+/// Writes the submission. Every early return writes nothing and answers as a success: a
+/// suppressed address, an erased one and an address another request created a moment ago are all
+/// the one page (the transaction is dropped, so it rolls back).
+///
+/// There is no "invalid" answer here. The shape was checked in [`submit`], before the limiter and
+/// the honeypot, so by the time this runs the only questions left are ones about the address —
+/// and every answer to one of those is the same page.
 ///
 /// **The order of the writes matters.** `suppressions::is_erased`, inside `contacts::create`,
 /// takes an advisory lock on the address; `contacts::routes::erase_contact` takes the same lock,
@@ -181,8 +192,8 @@ async fn apply(
     meta: &RequestMeta,
     form: &Form,
     lists: &[(Uuid, bool)],
-    submitted: &HashMap<String, Vec<String>>,
-) -> ApiResult<Outcome> {
+    checked: &contacts::Checked,
+) -> ApiResult<()> {
     // A form with no lists left subscribes nobody, so it writes nothing at all — not even the
     // contact row. `form_lists.list_id` cascades, so this is a live state and not a hypothetical
     // (`0023_forms_and_jobs.sql`), and a contact with no membership and no consent row is the
@@ -190,29 +201,11 @@ async fn apply(
     // what it agreed to. It is decided by the form's configuration, which is the same for every
     // submitter, so it tells nobody anything.
     if lists.is_empty() {
-        return Ok(Outcome::Done);
+        return Ok(());
     }
 
+    let email = checked.email();
     let mut tx = state.pool.begin().await?;
-    // **The shape is checked here, before anything that depends on the address, and that position
-    // is the whole point.** `contacts::create` is what validates the optional fields, and it only
-    // runs for an address that is not already a contact — so checking by attempting the insert
-    // answered `email=<target>&first_name=%01` three different ways: the error page for a new
-    // address, the success page for an existing one (validation never ran), and the success page
-    // for a suppressed one (it returns below, before any contact lookup). One request, no
-    // statistics, an address-existence oracle. Everything this call reads is the submission and
-    // the workspace's custom field definitions; it cannot ask a question about the address, which
-    // is what makes its answer safe to differ.
-    let checked =
-        match contacts::check(&mut tx, form.workspace_id, new_contact(form, submitted)).await {
-            Ok(checked) => checked,
-            // A malformed address, a name too long, a custom field that will not take what was typed.
-            // The shape of what was submitted, which the submitter can see and fix.
-            Err(ApiError::Validation(_)) => return Ok(Outcome::Invalid),
-            Err(e) => return Err(e),
-        };
-    let email = checked.email().to_owned();
-
     // **A bounce is let through; every other block refuses.** A workspace-wide opt-out
     // (`docs/adr/0001`), a complaint, an operator's manual block and an erasure tombstone are all
     // consent decisions, and a public form is the one caller with no operator behind it to
@@ -221,8 +214,13 @@ async fn apply(
     // usually fixing exactly that. The double opt-in confirmation is itself the deliverability
     // test, so letting them past costs one email to an address that may fail again.
     //
-    // `blocking_suppression` normalises the address itself and fails closed on one it cannot
-    // read; ours is already normalised by `check` above, so that arm is unreachable here.
+    // **It asks "is there a block that is not a bounce", not "what is the strongest block".**
+    // `blocking_suppression` answers the second question, `order by … limit 1` with workspace
+    // before instance and address before domain, so reading the reason off its answer would let a
+    // workspace-scope bounce *mask* an instance-wide complaint or a domain block — and the
+    // live-uniqueness index does not forbid that combination, it only forbids two rows in one
+    // slot. `is_suppressed_excluding_bounce` tests every row instead, and a reason this build has
+    // never seen counts as blocking.
     //
     // shortcut: this early return is a **timing** oracle, and byte-identity does not close it.
     // Measured on the dev container, fastest of five, warm: a new address 8.1-9.1 ms, a
@@ -233,16 +231,20 @@ async fn apply(
     // costs every honest submission the slowest path's latency and has to be re-tuned whenever
     // the writes change. Do that when an existence oracle at this resolution is worth 5 ms to
     // somebody; until then it is recorded here rather than unmeasured.
-    let block =
-        suppressions::blocking_suppression(&mut *tx, &state.secrets, form.workspace_id, &email)
-            .await?;
-    if block.is_some_and(|b| b.reason != suppressions::Reason::Bounced) {
-        return Ok(Outcome::Done);
+    if suppressions::is_suppressed_excluding_bounce(
+        &mut *tx,
+        &state.secrets,
+        form.workspace_id,
+        email,
+    )
+    .await?
+    {
+        return Ok(());
     }
-    let contact_id = match contact_id(&mut tx, form.workspace_id, &email).await? {
+    let contact_id = match contact_id(&mut tx, form.workspace_id, email).await? {
         Some(id) => id,
         None => {
-            match contacts::create_checked(&mut tx, &state.secrets, form.workspace_id, &checked)
+            match contacts::create_checked(&mut tx, &state.secrets, form.workspace_id, checked)
                 .await
             {
                 Ok(id) => id,
@@ -250,10 +252,12 @@ async fn apply(
                 // above and this insert. The unique violation has already aborted this transaction,
                 // so there is nothing to do but roll it back — and nothing is lost, because the
                 // request that won wrote what this one would have.
-                // `address-erased`: unreachable, since the tombstone is a suppression and the check
-                // above found it. Kept as an arm rather than an `unreachable!`, because a panic in
-                // this handler is a 500 for a stranger.
-                Err(ApiError::Conflict(_)) => return Ok(Outcome::Done),
+                // `address-erased`: the erasure tombstone is a `gdpr_erasure` suppression, which
+                // the check above already refuses, so this is unreachable — and it is the second
+                // guard either way, which is why the check above being wrong about erasure would
+                // still not create a contact. Kept as an arm rather than an `unreachable!`,
+                // because a panic in this handler is a 500 for a stranger.
+                Err(ApiError::Conflict(_)) => return Ok(()),
                 Err(e) => return Err(e),
             }
         }
@@ -355,7 +359,7 @@ async fn apply(
             form.workspace_id,
             contact_id,
             list_id,
-            &email,
+            email,
         )
         .await?;
     }
@@ -374,7 +378,7 @@ async fn apply(
         .await?;
     }
     tx.commit().await?;
-    Ok(Outcome::Done)
+    Ok(())
 }
 
 /// How long one `(contact, list)` must wait between confirmation emails, in minutes.
@@ -428,6 +432,14 @@ const RESEND_AFTER_MINUTES: i64 = 15;
 /// 2 buffers, 0.045 ms. The same lookup without it, `Seq Scan`, 1,786 buffers, 10.6 ms — and that
 /// is the figure that keeps rising. Dropping the bound does not change a single answer, which is
 /// why it needs saying here that it is not redundant.
+///
+/// **What it counts: every `confirmation_email` row for this pair in the window, whatever state
+/// it is in** — queued, claimed, completed or given up. That is deliberate and it is the reason
+/// `0025_jobs_completed_at.sql` exists: this throttle has no state of its own, so a worker that
+/// deleted a row on success would make the question answer "no" every time and turn an
+/// unauthenticated route back into a mailer, with nothing going red. The predicate names no
+/// `completed_at` and no `failed_at` precisely so that adding one later is a visible decision
+/// rather than a silent narrowing.
 async fn enqueue_confirmation(
     tx: &mut PgConnection,
     state: &AppState,
@@ -474,9 +486,15 @@ async fn enqueue_confirmation(
     Ok(())
 }
 
-/// The smallest UUIDv7 that could have been generated at `at`, for use as a lower bound on a
-/// v7 primary key. Only the first 48 bits — the millisecond timestamp — carry meaning here; the
-/// rest is whatever `new_v7` fills in, which is why this is a bound and not an identity.
+/// *A* UUIDv7 bearing `at`'s millisecond, for use as a lower bound on a v7 primary key.
+///
+/// **Not the smallest one.** `uuid` 1.29.1 fills the 74 bits below the timestamp with random
+/// data, not zeros, so ids generated in that same millisecond fall on both sides of this value.
+/// The error is therefore bounded by one millisecond and it falls in the harmless direction: a
+/// row enqueued in that exact millisecond may sit below the bound and be missed, which costs one
+/// extra confirmation email fifteen minutes later. It can never wrongly *block* a resend, because
+/// `created_at` is ANDed with it and is the rule. Zeroing the low bits would remove even that, and
+/// would mean hand-assembling a uuid from bytes to save a millisecond nobody can observe.
 fn uuid_at(at: DateTime<Utc>) -> Uuid {
     let seconds = at.timestamp().max(0).unsigned_abs();
     Uuid::new_v7(uuid::Timestamp::from_unix(
