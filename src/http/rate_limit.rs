@@ -180,18 +180,49 @@ const MAX_KEYS: usize = 100_000;
 
 /// The shortest interval between two sweeps of one limiter's map. A sweep can only free a window
 /// that has ended, and windows last `WINDOW`, so sweeping more often than this frees a handful of
-/// entries for a full scan. The cost of waiting is that a map full of windows that have *ended* is
-/// not reopened for up to a second, which delays an admissible key by up to a second and nothing
-/// else.
+/// entries for a full scan.
+///
+/// **What waiting costs, before anyone raises this number.** A map full of windows that have
+/// *ended* stays closed until the next sweep is allowed, and a new key arriving in that interval
+/// is not queued — it takes the refusal path like any other key that finds the map full, which is
+/// a `429` carrying `Retry-After: 60`, because a key with no window of its own is told to come
+/// back after a whole one. So the exposure is not "a key is delayed by `SWEEP_EVERY`"; it is
+/// "every new visitor for up to `SWEEP_EVERY` is refused for a minute". At one second that is
+/// negligible and errs towards refusing rather than admitting. At sixty it would not be, and this
+/// sentence is the one to read before changing the constant.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
-/// What a window is counted against. A workspace for the authenticated endpoints, an IP for the
-/// public pages, and never confusable: a workspace id and an address that happen to collide in
-/// their bytes are different keys.
+/// What a window is counted against. A workspace for the authenticated endpoints, a [`Bucket`] of
+/// addresses for the public pages, and never confusable: a workspace id and an address that happen
+/// to collide in their bytes are different keys.
+///
+/// `Workspace` takes its `Uuid` bare because a workspace id is already the thing being limited and
+/// a caller had to be authorised to hold one. An address is not: see [`Bucket`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     Workspace(Uuid),
-    Ip(IpAddr),
+    Ip(Bucket),
+}
+
+/// An address reduced to the block it is counted against — **the only thing this module will key a
+/// window on**, and the reason the bucketing cannot be skipped by a route that forgets.
+///
+/// The field is private and there is no constructor but [`From<IpAddr>`](Bucket::from), which
+/// buckets. So `Key::Ip(some_raw_address)` does not compile outside this module: the guarantee is
+/// the type's, not a convention in a doc comment or a test that has to be kept in step. That
+/// matters because keying on raw addresses was the defect this module shipped once already, and
+/// the next route to call `check` is one someone else writes.
+///
+/// `auth::rate_limit::bucket_of` does the masking and carries the reasoning — a /64 comes free
+/// with any VPS, so a limiter that counts single addresses stops nobody who holds an allocation.
+/// Sign-in has keyed through it since M0; this is the product's one answer, not a second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Bucket(IpAddr);
+
+impl From<IpAddr> for Bucket {
+    fn from(ip: IpAddr) -> Bucket {
+        Bucket(crate::auth::rate_limit::bucket_of(ip))
+    }
 }
 
 impl From<Uuid> for Key {
@@ -201,12 +232,8 @@ impl From<Uuid> for Key {
 }
 
 impl From<IpAddr> for Key {
-    /// **The address is bucketed here, not at the call site**, so no route can forget: a limiter
-    /// that counts raw addresses stops nobody who holds an allocation, and a /64 comes free with
-    /// any VPS. `auth::rate_limit::bucket_of` is the product's one answer to that and carries the
-    /// reasoning; sign-in has keyed through it since M0.
     fn from(ip: IpAddr) -> Key {
-        Key::Ip(crate::auth::rate_limit::bucket_of(ip))
+        Key::Ip(ip.into())
     }
 }
 

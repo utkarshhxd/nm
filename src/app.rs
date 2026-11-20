@@ -140,6 +140,14 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     // it defaults to `Json`, so a dev run is already the production format — and `public_url` asks
     // the same question the warning does, because a reverse proxy is how an instance gets a
     // hostname that is not localhost.
+    //
+    // THE GAP THIS TRADE ACCEPTS, so it is not rediscovered as a surprise: `public_url` defaults
+    // to `http://localhost:8080`, so an operator who deploys behind a proxy and never sets it
+    // gets no warning — on exactly the misconfiguration this exists for. That is deliberate and
+    // not worth a second heuristic, because it is self-limiting: the same unset `public_url` puts
+    // `localhost:8080` in every confirmation and unsubscribe link they send, which is a louder
+    // failure than a shared rate-limit window and is found first. The warning is aimed at the
+    // operator who configured their instance correctly and missed this one flag.
     if !cfg.trust_proxy_headers && !is_local_url(&cfg.public_url) {
         tracing::warn!(
             "trust_proxy_headers is off, so rate limiting keys on the peer address. If NM is \
