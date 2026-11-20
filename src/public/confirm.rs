@@ -8,11 +8,10 @@
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
-use std::net::{IpAddr, Ipv4Addr};
 
 use crate::{
     app::AppState,
@@ -21,24 +20,13 @@ use crate::{
     http::request_meta::RequestMeta,
     lists::MembershipStatus,
     public::{
-        page,
+        page::{UNKNOWN_IP, notice, with},
         token::{self, Purpose},
     },
 };
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/c/{token}", get(confirm))
-}
-
-/// The bucket a request whose client address we cannot see is counted in. `RequestMeta` has no IP
-/// only when the server was built without `ConnectInfo`, which production never is; one shared
-/// bucket for that case limits them together rather than letting them past the limiter.
-const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-
-/// A page with a status: every answer this route gives a browser is HTML, including the refusals.
-/// A subscriber who clicks a dead link gets a sentence, not an RFC 9457 document.
-fn notice(status: StatusCode, title: &str, body: &str) -> Response {
-    (status, page::shell(title, body.to_owned())).into_response()
 }
 
 /// What an expired link says, and what a link for a contact or membership that is no longer there
@@ -183,10 +171,4 @@ async fn confirm(
     };
     tx.commit().await?;
     Ok(with(quota.headers, answer))
-}
-
-/// Puts the `RateLimit` headers on an answer. Every answer carries them, refusals included, as the
-/// authenticated limited routes do.
-fn with(headers: HeaderMap, page: Response) -> Response {
-    (headers, page).into_response()
 }

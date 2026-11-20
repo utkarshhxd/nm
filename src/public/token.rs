@@ -22,21 +22,29 @@ const DAY: i64 = 24 * 60 * 60;
 
 /// What the link may do. Part of the signed payload, so a confirm link cannot be turned into an
 /// unsubscribe (or the reverse) by editing it.
+///
+/// **There is no `Preference` variant, and adding one back would be a mistake.** It existed until
+/// Task 5, with a 90-day TTL, for a preference-center door of its own. Spec §6.3 settled on one
+/// page and three doors instead: `/u/{token}` is both the RFC 8058 one-click POST and the
+/// preference center a human opens, so both methods parse `Unsubscribe` and there is one token to
+/// issue. A second variant that no route issues and no route accepts is a signed shape waiting to
+/// be given a meaning by someone who does not know why it was dropped — and a 90-day TTL on this
+/// link would contradict §6.2's "unsubscribe tokens do not expire" outright. Spec §6.2 carries a
+/// dated note. (2026-11-20)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Purpose {
     Confirm,
     Unsubscribe,
-    Preference,
 }
 
 impl Purpose {
     /// `None` for `Unsubscribe`: RFC 8058 one-click links sit in an inbox for years, and refusing
-    /// to honour one is a compliance failure, not a safety measure.
+    /// to honour one is a compliance failure, not a safety measure. The preference center is
+    /// reached by the same token, so it does not expire either.
     fn ttl_secs(self) -> Option<i64> {
         match self {
             Purpose::Confirm => Some(14 * DAY),
-            Purpose::Preference => Some(90 * DAY),
             Purpose::Unsubscribe => None,
         }
     }
@@ -44,6 +52,20 @@ impl Purpose {
 
 /// The field names are part of the token format: renaming one invalidates links already sent. No
 /// `serde(default)`, `deny_unknown_fields`: a payload this build did not write is refused, not read.
+///
+/// **This field list is final once the first unsubscribe link is sent, and there is no mechanism
+/// left to change it.** The two rules above are inherited from the selection token
+/// (`m1a-decisions.md`), where they are safe because that token lives an hour: adding a field
+/// there breaks nothing, and the escape hatch for a payload whose *meaning* changed is to bump
+/// the domain label, invalidating every outstanding token at once. Neither works here.
+/// `Purpose::Unsubscribe` has no TTL, so links sit in inboxes for years; a new field makes every
+/// one of them a hard deserialize error, and bumping `PUBLIC_DOMAIN` kills them all in one go.
+/// Spec §6.2 forbids exactly that: "an email sits in an inbox for years and RFC 8058 must still
+/// work."
+///
+/// So anything a later milestone needs in this payload — a campaign id for M2's click tracking, a
+/// key version for rotation — has to be added **before** the first send, not after. A field that
+/// cannot be added later is not a field that can be deferred. (2026-11-20)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Token {

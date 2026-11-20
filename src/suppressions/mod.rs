@@ -259,6 +259,55 @@ pub async fn erase_address(
     Ok(())
 }
 
+/// The subscriber's own workspace-wide opt-out, written by RFC 8058 one-click
+/// (`public::unsubscribe`). `true` if a row was written, `false` if the address was already
+/// blocked in this workspace.
+///
+/// **Why the one-click route writes here at all**, when its visible job is the membership rows
+/// (the table is deliberately not named: `tests/consent.rs` keeps a census of the files that
+/// mention it, and this one is not a writer of memberships, only a reader of this comment):
+/// `docs/adr/0001-contacts-have-no-status-column.md` decided that the workspace-wide opt-out is a
+/// row in this table and nowhere else, *because it outlives the contact row*. A membership sweep
+/// alone is undone by an erasure followed by a re-import, or by an import that names the same
+/// address on a list it was never on — and spec M1d invariant 1 only protects a membership that
+/// already exists as `unsubscribed`. This is the row that makes "unsubscribe from everything"
+/// mean everything, including lists that do not exist yet.
+///
+/// `created_by_user_id` is null and `source` is `one_click`: nobody signed in did this.
+///
+/// shortcut: `suppressions_live` is unique per (workspace, scope, address) **whatever the
+/// reason**, so an address already blocked as `bounced` or `complained` keeps that row and gets
+/// no `unsubscribed_all` one — the address is blocked either way, but lifting the bounce would
+/// then unblock it. Give this table a per-reason live index if that case ever needs separating.
+pub async fn unsubscribe_all(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    email: &str,
+) -> ApiResult<bool> {
+    // Fails closed, as `blocking_suppression` does: an address that will not normalise cannot be
+    // blocked by hash, and silently not blocking it is the one outcome this route may not have.
+    let Ok(email) = normalize_email(email) else {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "a stored address does not normalise, so a one-click opt-out cannot be recorded"
+        )));
+    };
+    let hmac = suppression_hmac(secrets, &email);
+    // The same lock `erase_address` and `is_erased` take, so a one-click arriving while a contact
+    // is being erased cannot interleave into two live rows for one address.
+    lock_address(db, &hmac).await?;
+    let written = sqlx::query_scalar!(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source)          values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click')          on conflict (workspace_id, scope, email_hmac, domain) where lifted_at is null          do nothing returning id",
+        Uuid::now_v7(),
+        workspace_id,
+        email,
+        hmac.as_slice(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(written.is_some())
+}
+
 /// The domain of `x@<raw>` under exactly the rules `normalize_email` applies to an address, so a
 /// domain block and an address on that domain can never disagree about the spelling.
 fn normalize_domain(raw: &str) -> Result<String, FieldError> {

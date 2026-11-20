@@ -76,12 +76,20 @@ pub fn serve_web(source: &dyn AssetSource, path: &str, accept_encoding: Option<&
 /// would otherwise be served `index.html` with a 200. The health checks are real routes and
 /// cannot reach this handler, but `serve_web` is public and must not contradict them.
 ///
+/// `crate::public::owns_path` covers `/c`, `/u` and `/f` — the subscriber's server-rendered
+/// pages, bare prefix included. That one is shared rather than spelled out twice, because for
+/// those three the two ideas below really are one: see the reasoning on `owns_path`.
+///
 /// This happens to list the same paths as `security_headers::uncacheable`, which are two
 /// different ideas that coincide — "never the SPA" and "never cached by a shared cache" — so
 /// they are deliberately NOT one function. `security_headers`'s tests assert the two agree, so
 /// a path added to only one of them fails loudly instead of drifting quietly.
 pub(crate) fn is_reserved(path: &str) -> bool {
-    path == "/api" || path.starts_with("/api/") || path == "/healthz" || path == "/readyz"
+    path == "/api"
+        || path.starts_with("/api/")
+        || path == "/healthz"
+        || path == "/readyz"
+        || crate::public::owns_path(path)
 }
 
 /// The precompressed variant the client accepts, else the raw file; `None` if neither exists.

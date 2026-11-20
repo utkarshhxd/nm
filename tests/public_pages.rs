@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The public, token-authenticated pages: `GET /c/{token}` and the shell every one of them is
-//! rendered into. `tests/public_tokens.rs` covers `issue`/`parse` on their own; this file is
-//! about what a browser gets.
+//! The public, token-authenticated pages: `GET /c/{token}`, `GET`/`POST /u/{token}`, and the
+//! shell every one of them is rendered into. `tests/public_tokens.rs` covers `issue`/`parse` on
+//! their own; this file is about what a browser (or a mail client) gets.
 
 mod common;
 
-use std::{net::IpAddr, path::Path};
+use std::{future::IntoFuture, net::IpAddr, path::Path, time::Instant};
 
 use axum::http::StatusCode;
 use chrono::Utc;
@@ -20,6 +20,9 @@ use uuid::Uuid;
 
 const DAY: i64 = 24 * 60 * 60;
 
+/// The body RFC 8058 §3.1 tells a mail client to POST.
+const ONE_CLICK: &str = "List-Unsubscribe=One-Click";
+
 /// A workspace with one contact holding one `pending` membership on one list: the state a
 /// confirmation link is issued against.
 struct Pending {
@@ -30,38 +33,60 @@ struct Pending {
     owner_email: String,
 }
 
-async fn pending(pool: &PgPool, slug: &str) -> Pending {
-    let owner_email = format!("owner-{slug}@example.com");
-    let owner = create_user(pool, &owner_email, PW, false).await;
-    let workspace = create_workspace(pool, owner, slug).await;
-    let contact = Uuid::now_v7();
+async fn make_contact(pool: &PgPool, workspace: Uuid, email: &str) -> Uuid {
+    let id = Uuid::now_v7();
     sqlx::query("insert into contacts (id, workspace_id, email) values ($1, $2, $3)")
-        .bind(contact)
+        .bind(id)
         .bind(workspace)
-        .bind(format!("subscriber-{slug}@ex.test"))
+        .bind(email)
         .execute(pool)
         .await
         .unwrap();
-    let list = Uuid::now_v7();
+    id
+}
+
+async fn make_list(
+    pool: &PgPool,
+    workspace: Uuid,
+    name: &str,
+    visibility: &str,
+    double_optin: bool,
+) -> Uuid {
+    let id = Uuid::now_v7();
     sqlx::query(
-        "insert into lists (id, workspace_id, name, double_optin) values ($1, $2, $3, true)",
+        "insert into lists (id, workspace_id, name, double_optin, visibility)          values ($1, $2, $3, $4, $5)",
     )
-    .bind(list)
+    .bind(id)
     .bind(workspace)
-    .bind("news")
+    .bind(name)
+    .bind(double_optin)
+    .bind(visibility)
     .execute(pool)
     .await
     .unwrap();
+    id
+}
+
+async fn make_member(pool: &PgPool, workspace: Uuid, contact: Uuid, list: Uuid, status: &str) {
     sqlx::query(
-        "insert into list_memberships (workspace_id, contact_id, list_id, status) \
-         values ($1, $2, $3, 'pending')",
+        "insert into list_memberships (workspace_id, contact_id, list_id, status)          values ($1, $2, $3, $4)",
     )
     .bind(workspace)
     .bind(contact)
     .bind(list)
+    .bind(status)
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn pending(pool: &PgPool, slug: &str) -> Pending {
+    let owner_email = format!("owner-{slug}@example.com");
+    let owner = create_user(pool, &owner_email, PW, false).await;
+    let workspace = create_workspace(pool, owner, slug).await;
+    let contact = make_contact(pool, workspace, &format!("subscriber-{slug}@ex.test")).await;
+    let list = make_list(pool, workspace, "news", "private", true).await;
+    make_member(pool, workspace, contact, list, "pending").await;
     Pending {
         app: TestApp::new(pool.clone()).await,
         workspace,
@@ -91,12 +116,44 @@ impl Pending {
         )
     }
 
+    /// An unsubscribe link for this contact. No `list_id`: it covers the whole workspace.
+    fn unsub(&self, nonce: &str, age_days: i64) -> String {
+        self.token(Purpose::Unsubscribe, None, nonce, age_days)
+    }
+
+    /// Another list in this workspace, with a membership for this contact at `status`.
+    async fn on_list(&self, name: &str, visibility: &str, status: &str) -> Uuid {
+        let list = make_list(&self.app.pool, self.workspace, name, visibility, true).await;
+        make_member(&self.app.pool, self.workspace, self.contact, list, status).await;
+        list
+    }
+
+    /// The status of the membership on the fixture's own list.
     async fn status(&self) -> Option<String> {
-        sqlx::query_scalar("select status from list_memberships where contact_id = $1")
-            .bind(self.contact)
-            .fetch_optional(&self.app.pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "select status from list_memberships where contact_id = $1 and list_id = $2",
+        )
+        .bind(self.contact)
+        .bind(self.list)
+        .fetch_optional(&self.app.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Every membership this contact has, as `(list_id, status)`, ordered by list.
+    async fn statuses(&self) -> Vec<(Uuid, String)> {
+        sqlx::query_as(
+            "select list_id, status from list_memberships where contact_id = $1 order by list_id",
+        )
+        .bind(self.contact)
+        .fetch_all(&self.app.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A POST to this contact's unsubscribe link.
+    async fn post_unsub(&self, link: &str, body: &str) -> axum_test::TestResponse {
+        self.app.post(&format!("/u/{link}")).text(body).await
     }
 }
 
@@ -108,6 +165,29 @@ type Evidence = (
     Option<String>,
     Option<String>,
 );
+
+/// `(list_id, action, source)` of every consent row, ordered by list so a test never depends on
+/// the order of rows written in one transaction (`now()` is transaction-start time, so they tie).
+async fn consent_by_list(pool: &PgPool) -> Vec<(Option<Uuid>, String, String)> {
+    sqlx::query_as("select list_id, action, source from consent_log order by list_id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Every live suppression in the workspace, as `(reason, source, email)`.
+async fn live_suppressions(
+    pool: &PgPool,
+    workspace: Uuid,
+) -> Vec<(String, String, Option<String>)> {
+    sqlx::query_as(
+        "select reason, source, email from suppressions           where workspace_id = $1 and lifted_at is null order by id",
+    )
+    .bind(workspace)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
 
 async fn consent_rows(pool: &PgPool) -> Vec<Evidence> {
     sqlx::query_as("select action, source, ip, token_jti, source_ref from consent_log order by id")
@@ -341,6 +421,27 @@ async fn every_public_page_is_no_store(pool: PgPool) {
             "{what}"
         );
     }
+    // `/u/`'s refusal is a page too. Its success is a 200 with no body (RFC 8058), which has
+    // nothing for a cache to keep and no content type to assert.
+    let bad = p.post_unsub("not-a-token", ONE_CLICK).await;
+    assert_eq!(
+        bad.header("cache-control"),
+        "no-store",
+        "unsubscribe invalid"
+    );
+    assert_eq!(
+        bad.header("content-type"),
+        "text/html; charset=utf-8",
+        "unsubscribe invalid"
+    );
+
+    // And the bare prefixes, which reach no handler at all: `public::owns_path` keeps them off
+    // the SPA, and `security_headers::uncacheable` keeps a shared cache off them.
+    for path in ["/c", "/c/", "/u", "/u/", "/f", "/f/"] {
+        let r = p.app.get(path).await;
+        assert_eq!(r.status_code(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(r.header("cache-control"), "no-store", "{path}");
+    }
 }
 
 #[sqlx::test]
@@ -370,4 +471,263 @@ async fn the_confirm_route_is_refused_past_the_per_ip_limit(pool: PgPool) {
     let r = p.app.get(&format!("/c/{}", p.link("n1", 0))).await;
     assert_eq!(r.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(p.status().await.as_deref(), Some("pending"));
+}
+
+// ---- Task 5: RFC 8058 one-click unsubscribe ----------------------------------------------------
+
+/// Spec §7.2: one click, every list in the workspace — not the list the email came from. The
+/// consent rows follow what actually changed, so the list that was already unsubscribed gets none.
+#[sqlx::test]
+async fn one_click_unsubscribes_from_every_list_in_the_workspace(pool: PgPool) {
+    let p = pending(&pool, "acme").await; // `news`, pending
+    let weekly = p.on_list("weekly", "public", "subscribed").await;
+    let already = p.on_list("old", "private", "unsubscribed").await;
+
+    let r = p.post_unsub(&p.unsub("n1", 0), ONE_CLICK).await;
+    r.assert_status_ok();
+    assert_eq!(r.text(), "", "RFC 8058 wants a 200 and nothing to read");
+
+    for (list, status) in p.statuses().await {
+        assert_eq!(status, "unsubscribed", "list {list}");
+    }
+    // Two list rows, not three: the membership that was already `unsubscribed` did not change, so
+    // nobody consented to anything a second time. Plus the workspace-wide opt-out, which has no
+    // list because it is about the address.
+    let mut want = vec![
+        (
+            Some(p.list),
+            "unsubscribed".to_owned(),
+            "one_click".to_owned(),
+        ),
+        (
+            Some(weekly),
+            "unsubscribed".to_owned(),
+            "one_click".to_owned(),
+        ),
+        (None, "suppressed".to_owned(), "one_click".to_owned()),
+    ];
+    want.sort();
+    let mut got = consent_by_list(&pool).await;
+    got.sort();
+    assert_eq!(got, want);
+    assert!(
+        !got.iter().any(|(l, _, _)| *l == Some(already)),
+        "the list that was already unsubscribed recorded nothing"
+    );
+    // The subscriber's own request, so the address really is theirs and is kept as evidence.
+    for row in consent_rows(&pool).await {
+        assert_eq!(row.2, Some("127.0.0.1".parse().unwrap()), "the IP");
+        assert_eq!(row.4, None, "no operator id");
+    }
+}
+
+/// `docs/adr/0001-contacts-have-no-status-column.md`: the workspace-wide opt-out is a
+/// `suppressions` row, keyed by address, **because it outlives the contact row**. A sweep of
+/// `list_memberships` alone leaves spec §4's second anti-goal wide open — a later import naming
+/// the same address on a *different* list writes a fresh `subscribed` row, and invariant 1 only
+/// protects a membership that already exists as `unsubscribed`.
+#[sqlx::test]
+async fn one_click_writes_the_workspace_wide_opt_out_that_outlives_the_contact(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    p.post_unsub(&p.unsub("n1", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        live_suppressions(&pool, p.workspace).await,
+        [(
+            "unsubscribed_all".to_owned(),
+            "one_click".to_owned(),
+            Some("subscriber-acme@ex.test".to_owned()),
+        )],
+    );
+    // It is the subscriber's own act, so no user is named as its author.
+    let by: Option<Uuid> =
+        sqlx::query_scalar("select created_by_user_id from suppressions where workspace_id = $1")
+            .bind(p.workspace)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(by, None);
+
+    // A second click adds no second row, and the opt-out survives every list being deleted —
+    // which is the half `list_memberships` cannot do.
+    p.post_unsub(&p.unsub("n2", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    sqlx::query("delete from lists where workspace_id = $1")
+        .bind(p.workspace)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live_suppressions(&pool, p.workspace).await.len(), 1);
+}
+
+/// Spec invariant 3, measured end to end.
+#[sqlx::test]
+async fn one_click_completes_in_under_five_seconds(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    for n in 0..10 {
+        p.on_list(&format!("list-{n}"), "public", "subscribed")
+            .await;
+    }
+    let started = Instant::now();
+    p.post_unsub(&p.unsub("n1", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    let took = started.elapsed();
+    assert!(took.as_secs() < 5, "one-click took {took:?}");
+    assert!(p.statuses().await.iter().all(|(_, s)| s == "unsubscribed"));
+}
+
+/// Review Focus 4. The two POSTs are issued **concurrently**, which is what mail clients produce:
+/// they prefetch, and some send the POST twice. Sequential would prove nothing — the second
+/// `UPDATE … WHERE status <> 'unsubscribed'` would simply match nothing. Concurrently, the second
+/// statement blocks on the row lock and re-reads the row the first one committed, which is the
+/// only case that tests the predicate being re-evaluated.
+#[sqlx::test]
+async fn two_overlapping_one_click_posts_write_consent_rows_only_for_real_changes(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("weekly", "public", "subscribed").await;
+    let link = p.unsub("n1", 0);
+    let path = format!("/u/{link}");
+
+    let (a, b) = tokio::join!(
+        p.app.post(&path).text(ONE_CLICK).into_future(),
+        p.app.post(&path).text(ONE_CLICK).into_future(),
+    );
+    a.assert_status_ok();
+    b.assert_status_ok();
+
+    assert!(p.statuses().await.iter().all(|(_, s)| s == "unsubscribed"));
+    // One row per list that changed, plus the one workspace-wide opt-out — never one per request.
+    let rows = consent_by_list(&pool).await;
+    assert_eq!(
+        rows.len(),
+        3,
+        "two requests, two memberships and one address: {rows:?}"
+    );
+    for list in [Some(p.list), Some(weekly), None] {
+        assert_eq!(
+            rows.iter().filter(|(l, _, _)| *l == list).count(),
+            1,
+            "{list:?} was recorded twice: {rows:?}"
+        );
+    }
+    assert_eq!(live_suppressions(&pool, p.workspace).await.len(), 1);
+}
+
+/// Spec invariant 4. The token names its workspace, and nothing else does.
+#[sqlx::test]
+async fn one_click_never_touches_another_workspaces_membership(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let other_owner = create_user(&pool, "owner-other@example.com", PW, false).await;
+    let other = create_workspace(&pool, other_owner, "other").await;
+    // The same address in both workspaces, so only the workspace in the token can separate them.
+    let their_contact = make_contact(&pool, other, "subscriber-acme@ex.test").await;
+    let their_list = make_list(&pool, other, "theirs", "public", true).await;
+    make_member(&pool, other, their_contact, their_list, "subscribed").await;
+
+    p.post_unsub(&p.unsub("n1", 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+
+    let theirs: String = sqlx::query_scalar(
+        "select status from list_memberships where contact_id = $1 and list_id = $2",
+    )
+    .bind(their_contact)
+    .bind(their_list)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(theirs, "subscribed", "another workspace's membership moved");
+    assert_eq!(live_suppressions(&pool, other).await, []);
+    let theirs_logged: i64 =
+        sqlx::query_scalar("select count(*) from consent_log where workspace_id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(theirs_logged, 0);
+}
+
+/// Spec §6.2: an email sits in an inbox for years and RFC 8058 must still work. There is no TTL
+/// arm for `Unsubscribe`, so this is the test that would catch one being added.
+#[sqlx::test]
+async fn an_unsubscribe_token_two_years_old_still_works(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    p.post_unsub(&p.unsub("n1", 2 * 365), ONE_CLICK)
+        .await
+        .assert_status_ok();
+    assert_eq!(p.status().await.as_deref(), Some("unsubscribed"));
+}
+
+#[sqlx::test]
+async fn a_one_click_consent_row_carries_the_token_nonce_as_its_jti(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let nonce = Uuid::now_v7().to_string();
+    p.post_unsub(&p.unsub(&nonce, 0), ONE_CLICK)
+        .await
+        .assert_status_ok();
+
+    let rows = consent_rows(&pool).await;
+    assert!(!rows.is_empty(), "nothing was recorded at all");
+    for row in rows {
+        assert_eq!(row.3, Some(nonce.clone()), "which link was followed");
+    }
+}
+
+/// **The one route that reads the limiter's verdict and does not obey it.** `check` returns an
+/// advisory `over`; `http::rate_limit::MAX_KEYS` names this route as the one that may not answer
+/// `429`, because an unsubscribe that does not stick is spec §4's second anti-goal and a mail
+/// client's one-click button has nobody to retry it. The headers are still carried and the
+/// request is still counted — what changes is only what the handler does about the verdict.
+#[sqlx::test]
+async fn one_click_is_not_refused_past_the_per_ip_limit(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    // Spent on another public route, which is also the proof that the budget is shared: Task 4b
+    // made `PUBLIC_PER_MINUTE` one budget for all five pages.
+    for _ in 0..PUBLIC_PER_MINUTE {
+        p.app.get("/c/not-a-token").await;
+    }
+    p.app
+        .get("/c/not-a-token")
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    let r = p.post_unsub(&p.unsub("n1", 0), ONE_CLICK).await;
+    r.assert_status_ok();
+    assert_eq!(r.header("ratelimit-remaining"), "0", "it was counted");
+    assert_eq!(p.status().await.as_deref(), Some("unsubscribed"));
+    assert_eq!(live_suppressions(&pool, p.workspace).await.len(), 1);
+}
+
+/// Each public route passes its own `Purpose` to `parse`. A confirm token is genuinely signed by
+/// this instance, so only the purpose can be what refuses it here.
+#[sqlx::test]
+async fn a_confirm_token_is_refused_by_the_unsubscribe_route(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let r = p.post_unsub(&p.link("n1", 0), ONE_CLICK).await;
+    assert_eq!(r.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.text().contains("no longer valid"), "{}", r.text());
+    assert_eq!(p.status().await.as_deref(), Some("pending"));
+    assert_eq!(consent_rows(&pool).await.len(), 0);
+    assert_eq!(live_suppressions(&pool, p.workspace).await, []);
+}
+
+/// Review Focus 2 again, for this route: the token still verifies after the contact is gone, and
+/// the answer is a `200` rather than a 500. There is no address left to suppress.
+#[sqlx::test]
+async fn one_click_for_a_deleted_contact_does_not_fail(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let link = p.unsub("n1", 0);
+    sqlx::query("delete from contacts where id = $1")
+        .bind(p.contact)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    p.post_unsub(&link, ONE_CLICK).await.assert_status_ok();
+    assert_eq!(consent_rows(&pool).await.len(), 0);
+    assert_eq!(live_suppressions(&pool, p.workspace).await, []);
 }

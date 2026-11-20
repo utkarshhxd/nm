@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() where workspace_id = $1 and contact_id = $2 and status <> 'unsubscribed' returning list_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "list_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "list_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9f278c5b0754a3fcda89d06283f99d9ba7565f250a33f6820e69c918b2da03c2"
+}

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The signed token the public pages (confirm, unsubscribe, preferences) are reached by. Pure
-//! unit-level over `issue`/`parse`: no database, so no harness.
+//! The signed token the public pages are reached by. Pure unit-level over `issue`/`parse`: no
+//! database, so no harness.
+//!
+//! Two purposes, not three: `/u/{token}` is both the RFC 8058 one-click POST and the preference
+//! center, so `Purpose::Preference` and its 90-day TTL were deleted in Task 5. See `Purpose`.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use nm::{
@@ -49,14 +52,14 @@ fn a_token_round_trips_through_issue_and_parse() {
 #[test]
 fn a_token_with_one_byte_altered_is_refused() {
     let s = secrets(7);
-    let raw = issue(&s, &token(Purpose::Preference, 0));
+    let raw = issue(&s, &token(Purpose::Unsubscribe, 0));
     let (payload, mac) = raw.split_once('.').unwrap();
     for altered in [
         format!("{}.{mac}", flip(payload)),
         format!("{payload}.{}", flip(mac)),
     ] {
         assert!(matches!(
-            parse(&s, &altered, Purpose::Preference),
+            parse(&s, &altered, Purpose::Unsubscribe),
             Err(ApiError::Unprocessable("link-invalid"))
         ));
     }
@@ -64,9 +67,9 @@ fn a_token_with_one_byte_altered_is_refused() {
 
 #[test]
 fn a_token_signed_with_another_secret_is_refused() {
-    let raw = issue(&secrets(7), &token(Purpose::Preference, 0));
+    let raw = issue(&secrets(7), &token(Purpose::Unsubscribe, 0));
     assert!(matches!(
-        parse(&secrets(8), &raw, Purpose::Preference),
+        parse(&secrets(8), &raw, Purpose::Unsubscribe),
         Err(ApiError::Unprocessable("link-invalid"))
     ));
 }
@@ -93,27 +96,6 @@ fn a_confirm_token_older_than_14_days_is_refused() {
 }
 
 #[test]
-fn a_preference_token_older_than_90_days_is_refused() {
-    let s = secrets(7);
-    assert!(
-        parse(
-            &s,
-            &issue(&s, &token(Purpose::Preference, 89)),
-            Purpose::Preference
-        )
-        .is_ok()
-    );
-    assert!(matches!(
-        parse(
-            &s,
-            &issue(&s, &token(Purpose::Preference, 91)),
-            Purpose::Preference
-        ),
-        Err(ApiError::Unprocessable("link-expired"))
-    ));
-}
-
-#[test]
 fn an_unsubscribe_token_two_years_old_is_accepted() {
     let s = secrets(7);
     let t = token(Purpose::Unsubscribe, 2 * 365);
@@ -123,14 +105,14 @@ fn an_unsubscribe_token_two_years_old_is_accepted() {
 #[test]
 fn the_purpose_is_part_of_what_is_signed() {
     let s = secrets(7);
-    let raw = issue(&s, &token(Purpose::Preference, 0));
+    let raw = issue(&s, &token(Purpose::Unsubscribe, 0));
     let (payload, mac) = raw.split_once('.').unwrap();
     let json = String::from_utf8(URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
-    let swapped = json.replace("preference", "unsubscribe");
+    let swapped = json.replace("unsubscribe", "confirm");
     assert_ne!(swapped, json, "the purpose must appear in the payload");
     let forged = format!("{}.{mac}", URL_SAFE_NO_PAD.encode(swapped));
     assert!(matches!(
-        parse(&s, &forged, Purpose::Unsubscribe),
+        parse(&s, &forged, Purpose::Confirm),
         Err(ApiError::Unprocessable("link-invalid"))
     ));
 }
@@ -178,7 +160,7 @@ fn a_token_issued_for_the_expected_purpose_is_accepted() {
 #[test]
 fn list_id_is_present_exactly_when_the_purpose_is_confirm() {
     let s = secrets(7);
-    let mut stray = token(Purpose::Preference, 0);
+    let mut stray = token(Purpose::Unsubscribe, 0);
     stray.list_id = Some(Uuid::now_v7());
     let mut missing = token(Purpose::Confirm, 0);
     missing.list_id = None;

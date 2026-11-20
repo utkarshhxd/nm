@@ -38,12 +38,21 @@ const HEADERS: [(HeaderName, &str); 4] = [
 /// is served `immutable`, which is what keeps the frontend fast. Widening this to every path
 /// would silently throw that away.
 ///
-/// The list is the same as `web_ui::is_reserved`'s, and the two stay separate on purpose: "never
-/// cached" and "never the SPA" are different ideas that happen to cover the same paths today.
-/// `uncacheable_and_is_reserved_agree` below pins that they still coincide, so adding a path to
-/// one and not the other fails rather than drifting.
+/// The subscriber's pages, via `crate::public::owns_path`: `/c`, `/u` and `/f`. `page::shell`
+/// already sets `no-store` on every page it renders, so this covers the answers that do not go
+/// through it — a bare `/u` with the token lost, and anything else under a prefix no handler
+/// claims. These name which lists a named person is on; a reverse proxy must keep none of it.
+///
+/// The list is otherwise the same as `web_ui::is_reserved`'s, and the two stay separate on
+/// purpose: "never cached" and "never the SPA" are different ideas that happen to cover the same
+/// paths today. `uncacheable_and_is_reserved_agree` below pins that they still coincide, so
+/// adding a path to one and not the other fails rather than drifting.
 fn uncacheable(path: &str) -> bool {
-    path == "/api" || path.starts_with("/api/") || path == "/healthz" || path == "/readyz"
+    path == "/api"
+        || path.starts_with("/api/")
+        || path == "/healthz"
+        || path == "/readyz"
+        || crate::public::owns_path(path)
 }
 
 /// Sets the baseline security headers on every response. Wrap the whole router
@@ -68,7 +77,7 @@ mod tests {
     use crate::http::web_ui::is_reserved;
 
     /// Every path either predicate has an opinion about, plus near misses.
-    const PATHS: [&str; 11] = [
+    const PATHS: [&str; 20] = [
         "/api",
         "/api/",
         "/api/v1/me",
@@ -80,6 +89,15 @@ mod tests {
         "/login",
         "/apiary",
         "/healthzz",
+        "/c",
+        "/c/",
+        "/c/abc.def",
+        "/u",
+        "/u/",
+        "/f",
+        "/f/signup",
+        "/contacts",
+        "/forms",
     ];
 
     #[test]
@@ -88,6 +106,14 @@ mod tests {
             assert!(uncacheable(path), "{path}");
         }
         for path in ["/assets/app-abc.js", "/", "/login", "/apiary", "/healthzz"] {
+            assert!(!uncacheable(path), "{path}");
+        }
+        // The subscriber's pages, bare prefix included — and their near misses, which are SPA
+        // routes and must stay the SPA's.
+        for path in ["/c", "/c/", "/c/abc.def", "/u", "/u/", "/f", "/f/signup"] {
+            assert!(uncacheable(path), "{path}");
+        }
+        for path in ["/contacts", "/forms"] {
             assert!(!uncacheable(path), "{path}");
         }
     }

@@ -12,8 +12,10 @@
 //! from an email client's browser and are the last chance a person has to leave a list. Nothing
 //! here loads the SPA bundle.
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use axum::{
-    http::{HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 
@@ -102,6 +104,29 @@ pub fn shell(title: &str, body: String) -> Response {
         Html(html),
     )
         .into_response()
+}
+
+/// The bucket a request whose client address we cannot see is counted in. `RequestMeta` has no IP
+/// only when the server was built without `ConnectInfo`, which production never is; one shared
+/// bucket for that case limits them together rather than letting them past the limiter.
+pub const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// A page with a status: every answer a public route gives a browser is HTML, including the
+/// refusals. A subscriber who clicks a dead link gets a sentence, not an RFC 9457 document.
+pub fn notice(status: StatusCode, title: &str, body: &str) -> Response {
+    (status, shell(title, body.to_owned())).into_response()
+}
+
+/// Puts the `RateLimit` headers on an answer. Every answer carries them, refusals included, as the
+/// authenticated limited routes do.
+///
+/// **This is the headers and nothing else.** There is deliberately no shared "too many requests"
+/// page here: `GET /c/{token}` and `GET /u/{token}` each write their own, because spec §8.9 says
+/// `POST /f/{slug}` must answer a rate-limited submission exactly as a successful one and
+/// `POST /u/{token}` must unsubscribe anyway. A refusal helper in this file is a refusal those two
+/// routes could inherit by reaching for the obvious name.
+pub fn with(headers: HeaderMap, page: Response) -> Response {
+    (headers, page).into_response()
 }
 
 #[cfg(test)]
