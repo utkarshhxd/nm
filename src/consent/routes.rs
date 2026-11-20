@@ -96,6 +96,26 @@ pub async fn list_consent(
     // Another workspace's contact is a 404 here, before any row is read.
     contacts::get(&mut conn, workspace_id, id).await?;
     let limit = page.limit();
+    // MEASURED, because an index is not behaviour and no test can assert one is used: the paging
+    // test below passes with or without `0024`. Postgres 16, a contact holding 40 rows of a
+    // 200,040-row `consent_log` with theirs the oldest in it — the shape that hurts, since a scan
+    // from the newest end reaches them last.
+    //
+    //   as shipped          Index Scan using consent_log_by_contact, Index Cond on
+    //                       (workspace_id, contact_id), no filter: 4 buffers, 0.103 ms
+    //   index dropped       Parallel Seq Scan + sort, 200,001 rows read to return 40:
+    //                       3,096 buffers, 13.7 ms — growing with the table, not the answer
+    //
+    // One caveat, so that a later re-measurement does not read as a contradiction: where a single
+    // contact holds a *large fraction* of the table, the planner prefers a backward scan of
+    // `consent_log_pkey` with a filter, because at that selectivity it expects a match every
+    // other index entry. Measured at 50,000 of 100,000 rows: 1,158 buffers, 3.4 ms. That needs a
+    // big table AND one contact owning most of it AND their rows being the oldest; the first two
+    // pull against each other and it was still milliseconds, so it is recorded, not worked around.
+    //
+    // The cursor is `($3 is null or c.id < $3)`, which cannot become an index condition, so a
+    // later page re-walks the earlier ones inside the index. That is the form every paged route
+    // here uses, and it is bounded by one contact's own history rather than by the table.
     let rows = sqlx::query_as!(
         ConsentEntry,
         r#"select c.id, c.action as "action: Action", c.source as "source: Source",

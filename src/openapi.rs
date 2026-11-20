@@ -259,4 +259,71 @@ mod tests {
              name, so give each one an explicit `operation_id = \"…\"` in its `#[utoipa::path(…)]`"
         );
     }
+
+    /// A schema name must be unique too, and **the document cannot be walked to find out.**
+    ///
+    /// utoipa derives a schema's name from the Rust type's name, and `components.schemas` is one
+    /// flat map keyed by it. Two registered types that share a name — `consent::Action` and a
+    /// future `audit::Action`, say — do not collide loudly: the second insert replaces the first,
+    /// the map still holds one well-formed entry under that key, and every `$ref` to it still
+    /// resolves. One of the two types then ships to every client with the other's shape, and the
+    /// generated TypeScript compiles, because `Action` exists and is a valid type. Nothing in the
+    /// Rust build, the document, or `openapi-typescript` says a word.
+    ///
+    /// So this reads the registration list rather than the result. The name utoipa uses is the
+    /// type path's last segment, which is checked rather than assumed: every name derived here
+    /// must appear as a key in the generated document. That second assertion is what keeps the
+    /// first honest — if the derivation rule ever stops holding (a `#[schema(as = "…")]` rename,
+    /// or a utoipa change), the names compared above would be the wrong strings and this fails
+    /// instead of passing silently.
+    ///
+    /// The reverse containment is deliberately not asserted: `Page_Form` and its siblings are
+    /// generated from `body = Page<Form>` on an operation and are in no list.
+    #[test]
+    fn schema_names_are_unique() {
+        let source = include_str!("openapi.rs");
+        let list = source
+            .split_once("components(schemas(")
+            .expect("the schema registration list is spelt `components(schemas(`")
+            .1;
+        let list = &list[..list.find("))").expect("the list is closed with `))`")];
+        let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for path in list
+            .lines()
+            .map(|line| line.trim().trim_end_matches(',').trim())
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        {
+            seen.entry(path.rsplit("::").next().expect("rsplit yields one part"))
+                .or_default()
+                .push(path);
+        }
+        assert!(
+            seen.len() > 50,
+            "only {} schemas parsed out of the registration list: the parse is wrong, not the list",
+            seen.len()
+        );
+
+        let doc = serde_json::to_value(spec()).expect("the spec serialises");
+        let schemas = doc["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas is an object");
+        let unpublished: Vec<_> = seen
+            .keys()
+            .filter(|name| !schemas.contains_key(**name))
+            .collect();
+        assert!(
+            unpublished.is_empty(),
+            "{unpublished:?} are registered but are not keys of components.schemas, so a schema's \
+             published name is no longer its type path's last segment — the uniqueness check below \
+             would be comparing the wrong strings. Teach this test the new rule before trusting it."
+        );
+
+        let duplicates: Vec<_> = seen.iter().filter(|(_, paths)| paths.len() > 1).collect();
+        assert!(
+            duplicates.is_empty(),
+            "two types share a schema name {duplicates:?} — one of them silently replaced the \
+             other in components.schemas and is shipping with the wrong shape. Rename one with \
+             `#[schema(as = …)]`."
+        );
+    }
 }
