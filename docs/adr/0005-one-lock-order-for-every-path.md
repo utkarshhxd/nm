@@ -26,11 +26,18 @@ Every transaction that takes more than one of these takes them in this order, an
 ```
 1. the address advisory lock      suppressions::lock_address / lock_address_for
 2. lists rows                     lists::lock_lists (for key share)
+2a. form_lists rows               (below lists; unordered against 3-6)
 3. suppressions rows
 4. contacts rows                  contacts::lock_contact (for key share)
 5. list_memberships rows
 6. consent_log rows
 ```
+
+`form_lists` is `2a` rather than a number of its own because only one thing is forced about it: it
+sits **below `lists`**, since `delete_list` holds the list row and then cascades into it. Nothing
+forces it against `suppressions`, `contacts`, `list_memberships` or `consent_log`, because no path
+takes it together with any of them — `forms::routes::set_lists` is its only direct writer and it
+touches nothing else on this list.
 
 Within a class, by `id` ascending. `lists::lock_lists` sorts for you.
 
@@ -99,6 +106,9 @@ holds its row across its whole cascade).
 | `lists::add_member` / `unsubscribe_member` | L, contacts, M, C |
 | `lists::routes::delete_list` | L, S, M, C (cascade) |
 | `lists::routes::update_list` (rename) | L, S (trigger) |
+| `forms::routes::create_form` / `update_form` | the `forms` row, L (`set_lists`), `form_lists` |
+| `contacts::import::routes::start_import` | L (held, not merely read), then `imports` |
+| `contacts::selection::tag` | the `tags` row (`for key share`), `contact_tags` |
 | `suppressions::routes::create_suppression` / `lift_suppression` | S, C (through `record_workspace_optout`) |
 
 ## The rule for new code
@@ -115,18 +125,63 @@ back; one that only updates may discard it, because a vanished list matches noth
 If a path cannot obey this, that is worth saying out loud rather than working around — put it in
 this table with the reason, and expect the next deadlock to be there.
 
-## What is not covered
+## The method, and the closed enumeration it produced
 
-`jobs`, `form_lists`, `contact_tags`, `tags` and `audit_log`. None of them is taken by two paths
-in conflicting orders today: `jobs` and `form_lists` are only ever reached through a `lists`
-cascade or after the `lists` and `contacts` rows are already held, `contact_tags` and `tags` only
-by the importer, and `audit_log` has no foreign keys and is append-only. Add them here if that
-changes.
+This section used to be a short list of tables somebody had thought about, and it was wrong twice:
+it omitted `contacts`, and then it said in so many words that `form_lists` was covered when it was
+not. Both were right answers reached by the wrong route — "which tables feel relevant" — so here is
+the route that is not guesswork.
 
-**And the honest warning, since this document has now been wrong twice.** The claim above that a
-path obeying this cannot deadlock with another that obeys it is only as good as the list of
-classes. It said that while `contacts` was missing, and it was false. Anything with a foreign key
-that two paths reach from opposite directions is a class, whether or not it is written here; the
-test for a new one is not "is it in the order" but "does any path take it, and does any other path
-take it the other way round". `issues/38` is the enforcement story that would stop this depending
-on somebody asking that question.
+**A class exists wherever one path writes a child table directly and another path reaches the same
+rows through a parent's `on delete` action.** The cascading path takes the parent first; the direct
+writer takes the child first and the parent last, through its own foreign key at the end of its
+statement. That is the inversion, every time. So the enumeration is over **foreign key parents**,
+because that is what bounds the set of cascades — there are nine, and every one is ruled on:
+
+| parent | ruling | why |
+|---|---|---|
+| `lists` | **class 2** | cascades into `form_lists`, `list_memberships`, `consent_log`, `suppressions`, `jobs`, `imports`; several paths write those directly |
+| `contacts` | **class 4** | cascades into `list_memberships`, `consent_log`, `contact_tags`, `jobs`; every membership writer takes it last through a foreign key |
+| `forms` | not a class | its only child is `form_lists`, and every exclusive taker of a `forms` row takes that row first |
+| `tags` | not a class **today** — see the tripwire below | its only child is `contact_tags`, and every writer either inserts `on conflict do nothing` (which retains no lock on a conflicting row) or deletes and asks for nothing back |
+| `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
+| `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
+| `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
+| `workspaces` | not a class | thirteen children and no exclusive taker (below) |
+| `users` | not a class | twelve children and no exclusive taker (below) |
+
+**"No exclusive taker" is the load-bearing phrase for the last three**, and it rests on a Postgres
+rule rather than on a count: an `UPDATE` that changes no column of a candidate key takes
+`FOR NO KEY UPDATE`, which does **not** conflict with the `FOR KEY SHARE` a foreign key check
+takes. Every update to these three touches non-key columns only, and `src/` contains no
+`delete from workspaces`, `delete from users` or `delete from api_keys`. If a delete appears, or an
+update starts changing a key column, they become classes the same day.
+
+`audit_log` is outside all of this: it has no foreign keys, nothing deletes from it, and it is
+append-only.
+
+### The tripwire on `tags`, and what to check rather than predict
+
+`tags` is quiet because of the shape of its writers, not because of anything structural — the
+mechanism is live. A writer that **deletes a contact's `contact_tags` rows and re-inserts them**
+deadlocks against `delete_tag` exactly as `set_lists` did against `delete_list`, and that is the
+obvious next endpoint: a `PUT /contacts/{id}/tags` replacing the set. It has the same shape
+`set_lists` already has.
+
+**So: if that endpoint is written, `tags` becomes class 2b and it takes `for key share` on the tag
+rows first.** This is written here as the thing to check when it merges, not as a prediction.
+
+Today's writers of `contact_tags` are `tags::apply`, `tags::remove`, `selection::tag`,
+`selection::untag` and the importer's `write_memberships_and_tags` — it is **not** "only the
+importer", which is what this section used to say. The ruling survives on `on conflict do nothing`,
+not on the writer count. And `jobs` is not a parent at all: nothing references it.
+
+**The honest warning, since this document has now been wrong twice.** The claim above that a path
+obeying this cannot deadlock with another that obeys it is only as good as the enumeration. It said
+that while `contacts` was missing and while `form_lists` was listed as covered. What is different
+now is that the enumeration is **closed and mechanical**: nine parents, all ruled on, each with a
+reason that can be re-checked against the schema rather than against somebody's memory. If a tenth
+parent appears, it is a new row in that table. If a class appears that is not reachable from any of
+the nine, the method itself is unsound and that is a bigger conversation than another round.
+`issues/38` is the enforcement story that would stop any of this depending on somebody remembering
+to ask.

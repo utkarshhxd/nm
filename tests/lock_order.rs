@@ -1018,3 +1018,202 @@ async fn a_bulk_subscribe_to_a_deleted_list_is_not_found(pool: PgPool) {
         .await;
     r.assert_status(StatusCode::NOT_FOUND);
 }
+
+/// **`update_form` against `delete_list`: `form_lists` is the fifth class.** ADR 0005 said
+/// `form_lists` was "only ever reached through a `lists` cascade or after the `lists` and
+/// `contacts` rows are already held", and `forms::routes::set_lists` is the writer that makes that
+/// false — it deletes every committed link and re-inserts, and nothing in `src/forms/` takes a
+/// `lists` row. So it holds a `form_lists` row the deletion's cascade needs, and then asks for the
+/// list through its own insert's foreign key.
+///
+/// Any PATCH naming `list_ids` reaches it, including one that keeps the same lists, which is the
+/// common case. `40P01` is neither a unique nor a foreign key violation, so it misses both of this
+/// module's mappings and falls through to `ApiError::Internal`: a `500` on an Editor route.
+#[sqlx::test]
+async fn a_form_update_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first = lists[0];
+    let form = Uuid::now_v7();
+    sqlx::query(
+        "insert into forms (id, workspace_id, slug, name, fields, headline, button_label) \
+         values ($1, $2, 'join', 'Signup', $3::jsonb, 'Join', 'Join')",
+    )
+    .bind(form)
+    .bind(fx.workspace)
+    .bind(
+        serde_json::json!([{"target": {"kind": "email"}, "required": true, "label": "Email"}])
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("form");
+    sqlx::query("insert into form_lists (workspace_id, form_id, list_id) values ($1, $2, $3)")
+        .bind(fx.workspace)
+        .bind(form)
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("the committed link the cascade has to wait for");
+
+    // The list, held exclusively, so the deletion and the form update queue on it in arrival
+    // order: the deletion first, which is what leaves it holding the list while the update is
+    // already holding the link row.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from lists where id = $1 for update")
+        .bind(first)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the list");
+
+    let delete_path = fx.delete_list_path(first);
+    let form_path = format!("/api/v1/workspaces/{}/forms/{form}", fx.workspace);
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&delete_path).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let mut editor = TestApp::new(pool.clone()).await;
+    editor.login("owner@example.com", PW).await;
+    let updating = tokio::spawn(async move {
+        editor
+            .patch(&form_path)
+            .json(&serde_json::json!({"list_ids": [first]}))
+            .await
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (deleted, updated) = (
+        deleting.await.expect("the deletion"),
+        updating.await.expect("the form update"),
+    );
+    no_server_error("the list deletion", &deleted);
+    no_server_error("the form update", &updated);
+}
+
+/// **Bulk tag against `delete_tag`.** Not a cycle — a tag deletion cascades into `contact_tags`
+/// and this insert writes rows it cannot see, so there was never a cycle, only a race. The route's
+/// `tags::get` guard is an unlocked read, so a tag deleted between it and the insert fired
+/// `contact_tags_workspace_id_tag_id_fkey` and reached the operator as a `500`, while the
+/// single-row sibling `tags::apply` answers `404` for the identical cause.
+///
+/// `selection::tag` now takes the tag `for key share` first, so inside its transaction the tag
+/// cannot vanish: the violation is unreachable rather than translated, and a tag already gone is
+/// the `404` the guard always meant.
+#[sqlx::test]
+async fn a_bulk_tag_and_a_tag_deletion_do_not_collide(pool: PgPool) {
+    let (fx, _lists) = fixture(&pool, &["first"]).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let tag = Uuid::now_v7();
+    sqlx::query("insert into tags (id, workspace_id, name) values ($1, $2, 'vip')")
+        .bind(tag)
+        .bind(fx.workspace)
+        .execute(&pool)
+        .await
+        .expect("tag");
+
+    // The deletion queues first, so it wins the row and commits before the bulk action looks.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from tags where id = $1 for update")
+        .bind(tag)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the tag");
+
+    let tag_path = format!("/api/v1/workspaces/{}/tags/{tag}", fx.workspace);
+    let bulk_path = format!("/api/v1/workspaces/{}/contacts/bulk/tag", fx.workspace);
+    let contact = fx.contact;
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&tag_path).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let mut tagger = TestApp::new(pool.clone()).await;
+    tagger.login("owner@example.com", PW).await;
+    let tagging = tokio::spawn(async move {
+        tagger
+            .post(&bulk_path)
+            .json(&serde_json::json!({"ids": [contact], "tag_id": tag}))
+            .await
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (deleted, tagged) = (
+        deleting.await.expect("the tag deletion"),
+        tagging.await.expect("the bulk tag"),
+    );
+    no_server_error("the tag deletion", &deleted);
+    no_server_error("the bulk tag", &tagged);
+    assert_eq!(
+        tagged.status_code(),
+        StatusCode::NOT_FOUND,
+        "a tag that is gone is a 404, the same answer `tags::apply` gives"
+    );
+}
+
+/// **`POST /imports/{id}/start` against `delete_list`.** Also a race rather than a cycle:
+/// `imports.list_id` is null until the `update` fires, so a list deletion has no committed row of
+/// this import's to block on — which is why `imports` is not a lock class.
+///
+/// The guard above that update was an unlocked read, so a list deleted in between fired
+/// `imports_workspace_id_list_id_fkey` and the operator read `internal error` — exactly what the
+/// guard exists to prevent, through a window two statements wide. Holding the row closes it.
+#[sqlx::test]
+async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first = lists[0];
+    let import = Uuid::now_v7();
+    sqlx::query(
+        "insert into imports (id, workspace_id, status, filename, delimiter, has_header) \
+         values ($1, $2, 'pending', 'a.csv', 44, true)",
+    )
+    .bind(import)
+    .bind(fx.workspace)
+    .execute(&pool)
+    .await
+    .expect("import");
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from lists where id = $1 for update")
+        .bind(first)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the list");
+
+    let delete_path = fx.delete_list_path(first);
+    let start_path = format!("/api/v1/workspaces/{}/imports/{import}/start", fx.workspace);
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&delete_path).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let mut starter = TestApp::new(pool.clone()).await;
+    starter.login("owner@example.com", PW).await;
+    let starting = tokio::spawn(async move {
+        starter
+            .post(&start_path)
+            .json(&serde_json::json!({
+                "list_id": first,
+                "mapping": [{"kind": "field", "value": "email"}],
+            }))
+            .await
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (deleted, started) = (
+        deleting.await.expect("the list deletion"),
+        starting.await.expect("the import start"),
+    );
+    no_server_error("the list deletion", &deleted);
+    no_server_error("the import start", &started);
+}

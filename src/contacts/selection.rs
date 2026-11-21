@@ -646,12 +646,39 @@ async fn run(
 }
 
 /// Puts the tag on every selected contact that lacks it; `affected` is how many were newly tagged.
+///
+/// **The tag is taken `for key share` first, and `404` if it is gone.** Its single-row sibling
+/// `tags::apply` maps the same foreign key violation to `404`, and this one let it reach
+/// `ApiError::Internal` — two routes answering differently for one cause. The route's own
+/// `tags::get` guard makes that rare but not impossible: it is an unlocked read, so a tag deleted
+/// between it and the insert below still fires `contact_tags_workspace_id_tag_id_fkey`.
+///
+/// **A pre-lock rather than a second mapping, and that is a choice worth stating.** Mapping the
+/// violation would have made the two answers agree while leaving which one you get decided by
+/// timing. Holding the row makes the tag unable to vanish inside this transaction, so the
+/// violation is unreachable from here rather than translated — the same shape `lists::lock_lists`
+/// gives every list writer, which is one rule instead of two. It is not an ordering fix: a tag
+/// deletion cascades into `contact_tags` and this statement inserts rows it cannot see, so there
+/// was never a cycle, only a race. `docs/adr/0005-one-lock-order-for-every-path.md`.
+///
+/// The cost is one row held for the length of a bulk action, which a tag deletion then waits for.
 pub async fn tag(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     tag_id: Uuid,
 ) -> ApiResult<Counts> {
+    if sqlx::query_scalar!(
+        "select 1 as one from tags where workspace_id = $1 and id = $2 for key share",
+        sel.workspace_id(),
+        tag_id,
+    )
+    .fetch_optional(&mut *db)
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
     run(db, sel, excluded, |q| {
         q.push("insert into contact_tags (workspace_id, contact_id, tag_id) select ")
             .push_bind(sel.workspace_id())

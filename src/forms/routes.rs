@@ -166,12 +166,32 @@ async fn audit_form(
 }
 
 /// Replaces the form's lists. One statement per side, so the foreign key sees every id.
+///
+/// **Position 2 first, because this is a `form_lists` writer and a list deletion cascades into
+/// `form_lists`.** The delete below takes every committed link row exclusively and the insert then
+/// asks for each list through its own foreign key at the end of the statement — so without this it
+/// ran `form_lists` then `lists`, while `delete_list` runs `lists` and then cascades into
+/// `form_lists`. Reproduced through `PATCH /forms/{id}` against `DELETE /lists/{id}` on Postgres
+/// 16.15: `deadlock detected … while deleting tuple in relation "form_lists"`, and because `40P01`
+/// is neither a unique nor a foreign key violation it missed both mappings in this module and
+/// reached an Editor as a `500`. **Any** patch naming `list_ids` reaches it, including one that
+/// keeps the same lists. `docs/adr/0005-one-lock-order-for-every-path.md`.
+///
+/// A list that is already gone gets the same `unknown list` the insert's foreign key would have
+/// produced, so the answer does not change — only when it is decided.
 async fn set_lists(
     db: &mut PgConnection,
     workspace_id: Uuid,
     form_id: Uuid,
     list_ids: &[Uuid],
 ) -> ApiResult<()> {
+    let locked = crate::lists::lock_lists(&mut *db, workspace_id, list_ids).await?;
+    if list_ids.iter().any(|id| !locked.contains(id)) {
+        return Err(ApiError::Validation(vec![FieldError::new(
+            "list_ids",
+            "unknown list",
+        )]));
+    }
     sqlx::query!(
         "delete from form_lists where workspace_id = $1 and form_id = $2",
         workspace_id,

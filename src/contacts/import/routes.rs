@@ -997,7 +997,22 @@ pub async fn start_import(
     if let Some(list_id) = input.list_id {
         // 404, as every other id in a body that names another workspace's row. Without it the
         // composite foreign key refuses the update below and the operator reads `internal error`.
-        lists::get(&mut tx, workspace_id, list_id).await?;
+        //
+        // **`lock_lists` rather than a plain read, and that is the whole of the difference.** This
+        // guard was an UNLOCKED read, so a list deleted between it and the `update imports … set
+        // list_id` below fired `imports_workspace_id_list_id_fkey` and the operator read `internal
+        // error` anyway — the thing the guard exists to prevent, reached by a window of two
+        // statements. Holding the row closes it: the deletion waits, and a list already gone is
+        // the `404` the guard always meant to give. It is not an ordering fix, because there is
+        // nothing to order against — `imports.list_id` is null until that statement, so a list
+        // deletion's cascade has no committed row of ours to block on, which is also why `imports`
+        // is not a lock class. `docs/adr/0005-one-lock-order-for-every-path.md`.
+        if lists::lock_lists(&mut tx, workspace_id, &[list_id])
+            .await?
+            .is_empty()
+        {
+            return Err(ApiError::NotFound);
+        }
     }
     let job = ImportJob {
         id,
