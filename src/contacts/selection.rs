@@ -661,7 +661,14 @@ async fn run(
 /// deletion cascades into `contact_tags` and this statement inserts rows it cannot see, so there
 /// was never a cycle, only a race. `docs/adr/0005-one-lock-order-for-every-path.md`.
 ///
-/// The cost is one row held for the length of a bulk action, which a tag deletion then waits for.
+/// **The cost, measured rather than guessed, because the obvious statement of it understates.**
+/// It is not "one row for the length of the insert": against a 6 s hold, `delete_tag` waited 4.98 s
+/// and `update_tag` 4.88 s — the latter because `tags` carries `unique (workspace_id, name)`, so a
+/// rename is a key update and conflicts. Worse, the bulk action can itself be blocked meanwhile, on
+/// the `contacts` rows a concurrent erase or bulk delete holds (measured 4.19 s), so what a tag
+/// deleter waits for is that **chain**, not this statement's own duration. Never a cycle — this
+/// holds nothing those paths need — but an operator renaming a tag during a large bulk action is
+/// waiting on work that has nothing to do with the tag.
 pub async fn tag(
     db: &mut PgConnection,
     sel: &Selection,

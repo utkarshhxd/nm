@@ -34,10 +34,30 @@ Every transaction that takes more than one of these takes them in this order, an
 ```
 
 `form_lists` is `2a` rather than a number of its own because only one thing is forced about it: it
-sits **below `lists`**, since `delete_list` holds the list row and then cascades into it. Nothing
-forces it against `suppressions`, `contacts`, `list_memberships` or `consent_log`, because no path
-takes it together with any of them — `forms::routes::set_lists` is its only direct writer and it
-touches nothing else on this list.
+sits **below `lists`**, since `delete_list` holds the list row and then cascades into it.
+
+**It is unordered against 3-6, and the reason is not the one first written here.** That said "no
+path takes it together with any of them", which is false: `delete_list` takes all of them in one
+transaction. The cascade on `lists` fires in constraint-OID order, read off the catalog —
+`list_memberships`, `imports`, `consent_log`, `form_lists`, `jobs`, `suppressions` — with
+`suppressions` additionally hand-pre-locked before the delete. The real reason the position is free
+is that `delete_list` is the **only** path taking them together, so there is no second path to
+invert against. A right ruling on a false reason is exactly what let `form_lists` through in the
+first place, which is why this paragraph is longer than the ruling needs.
+
+**And `set_lists` does not obey "below `lists`" for every row it takes.** It holds `lists` only for
+the ids it keeps or adds, then deletes the link rows of the lists it **drops** without ever holding
+those `lists` rows. What makes that safe is not the ordering but `form_lists`' primary key
+`(form_id, list_id)`: `set_lists(F)` touches `{F} × lists(F)` and `delete_list(L)` touches
+`forms(L) × {L}`, so the two intersect in **at most one row**, and a one-row intersection cannot
+host an ABBA — whoever gets that row finishes. Both arrival orders were raced and both commit. The
+same argument clears `delete_form` against `delete_list`.
+
+**Whether that argument transfers is the thing to check for the next table of this shape**, and
+there is one coming: the `PUT /contacts/{id}/tags` tripwire below has the identical
+delete-and-reinsert shape over `contact_tags`, which also has a composite primary key. If the
+intersection is again at most one row, the same reasoning applies; if a writer ever deletes by one
+half of the key alone, it does not.
 
 Within a class, by `id` ascending. `lists::lock_lists` sorts for you.
 
@@ -150,6 +170,16 @@ because that is what bounds the set of cascades — there are nine, and every on
 | `workspaces` | not a class | thirteen children and no exclusive taker (below) |
 | `users` | not a class | twelve children and no exclusive taker (below) |
 
+**Two measured properties this rests on, worth re-checking rather than re-deriving.** The "no
+cycle" result for `selection::tag` depends on Postgres granting a compatible `FOR KEY SHARE` past
+an already-queued `FOR UPDATE` waiter — measured on 16.15 as granted in 1.1 ms while the exclusive
+waiter went on waiting 2.4 s. That is an implementation property of `heap_lock_tuple`, **not a
+documented guarantee**, so it is worth re-measuring on a major-version upgrade. And `start_import`'s
+`lock_lists` does **not** hold the list for the length of a run: the `update imports … list_id`
+below it already took that same row through its own foreign key and held it to commit, so the
+change moves the acquisition point by microseconds and closes a window, rather than extending a
+hold.
+
 **"No exclusive taker" is the load-bearing phrase for the last three**, and it rests on a Postgres
 rule rather than on a count: an `UPDATE` that changes no column of a candidate key takes
 `FOR NO KEY UPDATE`, which does **not** conflict with the `FOR KEY SHARE` a foreign key check
@@ -175,6 +205,17 @@ Today's writers of `contact_tags` are `tags::apply`, `tags::remove`, `selection:
 `selection::untag` and the importer's `write_memberships_and_tags` — it is **not** "only the
 importer", which is what this section used to say. The ruling survives on `on conflict do nothing`,
 not on the writer count. And `jobs` is not a parent at all: nothing references it.
+
+### Known and open: the importer's tag race
+
+`write_memberships_and_tags` still raises `23503` on `contact_tags_workspace_id_tag_id_fkey` when a
+tag is deleted while it runs, failing the whole import. Its `known` CTE reads `tags` under the
+statement's snapshot while the end-of-statement referential check uses a newer one, so a tag it
+*found* can be gone by the time the check runs; a tag it *created* in the same statement cannot,
+being uncommitted. `selection::tag`'s pre-lock does not transfer, because **the importer resolves
+tags by name, not by id**, and the whole thing is one statement, so the lock cannot be hoisted
+without restructuring it. Reproduced, pre-existing, and recorded here so the next person meets it
+as a known gap rather than as a new finding.
 
 **The honest warning, since this document has now been wrong twice.** The claim above that a path
 obeying this cannot deadlock with another that obeys it is only as good as the enumeration. It said
