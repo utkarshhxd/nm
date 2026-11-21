@@ -89,6 +89,23 @@ derived from the key the operator pasted, so the two cannot disagree.
 *Cost if wrong:* one more manual step during domain setup. The DNS checker compares the published
 `p=` against the stored key, so a mismatch is caught rather than discovered as a signature failure.
 
+**D5a — the amendment Task 7's implementation forced, recorded because it narrows what we promise.**
+D5 below says a failure to connect, negotiate TLS or read the greeting is `Transient`, on the
+grounds that nothing was submitted. **lettre cannot tell us that.** A socket closed *before* the
+greeting and one closed *after* the terminating `.` arrive identically — `Kind::Response`,
+`"incomplete response"` — and there is no `is_connection()` to separate them. So the shipped rule
+is: a reply code is unambiguous (4xx `Transient`, 5xx `Failed`); `is_tls`, `is_client` and
+`is_transport_shutdown` can only arise before the body is offered, so `Transient`; a connection
+never made is read off lettre's one string, `"Connection error"`, pinned by a test; and
+**everything else, including every timeout, is `Unknown`.**
+*What this costs:* a relay that is briefly unreachable in a way that manifests as a *hang* rather
+than a refusal now loses those messages permanently instead of retrying them. That is the
+conservative direction and the same trade D5 makes, but it is a wider net than D5 described, and an
+operator seeing unexplained `unknown` rows should suspect a hanging relay first.
+*The brittle edge:* that `"Connection error"` string is a literal match on a crate's message. It is
+guarded by a test, and if it ever stops matching the failure is toward lost mail rather than double
+sends — the right way to break.
+
 **D5 — anything that could have been accepted is `unknown`, and `unknown` is never retried.**
 Outcomes are classified from lettre's SMTP error kinds: a failure to connect, negotiate TLS, or
 read the greeting is `Transient` (nothing was submitted, retrying is safe); a 4xx reply including

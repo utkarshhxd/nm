@@ -1,13 +1,20 @@
 services:
   postgres:
     image: postgres:16-alpine
-    # 100 is the default and it is not enough for this suite. `sqlx::test` gives every test its own
-    # database, `cargo test` runs the integration binaries in parallel, and `tests/lock_order.rs`
-    # holds four connections per test at its critical moment — a wedge, a probe, and two routes
-    # blocked mid-request. Past the ceiling a route does not block, it fails to acquire, and
-    # `settle` then reports that the interleaving never formed. That is the guard behaving
-    # correctly about a condition that is not the product's fault, which is the worst kind of red:
-    # it trains people to re-run instead of to read. Raise this before raising `settle`'s budget.
+    # 100 is the default and it is not enough for this suite: `sqlx::test` gives every test its own
+    # database, and `tests/lock_order.rs` now opens a pool of its own per test on top of that.
+    #
+    # THIS IS NOT WHAT CAUSED THE lock_order FLAKE, though an earlier version of this comment said
+    # it was. That failure was a client-side budget, not a server-side ceiling: `#[sqlx::test]`
+    # pools are children of one process-wide master pool capped at 20, each child steals permits
+    # from it, and pool creation opens a connection eagerly — so on a 16-core box the sixteen tests
+    # libtest has in flight had spent sixteen of the twenty before any test reached its critical
+    # section. A route that then cannot acquire does not block, it waits out sqlx's 30 s
+    # `acquire_timeout` and answers 500, and `settle` truthfully reports that no interleaving
+    # formed. The two 30 s waits are the ~40 s signature a failing run had.
+    #
+    # The raise is kept because it is correct on its own terms — those per-test pools need room —
+    # and recorded wrongly once already, so: check the client's pool arithmetic before this number.
     command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: nm
