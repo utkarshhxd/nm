@@ -717,6 +717,18 @@ sending. New config: `worker_pool_size` (default 5) and `worker_concurrency` (de
 messages one tick sends at once). `Config`'s hand-written `Debug` destructures without `..`, so both
 new fields must be named there — that is deliberate, and it forces a redaction decision.
 
+**Two things ADR 0005 assigns to this tick, which nothing else owns.** Both came out of the
+lock-order review and would otherwise be rulings with no reader:
+
+1. **The tick passes the *pool* to `take`, never a transaction.** The ADR's tripwire fires on any
+   transaction that holds a `relay_buckets` row across more than one statement, and a tick that
+   wrapped the debit and the sends together would be exactly that — the `relays` ruling stops
+   describing the code the moment it happens.
+2. **A `23503` from `take` means the relay was deleted underneath this tick.** It is a real,
+   reachable path — an operator deleting a relay while a worker debits it — and until now it was
+   documented with no owner. The tick reads it as *this relay is gone*, falls to the next relay in
+   failover order, and does not fail the claimed jobs over it. Give it a test.
+
 **The tick has a budget, and it is half the lease.** `BATCH` is 16 and `worker_concurrency` is 4, so
 a tick of four waves against a relay that burns the full 60-second `SESSION_TIMEOUT` each wave takes
 240 seconds — twice `LEASE_SECS`. A tick that outlives its own lease is the double-send in Review
