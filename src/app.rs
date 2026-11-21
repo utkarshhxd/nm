@@ -18,11 +18,12 @@ use crate::{
     http,
     http::csrf,
     http::rate_limit::{
-        EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE, PUBLIC_PER_MINUTE, RateLimiter,
-        SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
+        DNS_CHECK_PER_MINUTE, EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE,
+        PUBLIC_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
     },
     http::security_headers::security_headers,
     public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
+    sending_domains::dns,
     telemetry,
 };
 
@@ -67,6 +68,12 @@ pub struct AppState {
     /// twenty of them take `/readyz` and the authenticated API down with them. It refuses nobody —
     /// a request without a slot waits for one. See `public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS`.
     pub one_click_slots: Arc<Semaphore>,
+    /// Per-workspace cap on `POST /sending-domains/{id}/check`, which makes outbound DNS lookups
+    /// on an authenticated request. See `http::rate_limit::DNS_CHECK_PER_MINUTE`.
+    pub check_limit: Arc<RateLimiter>,
+    /// The DNS checker's resolver, built once: it owns the sockets and the nameserver state, and a
+    /// request that built its own would throw both away. See `sending_domains::dns`.
+    pub resolver: Arc<dns::Resolver>,
 }
 
 impl AppState {
@@ -86,6 +93,8 @@ impl AppState {
             public_limit: Arc::new(RateLimiter::per_minute(PUBLIC_PER_MINUTE)),
             submit_limit: Arc::new(RateLimiter::per_minute(SUBMIT_PER_MINUTE)),
             one_click_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ONE_CLICKS)),
+            check_limit: Arc::new(RateLimiter::per_minute(DNS_CHECK_PER_MINUTE)),
+            resolver: Arc::new(dns::system_resolver()?),
         })
     }
 

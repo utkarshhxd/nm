@@ -4488,6 +4488,314 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/sending-domains": {
+      "get": {
+        "tags": [
+          "crate::sending_domains::routes"
+        ],
+        "operationId": "list_sending_domains",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first. Never carries a key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SendingDomainView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::sending_domains::routes"
+        ],
+        "summary": "Which addresses a workspace may send as, and with what key, so writing it takes admin.",
+        "operationId": "create_sending_domain",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSendingDomain"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendingDomainView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: configuring a sending domain takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "sending-domain-taken"
+          },
+          "422": {
+            "description": "an invalid or missing field, an app-signed domain without a key, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/sending-domains/{id}": {
+      "get": {
+        "tags": [
+          "crate::sending_domains::routes"
+        ],
+        "operationId": "get_sending_domain",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sending domain id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendingDomainView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such sending domain in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::sending_domains::routes"
+        ],
+        "summary": "A hard delete.",
+        "operationId": "delete_sending_domain",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sending domain id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "insufficient-role: configuring a sending domain takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such sending domain in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::sending_domains::routes"
+        ],
+        "operationId": "update_sending_domain",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sending domain id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSendingDomain"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendingDomainView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: configuring a sending domain takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such sending domain in this workspace"
+          },
+          "422": {
+            "description": "an invalid field, an explicit null for a field that cannot be cleared, a change that leaves an app-signed domain without a key, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/sending-domains/{id}/check": {
+      "post": {
+        "tags": [
+          "crate::sending_domains::routes"
+        ],
+        "summary": "Looks the domain's records up, stores what it finds as `checks` and returns the domain.",
+        "description": "**Holds no database connection while it waits on DNS**: the row is read, the connection goes\nback to the pool, the lookups run, and a second statement writes the result. A nameserver that\nhangs costs this request five seconds and the pool nothing.\n\nNot audited: the result is derived from DNS, not something an operator configured, and the\nroute is limited to a few a minute.",
+        "operationId": "check_sending_domain",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Sending domain id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The domain with its `checks` and `checked_at` just written. A failing check is a result, not an error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendingDomainView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: checking a sending domain takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such sending domain in this workspace"
+          },
+          "409": {
+            "description": "sending-domain-changed: it was edited while being checked"
+          },
+          "429": {
+            "description": "rate-limited: too many checks for this workspace"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/suppressions": {
       "get": {
         "tags": [
@@ -5291,6 +5599,57 @@
           }
         }
       },
+      "CheckResult": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pass"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "fail"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "not_checked"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One check's verdict. On the wire (and in `sending_domains.checks`) it is\n`{\"status\": \"pass\"}`, `{\"status\": \"fail\", \"reason\": \"...\"}` or `{\"status\": \"not_checked\"}`.\n\nA `Fail` reason is shown to an operator and stored, so it must never carry key material: a\nmismatched DKIM `p=` says that it differs and names neither value."
+      },
       "ColumnTarget": {
         "oneOf": [
           {
@@ -5701,6 +6060,36 @@
         "properties": {
           "password": {
             "type": "string"
+          }
+        }
+      },
+      "DnsChecks": {
+        "type": "object",
+        "description": "The four checks. Every field defaults to `NotChecked`, so the `{}` a new domain starts with\nand a document written before a check existed both read back as \"not run\".",
+        "properties": {
+          "dkim": {
+            "$ref": "#/components/schemas/CheckResult",
+            "default": {
+              "status": "not_checked"
+            }
+          },
+          "dmarc": {
+            "$ref": "#/components/schemas/CheckResult",
+            "default": {
+              "status": "not_checked"
+            }
+          },
+          "return_path": {
+            "$ref": "#/components/schemas/CheckResult",
+            "default": {
+              "status": "not_checked"
+            }
+          },
+          "spf": {
+            "$ref": "#/components/schemas/CheckResult",
+            "default": {
+              "status": "not_checked"
+            }
           }
         }
       },
@@ -6760,6 +7149,52 @@
             ],
             "format": "uuid",
             "description": "Contacts with this tag."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewSendingDomain": {
+        "type": "object",
+        "required": [
+          "domain",
+          "signing"
+        ],
+        "properties": {
+          "dkim_private_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An unencrypted RSA private key in PEM (`BEGIN PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`).\nRequired when `signing` is `app`. Stored encrypted and never returned."
+          },
+          "dkim_selector": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the DKIM key is published, as `{selector}._domainkey.{domain}`. Default `nm1`."
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain mail is sent from, as in `news@example.com`'s `example.com`. ASCII (punycode for\nan internationalized name); stored lower case."
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display name a campaign from this domain defaults to."
+          },
+          "return_path_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A domain whose CNAME carries bounces to the relay. The sending domain or a subdomain of it."
+          },
+          "signing": {
+            "$ref": "#/components/schemas/Signing",
+            "description": "`relay` if the relay signs, `app` if this product does."
           }
         },
         "additionalProperties": false
@@ -7900,6 +8335,85 @@
           }
         }
       },
+      "Page_SendingDomainView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A sending domain as the API shows it. There is no key field, on purpose: `has_dkim_key` is all\nan operator may learn about it.",
+              "required": [
+                "id",
+                "workspace_id",
+                "domain",
+                "signing",
+                "dkim_selector",
+                "has_dkim_key",
+                "checks"
+              ],
+              "properties": {
+                "checked_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time",
+                  "description": "When `checks` was written; null if the checker has never run for this configuration."
+                },
+                "checks": {
+                  "$ref": "#/components/schemas/DnsChecks",
+                  "description": "The DNS checker's last result; every check is `not_checked` until it has run."
+                },
+                "dkim_selector": {
+                  "type": "string"
+                },
+                "domain": {
+                  "type": "string",
+                  "description": "Lower case. Unique in the workspace, and fixed once created."
+                },
+                "from_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The display name a campaign from this domain defaults to."
+                },
+                "has_dkim_key": {
+                  "type": "boolean",
+                  "description": "Whether a DKIM private key is stored. The key itself is never returned."
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "return_path_domain": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "signing": {
+                  "$ref": "#/components/schemas/Signing"
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Suppression": {
         "type": "object",
         "required": [
@@ -8379,6 +8893,68 @@
           }
         }
       },
+      "SendingDomainView": {
+        "type": "object",
+        "description": "A sending domain as the API shows it. There is no key field, on purpose: `has_dkim_key` is all\nan operator may learn about it.",
+        "required": [
+          "id",
+          "workspace_id",
+          "domain",
+          "signing",
+          "dkim_selector",
+          "has_dkim_key",
+          "checks"
+        ],
+        "properties": {
+          "checked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When `checks` was written; null if the checker has never run for this configuration."
+          },
+          "checks": {
+            "$ref": "#/components/schemas/DnsChecks",
+            "description": "The DNS checker's last result; every check is `not_checked` until it has run."
+          },
+          "dkim_selector": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string",
+            "description": "Lower case. Unique in the workspace, and fixed once created."
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The display name a campaign from this domain defaults to."
+          },
+          "has_dkim_key": {
+            "type": "boolean",
+            "description": "Whether a DKIM private key is stored. The key itself is never returned."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "return_path_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signing": {
+            "$ref": "#/components/schemas/Signing"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "SetupResponse": {
         "type": "object",
         "required": [
@@ -8394,6 +8970,14 @@
             "description": "Base32 secret, shown only here."
           }
         }
+      },
+      "Signing": {
+        "type": "string",
+        "description": "Who signs the domain's mail with DKIM. Stored as text under a `check` constraint.",
+        "enum": [
+          "relay",
+          "app"
+        ]
       },
       "Source": {
         "type": "string",
@@ -8750,6 +9334,38 @@
           "rules": {
             "type": "object",
             "description": "The whole replacement document. Cannot be `null` (refused, not ignored): leave it out to\nleave the rules alone. Resending the stored document is accepted unchanged, even if it\nnames a field that has since been archived."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateSendingDomain": {
+        "type": "object",
+        "description": "A field left out is left alone. `from_name`, `return_path_domain` and `dkim_private_key` may be\n`null`, which clears them; on any other field `null` is `422`, because there is nothing to\nclear it to. The domain itself cannot be changed: delete the domain and add the new one.\n\nChanging `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`, which no\nlonger describe what is configured.",
+        "properties": {
+          "dkim_private_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absent keeps the stored key; `null` removes it; a PEM string replaces it."
+          },
+          "dkim_selector": {
+            "type": "string"
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "return_path_domain": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signing": {
+            "$ref": "#/components/schemas/Signing"
           }
         },
         "additionalProperties": false

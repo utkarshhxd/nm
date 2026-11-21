@@ -73,6 +73,10 @@ pub mod actions {
     pub const RELAY_CREATED: &str = "relay.created";
     pub const RELAY_UPDATED: &str = "relay.updated";
     pub const RELAY_DELETED: &str = "relay.deleted";
+    // Metadata names the domain and, on an update, which fields were sent. Never the DKIM key.
+    pub const SENDING_DOMAIN_CREATED: &str = "sending_domain.created";
+    pub const SENDING_DOMAIN_UPDATED: &str = "sending_domain.updated";
+    pub const SENDING_DOMAIN_DELETED: &str = "sending_domain.deleted";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

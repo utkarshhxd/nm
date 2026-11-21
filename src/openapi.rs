@@ -108,6 +108,12 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::relay::routes::create_relay,
         crate::relay::routes::update_relay,
         crate::relay::routes::delete_relay,
+        crate::sending_domains::routes::list_sending_domains,
+        crate::sending_domains::routes::get_sending_domain,
+        crate::sending_domains::routes::create_sending_domain,
+        crate::sending_domains::routes::update_sending_domain,
+        crate::sending_domains::routes::delete_sending_domain,
+        crate::sending_domains::routes::check_sending_domain,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -207,6 +213,12 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::relay::routes::RelayView,
         crate::relay::routes::NewRelay,
         crate::relay::routes::UpdateRelay,
+        crate::sending_domains::Signing,
+        crate::sending_domains::CheckResult,
+        crate::sending_domains::DnsChecks,
+        crate::sending_domains::routes::SendingDomainView,
+        crate::sending_domains::routes::NewSendingDomain,
+        crate::sending_domains::routes::UpdateSendingDomain,
     ))
 )]
 struct ApiDoc;

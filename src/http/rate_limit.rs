@@ -104,6 +104,14 @@ pub const EXPORT_PER_MINUTE: u32 = 5;
 /// one import at a time per workspace, however many files are waiting.
 pub const IMPORT_PER_MINUTE: u32 = 60;
 
+/// How many DNS checks one workspace may run per window. A check makes up to four lookups against
+/// whatever nameserver the host uses, on an authenticated request, and may hold that request for
+/// `sending_domains::dns::LOOKUP_TIMEOUT` when a nameserver hangs. It holds no database
+/// connection while it waits, so this protects the resolver and the host's patience with it, not
+/// the pool. Ten a minute is a person fixing a record and pressing the button until it goes green,
+/// with room for a few domains; a loop gets stopped.
+pub const DNS_CHECK_PER_MINUTE: u32 = 10;
+
 /// How many requests one **IP address** may make to the five public pages per window
 /// (`/c/`, `/u/`, `/f/`; spec M1d §7.2). One limiter and one budget for all five, because what it
 /// protects is the pool they share.

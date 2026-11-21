@@ -48,6 +48,21 @@ impl TestApp {
         let mut config = test_config("postgres://unused");
         f(&mut config);
         let state = AppState::new(pool.clone(), config).expect("app state");
+        TestApp::from_state(pool, state)
+    }
+
+    /// An app whose DNS checker asks `resolver` and not the host's nameservers.
+    pub async fn with_resolver(
+        pool: PgPool,
+        resolver: nm::sending_domains::dns::Resolver,
+    ) -> TestApp {
+        let mut state =
+            AppState::new(pool.clone(), test_config("postgres://unused")).expect("app state");
+        state.resolver = std::sync::Arc::new(resolver);
+        TestApp::from_state(pool, state)
+    }
+
+    fn from_state(pool: PgPool, state: AppState) -> TestApp {
         let server = test_server(app::router(state.clone()));
         TestApp {
             server,

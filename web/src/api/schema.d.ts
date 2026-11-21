@@ -1172,6 +1172,65 @@ export interface paths {
         patch: operations["update_segment"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/sending-domains": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_sending_domains"];
+        put?: never;
+        /** Which addresses a workspace may send as, and with what key, so writing it takes admin. */
+        post: operations["create_sending_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/sending-domains/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_sending_domain"];
+        put?: never;
+        post?: never;
+        /** A hard delete. */
+        delete: operations["delete_sending_domain"];
+        options?: never;
+        head?: never;
+        patch: operations["update_sending_domain"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/sending-domains/{id}/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Looks the domain's records up, stores what it finds as `checks` and returns the domain.
+         * @description **Holds no database connection while it waits on DNS**: the row is read, the connection goes
+         *     back to the pool, the lookups run, and a second statement writes the result. A nameserver that
+         *     hangs costs this request five seconds and the pool nothing.
+         *
+         *     Not audited: the result is derived from DNS, not something an operator configured, and the
+         *     route is limited to a few a minute.
+         */
+        post: operations["check_sending_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/suppressions": {
         parameters: {
             query?: never;
@@ -1424,6 +1483,24 @@ export interface components {
         ChangeRole: {
             role: components["schemas"]["Role"];
         };
+        /**
+         * @description One check's verdict. On the wire (and in `sending_domains.checks`) it is
+         *     `{"status": "pass"}`, `{"status": "fail", "reason": "..."}` or `{"status": "not_checked"}`.
+         *
+         *     A `Fail` reason is shown to an operator and stored, so it must never carry key material: a
+         *     mismatched DKIM `p=` says that it differs and names neither value.
+         */
+        CheckResult: {
+            /** @enum {string} */
+            status: "pass";
+        } | {
+            reason: string;
+            /** @enum {string} */
+            status: "fail";
+        } | {
+            /** @enum {string} */
+            status: "not_checked";
+        };
         /** @description What one CSV column is written to. */
         ColumnTarget: {
             /** @enum {string} */
@@ -1583,6 +1660,36 @@ export interface components {
         Dir: "asc" | "desc";
         DisableRequest: {
             password: string;
+        };
+        /**
+         * @description The four checks. Every field defaults to `NotChecked`, so the `{}` a new domain starts with
+         *     and a document written before a check existed both read back as "not run".
+         */
+        DnsChecks: {
+            /**
+             * @default {
+             *       "status": "not_checked"
+             *     }
+             */
+            dkim: components["schemas"]["CheckResult"];
+            /**
+             * @default {
+             *       "status": "not_checked"
+             *     }
+             */
+            dmarc: components["schemas"]["CheckResult"];
+            /**
+             * @default {
+             *       "status": "not_checked"
+             *     }
+             */
+            return_path: components["schemas"]["CheckResult"];
+            /**
+             * @default {
+             *       "status": "not_checked"
+             *     }
+             */
+            spf: components["schemas"]["CheckResult"];
         };
         /** @description Whether a contact may be mailed, and if a standing block stops it, which one. */
         Eligibility: {
@@ -2052,6 +2159,26 @@ export interface components {
              */
             tag_id?: string | null;
         };
+        NewSendingDomain: {
+            /**
+             * @description An unencrypted RSA private key in PEM (`BEGIN PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`).
+             *     Required when `signing` is `app`. Stored encrypted and never returned.
+             */
+            dkim_private_key?: string | null;
+            /** @description Where the DKIM key is published, as `{selector}._domainkey.{domain}`. Default `nm1`. */
+            dkim_selector?: string | null;
+            /**
+             * @description The domain mail is sent from, as in `news@example.com`'s `example.com`. ASCII (punycode for
+             *     an internationalized name); stored lower case.
+             */
+            domain: string;
+            /** @description Display name a campaign from this domain defaults to. */
+            from_name?: string | null;
+            /** @description A domain whose CNAME carries bounces to the relay. The sending domain or a subdomain of it. */
+            return_path_domain?: string | null;
+            /** @description `relay` if the relay signs, `app` if this product does. */
+            signing: components["schemas"]["Signing"];
+        };
         /**
          * @description A suppression to add. `scope` decides which of `email` and `domain` is required, and the other
          *     must be absent.
@@ -2465,6 +2592,31 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_SendingDomainView: {
+            data: {
+                /**
+                 * Format: date-time
+                 * @description When `checks` was written; null if the checker has never run for this configuration.
+                 */
+                checked_at?: string | null;
+                /** @description The DNS checker's last result; every check is `not_checked` until it has run. */
+                checks: components["schemas"]["DnsChecks"];
+                dkim_selector: string;
+                /** @description Lower case. Unique in the workspace, and fixed once created. */
+                domain: string;
+                /** @description The display name a campaign from this domain defaults to. */
+                from_name?: string | null;
+                /** @description Whether a DKIM private key is stored. The key itself is never returned. */
+                has_dkim_key: boolean;
+                /** Format: uuid */
+                id: string;
+                return_path_domain?: string | null;
+                signing: components["schemas"]["Signing"];
+                /** Format: uuid */
+                workspace_id: string;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Suppression: {
             data: {
                 /** Format: date-time */
@@ -2661,11 +2813,42 @@ export interface components {
              */
             snapshot_id: string;
         };
+        /**
+         * @description A sending domain as the API shows it. There is no key field, on purpose: `has_dkim_key` is all
+         *     an operator may learn about it.
+         */
+        SendingDomainView: {
+            /**
+             * Format: date-time
+             * @description When `checks` was written; null if the checker has never run for this configuration.
+             */
+            checked_at?: string | null;
+            /** @description The DNS checker's last result; every check is `not_checked` until it has run. */
+            checks: components["schemas"]["DnsChecks"];
+            dkim_selector: string;
+            /** @description Lower case. Unique in the workspace, and fixed once created. */
+            domain: string;
+            /** @description The display name a campaign from this domain defaults to. */
+            from_name?: string | null;
+            /** @description Whether a DKIM private key is stored. The key itself is never returned. */
+            has_dkim_key: boolean;
+            /** Format: uuid */
+            id: string;
+            return_path_domain?: string | null;
+            signing: components["schemas"]["Signing"];
+            /** Format: uuid */
+            workspace_id: string;
+        };
         SetupResponse: {
             otpauth_url: string;
             /** @description Base32 secret, shown only here. */
             secret: string;
         };
+        /**
+         * @description Who signs the domain's mail with DKIM. Stored as text under a `check` constraint.
+         * @enum {string}
+         */
+        Signing: "relay" | "app";
         /**
          * @description What caused the change. **The code path, never the actor**: a session-authenticated operator
          *     using bulk subscribe is `Api`, because that is the writer the change went through.
@@ -2835,6 +3018,22 @@ export interface components {
              *     names a field that has since been archived.
              */
             rules?: Record<string, never>;
+        };
+        /**
+         * @description A field left out is left alone. `from_name`, `return_path_domain` and `dkim_private_key` may be
+         *     `null`, which clears them; on any other field `null` is `422`, because there is nothing to
+         *     clear it to. The domain itself cannot be changed: delete the domain and add the new one.
+         *
+         *     Changing `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`, which no
+         *     longer describe what is configured.
+         */
+        UpdateSendingDomain: {
+            /** @description Absent keeps the stored key; `null` removes it; a PEM string replaces it. */
+            dkim_private_key?: string | null;
+            dkim_selector?: string;
+            from_name?: string | null;
+            return_path_domain?: string | null;
+            signing?: components["schemas"]["Signing"];
         };
         UpdateTag: {
             /** @description Unique in the workspace. 1-100 characters. */
@@ -6790,6 +6989,272 @@ export interface operations {
             };
             /** @description invalid name or description, an explicit null for `name`, an unknown field, or a rule document that is not a whole, valid one */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_sending_domains: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first. Never carries a key. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_SendingDomainView"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_sending_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSendingDomain"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SendingDomainView"];
+                };
+            };
+            /** @description insufficient-role: configuring a sending domain takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description sending-domain-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid or missing field, an app-signed domain without a key, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_sending_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Sending domain id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SendingDomainView"];
+                };
+            };
+            /** @description not a member, or no such sending domain in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_sending_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Sending domain id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: configuring a sending domain takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such sending domain in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_sending_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Sending domain id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateSendingDomain"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SendingDomainView"];
+                };
+            };
+            /** @description insufficient-role: configuring a sending domain takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such sending domain in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid field, an explicit null for a field that cannot be cleared, a change that leaves an app-signed domain without a key, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    check_sending_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Sending domain id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The domain with its `checks` and `checked_at` just written. A failing check is a result, not an error. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SendingDomainView"];
+                };
+            };
+            /** @description insufficient-role: checking a sending domain takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such sending domain in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description sending-domain-changed: it was edited while being checked */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many checks for this workspace */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -20,6 +20,7 @@ pub mod pagination;
 pub mod public;
 pub mod relay;
 pub mod segments;
+pub mod sending_domains;
 pub mod suppressions;
 pub mod tags;
 pub mod telemetry;
