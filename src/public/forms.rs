@@ -41,7 +41,7 @@ use crate::{
     error::{ApiError, ApiResult},
     forms::{self, Form, FormTarget},
     http::request_meta::RequestMeta,
-    lists::{MembershipSource, MembershipStatus},
+    lists::{self, MembershipSource, MembershipStatus},
     public::{
         page::{self, UNKNOWN_IP, notice, with},
         token::{self, Purpose, Token},
@@ -253,6 +253,30 @@ async fn apply(
     // It is also the first lock the erase path takes, so taking it here keeps the ordering the
     // paragraph above requires rather than disturbing it.
     suppressions::lock_address_for(&mut tx, &state.secrets, email).await?;
+    // **Position 2, and it closes a `500` as well as a cycle.** The membership inserts below take
+    // these same rows through their foreign keys, and the confirmation `jobs` rows take them
+    // again, so without this the order was `list_memberships` → `lists` against `delete_list`'s
+    // `lists` → `list_memberships`. It also answers what used to happen when a list was deleted
+    // between `lists_of` reading it and the insert naming it: a `23503` that reached an anonymous
+    // submitter as an Internal error, on the one route that may not answer differently. A list
+    // gone by now is simply not in `live` and the submission carries on without it; one deleted
+    // after this line cannot be, because the deletion waits here.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    let live = lists::lock_lists(
+        &mut tx,
+        form.workspace_id,
+        &lists.iter().map(|l| l.0).collect::<Vec<_>>(),
+    )
+    .await?;
+    let lists: Vec<(Uuid, bool)> = lists
+        .iter()
+        .copied()
+        .filter(|l| live.contains(&l.0))
+        .collect();
+    if lists.is_empty() {
+        return Ok(());
+    }
+    let lists = &lists[..];
     // **A bounce is let through; every other block refuses.** A workspace-wide opt-out
     // (`docs/adr/0001`), a complaint, an operator's manual block and an erasure tombstone are all
     // consent decisions, and a public form is the one caller with no operator behind it to

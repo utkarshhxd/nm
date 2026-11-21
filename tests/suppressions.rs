@@ -818,52 +818,6 @@ async fn a_second_untick_after_a_rename_does_not_steal_the_orphan_of_the_new_nam
     );
 }
 
-/// **The re-subscribe half of the preference centre has to take the `lists` row before the refusal
-/// it lifts.** The membership insert that follows takes `FOR KEY SHARE` on that row through its own
-/// foreign key, so a lift that touched `suppressions` first would run the two in the opposite order
-/// from a rename, which goes `lists` then `suppressions` through its trigger — and the two
-/// deadlock. Reproduced against Postgres 16 before this: `deadlock detected` while locking a tuple
-/// in `lists`, victim chosen by Postgres, so either a `500` on the public page or a failed rename.
-///
-/// The order is the requirement here, so the order is what is asserted: another session asking for
-/// the same `lists` row must find it already held.
-#[sqlx::test]
-async fn a_re_tick_takes_the_list_row_before_the_refusal_it_lifts(pool: PgPool) {
-    let w = workspace(&pool, "acme").await;
-    let mut conn = pool.acquire().await.unwrap();
-    let list = make_list(&mut conn, w.id, "news").await;
-    unsubscribe_list(&mut conn, &secrets(), w.id, list, ADA)
-        .await
-        .expect("refuse news");
-    drop(conn);
-
-    let mut ticking = pool.begin().await.unwrap();
-    lift_unsubscribed_list(&mut ticking, &secrets(), w.id, list, ADA)
-        .await
-        .expect("the subscriber comes back");
-
-    // `for update` conflicts with the `for key share` the lift must be holding, and touches
-    // nothing else, so the refusal row this transaction also holds cannot be what blocks it.
-    let mut probe = pool.begin().await.unwrap();
-    sqlx::query("set local lock_timeout = '250ms'")
-        .execute(&mut *probe)
-        .await
-        .unwrap();
-    let err = sqlx::query("select 1 from lists where id = $1 for update")
-        .bind(list)
-        .fetch_all(&mut *probe)
-        .await
-        .expect_err("the lift must already hold the list row");
-    assert_eq!(
-        err.as_database_error()
-            .and_then(|e| e.code())
-            .as_deref()
-            .map(ToOwned::to_owned),
-        Some("55P03".to_owned()),
-        "expected the probe to time out waiting for the list row, got {err}"
-    );
-}
-
 /// **Two renames over an orphaned refusal, which is where this used to leave debris that the next
 /// rename choked on.** The first rename moves the refusal onto the name the orphan already holds;
 /// if the orphan were then adopted onto the same list, the address would have two live refusals on
@@ -1007,4 +961,75 @@ async fn a_list_born_over_two_orphans_of_its_name_adopts_one_of_them(pool: PgPoo
         "exactly one orphan is adopted, or the list could not have been created: {rows:?}"
     );
     assert_eq!(rows.len(), 2, "and the other keeps waiting: {rows:?}");
+}
+
+/// **A re-tick answers "the list called X", so every refusal of the list called X goes.** Lifting
+/// only the row carrying the list's id left a duplicate orphan of that name still waiting: adopt
+/// one onto a recreated list, let the subscriber re-tick it, delete and recreate the list again,
+/// and the second orphan is adopted and refuses the list they explicitly asked for. Narrow — four
+/// operator actions around one subscriber action — and it errs toward not mailing, which is why it
+/// took a sweep rather than a report to find it.
+#[sqlx::test]
+async fn a_re_tick_clears_every_refusal_of_that_lists_name_not_only_the_adopted_one(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    // Two orphans named `bulletin`, by the route `a_list_born_over_two_orphans_of_its_name…` pins.
+    let gone = make_list(&mut conn, w.id, "bulletin").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, gone, ADA)
+        .await
+        .expect("refuse bulletin");
+    let news = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse news");
+    drop(conn);
+    sqlx::query("delete from lists where id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("delete bulletin");
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("rename news to bulletin");
+    sqlx::query("delete from lists where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("delete it too");
+    let mut conn = pool.acquire().await.unwrap();
+    let reborn = make_list(&mut conn, w.id, "bulletin").await;
+    assert_eq!(
+        refusals(&pool, w.id).await.len(),
+        2,
+        "the premise: one orphan adopted onto the new list, one still waiting"
+    );
+
+    // The subscriber asks for the list called `bulletin`.
+    lift_unsubscribed_list(&mut conn, &secrets(), w.id, reborn, ADA)
+        .await
+        .expect("the subscriber comes back");
+    drop(conn);
+    assert_eq!(
+        refusals(&pool, w.id).await,
+        [],
+        "a refusal of that name survived the re-tick"
+    );
+
+    // Which is what it is for: delete and recreate again, and nothing is adopted back.
+    sqlx::query("delete from lists where id = $1")
+        .bind(reborn)
+        .execute(&pool)
+        .await
+        .expect("delete the reborn list");
+    let mut conn = pool.acquire().await.unwrap();
+    let again = make_list(&mut conn, w.id, "bulletin").await;
+    drop(conn);
+    assert_eq!(
+        refusals(&pool, w.id).await,
+        [],
+        "the list the subscriber asked for is refused again, by a row they never wrote"
+    );
+    assert!(!again.is_nil());
 }

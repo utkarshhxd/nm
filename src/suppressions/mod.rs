@@ -501,15 +501,13 @@ pub async fn lift_unsubscribed_all(
 /// the reason [`unsubscribe_all`] gives: it takes [`lock_address`], and the erase path takes that
 /// lock first and only then deletes the contact, which cascades to the membership rows.
 ///
-/// **`for key share` also fixes the lock order rather than disturbing it, which is why it is safe
-/// to add here.** The membership writes that follow take `FOR KEY SHARE` on the same `lists` row
-/// through their own foreign key, so without this line the order was `suppressions` then `lists`,
-/// while a rename and a list deletion both take `lists` and then `suppressions` — an ABBA cycle
-/// that Postgres breaks with `40P01`. Reproduced against Postgres 16: a concurrent rename and
-/// preference-center save deadlocked, and the victim was the operator's rename. Reading the `lists`
-/// row first puts this path in the same order as both of those. The erase path never touches
-/// `lists`, and the rename and deletion paths never take the address advisory lock, so no other
-/// pair is affected. [`lift_unsubscribed_list`] takes the same row for the same reason.
+/// **The lock it takes is for the name it reads, not for the lock order.** It happens to put this
+/// statement in order too, and for one round that was the whole argument — but ordering is the
+/// path's job now, taken once in `save` through `lists::lock_lists`, because arguing it per call
+/// is what produced four deadlocks in three rounds. See
+/// `docs/adr/0005-one-lock-order-for-every-path.md`. What this line is load-bearing for is the
+/// name, and `tests/suppressions.rs::a_rename_that_commits_mid_save_does_not_leave_the_old_name_on_the_refusal`
+/// is what holds it.
 ///
 /// **What that wait costs, measured in what holds the row.** A rename holds it for one `UPDATE`
 /// and its trigger. A **list deletion** holds it for its whole cascade — `list_memberships`,
@@ -595,16 +593,15 @@ pub async fn unsubscribe_list(
 /// reach it: `tests/import.rs` pins that direction, because getting it backwards turns a consent
 /// feature into a trap.
 ///
-/// **It reads the `lists` row `for key share` before it touches the refusal, and that ordering is
-/// the point of the CTE.** `save` re-ticks a box by calling this and then inserting the membership,
-/// and that insert takes `FOR KEY SHARE` on the same `lists` row through
-/// `list_memberships_workspace_id_list_id_fkey`. Without the CTE the order is `suppressions` then
-/// `lists`, while a rename and a list deletion both run `lists` then `suppressions` — an ABBA
-/// cycle. Reproduced against Postgres 16: a subscriber re-ticking a list while an operator renamed
-/// it deadlocked, and Postgres chose the victim, so it was a `500` on the public preference centre
-/// or a failed rename depending on timing. The `unsubscribe_list` half took the `lists` row first
-/// already; this is the other half, and the two sets are disjoint by construction in `save`, which
-/// is why fixing one did not reach the other.
+/// **It takes no `lists` row of its own; its caller has taken them all.** This used to read the
+/// row `for key share` to put itself in the lock order, which worked and then turned out to be the
+/// wrong altitude: `save` re-ticks one box and unticks another, and the only reason a per-call
+/// lock was enough is that those two sets are disjoint. Three review rounds of that reasoning
+/// produced four deadlocks, so position 2 is now the path's job and is taken once, for every
+/// candidate list, in `save`. `docs/adr/0005-one-lock-order-for-every-path.md`.
+///
+/// `tests/lock_order.rs::a_re_tick_and_a_rename_do_not_deadlock` is what holds it, and it holds
+/// `save`'s `lock_lists` rather than anything here.
 pub async fn lift_unsubscribed_list(
     db: &mut PgConnection,
     secrets: &Secrets,
@@ -617,18 +614,30 @@ pub async fn lift_unsubscribed_list(
     };
     let hmac = suppression_hmac(secrets, &email);
     sqlx::query!(
-        // The `lists` row is taken FIRST, and the CTE is what makes that inseparable from the
-        // lift rather than a second statement somebody could drop. See the ordering paragraph on
-        // the doc comment: without it this path runs `suppressions` then `lists` — the membership
-        // insert that follows takes `FOR KEY SHARE` on the same row through its own foreign key —
-        // while a rename runs `lists` then `suppressions`, and the two deadlock.
+        // The CTE is here for the list's NAME, which the orphan arm below needs, and no longer to
+        // order anything: `docs/adr/0005` puts position 2 on the path, and `save` — this
+        // function's only caller — takes every candidate list through `lists::lock_lists` before
+        // it gets here. A second `for key share` on the same row would be a guard no test can see
+        // fail, which is the shape this branch has learnt to distrust. A future caller that takes
+        // no list rows of its own is the ADR's problem, not this statement's.
+        // **Every refusal of this list BY NAME goes too, not only the one carrying its id.** An
+        // orphan naming this list is a refusal of "the list called X", and the subscriber has just
+        // asked for the list called X; leaving it would let the next delete-and-recreate adopt it
+        // and refuse the list they explicitly asked for. That is reachable — two orphans of one
+        // name, one adopted, this lifting only the adopted one, then a delete and a recreate — and
+        // it is why `0027` no longer calls a surviving duplicate one nobody reads.
+        //
+        // It cannot make a list deletion fail: lifting only ever takes rows OUT of the live
+        // partial indexes, so nothing the `on delete set null` sweep writes can collide because of
+        // it.
         "with locked as materialized ( \
-             select id from lists where workspace_id = $1 and id = $3 for key share \
+             select id, name from lists where workspace_id = $1 and id = $3 \
          ) \
          update suppressions s set lifted_at = now() \
            from locked l \
           where s.workspace_id = $1 and s.scope = 'list' and s.email_hmac = $2 \
-            and s.list_id = l.id and s.lifted_at is null",
+            and s.lifted_at is null \
+            and (s.list_id = l.id or (s.list_id is null and s.list_name = l.name))",
         workspace_id,
         hmac.as_slice(),
         list_id,

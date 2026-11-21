@@ -384,6 +384,24 @@ pub async fn delete_list(
 ) -> ApiResult<StatusCode> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
+    // **Position 3, taken by hand, because the cascade takes it last.** Deleting the row below
+    // reaches `list_memberships` first and `suppressions` last — foreign key actions fire in the
+    // order the constraints were created, and `0027`'s is the newest on this table. That put this
+    // path at `list_memberships` → `suppressions` while `erase_contact` runs `suppressions` →
+    // `list_memberships` (its tombstone has to exist before the contact dies), and the two
+    // deadlocked: reproduced on Postgres 16.15, victim either a GDPR erasure or this deletion.
+    //
+    // A lock rather than an `update … set list_id = null`, so the foreign key keeps owning what a
+    // deleted list does to a refusal; this only decides when the row is taken.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    sqlx::query!(
+        "select 1 as one from suppressions \
+          where workspace_id = $1 and list_id = $2 order by id for update",
+        workspace_id,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
     let deleted = sqlx::query!(
         "delete from lists where workspace_id = $1 and id = $2",
         workspace_id,

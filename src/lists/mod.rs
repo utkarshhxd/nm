@@ -154,6 +154,44 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
+/// **Position 2 of the one lock order (`docs/adr/0005-one-lock-order-for-every-path.md`).** Takes
+/// `for key share` on every list in `ids` that exists in this workspace, by `id` ascending, and
+/// returns the ones it got.
+///
+/// **Call this before writing a `list_memberships` or a `consent_log` row naming any of them.**
+/// Both of those tables carry a foreign key to `lists`, and a foreign key check runs at the END of
+/// the statement that triggered it — so a path that just writes the row takes the `lists` row
+/// *after* the membership row, which is the opposite of the order `delete_list` and the rename
+/// trigger take them in. That is an ABBA cycle, and M1d shipped four of them before the order was
+/// written down. Taking the rows here, first, is what makes a path obey the order rather than
+/// argue about one pair of it.
+///
+/// **The returned ids are the ones that still exist**, and a caller that writes memberships should
+/// narrow itself to them rather than trusting the ids it was given: a list deleted between the
+/// caller reading it and this call is gone, and naming it anyway is a foreign key violation —
+/// which on the public form route reached an anonymous submitter as a `500`. A list deleted
+/// *after* this call cannot be, because the deletion blocks on the lock this took.
+///
+/// `for key share` and not something stronger: it conflicts with deleting the row and with
+/// renaming it (`name` belongs to `lists_workspace_id_name_key`, so a rename is a key update), and
+/// with nothing else. Two callers of this never block each other.
+pub async fn lock_lists(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    ids: &[Uuid],
+) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar!(
+        // `order by` before the locking clause, so two transactions locking overlapping sets take
+        // them in the same sequence and cannot cycle within the class.
+        r#"select id as "id!" from lists where workspace_id = $1 and id = any($2)
+            order by id for key share"#,
+        workspace_id,
+        ids,
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// Puts the contact on the list and returns the membership's status — for a new member the one
 /// just written, `Subscribed` on a single-opt-in list and `Pending` on a double-opt-in one; for a
 /// contact already on the list, the status it already had, which may not be the one asked for. The
@@ -178,8 +216,12 @@ pub async fn add_member(
     source: MembershipSource,
     cx: &consent::Context,
 ) -> ApiResult<MembershipStatus> {
+    // `for key share` on the read this already does: position 2 of the lock order, before the
+    // membership and consent rows below take the same row through their foreign keys. One word
+    // rather than a call to [`lock_lists`], because the row was being read here anyway.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
     let double_optin = sqlx::query_scalar!(
-        "select double_optin from lists where workspace_id = $1 and id = $2",
+        "select double_optin from lists where workspace_id = $1 and id = $2 for key share",
         workspace_id,
         list_id,
     )
@@ -272,6 +314,9 @@ pub async fn unsubscribe_member(
     contact_id: Uuid,
     cx: &consent::Context,
 ) -> ApiResult<()> {
+    // Position 2, before the membership row below and the consent row after it, both of which take
+    // this same list row through their foreign keys. `docs/adr/0005-one-lock-order-for-every-path.md`.
+    lock_lists(&mut *db, workspace_id, &[list_id]).await?;
     // One statement, so one snapshot: "did this change anything" and "is there a membership at
     // all" cannot disagree. Asking separately let a membership another transaction committed in
     // between turn a 404 into a `204` over a contact who is still subscribed.

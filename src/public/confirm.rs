@@ -18,7 +18,7 @@ use crate::{
     consent,
     error::{ApiError, ApiResult},
     http::request_meta::RequestMeta,
-    lists::MembershipStatus,
+    lists::{self, MembershipStatus},
     public::{
         page::{UNKNOWN_IP, notice, with},
         token::{self, Purpose},
@@ -104,6 +104,11 @@ async fn confirm(
     };
 
     let mut tx = state.pool.begin().await?;
+    // Position 2, before the membership row below and the consent row after it, both of which take
+    // this list row through their foreign keys. A list deleted since the link was issued locks
+    // nothing and the update below matches nothing, which is the answer this route already gives.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    lists::lock_lists(&mut tx, token.workspace_id, &[list_id]).await?;
     // One statement, so the change and the status it replaced come from one snapshot. `status` is
     // the row as it was **before** this update, because the sub-select reads the same snapshot the
     // CTE did: a confirmed row reads `pending` here, which is why `confirmed` is tested first.

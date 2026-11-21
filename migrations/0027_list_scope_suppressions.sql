@@ -98,7 +98,14 @@ create unique index suppressions_live_list on suppressions
 -- list called X and a refusal of a live list that was later renamed to X orphans into two rows
 -- named X when that list is deleted too. Making that a unique violation would fail the operator's
 -- list deletion from inside `on delete set null`, which is a far worse place to put it than a
--- duplicate nobody reads — no reader matches an orphan, and the adoption below takes exactly one.
+-- duplicate — and the adoption below takes exactly one, so the live list carries exactly one.
+--
+-- **The duplicate is not inert, and that is the price.** No reader matches an orphan directly, but
+-- the survivor is still waiting: adopt one onto a recreated list, let the subscriber re-tick it,
+-- delete the list and recreate it again, and the second duplicate is adopted and refuses the list
+-- they asked for. `suppressions::lift_unsubscribed_list` closes that by lifting every refusal of
+-- the list's NAME rather than only the one carrying its id — a re-tick says "the list called X",
+-- so every refusal of the list called X is what it answers.
 --
 -- Keyed on `list_id`: the only thing a reader matches on. It is also what the foreign key above
 -- walks when a list is deleted and what the rename trigger walks. Partial, because every address

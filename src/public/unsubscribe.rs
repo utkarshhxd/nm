@@ -26,7 +26,7 @@ use crate::{
     consent,
     error::ApiResult,
     http::request_meta::RequestMeta,
-    lists::{MembershipSource, MembershipStatus},
+    lists::{self, MembershipSource, MembershipStatus},
     public::{
         page::{self, UNKNOWN_IP, notice, with},
         token::{self, Purpose, Token},
@@ -397,6 +397,25 @@ async fn save(
             off.push(topic.id);
         }
     }
+    // **Position 2, and it has to be here rather than inside the two `suppressions` calls below.**
+    // Each of those takes its own list row, which was enough to order them against a rename — but
+    // `lift_unsubscribed_all` is a `suppressions` write and it runs first, so this transaction
+    // reached position 3 before position 2. Taking every candidate list up front puts the whole
+    // save in order: `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // **And it narrows the two change sets to the lists that still exist.** `topics` read them
+    // without a lock, so one deleted in between would otherwise be named by the membership
+    // statements and fail their foreign key — a `500` on a page whose whole contract is that it
+    // cannot answer differently. A list deleted after this line cannot be, because the deletion
+    // waits for these locks.
+    let live = lists::lock_lists(
+        &mut tx,
+        token.workspace_id,
+        &[on.clone(), off.clone()].concat(),
+    )
+    .await?;
+    on.retain(|id| live.contains(id));
+    off.retain(|id| live.contains(id));
     // The workspace-wide opt-out was theirs to set through one-click, so it is theirs to clear by
     // asking for a list again — otherwise this page shows boxes that tick and change nothing a
     // send would honour. Only `unsubscribed_all` is lifted; a bounce, a complaint, an operator's
@@ -648,6 +667,12 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
     )
     .fetch_optional(&mut *tx)
     .await?;
+    // **Position 1 of the lock order, on every path, before anything is read about the address.**
+    // `unsubscribe_all` takes it too, but only when there is an address to take it for; a token
+    // for a deleted contact skipped it entirely and ran unordered against the erase path.
+    if let Some(email) = &email {
+        suppressions::lock_address_for(&mut tx, &state.secrets, email).await?;
+    }
     // First, and before any membership row is locked: see the ordering paragraph above.
     let suppressed = match &email {
         Some(email) => {
@@ -656,10 +681,31 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
         }
         None => false,
     };
+    // **Position 2 and 4 in one statement, which is the only way this sweep can take them in that
+    // order.** Each `consent::record` below takes `for key share` on its list through
+    // `consent_log`'s foreign key, so the sweep alone ran `list_memberships` → `lists` while
+    // `delete_list` runs `lists` → `list_memberships`. Reproduced on Postgres 16.15: the victim
+    // was this route, which `apply` above may not let fail. `docs/adr/0005`.
+    //
+    // **The `locked` CTE is also what makes the lock set exactly right.** Reading the contact's
+    // lists and then locking them would leave a membership another transaction commits in between
+    // swept but unlocked, and its consent row would take the list outside the order again. Here
+    // one snapshot decides both: a membership that is not visible to the CTE is not visible to the
+    // update either, so every list this writes a consent row for is one it holds.
     let changed: Vec<Uuid> = sqlx::query_scalar!(
-        "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
-          where workspace_id = $1 and contact_id = $2 and status <> 'unsubscribed' \
-         returning list_id",
+        r#"with locked as materialized (
+               select l.id from lists l
+                where l.workspace_id = $1
+                  and exists (select 1 from list_memberships m
+                               where m.workspace_id = $1 and m.contact_id = $2
+                                 and m.list_id = l.id)
+                order by l.id for key share
+           )
+           update list_memberships m set status = 'unsubscribed', unsubscribed_at = now()
+             from locked l
+            where m.workspace_id = $1 and m.contact_id = $2 and m.list_id = l.id
+              and m.status <> 'unsubscribed'
+           returning m.list_id as "list_id!""#,
         token.workspace_id,
         token.contact_id,
     )

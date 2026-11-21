@@ -759,6 +759,9 @@ pub async fn subscribe(
         MembershipStatus::Subscribed => consent::Action::Subscribed,
         MembershipStatus::Unsubscribed => consent::Action::Unsubscribed,
     };
+    // Position 2: one row, however many contacts the statement below covers, taken before the
+    // membership and consent rows that name it. `docs/adr/0005-one-lock-order-for-every-path.md`.
+    crate::lists::lock_lists(&mut *db, sel.workspace_id(), &[list_id]).await?;
     run_recorded(db, sel, excluded, list_id, (action, source_ref), |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) \
                 select ")
@@ -800,6 +803,11 @@ pub async fn unsubscribe(
     source_ref: Option<&str>,
 ) -> ApiResult<Counts> {
     let recorded = (consent::Action::Unsubscribed, source_ref);
+    // Position 2, as in [`subscribe`]: this statement updates existing membership rows and then
+    // writes a consent row per changed one, so without it the order is `list_memberships` →
+    // `lists`, which is the cycle `delete_list` closes.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    crate::lists::lock_lists(&mut *db, sel.workspace_id(), &[list_id]).await?;
     run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push(
             "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
