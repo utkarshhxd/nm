@@ -247,6 +247,13 @@ record:
 4. Does a signature **we** apply before submission survive OCI's handling? If OCI mutates headers
    after acceptance, app-side signing breaks and that is the planned workaround.
 5. Which `d=` appears when customer DKIM is configured — ours, Oracle's, or both.
+6. **The exact text of a suppression reply.** Send to an address already on OCI's suppression list
+   and record the reply verbatim. The transport classifies an accepted reply as a *failure* by
+   matching the phrase `Suppression for user`; **if the real reply omits that phrase, the message
+   records as `Sent` and the operator is told someone received mail who did not** — precisely the
+   anti-goal §4 exists to prevent. Nothing local can settle it: the only source of truth is what
+   Oracle sends. The documented form is `254 4.7.1`, and Task 7's review established that lettre
+   parses `254` as a 2xx, so the phrase match is load-bearing rather than belt-and-braces.
 
 **If 1 and 2 are no, app-side signing stops being a switch and becomes the only supported mode for
 this relay.** The code supports both either way; the answer decides the default.
