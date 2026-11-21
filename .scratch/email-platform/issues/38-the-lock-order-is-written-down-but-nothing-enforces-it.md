@@ -74,6 +74,24 @@ complete. **Any new foreign key into a table a write path touches must be put th
 question**, and the answer recorded in ADR 0005 — including a "ruled out, because…" when the
 answer is no, so the next person does not have to re-derive it.
 
+## The enumeration's one blind spot, checked and currently empty
+
+The method above enumerates **FK parents**, because every cycle found on this branch ran through an
+`on delete` referential action. It does **not** cover a *trigger* that writes another table —
+`0027`'s rename trigger is exactly that, and it is in the order because someone thought about it,
+not because the method found it.
+
+Checked, 2026-11-21: the schema declares **five trigger functions** across `consent_log`, `jobs`
+and `lists`. Four of them (`consent_log_append_only`, `consent_log_no_destroy` twice,
+`jobs_throttle_retention`) only `raise exception` or `return old`/`new` — **they write nothing**.
+The only trigger that writes another table is `suppressions_follow_list_name()`, which writes
+`suppressions` from `lists`, and it is already the statement that forces position 2 above
+position 3.
+
+**So the blind spot is real and currently empty.** A second trigger that writes another table
+would fall outside the method entirely, so adding one means extending the enumeration, not just
+the order.
+
 ## Why grepping for `40P01` would have missed most of this
 
 Writing a deadlock test for each of the six remaining paths turned up a distinction nobody had
