@@ -463,8 +463,11 @@ SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }, BIT STRING { … } }`); write it an
     published output, byte for byte.
   - `relaxed_body_canonicalization_matches_rfc_6376`: same, including that under **relaxed**
     canonicalization a body of only CRLFs and an empty body **both** canonicalize to the empty
-    string — RFC 6376 §3.4.4, *"a completely empty or missing body is canonicalized as a null
-    input"*. An earlier version of this line said a CRLF-only body gives a single CRLF; that is
+    string — RFC 6376 §3.4.4. (The phrase *"canonicalized as a null input"* belongs to **§3.4.3**,
+    where it describes the *simple* algorithm's opposite behaviour; it was quoted here as if it
+    were §3.4.4's and it is not. The conclusion is right and independently checked against the
+    published vectors — the citation was not.) An earlier version of this line said a CRLF-only
+    body gives a single CRLF; that is
     **simple** canonicalization (§3.4.3), and implementing it here would have produced a wrong `bh`
     for every message with trailing blank lines — which is most of them. Corroborate with the
     empty-body hash `47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=`, the base64 SHA-256 of nothing.
