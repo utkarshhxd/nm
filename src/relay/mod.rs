@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{crypto::secrets::Secrets, error::ApiResult};
 
+pub mod bucket;
 pub mod routes;
 pub mod transport;
 
