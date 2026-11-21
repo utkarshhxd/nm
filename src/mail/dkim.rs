@@ -77,7 +77,7 @@ pub fn key_from_pem(pem: &str) -> Result<SigningKey, DkimError> {
         return Err(DkimError::NotPem);
     }
     if !matches!(label, "PRIVATE KEY" | "RSA PRIVATE KEY") {
-        return Err(DkimError::WrongPemLabel(label.to_owned()));
+        return Err(DkimError::WrongPemLabel(pem_label(label)));
     }
     let der = Zeroizing::new(
         STANDARD
@@ -85,6 +85,21 @@ pub fn key_from_pem(pem: &str) -> Result<SigningKey, DkimError> {
             .map_err(|_| DkimError::BadBase64)?,
     );
     key_from_der(&der)
+}
+
+/// A PEM label as a refusal may repeat it: the characters a label is made of, and no more. What
+/// is quoted here came from whoever sent the key, and an error is shown and stored.
+fn pem_label(label: &str) -> String {
+    let kept: String = label
+        .chars()
+        .filter(|c| c.is_ascii_uppercase() || *c == ' ')
+        .take(32)
+        .collect();
+    if kept.trim().is_empty() {
+        "(unprintable)".to_owned()
+    } else {
+        kept
+    }
 }
 
 /// A key as it is stored: the DER a PEM carried, with the armour gone.
@@ -135,11 +150,11 @@ pub fn pkcs1_to_spki(pkcs1: &[u8]) -> Vec<u8> {
 /// The inverse: the PKCS#1 `RSAPublicKey` inside a SubjectPublicKeyInfo, which is the form
 /// `ring`'s verification wants a published `p=` in.
 pub fn spki_to_pkcs1(spki: &[u8]) -> Result<Vec<u8>, DkimError> {
-    let body = contents(spki, 0x30, "it is not a SEQUENCE")?;
+    let body = contents(spki, 0x30, "it is not one DER SEQUENCE")?;
     let rest = body
         .strip_prefix(RSA_ALGORITHM_ID)
         .ok_or(DkimError::NotSpki("its algorithm is not rsaEncryption"))?;
-    match contents(rest, 0x03, "it has no key BIT STRING")?.split_first() {
+    match contents(rest, 0x03, "it does not end with one key BIT STRING")?.split_first() {
         Some((0, pkcs1)) => Ok(pkcs1.to_vec()),
         _ => Err(DkimError::NotSpki(
             "its key BIT STRING is not a whole number of bytes",
@@ -162,7 +177,9 @@ fn element(tag: u8, contents: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The contents of the DER element `input` starts with, which must carry `tag`.
+/// The contents of the DER element `input` is: one element carrying `tag`, and nothing after it.
+/// Bytes past the element are refused rather than ignored — a key with something appended is not
+/// the key, and silently taking the prefix would let two different inputs be the same key.
 fn contents<'a>(input: &'a [u8], tag: u8, what: &'static str) -> Result<&'a [u8], DkimError> {
     let bad = || DkimError::NotSpki(what);
     let [found, first, rest @ ..] = input else {
@@ -183,7 +200,10 @@ fn contents<'a>(input: &'a [u8], tag: u8, what: &'static str) -> Result<&'a [u8]
             .fold(0usize, |acc, b| (acc << 8) | *b as usize);
         (len, &rest[n..])
     };
-    rest.get(..len).ok_or_else(bad)
+    if rest.len() != len {
+        return Err(bad());
+    }
+    Ok(rest)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -217,8 +237,9 @@ fn relaxed_body(body: &[u8]) -> Vec<u8> {
         .split(|b| *b == b'\n')
         .map(|line| collapse(line.strip_suffix(b"\r").unwrap_or(line)))
         .collect();
-    // §3.4.4: ignore every empty line at the end, which leaves a completely empty or
-    // whitespace-only body as the null input the section ends on.
+    // §3.4.4(b): ignore every empty line at the end. An empty or whitespace-only body therefore
+    // canonicalizes to nothing at all. (The sentence about "a null input" belongs to §3.4.3, the
+    // simple algorithm, which is the one that leaves a CRLF; the vectors are what settle this.)
     while lines.last().is_some_and(Vec::is_empty) {
         lines.pop();
     }
@@ -274,23 +295,7 @@ pub fn signed_bytes(
     let at = find(&wire, b"\r\n\r\n").ok_or(DkimError::NoHeaderBreak)?;
     let (head, body) = (&wire[..at + 2], &wire[at + 4..]);
 
-    // `h=` is SIGNED_HEADERS restricted to the fields this message carries. RFC 6376 §5.4.2: a
-    // name that occurs more than once is signed at its last instance, so a header slipped in
-    // above an existing one cannot be signed in its place. No name is listed twice, so no
-    // instance can be claimed twice either.
-    let present = fields(head);
-    let mut signed: Vec<&[u8]> = Vec::with_capacity(SIGNED_HEADERS.len());
-    let mut h: Vec<&str> = Vec::with_capacity(SIGNED_HEADERS.len());
-    for name in SIGNED_HEADERS {
-        if let Some(field) = present
-            .iter()
-            .rev()
-            .find(|f| field_name(f).eq_ignore_ascii_case(name.as_bytes()))
-        {
-            signed.push(field);
-            h.push(name);
-        }
-    }
+    let (signed, h) = signed_fields(&fields(head));
 
     let bh = STANDARD.encode(digest::digest(&digest::SHA256, &relaxed_body(body)));
     let t = std::time::SystemTime::now()
@@ -357,6 +362,28 @@ fn fold(tags: &str) -> String {
     }
     out.push_str("\r\n");
     out
+}
+
+/// The fields to sign and the `h=` that names them: [`SIGNED_HEADERS`] restricted to the fields
+/// the message carries, in that order.
+///
+/// RFC 6376 §5.4.2: a name that occurs more than once is signed at its **last** instance, so a
+/// header slipped in above the real one is not what gets signed. No name is listed twice, so no
+/// instance can be claimed twice either.
+fn signed_fields<'a>(present: &[&'a [u8]]) -> (Vec<&'a [u8]>, Vec<&'static str>) {
+    let mut signed = Vec::with_capacity(SIGNED_HEADERS.len());
+    let mut h = Vec::with_capacity(SIGNED_HEADERS.len());
+    for name in SIGNED_HEADERS {
+        if let Some(field) = present
+            .iter()
+            .rev()
+            .find(|f| field_name(f).eq_ignore_ascii_case(name.as_bytes()))
+        {
+            signed.push(*field);
+            h.push(*name);
+        }
+    }
+    (signed, h)
 }
 
 /// The first `needle` in `haystack`.
@@ -533,11 +560,10 @@ mod tests {
         assert_eq!(canon_body("  C\r\n"), " C\r\n");
         // A body with no terminator gets one.
         assert_eq!(canon_body("hello"), "hello\r\n");
-        // §3.4.4: empty lines at the end are ignored, and "a completely empty or missing body is
-        // canonicalized as a null input" — so a body of nothing but CRLFs is the empty string,
-        // and its `bh` is the SHA-256 of nothing, the value every implementation publishes for
-        // an empty relaxed body. (Simple canonicalization, §3.4.3, is the one that leaves a
-        // CRLF behind; this is not that.)
+        // §3.4.4(b) ignores every empty line at the end, so a body of nothing but CRLFs is the
+        // empty string and its `bh` is the SHA-256 of nothing — the empty-body `bh` every
+        // implementation publishes, which is the check that settles it. Simple canonicalization
+        // (§3.4.3) is the one that leaves a CRLF behind; this is not that.
         assert_eq!(canon_body(""), "");
         assert_eq!(canon_body("\r\n\r\n\r\n"), "");
         assert_eq!(
@@ -556,9 +582,60 @@ mod tests {
         for want in ["list-unsubscribe", "list-unsubscribe-post"] {
             assert!(names.contains(&want.to_owned()), "h={h}");
         }
-        // And `h=` is the whole of SIGNED_HEADERS, since this message carries every one of them.
-        let expected: Vec<String> = SIGNED_HEADERS.iter().map(|h| h.to_lowercase()).collect();
-        assert_eq!(names, expected, "h={h}");
+        // Spelled out rather than derived from SIGNED_HEADERS, which would be that list
+        // compared with itself: `From` is mandatory (RFC 6376 §5.4) and dropping it would pass
+        // a test written that way.
+        assert_eq!(
+            names,
+            [
+                "from",
+                "to",
+                "subject",
+                "date",
+                "message-id",
+                "mime-version",
+                "content-type",
+                "list-unsubscribe",
+                "list-unsubscribe-post",
+                "feedback-id",
+            ],
+            "h={h}"
+        );
+    }
+
+    /// **The signature says which domain and which selector it was made for.** Swap `d=` and
+    /// `s=` in the emitted tags and every receiver looks the key up at the selector's domain and
+    /// the domain's selector: nothing is delivered, and nothing local notices.
+    #[test]
+    fn the_signature_names_the_domain_selector_and_algorithm_it_was_given() {
+        let signed = signed_bytes(&message(), &key(SIGNING_PKCS8), "brand.test", "nm1").unwrap();
+        assert_eq!(tag(&signed, "d"), "brand.test");
+        assert_eq!(tag(&signed, "s"), "nm1");
+        assert_eq!(tag(&signed, "v"), "1");
+        assert_eq!(tag(&signed, "a"), "rsa-sha256");
+        assert_eq!(tag(&signed, "c"), "relaxed/relaxed");
+        // `t=` is when it was signed, in seconds since the epoch.
+        let t: u64 = tag(&signed, "t").parse().expect("t= is a number");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(t <= now && now - t < 300, "t={t} against a clock at {now}");
+    }
+
+    /// RFC 6376 §5.4.2: where a name occurs more than once, the signature covers the last
+    /// instance, so a header prepended above the real one is not the one that gets signed.
+    #[test]
+    fn a_repeated_header_is_signed_at_its_last_instance() {
+        let head = b"From: forged@evil.test\r\nSubject: hi\r\nFrom: real@brand.test\r\n".as_slice();
+        let (signed, h) = signed_fields(&fields(head));
+        assert_eq!(h, ["From", "Subject"]);
+        assert_eq!(
+            String::from_utf8_lossy(signed[0]),
+            "From: real@brand.test\r\n"
+        );
+        // A name the message does not carry is left out of `h=` rather than signed as empty.
+        assert!(!h.contains(&"List-Unsubscribe"), "h={h:?}");
     }
 
     #[test]
@@ -611,9 +688,17 @@ mod tests {
             let pkcs1 = key.0.public().as_ref().to_vec();
             assert_eq!(spki_to_pkcs1(&pkcs1_to_spki(&pkcs1)).unwrap(), pkcs1);
         }
-        // And what is not a SubjectPublicKeyInfo is refused rather than returned as one.
+        // And what is not a SubjectPublicKeyInfo is refused rather than returned as one. The
+        // last of these is a whole, valid key with four bytes stuck on the end: taking the
+        // prefix and ignoring them would make two different inputs the same key.
         let pkcs1 = key(SIGNING_PKCS8).0.public().as_ref().to_vec();
-        for bad in [&b""[..], &[0x30, 0x03, 0x02, 0x01, 0x00][..], &pkcs1[..]] {
+        let trailing = [&pkcs1_to_spki(&pkcs1)[..], b"junk"].concat();
+        for bad in [
+            &b""[..],
+            &[0x30, 0x03, 0x02, 0x01, 0x00][..],
+            &pkcs1[..],
+            &trailing[..],
+        ] {
             assert!(
                 matches!(spki_to_pkcs1(bad), Err(DkimError::NotSpki(_))),
                 "accepted {} bytes as a public key",
@@ -684,6 +769,15 @@ mod tests {
         says("truncated base64", "base64");
         says("nothing at all", "PEM");
         says("a PEM with no END", "PEM");
+        // The label is quoted back, so only the characters a PEM label is made of are: what is
+        // in a refusal came from whoever sent the key.
+        let Err(junk) = key_from_pem(
+            "-----BEGIN <script>x</script>-----\nAAAA\n-----END <script>x</script>-----",
+        ) else {
+            panic!("a PEM labelled with anything at all was accepted");
+        };
+        let junk = junk.to_string();
+        assert!(!junk.contains("script") && !junk.contains('<'), "{junk}");
         // No two of the first four read alike, so an operator is told which mistake they made.
         for (i, (what, a)) in messages.iter().enumerate().take(4) {
             for (other, b) in &messages[i + 1..4] {

@@ -668,10 +668,12 @@ pub async fn check_sending_domain(
     // key it signs with, as the bare base64 `p=` carries — `dns::check` compares that value, not
     // the whole record, and giving it the record would fail a correctly configured domain. A
     // relay-signed domain publishes the relay's key, which this product cannot know, so any key
-    // passes there.
+    // passes there. The decrypted key is held in `Zeroizing` for the two statements it is alive:
+    // it is the one place outside the signer where it exists in the clear.
     let expected_p = match row.signing {
         Signing::App => super::dkim_private_key(&state.pool, &state.secrets, workspace_id, id)
             .await?
+            .map(Zeroizing::new)
             .map(|der| dkim::key_from_der(&der).map(|key| dkim::public_key_p(&key)))
             .transpose()
             .map_err(|e| {
