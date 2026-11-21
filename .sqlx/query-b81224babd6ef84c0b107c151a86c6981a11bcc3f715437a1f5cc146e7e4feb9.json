@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select 1 as one from contacts where workspace_id = $1 and id = $2 for key share",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b81224babd6ef84c0b107c151a86c6981a11bcc3f715437a1f5cc146e7e4feb9"
+}

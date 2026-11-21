@@ -15,7 +15,7 @@ use axum::{
 
 use crate::{
     app::AppState,
-    consent,
+    consent, contacts,
     error::{ApiError, ApiResult},
     http::request_meta::RequestMeta,
     lists::{self, MembershipStatus},
@@ -109,6 +109,10 @@ async fn confirm(
     // nothing and the update below matches nothing, which is the answer this route already gives.
     // `docs/adr/0005-one-lock-order-for-every-path.md`.
     lists::lock_lists(&mut tx, token.workspace_id, &[list_id]).await?;
+    // Position 4. A contact deleted since the link was issued took its membership with it, so the
+    // update below matches nothing and the page says the link is no longer valid -- which is what
+    // it already did, now reached in order instead of through a foreign key at statement end.
+    contacts::lock_contact(&mut tx, token.workspace_id, token.contact_id).await?;
     // One statement, so the change and the status it replaced come from one snapshot. `status` is
     // the row as it was **before** this update, because the sub-select reads the same snapshot the
     // CTE did: a confirmed row reads `pending` here, which is why `confirmed` is tested first.

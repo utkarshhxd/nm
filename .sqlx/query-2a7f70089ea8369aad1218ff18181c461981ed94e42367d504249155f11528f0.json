@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select 1 as one from lists where workspace_id = $1 and id = $2 for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2a7f70089ea8369aad1218ff18181c461981ed94e42367d504249155f11528f0"
+}

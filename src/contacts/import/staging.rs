@@ -363,6 +363,29 @@ pub async fn upsert_from_staging(
     let table = staging_table(import.id);
     let ws = import.workspace_id;
 
+    // **Position 2, here rather than beside the statement it protects, because the contacts upsert
+    // below is position 4.** The membership and consent rows this job writes take `for key share`
+    // on their list through a foreign key at the end of their statement, so without this the
+    // importer ran `list_memberships` before `lists` while `delete_list` runs `lists` before
+    // `list_memberships`. It cannot be hoisted INTO that statement -- `wanted` is a `union`, and a
+    // locking clause is not allowed with one -- so it is a statement of its own, and it belongs
+    // ahead of the contacts it also takes.
+    //
+    // The set is the job's own list plus every list the FILE names, which is why it reads the
+    // staging table. An import holds these for its whole run, so a list it names cannot be renamed
+    // or deleted until it finishes -- which is the honest answer anyway.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // `AssertSqlSafe`: the only interpolation is `staging_table`'s fixed prefix with the import id
+    // in hex, as everywhere else in this file.
+    sqlx::query(AssertSqlSafe(format!(
+        "select 1 from lists l           where l.workspace_id = $1             and (l.id = $2                  or l.name in (select btrim(e->>'name')                                  from {table} s, lateral jsonb_array_elements(s.lists) e))           order by l.id for key share"
+    )))
+    .bind(ws)
+    .bind(import.list_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
     // `fail on duplicate` is a pre-flight and not an `on conflict` arm: the operator asked for
     // their file back untouched, and a per-row importer would already have written every row
     // ahead of the duplicate before it found it. The address in the refusal is one the operator
@@ -633,31 +656,6 @@ async fn write_memberships_and_tags(
     };
     // `AssertSqlSafe`: the only interpolations are `staging_table`'s fixed prefix with the import
     // id in hex, `written` (one of the two literals above) and [`SQL_UUID_V7`]. Nothing a client
-    // **Position 2, in its own statement, because the one below cannot take it in order.** That
-    // statement inserts memberships and consent rows, and both take `for key share` on their list
-    // through a foreign key at the end of the statement — so it runs `list_memberships` → `lists`
-    // while `delete_list` runs `lists` → `list_memberships`. There is no way to hoist the lock
-    // inside it: `wanted` is a `union`, and a locking clause is not allowed with one.
-    //
-    // The set is the job's own list plus every list the FILE names, which is why it has to read
-    // the staging table. An import holds these for its whole run, so a list it names cannot be
-    // renamed or deleted until it finishes — which is the honest answer anyway.
-    // `docs/adr/0005-one-lock-order-for-every-path.md`.
-    //
-    // `AssertSqlSafe`: the only interpolation is `staging_table`'s fixed prefix with the import id
-    // in hex, exactly as below.
-    sqlx::query(AssertSqlSafe(format!(
-        "select 1 from lists l \
-          where l.workspace_id = $1 \
-            and (l.id = $2 \
-                 or l.name in (select btrim(e->>'name') \
-                                 from {table} s, lateral jsonb_array_elements(s.lists) e)) \
-          order by l.id for key share"
-    )))
-    .bind(import.workspace_id)
-    .bind(import.list_id)
-    .fetch_all(&mut *conn)
-    .await?;
     // sent reaches this string; the list the operator chose and the `import` provenance are bound.
     let (declined, suppressed): (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
         // `picked` and `live` again, and for the same two reasons as the statement before this

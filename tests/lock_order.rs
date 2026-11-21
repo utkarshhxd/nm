@@ -28,10 +28,50 @@ use uuid::Uuid;
 /// The body RFC 8058 §3.1 tells a mail client to POST.
 const ONE_CLICK: &str = "List-Unsubscribe=One-Click";
 
-/// How long a wedged transaction is held, and how long a blocked request is given to reach its
-/// block. Generous: a test that released the wedge too early would simply not interleave, and the
-/// mutation checks are what show the interleaving really happens.
-const SETTLE: Duration = Duration::from_millis(400);
+/// **At most two of these run at once, and that is not tidiness.** Each test holds four
+/// connections at its critical moment — the wedge, the probe, and two routes blocked mid-request —
+/// and fourteen of them at once exhausts what the server will give a test binary. A route that
+/// cannot get a connection does not block, it fails, and the test then reports that the
+/// interleaving never formed. Which is the right answer, loudly: before `settle` existed those
+/// runs went green instead.
+static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+/// How many sessions in this test's database are waiting on a lock right now.
+///
+/// It runs on a connection of its own, taken before anything is spawned. Asking the pool each time
+/// does not work: by the time two routes and a wedge are in flight the pool is empty, and the
+/// probe fails to acquire rather than returning an answer.
+async fn blocked(probe: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from pg_stat_activity           where datname = current_database() and wait_event_type = 'Lock'",
+    )
+    .fetch_one(&mut *probe)
+    .await
+    .expect("read pg_stat_activity")
+}
+
+/// Waits until `n` sessions are blocked on a lock, and **fails if they never are**.
+///
+/// This replaces a fixed sleep, and the direction of its failure is the whole point. A sleep that
+/// is too short fails OPEN: the second actor wins outright, the first finds nothing left to do,
+/// and a test that asserts only an HTTP status goes green having interleaved nothing. That is not
+/// hypothetical — three of these tests passed in a full run and failed every time in isolation,
+/// because fourteen concurrent `sqlx::test` databases made 400 ms too short. Waiting on the
+/// condition instead is both deterministic and loud: if the interleaving does not form, this
+/// panics saying so.
+async fn settle(probe: &mut sqlx::PgConnection, n: i64) {
+    for _ in 0..240 {
+        if blocked(probe).await >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "only {} of {n} sessions ever blocked: the interleaving never formed, so this test          would have proved nothing",
+        blocked(probe).await
+    );
+}
 
 struct Fx {
     app: TestApp,
@@ -135,7 +175,9 @@ impl Fx {
 /// `lists`. Nothing here depends on which order the sweep returned its lists in.
 #[sqlx::test]
 async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
 
     let mut held = pool.begin().await.unwrap();
@@ -150,14 +192,14 @@ async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
         let app = TestApp::new(pool.clone()).await;
         async move { app.post(&format!("/u/{link}")).text(ONE_CLICK).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let path = fx.delete_list_path(first);
     let deleting = tokio::spawn({
         let admin = fx.admin;
         async move { admin.delete(&path).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (clicked, deleted) = (
@@ -181,7 +223,9 @@ async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 /// the erasure stops between its tombstone and its cascade.
 #[sqlx::test]
 async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let mut conn = pool.acquire().await.unwrap();
     nm::suppressions::unsubscribe_list(
@@ -208,12 +252,12 @@ async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
         let admin = fx.admin;
         async move { admin.post(&erase_path).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let mut deleter = TestApp::new(pool.clone()).await;
     deleter.login("owner@example.com", PW).await;
     let deleting = tokio::spawn(async move { deleter.delete(&path).await });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (erased, deleted) = (
@@ -234,7 +278,9 @@ async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
 /// return is not order.
 #[sqlx::test]
 async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let mut conn = pool.acquire().await.unwrap();
     nm::suppressions::unsubscribe_list(
@@ -269,7 +315,7 @@ async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
         let body = format!("list={first}");
         async move { app.post(&format!("/u/{link}")).text(&body).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let renaming = tokio::spawn({
         let pool = pool.clone();
@@ -280,7 +326,7 @@ async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
                 .await
         }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let saved = saving.await.expect("the save");
@@ -298,7 +344,9 @@ async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
 /// this reason. One of them is held here rather than four, because the mechanism is one.
 #[sqlx::test]
 async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
 
     let mut held = pool.begin().await.unwrap();
@@ -317,12 +365,12 @@ async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPoo
         let admin = fx.admin;
         async move { admin.post(&unsub_path).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let mut deleter = TestApp::new(pool.clone()).await;
     deleter.login("owner@example.com", PW).await;
     let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (unsubscribed, deleted) = (
@@ -354,7 +402,9 @@ async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPoo
 /// answers an anonymous submitter `500` where every other outcome is the same success page.
 #[sqlx::test]
 async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let form = Uuid::now_v7();
     sqlx::query(
@@ -400,7 +450,7 @@ async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
                 .await
         }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let path = fx.delete_list_path(first);
     fx.admin
@@ -422,7 +472,9 @@ async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
 /// the deletion's cascade can see the row and wait for it: this one is a true cycle.
 #[sqlx::test]
 async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     sqlx::query("update list_memberships set status = 'pending', subscribed_at = null")
         .execute(&pool)
@@ -453,14 +505,14 @@ async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
         let app = TestApp::new(pool.clone()).await;
         async move { app.get(&format!("/c/{link}")).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let path = fx.delete_list_path(first);
     let deleting = tokio::spawn({
         let admin = fx.admin;
         async move { admin.delete(&path).await }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (confirmed, deleted) = (
@@ -475,7 +527,9 @@ async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 /// cascade, so this is the foreign key kind: the deletion commits out from under it.
 #[sqlx::test]
 async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let fresh = lists[1];
     sqlx::query("delete from list_memberships where list_id = $1")
         .bind(fresh)
@@ -502,12 +556,12 @@ async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
                 .await
         }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let mut deleter = TestApp::new(pool.clone()).await;
     deleter.login("owner@example.com", PW).await;
     let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (added, deleted) = (
@@ -525,7 +579,9 @@ async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
 /// Bulk subscribe against a list deletion: the foreign key kind, as the single-member add above.
 #[sqlx::test]
 async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let fresh = lists[1];
     sqlx::query("delete from list_memberships where list_id = $1")
         .bind(fresh)
@@ -555,12 +611,12 @@ async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
                 .await
         }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let mut deleter = TestApp::new(pool.clone()).await;
     deleter.login("owner@example.com", PW).await;
     let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (subscribed, deleted) = (
@@ -575,7 +631,9 @@ async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
 /// one in the same statement, so the cascade can see what it holds: the deadlock kind.
 #[sqlx::test]
 async fn a_bulk_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
     let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
 
     let mut held = pool.begin().await.unwrap();
@@ -600,12 +658,12 @@ async fn a_bulk_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
                 .await
         }
     });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 1).await;
 
     let mut deleter = TestApp::new(pool.clone()).await;
     deleter.login("owner@example.com", PW).await;
     let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
-    tokio::time::sleep(SETTLE).await;
+    settle(&mut probe, 2).await;
 
     held.commit().await.expect("release the wedge");
     let (unsubscribed, deleted) = (
@@ -614,4 +672,349 @@ async fn a_bulk_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     );
     unsubscribed.assert_status_ok();
     deleted.assert_status(StatusCode::NO_CONTENT);
+}
+
+// ---- `delete_list`'s own order, and the `contacts` class -------------------------------------
+//
+// Every test above pairs some path AGAINST `delete_list`, which means `delete_list`'s own order
+// was never the thing under test — and it was wrong. Every test above also wedges the `contacts`
+// row with a transaction that never asks for anything back, which cannot cycle; a transaction that
+// DELETES a contact does ask, for the very membership rows the wedged route is holding. Both gaps
+// are closed below.
+
+/// Nothing in either of these two is blocked outright, so neither can be asserted with a single
+/// status: a list deleted out from under a rename is an honest `404`, and a save whose lists all
+/// vanished is an honest `200`. What may not happen is a `5xx` — Postgres aborting one side with
+/// `40P01` surfaces as `ApiError::Internal`.
+fn no_server_error(label: &str, r: &axum_test::TestResponse) {
+    assert!(
+        !r.status_code().is_server_error(),
+        "{label} answered {} — a deadlock reaches a caller as a 500",
+        r.status_code()
+    );
+}
+
+/// Locks the one `list`-scope refusal in the workspace, so that both sides of the pair below queue
+/// on it and are released together. Postgres grants in arrival order, which is what makes the
+/// interleaving deterministic rather than a coin flip.
+async fn wedge_the_refusal(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.unwrap();
+    let locked: Vec<Uuid> = sqlx::query_scalar(
+        "select id from suppressions where scope = 'list' and lifted_at is null for update",
+    )
+    .fetch_all(&mut *held)
+    .await
+    .expect("wedge the refusal");
+    assert_eq!(locked.len(), 1, "the premise: one refusal to queue on");
+    held
+}
+
+/// **`delete_list` against a rename of the same list.** `delete_list` takes the `suppressions`
+/// rows for the list before it takes the list itself, which is position 3 before position 2 — the
+/// one path in the ADR's own table that violated the order the ADR derives. A rename goes `lists`
+/// then `suppressions` through its trigger, so the two invert.
+#[sqlx::test]
+async fn a_list_deletion_and_a_rename_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first = lists[0];
+    let mut conn = pool.acquire().await.unwrap();
+    nm::suppressions::unsubscribe_list(
+        &mut conn,
+        &fx.app.state.secrets,
+        fx.workspace,
+        first,
+        "ada@example.com",
+    )
+    .await
+    .expect("a refusal of this list");
+    drop(conn);
+
+    let held = wedge_the_refusal(&pool).await;
+
+    let delete_path = fx.delete_list_path(first);
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&delete_path).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let rename_path = format!("/api/v1/workspaces/{}/lists/{first}", fx.workspace);
+    let mut renamer = TestApp::new(pool.clone()).await;
+    renamer.login("owner@example.com", PW).await;
+    let renaming = tokio::spawn(async move {
+        renamer
+            .patch(&rename_path)
+            .json(&serde_json::json!({"name": "renamed"}))
+            .await
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (deleted, renamed) = (
+        deleting.await.expect("the deletion"),
+        renaming.await.expect("the rename"),
+    );
+    no_server_error("the deletion", &deleted);
+    no_server_error("the rename", &renamed);
+}
+
+/// **`delete_list` against the preference centre's re-tick**, which is the same inversion reached
+/// from the other side: `save` takes the list through `lock_lists` and then *updates* the existing
+/// refusal, so it holds position 2 and wants position 3 while `delete_list` holds 3 and wants 2.
+/// Postgres picks the victim, so half the time this is a `500` on `POST /u/{token}`.
+#[sqlx::test]
+async fn a_list_deletion_and_a_re_tick_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first = lists[0];
+    let mut conn = pool.acquire().await.unwrap();
+    nm::suppressions::unsubscribe_list(
+        &mut conn,
+        &fx.app.state.secrets,
+        fx.workspace,
+        first,
+        "ada@example.com",
+    )
+    .await
+    .expect("a refusal of this list");
+    sqlx::query("update list_memberships set status = 'unsubscribed'")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+
+    let held = wedge_the_refusal(&pool).await;
+
+    let delete_path = fx.delete_list_path(first);
+    let link = fx.unsub();
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&delete_path).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let saving = tokio::spawn({
+        let app = TestApp::new(pool.clone()).await;
+        let body = format!("list={first}");
+        async move { app.post(&format!("/u/{link}")).text(&body).await }
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (deleted, saved) = (
+        deleting.await.expect("the deletion"),
+        saving.await.expect("the save"),
+    );
+    no_server_error("the deletion", &deleted);
+    no_server_error("the preference centre", &saved);
+}
+
+/// Locks the contact's membership rows, so that the writer and the contact deletion below both
+/// queue on them in arrival order. The writer arrives first and is granted first, which is what
+/// leaves it holding a membership row while the deletion holds the contact.
+async fn wedge_the_memberships(
+    pool: &PgPool,
+    contact: Uuid,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from list_memberships where contact_id = $1 for update")
+        .bind(contact)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the membership rows");
+    held
+}
+
+/// **The `contacts` class, which the order did not name.** Every `list_memberships` and
+/// `consent_log` row carries a foreign key to `contacts`, so every writer took that row
+/// `for key share` **last**, at the end of its statement — while every contact-deleting path takes
+/// it **first**, exclusively, and then cascades into the membership rows. An inversion on a whole
+/// class rather than a pair.
+///
+/// It is the same split the tests above found for `delete_list`: a path that UPDATES a membership
+/// row deadlocks, a path that inserts one does not. Three are held here, one per route that
+/// updates: the operator's, and the two unauthenticated ones.
+#[sqlx::test]
+async fn an_operator_unsubscribe_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first = lists[0];
+    let held = wedge_the_memberships(&pool, fx.contact).await;
+
+    let unsub_path = format!(
+        "/api/v1/workspaces/{}/lists/{first}/members/{}/unsubscribe",
+        fx.workspace, fx.contact
+    );
+    let delete_path = format!(
+        "/api/v1/workspaces/{}/contacts/{}",
+        fx.workspace, fx.contact
+    );
+    let unsubscribing = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.post(&unsub_path).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let mut deleter = TestApp::new(pool.clone()).await;
+    deleter.login("owner@example.com", PW).await;
+    let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (unsubscribed, deleted) = (
+        unsubscribing.await.expect("the unsubscribe"),
+        deleting.await.expect("the deletion"),
+    );
+    no_server_error("the operator unsubscribe", &unsubscribed);
+    no_server_error("the contact deletion", &deleted);
+}
+
+/// `GET /c/{token}` against a contact deletion. Unauthenticated, and it promotes an existing
+/// membership row, so it is the deadlocking kind.
+#[sqlx::test]
+async fn a_confirmation_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first = lists[0];
+    sqlx::query("update list_memberships set status = 'pending', subscribed_at = null")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let link = issue(
+        &fx.app.state.secrets,
+        &Token {
+            workspace_id: fx.workspace,
+            contact_id: fx.contact,
+            purpose: Purpose::Confirm,
+            list_id: Some(first),
+            issued_at: Utc::now().timestamp(),
+            nonce: "c2".to_owned(),
+            kid: None,
+            ref_id: None,
+        },
+    );
+    let held = wedge_the_memberships(&pool, fx.contact).await;
+
+    let delete_path = format!(
+        "/api/v1/workspaces/{}/contacts/{}",
+        fx.workspace, fx.contact
+    );
+    let confirming = tokio::spawn({
+        let app = TestApp::new(pool.clone()).await;
+        async move { app.get(&format!("/c/{link}")).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&delete_path).await }
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (confirmed, deleted) = (
+        confirming.await.expect("the confirmation"),
+        deleting.await.expect("the deletion"),
+    );
+    no_server_error("the confirmation", &confirmed);
+    no_server_error("the contact deletion", &deleted);
+}
+
+/// `POST /u/{token}` with the RFC 8058 body, against a contact deletion. This is the route whose
+/// own comment says it may not fail, and the advisory lock does not help: `delete_contact` never
+/// takes it.
+#[sqlx::test]
+async fn a_one_click_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let _ = lists;
+    let held = wedge_the_memberships(&pool, fx.contact).await;
+
+    let link = fx.unsub();
+    let delete_path = format!(
+        "/api/v1/workspaces/{}/contacts/{}",
+        fx.workspace, fx.contact
+    );
+    let one_click = tokio::spawn({
+        let app = TestApp::new(pool.clone()).await;
+        async move { app.post(&format!("/u/{link}")).text(ONE_CLICK).await }
+    });
+    settle(&mut probe, 1).await;
+
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&delete_path).await }
+    });
+    settle(&mut probe, 2).await;
+
+    held.commit().await.expect("release the wedge");
+    let (clicked, deleted) = (
+        one_click.await.expect("the one-click"),
+        deleting.await.expect("the deletion"),
+    );
+    no_server_error("the one-click", &clicked);
+    no_server_error("the contact deletion", &deleted);
+}
+
+/// **`add_member` answers `404` when the list is gone, and nothing pinned that.** Its error
+/// mapping reads *"the list exists in this workspace, so the only foreign key left to fail is the
+/// contact's"* and sends every foreign key violation to `NotFound` — which is only true because
+/// the `for key share` above it is on a `fetch_one`, so a vanished list raises `RowNotFound` first.
+/// The concurrency test beside this one asserts `is_success()` and so says nothing about the
+/// answer when the list really has gone. No wedge and no race: the list is simply deleted first.
+#[sqlx::test]
+async fn adding_a_member_to_a_deleted_list_is_not_found(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let first = lists[0];
+    fx.admin
+        .delete(&fx.delete_list_path(first))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let r = fx
+        .admin
+        .post(&format!(
+            "/api/v1/workspaces/{}/lists/{first}/members",
+            fx.workspace
+        ))
+        .json(&serde_json::json!({"contact_id": fx.contact}))
+        .await;
+    r.assert_status(StatusCode::NOT_FOUND);
+}
+
+/// Bulk subscribe to a list that is gone answers `404`. Pinned beside `add_member`'s `404` above
+/// and for the same reason — nothing held it — but note what it does **not** hold.
+///
+/// `selection::subscribe` now narrows itself to what `lists::lock_lists` returned, because it is
+/// the one caller that INSERTS and discarding the answer meant naming a deleted list in the insert
+/// and reporting its foreign key violation as a `500`. This test passes with or without that
+/// narrowing, because `bulk_subscribe_contacts` calls `lists::get` first and answers `404` from
+/// there. The narrowing is reachable only when a deletion commits between that read and the
+/// insert — two statements of one transaction apart — which no wedge available here can hold open.
+/// So it is defence that matches `lock_lists`'s stated contract, and it is unpinned; said out loud
+/// rather than dressed up by this test.
+#[sqlx::test]
+async fn a_bulk_subscribe_to_a_deleted_list_is_not_found(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
+    let fresh = lists[1];
+    fx.admin
+        .delete(&fx.delete_list_path(fresh))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    let r = fx
+        .admin
+        .post(&format!(
+            "/api/v1/workspaces/{}/contacts/bulk/subscribe",
+            fx.workspace
+        ))
+        .json(&serde_json::json!({"ids": [fx.contact], "list_id": fresh}))
+        .await;
+    r.assert_status(StatusCode::NOT_FOUND);
 }

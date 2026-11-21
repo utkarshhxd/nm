@@ -394,6 +394,22 @@ pub async fn delete_list(
     // A lock rather than an `update … set list_id = null`, so the foreign key keeps owning what a
     // deleted list does to a refusal; this only decides when the row is taken.
     // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // **Position 2 first, and this line is the whole of what was wrong with the version that
+    // introduced the pre-lock below.** Taking the refusals and only then deleting the row is
+    // `suppressions` before `lists` — the one path that broke the order the ADR derives, in the
+    // commit that derived it. A rename goes `lists` then `suppressions` through its trigger and
+    // the preference centre's re-tick takes the list and then updates the refusal, so both inverted
+    // against this; reproduced through both routes on Postgres 16.15, and half the time the victim
+    // was `POST /u/{token}`, which may not answer differently. The `delete` below needs this row
+    // exclusively anyway, so taking it here costs nothing but the order.
+    sqlx::query!(
+        "select 1 as one from lists where workspace_id = $1 and id = $2 for update",
+        workspace_id,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query!(
         "select 1 as one from suppressions \
           where workspace_id = $1 and list_id = $2 order by id for update",

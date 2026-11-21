@@ -637,7 +637,12 @@ async fn contact_id(
     email: &str,
 ) -> ApiResult<Option<Uuid>> {
     sqlx::query_scalar!(
-        "select id from contacts where workspace_id = $1 and email = $2",
+        // Position 4: `for key share`, because the membership, consent and `jobs` rows below all
+        // carry a foreign key to this row and would otherwise take it last, at the end of their
+        // own statements, while every path that deletes a contact takes it first.
+        // `docs/adr/0005-one-lock-order-for-every-path.md`. A contact this route CREATES is locked
+        // by its own insert, so both halves of the branch are in order.
+        "select id from contacts where workspace_id = $1 and email = $2 for key share",
         workspace_id,
         email,
     )

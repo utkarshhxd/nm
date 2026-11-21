@@ -297,6 +297,38 @@ pub async fn create_checked(
 }
 
 /// The contact, or `404` if it is not in this workspace.
+/// **Position 4 of the one lock order (`docs/adr/0005-one-lock-order-for-every-path.md`).** Takes
+/// `for key share` on the contact and says whether it is still there.
+///
+/// **Call this before writing a `list_memberships` or a `consent_log` row about it.** Both tables
+/// carry `foreign key (workspace_id, contact_id) references contacts`, and a foreign key check
+/// runs at the END of the statement that triggered it — so a writer that does not take the row
+/// itself takes it *last*, after the membership rows, while `contacts::routes::delete_contact`,
+/// `selection::delete` and `erase_contact` take it **first**, exclusively, and then cascade into
+/// those same membership rows. That is the `lists` inversion again on a second class, and it is
+/// the one the order did not name until it had produced three more cycles: the operator's per-list
+/// unsubscribe, `GET /c/{token}` and the RFC 8058 one-click, the last two unauthenticated.
+///
+/// The advisory address lock is no help here, because none of the three deleting paths takes it.
+///
+/// `false` means the contact is gone, and a caller that writes memberships should stop rather than
+/// name it: a list of reasons it might be gone is not worth as much as not writing a row whose
+/// foreign key is about to fail.
+pub async fn lock_contact(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    id: Uuid,
+) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar!(
+        "select 1 as one from contacts where workspace_id = $1 and id = $2 for key share",
+        workspace_id,
+        id,
+    )
+    .fetch_optional(db)
+    .await?
+    .is_some())
+}
+
 pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResult<Contact> {
     sqlx::query_as!(
         Contact,

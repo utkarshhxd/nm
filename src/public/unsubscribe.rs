@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    consent,
+    consent, contacts,
     error::ApiResult,
     http::request_meta::RequestMeta,
     lists::{self, MembershipSource, MembershipStatus},
@@ -443,6 +443,12 @@ async fn save(
             .await?
     };
 
+    // Position 4, after the suppressions writes above and before the membership rows below, both
+    // of which carry a foreign key to it. Without it this page took the contact row last, at the
+    // end of a statement, while every path that deletes a contact takes it first and then cascades
+    // into the very membership rows this is about to lock.
+    contacts::lock_contact(&mut tx, token.workspace_id, token.contact_id).await?;
+
     // **The durable half of a per-list unsubscribe, and the half a deletion cannot take.** The
     // `list_memberships` row below dies with the contact and with the list; this one is keyed on
     // the address and outlives both, the way `unsubscribe_all` already does for "everything".
@@ -673,7 +679,31 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
     if let Some(email) = &email {
         suppressions::lock_address_for(&mut tx, &state.secrets, email).await?;
     }
-    // First, and before any membership row is locked: see the ordering paragraph above.
+    // **Position 2, and it has to come before `unsubscribe_all` rather than after it.** That call
+    // writes a `suppressions` row, which is position 3, so taking the lists after it was `A, S, L`
+    // — the same inversion `save` was restructured to fix, left standing one function over and
+    // recorded in the ADR as if it were not. It is benign only by accident today (the row it writes
+    // is `scope = 'address'` with a null `list_id`, which neither `delete_list`'s pre-lock nor the
+    // rename trigger touches), and accidents are what this order exists to stop relying on.
+    //
+    // **The ids are carried forward rather than re-derived**, which is what the locking CTE this
+    // replaces was for: reading the contact's lists and then locking them separately would leave a
+    // membership another transaction commits in between swept but unlocked, and its consent row
+    // would take that list out of order. Binding the locked ids into the sweep keeps the two sets
+    // identical — a membership on a list that is not in `locked` is simply not swept, so no consent
+    // row names it.
+    let locked: Vec<Uuid> = sqlx::query_scalar!(
+        r#"select l.id as "id!" from lists l
+            where l.workspace_id = $1
+              and exists (select 1 from list_memberships m
+                           where m.workspace_id = $1 and m.contact_id = $2 and m.list_id = l.id)
+            order by l.id for key share"#,
+        token.workspace_id,
+        token.contact_id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    // Position 3.
     let suppressed = match &email {
         Some(email) => {
             suppressions::unsubscribe_all(&mut tx, &state.secrets, token.workspace_id, email)
@@ -681,33 +711,20 @@ async fn one_click(state: &AppState, meta: &RequestMeta, token: &Token) -> ApiRe
         }
         None => false,
     };
-    // **Position 2 and 4 in one statement, which is the only way this sweep can take them in that
-    // order.** Each `consent::record` below takes `for key share` on its list through
-    // `consent_log`'s foreign key, so the sweep alone ran `list_memberships` → `lists` while
-    // `delete_list` runs `lists` → `list_memberships`. Reproduced on Postgres 16.15: the victim
-    // was this route, which `apply` above may not let fail. `docs/adr/0005`.
-    //
-    // **The `locked` CTE is also what makes the lock set exactly right.** Reading the contact's
-    // lists and then locking them would leave a membership another transaction commits in between
-    // swept but unlocked, and its consent row would take the list outside the order again. Here
-    // one snapshot decides both: a membership that is not visible to the CTE is not visible to the
-    // update either, so every list this writes a consent row for is one it holds.
+    // Position 4, before the sweep and the consent rows, both of which carry a foreign key to the
+    // contact. Without it this route took that row last while every path that deletes a contact
+    // takes it first and then cascades into these very membership rows: reproduced on Postgres
+    // 16.15 as a `500` on the one route whose contract says it may not fail.
+    contacts::lock_contact(&mut tx, token.workspace_id, token.contact_id).await?;
+    // Position 5.
     let changed: Vec<Uuid> = sqlx::query_scalar!(
-        r#"with locked as materialized (
-               select l.id from lists l
-                where l.workspace_id = $1
-                  and exists (select 1 from list_memberships m
-                               where m.workspace_id = $1 and m.contact_id = $2
-                                 and m.list_id = l.id)
-                order by l.id for key share
-           )
-           update list_memberships m set status = 'unsubscribed', unsubscribed_at = now()
-             from locked l
-            where m.workspace_id = $1 and m.contact_id = $2 and m.list_id = l.id
+        r#"update list_memberships m set status = 'unsubscribed', unsubscribed_at = now()
+            where m.workspace_id = $1 and m.contact_id = $2 and m.list_id = any($3)
               and m.status <> 'unsubscribed'
            returning m.list_id as "list_id!""#,
         token.workspace_id,
         token.contact_id,
+        &locked[..],
     )
     .fetch_all(&mut *tx)
     .await?;

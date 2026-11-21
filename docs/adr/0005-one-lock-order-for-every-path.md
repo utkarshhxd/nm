@@ -25,15 +25,25 @@ Every transaction that takes more than one of these takes them in this order, an
 
 ```
 1. the address advisory lock      suppressions::lock_address / lock_address_for
-2. lists rows                     lists::lock_lists / lock_lists_of_contact (for key share)
+2. lists rows                     lists::lock_lists (for key share)
 3. suppressions rows
-4. list_memberships rows
-5. consent_log rows
+4. contacts rows                  contacts::lock_contact (for key share)
+5. list_memberships rows
+6. consent_log rows
 ```
 
 Within a class, by `id` ascending. `lists::lock_lists` sorts for you.
 
-**Why this order and not another.** Three of the five positions are forced, and the other two
+**`contacts` was missing until it had produced three more cycles**, and the shape of that miss is
+worth more than the fix. Every `list_memberships` and `consent_log` row carries a foreign key to
+`contacts` exactly as it does to `lists`, so every writer took the contact row *last*, at the end
+of its statement, while `delete_contact`, `selection::delete` and `erase_contact` take it **first**
+and then cascade into those same membership rows. It is the `lists` inversion again, on a class
+nobody had named — and it was invisible because the tests that hold the `lists` class all wedge the
+contact row with a transaction that never asks for anything back, which cannot cycle. The
+antagonist was standing in the fixture.
+
+**Why this order and not another.** Four of the six positions are forced, and the other two
 follow:
 
 - `lists` cannot move below `suppressions`, because the rename trigger
@@ -44,6 +54,11 @@ follow:
 - `suppressions` must sit above `list_memberships`, because `contacts::routes::erase_contact` has
   to write the tombstone before it deletes the contact — the tombstone is what makes a concurrent
   create of that address impossible, and the contact delete is what cascades into the memberships.
+- `contacts` must sit **below `suppressions`**, because `erase_contact` writes its tombstone and
+  only then deletes the contact; and **above `list_memberships`**, because every path that deletes
+  a contact takes the row and then cascades into the memberships. Nothing forces it against
+  `lists`: no path takes both exclusively, so it sits after `lists` to keep one sequence rather
+  than two.
 - `consent_log` goes last because it is written last everywhere: it records what the membership
   write did, so it cannot precede it.
 - The advisory lock goes first because it is the only one of the five that is not a row, it is
@@ -72,22 +87,30 @@ holds its row across its whole cascade).
 
 | path | order it takes |
 |---|---|
-| `public::unsubscribe::save` (preference centre) | A, L (every candidate list), S, M, C |
-| `public::unsubscribe::one_click` | A, L (the contact's lists, locked by the sweep's own CTE), S, M, C |
-| `public::forms::apply` | A, L (the form's lists), S (read), M, C |
-| `public::confirm` | L, M, C |
-| `contacts::routes::erase_contact` | A, S, M, C (cascade). Takes no `lists` row. |
-| `contacts::import::staging::write_memberships_and_tags` | L (the job's list and every list the file names), M, C |
-| `contacts::selection::subscribe` / `unsubscribe` | L, M, C |
-| `lists::add_member` / `unsubscribe_member` | L, M, C |
+| `public::unsubscribe::save` (preference centre) | A, L (every candidate list), S, contacts, M, C |
+| `public::unsubscribe::one_click` | A, L (the contact's lists), S, contacts, M, C |
+| `public::forms::apply` | A, L (the form's lists), S (read), contacts, M, C |
+| `public::confirm` | L, contacts, M, C |
+| `contacts::routes::erase_contact` | A, S, contacts, M, C (cascade). Takes no `lists` row. |
+| `contacts::routes::delete_contact` | contacts, M, C (cascade). No tombstone, so no S. |
+| `contacts::selection::delete` | contacts, M, C (cascade), over a selection |
+| `contacts::import::staging::upsert_from_staging` | L (the job's list and every list the file names), contacts (the upsert, exclusively), M, C |
+| `contacts::selection::subscribe` / `unsubscribe` | L, contacts (the `sel` CTE), M, C |
+| `lists::add_member` / `unsubscribe_member` | L, contacts, M, C |
 | `lists::routes::delete_list` | L, S, M, C (cascade) |
 | `lists::routes::update_list` (rename) | L, S (trigger) |
+| `suppressions::routes::create_suppression` / `lift_suppression` | S, C (through `record_workspace_optout`) |
 
 ## The rule for new code
 
 If you write `list_memberships` or `consent_log`, call `lists::lock_lists` with the list ids you
-are about to name, first. If you also touch `suppressions`, do that between the two. If the write
-is about one address, take `suppressions::lock_address_for` before any of it.
+are about to name and `contacts::lock_contact` with the contact, in that order, first. If you also
+touch `suppressions`, do that between the two. If the write is about one address, take
+`suppressions::lock_address_for` before any of it.
+
+**Use what `lock_lists` returns.** A caller that inserts must narrow itself to the ids that came
+back; one that only updates may discard it, because a vanished list matches nothing and it answers
+`404` anyway. Getting that wrong is a foreign key violation reported as a `500`.
 
 If a path cannot obey this, that is worth saying out loud rather than working around — put it in
 this table with the reason, and expect the next deadlock to be there.
@@ -96,5 +119,14 @@ this table with the reason, and expect the next deadlock to be there.
 
 `jobs`, `form_lists`, `contact_tags`, `tags` and `audit_log`. None of them is taken by two paths
 in conflicting orders today: `jobs` and `form_lists` are only ever reached through a `lists`
-cascade or after the `lists` row is already held, `contact_tags` and `tags` only by the importer,
-and `audit_log` has no foreign keys and is append-only. Add them here if that changes.
+cascade or after the `lists` and `contacts` rows are already held, `contact_tags` and `tags` only
+by the importer, and `audit_log` has no foreign keys and is append-only. Add them here if that
+changes.
+
+**And the honest warning, since this document has now been wrong twice.** The claim above that a
+path obeying this cannot deadlock with another that obeys it is only as good as the list of
+classes. It said that while `contacts` was missing, and it was false. Anything with a foreign key
+that two paths reach from opposite directions is a class, whether or not it is written here; the
+test for a new one is not "is it in the order" but "does any path take it, and does any other path
+take it the other way round". `issues/38` is the enforcement story that would stop this depending
+on somebody asking that question.

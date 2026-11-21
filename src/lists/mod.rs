@@ -232,6 +232,12 @@ pub async fn add_member(
     } else {
         MembershipStatus::Subscribed
     };
+    // Position 4, before the membership and consent rows that both carry a foreign key to it.
+    // A contact deleted in the meantime is the `404` the insert's own foreign key would have
+    // produced anyway, taken a statement earlier and in order.
+    if !crate::contacts::lock_contact(&mut *db, workspace_id, contact_id).await? {
+        return Err(ApiError::NotFound);
+    }
     let written = sqlx::query!(
         r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source)
            values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end, $5)
@@ -317,6 +323,11 @@ pub async fn unsubscribe_member(
     // Position 2, before the membership row below and the consent row after it, both of which take
     // this same list row through their foreign keys. `docs/adr/0005-one-lock-order-for-every-path.md`.
     lock_lists(&mut *db, workspace_id, &[list_id]).await?;
+    // Position 4. A contact that is gone has no membership either, which is the same `404` the
+    // statement below would reach on its own.
+    if !crate::contacts::lock_contact(&mut *db, workspace_id, contact_id).await? {
+        return Err(ApiError::NotFound);
+    }
     // One statement, so one snapshot: "did this change anything" and "is there a membership at
     // all" cannot disagree. Asking separately let a membership another transaction committed in
     // between turn a 404 into a `204` over a contact who is still subscribed.

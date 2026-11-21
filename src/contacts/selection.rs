@@ -604,9 +604,21 @@ fn statement_logging(
     returning: &str,
     log: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> QueryBuilder<Postgres> {
+    // **`for key share` on `sel`: position 4, in the only place a set-based action can take it.**
+    // The membership rows this statement writes and the `consent_log` rows beside them both carry
+    // a foreign key to `contacts`, so without it the statement takes every contact row LAST, at
+    // its own end, while `delete_contact` and `selection::delete` take them first and cascade into
+    // those same memberships. `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // It is the rows this statement is already scanning, so it adds no reads; what it adds is a
+    // tuple lock per selected contact, which `MAX_SELECTION` bounds the same way it bounds
+    // everything else here. `statement` delegates here, so `tag`, `untag` and `delete` get it too:
+    // the first two need no `consent_log` row and the third takes the rows exclusively a moment
+    // later, so for them it is the `order by` that earns its place — two concurrent bulk deletes
+    // over overlapping selections now take the contact rows in the same sequence.
     let mut q = QueryBuilder::<Postgres>::new("with sel as (select id from contacts where ");
     push_selected(&mut q, sel, excluded);
-    q.push("), done as (");
+    q.push(" order by id for key share), done as (");
     action(&mut q);
     // `AssertSqlSafe`: `returning` is one of the two literals this private function is called
     // with, and nothing a client sent reaches it. `QueryBuilder::push` takes any `Display` and
@@ -761,7 +773,18 @@ pub async fn subscribe(
     };
     // Position 2: one row, however many contacts the statement below covers, taken before the
     // membership and consent rows that name it. `docs/adr/0005-one-lock-order-for-every-path.md`.
-    crate::lists::lock_lists(&mut *db, sel.workspace_id(), &[list_id]).await?;
+    //
+    // **And the answer is used, which the other callers of `lock_lists` do and this one did not.**
+    // It is the only one of them that INSERTS: a list deleted before the lock was still named by
+    // the insert, its foreign key failed, and `ApiError::Internal` answered `500` where the honest
+    // answer is that the list is not there. `confirm` and `unsubscribe_member` discard it safely
+    // because they only update, so a vanished list matches nothing and they already answer `404`.
+    if crate::lists::lock_lists(&mut *db, sel.workspace_id(), &[list_id])
+        .await?
+        .is_empty()
+    {
+        return Err(ApiError::NotFound);
+    }
     run_recorded(db, sel, excluded, list_id, (action, source_ref), |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) \
                 select ")
@@ -886,9 +909,10 @@ mod tests {
             "with sel as (select id from contacts where workspace_id = $1 and id in (select \
              m.contact_id from selection_snapshot_members m join selection_snapshots s on \
              s.workspace_id = m.workspace_id and s.id = m.snapshot_id where m.workspace_id = $2 \
-             and m.snapshot_id = $3 and s.expires_at > now()) and id <> all($4)), done as (delete \
-             from contacts where id in (select id from sel) returning 1) select (select count(*) \
-             from sel)::bigint, (select count(*) from done)::bigint"
+             and m.snapshot_id = $3 and s.expires_at > now()) and id <> all($4) order by id for \
+             key share), done as (delete from contacts where id in (select id from sel) \
+             returning 1) select (select count(*) from sel)::bigint, (select count(*) from \
+             done)::bigint"
         );
     }
 
