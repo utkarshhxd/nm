@@ -89,8 +89,8 @@ pub struct NewSendingDomain {
 /// `null`, which clears them; on any other field `null` is `422`, because there is nothing to
 /// clear it to. The domain itself cannot be changed: delete the domain and add the new one.
 ///
-/// Changing `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`, which no
-/// longer describe what is configured.
+/// Changing `signing`, `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`,
+/// which no longer describe what is configured.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSendingDomain {
@@ -504,10 +504,15 @@ pub async fn update_sending_domain(
         return_path_domain,
         dkim_private_key,
     } = input;
-    // What `checks` described is gone when any of these is sent. Sent again with the same value
-    // resets too: cheaper than reading the row to find out, and a re-check is one click.
-    let reset_checks =
-        dkim_selector.is_some() || return_path_domain.is_some() || dkim_private_key.is_some();
+    // What `checks` described is gone when any of these is sent. `signing` is one: it changes
+    // whose key has to be published at the selector, so a `dkim: pass` earned under the other mode
+    // would tell an operator a configuration is verified that nothing has checked. Sent again with
+    // the same value resets too: cheaper than reading the row to find out, and a re-check is one
+    // click.
+    let reset_checks = signing.is_some()
+        || dkim_selector.is_some()
+        || return_path_domain.is_some()
+        || dkim_private_key.is_some();
     let mut errors = Vec::new();
     let from_name_sent = new_from_name.is_some();
     let new_from_name = new_from_name

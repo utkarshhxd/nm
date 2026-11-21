@@ -825,6 +825,8 @@ async fn editing_what_was_checked_resets_the_verdict(pool: PgPool) {
         json!({"dkim_selector": "s2"}),
         json!({"return_path_domain": null}),
         json!({"dkim_private_key": pem(KEY_DER)}),
+        // Whose key must be published at the selector changes with the mode.
+        json!({"signing": "app"}),
     ] {
         t.admin.post(&check_path(t.id, id)).await.assert_status_ok();
         let r = t.admin.patch(&domain_path(t.id, id)).json(&patch).await;
@@ -1105,6 +1107,38 @@ async fn a_domain_edited_while_it_is_being_checked_is_not_given_the_old_verdict(
     assert_eq!(shown["checked_at"], Value::Null);
     assert_eq!(shown["checks"]["dkim"], json!({"status": "not_checked"}));
     assert_eq!(shown["dkim_selector"], json!("s2"));
+}
+
+#[sqlx::test]
+async fn a_domain_deleted_while_it_is_being_checked_is_404(pool: PgPool) {
+    let ns = nameserver(complete_zone()).await;
+    let t = tenant_with(&pool, "acme", |p| {
+        TestApp::with_resolver(p, resolver_for(&ns))
+    })
+    .await;
+    let id = add_domain(&t, body("example.com", "relay")).await;
+
+    let hang = ns.hold.clone().lock_owned().await;
+    let check = async { t.admin.post(&check_path(t.id, id)).await };
+    let delete = async {
+        while ns.queries.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        t.admin
+            .delete(&domain_path(t.id, id))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        drop(hang);
+    };
+    let (checked, ()) = tokio::join!(check, delete);
+
+    // Gone, not "changed": the two are told apart, and nothing was written back.
+    checked.assert_status(StatusCode::NOT_FOUND);
+    let left: i64 = sqlx::query_scalar("select count(*) from sending_domains")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }
 
 #[sqlx::test]

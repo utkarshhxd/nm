@@ -9340,7 +9340,7 @@
       },
       "UpdateSendingDomain": {
         "type": "object",
-        "description": "A field left out is left alone. `from_name`, `return_path_domain` and `dkim_private_key` may be\n`null`, which clears them; on any other field `null` is `422`, because there is nothing to\nclear it to. The domain itself cannot be changed: delete the domain and add the new one.\n\nChanging `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`, which no\nlonger describe what is configured.",
+        "description": "A field left out is left alone. `from_name`, `return_path_domain` and `dkim_private_key` may be\n`null`, which clears them; on any other field `null` is `422`, because there is nothing to\nclear it to. The domain itself cannot be changed: delete the domain and add the new one.\n\nChanging `signing`, `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`,\nwhich no longer describe what is configured.",
         "properties": {
           "dkim_private_key": {
             "type": [

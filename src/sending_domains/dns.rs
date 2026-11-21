@@ -56,7 +56,13 @@ pub fn system_resolver() -> anyhow::Result<Resolver> {
     let config = match read_system_conf() {
         Ok((config, _)) => config,
         Err(e) => {
-            tracing::warn!(error = %e, "cannot read the system resolver configuration; the DNS checker will use Cloudflare's");
+            // The names looked up are customers' domains, and this sends them to a third party.
+            // Falling back beats refusing to start; doing it silently would not be.
+            tracing::warn!(
+                error = %e,
+                fallback = "Cloudflare (1.1.1.1)",
+                "cannot read the system resolver configuration, so the DNS checker will send                  its lookups (your customers' sending domains) to Cloudflare's public resolver;                  fix the host's resolver configuration to keep them on your own infrastructure"
+            );
             ResolverConfig::udp_and_tcp(&CLOUDFLARE)
         }
     };
@@ -73,7 +79,7 @@ pub async fn check(resolver: &Resolver, d: &SendingDomain, expected_p: Option<&s
 
 /// [`check`] with the per-lookup bound given. The lookups run under `tokio::join!`, so the whole
 /// takes about one `timeout` when every nameserver is silent, not four.
-pub async fn check_within(
+async fn check_within(
     resolver: &Resolver,
     d: &SendingDomain,
     expected_p: Option<&str>,
@@ -187,7 +193,7 @@ fn exactly_one(records: &[String], version: &str, none: &str, several: &str) -> 
 
 /// SPF: a `v=spf1` record, and only one. Two is not belt and braces: RFC 7208 §4.5 makes it a
 /// permanent error, so SPF fails for the whole domain.
-pub fn spf(records: &[String]) -> CheckResult {
+fn spf(records: &[String]) -> CheckResult {
     exactly_one(
         records,
         "v=spf1",
@@ -199,7 +205,7 @@ pub fn spf(records: &[String]) -> CheckResult {
 
 /// DMARC: a `v=DMARC1` record at `_dmarc.{domain}`, and only one: a receiver that finds several
 /// ignores them all (RFC 7489 §6.6.3).
-pub fn dmarc(records: &[String]) -> CheckResult {
+fn dmarc(records: &[String]) -> CheckResult {
     exactly_one(
         records,
         "v=DMARC1",
@@ -212,7 +218,7 @@ pub fn dmarc(records: &[String]) -> CheckResult {
 /// DKIM: one `v=DKIM1` record with a non-empty `p=`, equal to `expected_p` when that is given.
 /// Whitespace inside `p=` is not part of the key (RFC 6376 §3.6.1 allows folding there), so it is
 /// dropped from both sides before they are compared.
-pub fn dkim(records: &[String], expected_p: Option<&str>) -> CheckResult {
+fn dkim(records: &[String], expected_p: Option<&str>) -> CheckResult {
     let keys: Vec<&String> = records
         .iter()
         .filter(|r| tag(r, "v").is_some_and(|v| v.eq_ignore_ascii_case("DKIM1")))
@@ -271,7 +277,7 @@ fn strip_whitespace(s: &str) -> String {
 /// the shorter. That is exact for a return path that is a subdomain of the sending domain, which
 /// is the shape every provider's instructions give; add the list if a from-domain that is itself
 /// a subdomain of one it does not own ever needs telling apart.
-pub fn aligned(domain: &str, return_path: &str) -> bool {
+fn aligned(domain: &str, return_path: &str) -> bool {
     let (a, b) = (
         domain.trim_end_matches('.').to_ascii_lowercase(),
         return_path.trim_end_matches('.').to_ascii_lowercase(),

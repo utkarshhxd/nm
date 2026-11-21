@@ -3024,8 +3024,8 @@ export interface components {
          *     `null`, which clears them; on any other field `null` is `422`, because there is nothing to
          *     clear it to. The domain itself cannot be changed: delete the domain and add the new one.
          *
-         *     Changing `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`, which no
-         *     longer describe what is configured.
+         *     Changing `signing`, `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`,
+         *     which no longer describe what is configured.
          */
         UpdateSendingDomain: {
             /** @description Absent keeps the stored key; `null` removes it; a PEM string replaces it. */
