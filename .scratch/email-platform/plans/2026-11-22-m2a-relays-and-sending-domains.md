@@ -679,6 +679,13 @@ The sequence, in order:
 4. Resolve the sending domain for the workspace, then the relays in failover order.
 5. Build with `mail::build`, sign with `mail::dkim::signed_bytes` when the domain is `app`-signed —
    otherwise take `lettre::Message::formatted()` — and submit with `Transports::send`.
+
+   **The "unsubscribe link is ours" requirement is yours to keep, not `build`'s.** Task 5's review
+   established that `build` enforces only that the URL is `https`; *whose* host it points at is
+   decided entirely by the caller. So the guarantee in spec §5.5 — that a click can never land on a
+   relay's suppression list instead of our `consent_log` — rests on this handler deriving the
+   unsubscribe URL from `config.public_url` and the M1d token machinery, and on nothing else. Build
+   it that way and give it a test that would fail if the URL came from anywhere else.
 6. Record: `Sent` → `complete`; `Transient` → `defer`; `Failed` and `Unknown` → `fail`, with the
    reason. **`Unknown` is never retried** (§5.8).
 
