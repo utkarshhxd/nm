@@ -46,6 +46,34 @@ It is bigger than the milestone it was found in, it touches every writer at once
 own review rather than a fix round. **If a seventh deadlock ever appears in this area, stop fixing
 pairs and do this instead.**
 
+## The table has been wrong twice, in the commits that wrote the rule
+
+Not a hypothetical. Both were caught by review, not by a test:
+
+- **`one_click`'s row said `A, L, S` while the code did `A, S, L`** — a path recorded as fixed that
+  was not, in the very commit that wrote the rule it violates. Benign only by accident, because
+  `unsubscribe_all` writes a row with a null `list_id` that neither the rename trigger nor
+  `delete_list`'s pre-lock touches.
+- **`delete_list` itself took position 3 before position 2**, which is the one order the ADR's own
+  derivation argues is impossible. It deadlocked against a rename and against the public
+  preference centre, and the control proved it was a regression introduced by the ADR commit.
+
+**The table is hand-maintained prose about lock order, and lock order is the thing this subsystem
+has been wrong about five rounds running.** Nothing derives the table from the code, so a row can
+describe a path that does not exist. That is the argument for the refactor above, in its sharpest
+form: it would make the order derivable rather than asserted.
+
+## The method that found the `contacts` class, written down so it can be re-run
+
+> For each table a writer references by foreign key: does the **writer** take the parent row last —
+> implicitly, through the FK's `FOR KEY SHARE` at statement end — while some **deleting** path
+> takes that same parent row first and exclusively, then reaches the child rows the writer holds?
+
+That is how `contacts` was found, one round after the previous review had declared the order
+complete. **Any new foreign key into a table a write path touches must be put through this
+question**, and the answer recorded in ADR 0005 — including a "ruled out, because…" when the
+answer is no, so the next person does not have to re-derive it.
+
 ## Why grepping for `40P01` would have missed most of this
 
 Writing a deadlock test for each of the six remaining paths turned up a distinction nobody had
