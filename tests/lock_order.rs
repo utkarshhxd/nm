@@ -1304,15 +1304,34 @@ async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
 /// writes the foreign-key columns, so it takes `for key share` on the `relays` row at the end of
 /// the statement. The **update** arm writes `tokens` and `refilled_at` only — neither is part of
 /// the foreign key — so the referential trigger does not fire and it takes nothing on the parent.
+/// **This is now a copy of the shipped statement, not a reconstruction of a plan's description of
+/// it**, and the difference mattered. While `take` did not yet exist, this constant was written
+/// from the plan's wording; Task 8 then wrote the real thing and found two departures, one of them
+/// a bug this constant still had:
+///
+/// * the insert arm is a `select … where $3 >= $4` rather than `values`, so a first take larger
+///   than the limit proposes no row and returns `false`, instead of inserting a negative balance
+///   and raising `23514` against `relay_buckets_tokens_non_negative`;
+/// * the refill is wrapped in `greatest(0, …)`. `now()` is **transaction start time**, so a taker
+///   that began later but committed first leaves `refilled_at` *ahead* of this transaction's
+///   `now()`. The elapsed interval is then slightly negative, `floor` turns that into `-1`, and
+///   the update arm **removes** a token instead of adding none. Measured: the concurrency test
+///   granted 45 of 50 before the clamp.
+///
+/// Both arms' lock behaviour is unchanged — the insert arm still writes the foreign-key columns and
+/// so still takes `for key share` on `relays`, the update arm still writes only `tokens` and
+/// `refilled_at` and so still takes nothing on the parent — which is why ADR 0005's ruling survives
+/// the change. **Keep this in step with `src/relay/bucket.rs::TAKE`**: the moment the two drift,
+/// the lock-order evidence is about a statement nothing runs.
 const DEBIT: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
-     values ($1, $2, $3::int - $4::int, now())
+     select $1, $2, $3::int - $4::int, now() where $3::int >= $4::int
      on conflict (relay_id) do update
         set tokens = least($3::int, relay_buckets.tokens
-              + floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)::int)
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60))::int)
               - $4::int,
             refilled_at = now()
       where least($3::int, relay_buckets.tokens
-              + floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)::int)
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60))::int)
               >= $4::int
      returning tokens";
 
