@@ -470,6 +470,17 @@ SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }, BIT STRING { … } }`); write it an
   `None`, so a published record that does not match the key we sign with becomes a failing check.
   Add the integration test that proves it: save a key, publish a *different* `p=` in the test
   resolver, assert the DKIM check fails and that the failure text names neither key.
+
+  **Two facts from Task 4's shipped code, which you must match rather than assume:**
+
+  1. **`dns::check`'s `expected_p` is the bare base64, not the whole record.** `public_key_txt`
+     returns `v=DKIM1; k=rsa; p=<base64>`. Pass **only the `p=` value**. Passing the whole record
+     makes the comparison fail every time, which would read as "the operator published the wrong
+     key" on a correctly configured domain — a false alarm pointing at the wrong person.
+  2. **The stored DKIM key is DER with the PEM armour stripped, and the armour is where the
+     PKCS#1-versus-PKCS#8 distinction lived.** `key_from_pem` therefore cannot tell them apart from
+     the bytes alone: **try both** (`RsaKeyPair::from_der` then `from_pkcs8`, or the reverse) and
+     fail only when neither parses. A test must cover a key saved in each format.
 - [ ] **Step 6: Run the tests and the full gate.** Commit.
 
 ---
