@@ -1327,13 +1327,21 @@ const DEBIT: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, 
      select $1, $2, $3::int - $4::int, now() where $3::int >= $4::int
      on conflict (relay_id) do update
         set tokens = least($3::int, relay_buckets.tokens
-              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60))::int)
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)))::int
               - $4::int,
             refilled_at = now()
       where least($3::int, relay_buckets.tokens
-              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60))::int)
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)))::int
               >= $4::int
      returning tokens";
+
+/// The lock-order evidence is about `DEBIT`; what runs is `bucket::take`. If they drift, the
+/// evidence is about a statement nothing executes, and nobody would notice until a production
+/// deadlock. This is the whole enforcement of "keep this in step".
+#[test]
+fn debit_is_the_statement_take_runs() {
+    assert_eq!(DEBIT, nm::relay::bucket::TAKE);
+}
 
 fn sqlstate(err: &sqlx::Error) -> String {
     err.as_database_error()

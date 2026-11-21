@@ -101,6 +101,16 @@ async fn tokens_refill_with_time(pool: PgPool) {
         take(&pool, ws, relay, 60, 30).await.expect("take"),
         "30 seconds at 60 a minute must allow 30"
     );
+    // The clock must have restarted. A `refilled_at` left where it was makes every later take
+    // refill from the original timestamp, and the bucket stops limiting at all: it refills to the
+    // limit on every call and no constraint notices, since over-refill is not a negative balance.
+    // Nothing else here would catch it: refusals never reach the update arm and a grant leaves
+    // `tokens` the same either way. Ten more, at once, can only come from refill the test earned
+    // in milliseconds, which is none.
+    assert!(
+        !take(&pool, ws, relay, 60, 10).await.expect("take"),
+        "a second take straight after must find nothing to refill"
+    );
     // What is left is whatever accrued in the test since: nought to a few. A refill that counted
     // its elapsed time from the post-update `refilled_at` would have granted nothing above.
     let left = balance(&pool, relay).await.expect("row");
@@ -128,6 +138,35 @@ async fn refill_is_capped_at_the_limit(pool: PgPool) {
     assert!(
         (0..5).contains(&left),
         "the balance must have been capped at 60, found {left} left"
+    );
+}
+
+/// `refilled_at` ahead of the transaction's `now()` is what two concurrent takers produce (`now()` is
+/// the transaction's start, so the one that began later can commit first). The concurrency test
+/// finds it by racing; this makes it deterministic. Unclamped, `floor(-5)` refills -5 and the
+/// balance drops below 9. Five seconds of drift would be needed to hide it, and it takes millis.
+#[sqlx::test]
+async fn a_refilled_at_in_the_future_does_not_shrink_the_balance(pool: PgPool) {
+    let (ws, relay) = relay_fixture(&pool).await;
+    seed(&pool, ws, relay, 10, -5).await;
+    assert!(take(&pool, ws, relay, 60, 1).await.expect("take"));
+    let left = balance(&pool, relay).await.expect("row");
+    assert!(
+        left >= 9,
+        "a negative elapsed time must refill nothing, found {left}"
+    );
+}
+
+/// A bucket idle for sixty-eight years on a limit of `i32::MAX` has a refill far beyond `int`.
+/// Cast before the cap it raises `22003`; the contract is a plain grant.
+#[sqlx::test]
+async fn a_long_idle_bucket_on_a_huge_limit_does_not_overflow(pool: PgPool) {
+    let (ws, relay) = relay_fixture(&pool).await;
+    seed(&pool, ws, relay, 0, i32::MAX).await;
+    assert!(
+        take(&pool, ws, relay, i32::MAX, 1)
+            .await
+            .expect("must not raise 22003")
     );
 }
 

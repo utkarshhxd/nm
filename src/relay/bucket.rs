@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 /// `$1` relay, `$2` workspace, `$3` the relay's limit per minute, `$4` tokens wanted.
 ///
-/// Differs from `lock_order.rs`'s `DEBIT` in one place: the insert arm is `select ... where
-/// $3 >= $4` rather than `values (...)`. A first take of more than the limit would otherwise
+/// `tests/lock_order.rs` holds a copy as `DEBIT` and asserts the two are equal, which is why this is
+/// `pub`. The insert arm is `select ... where $3 >= $4` rather than `values (...)`: a first take of more than the limit would otherwise
 /// insert `$3 - $4`, which is negative, and `relay_buckets_tokens_non_negative` would raise
 /// `23514` where this function promises `false`. With the `where`, no row is proposed, so there is
 /// no conflict and no row either: `fetch_optional` sees `None`. Both arms still have the shape the
@@ -34,20 +34,24 @@ use uuid::Uuid;
 /// not the moment the row is reached: a taker that started a millisecond later but committed first
 /// leaves `refilled_at` ahead of this transaction's `now()`, the elapsed time is negative, and an
 /// unclamped `floor` of a small negative number is `-1`. Twenty concurrent takers lost a token that
-/// way (45 granted of 50), and `DEBIT` in `lock_order.rs` has the same flaw.
+/// way (45 granted of 50).
+///
+/// The sum is `numeric` and is capped by `least` *before* it is cast to `int`. Cast first and a
+/// long-idle bucket on a high limit overflows `int` and raises `22003` rather than returning.
 ///
 /// The refill uses the row's `refilled_at` as it was before this statement, because a `set` list
 /// reads the old row. `refilled_at = now()` therefore restarts the clock only after the elapsed
 /// time was counted.
-const TAKE: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+#[doc(hidden)]
+pub const TAKE: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
      select $1, $2, $3::int - $4::int, now() where $3::int >= $4::int
      on conflict (relay_id) do update
         set tokens = least($3::int, relay_buckets.tokens
-              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60))::int)
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)))::int
               - $4::int,
             refilled_at = now()
       where least($3::int, relay_buckets.tokens
-              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60))::int)
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)))::int
               >= $4::int
      returning tokens";
 
@@ -56,6 +60,10 @@ const TAKE: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, r
 ///
 /// Debited once per claimed batch, never per message. `n <= 0` is `false` without a round trip: a
 /// batch that thinks it has no messages has nothing to spend tokens on.
+///
+/// **Pass the pool, not a transaction.** A transaction that holds a `relay_buckets` row across more
+/// than one statement is what ADR 0005's tripwire 3 fires on: the insert arm asks for `relays`
+/// last, and a held row makes this half of a cycle. One statement, one implicit transaction.
 pub async fn take(
     db: impl PgExecutor<'_>,
     workspace_id: Uuid,
