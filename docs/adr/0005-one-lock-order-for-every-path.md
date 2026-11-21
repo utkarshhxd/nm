@@ -264,11 +264,13 @@ append-only.
 
 ### Why `relays` is not a class, and the four tests that are the evidence
 
-**None of the code this section rules on exists yet.** `src/` contains no `relay` module; the
-`take` described below is the plan's wording for Task 8, reconstructed as the `DEBIT` constant in
-`tests/lock_order.rs`, and the CRUD handlers are Task 3's. The same caveat is on the path table
-above, repeated here because this is the section somebody reads in a hurry. If Task 8 writes `take`
-differently, the tripwire list at the end of this section is the part to re-check first.
+**Half the code this section rules on still does not exist.** `src/relay/` now holds the CRUD
+handlers, and `delete_relay` has been checked against this section (see the symmetric gap below).
+But `take` has not been written: what is described below is the plan's wording for Task 8,
+reconstructed as the `DEBIT` constant in `tests/lock_order.rs`. The same caveat is on the path
+table above, repeated here because this is the section somebody reads in a hurry. **If Task 8
+writes `take` differently, the tripwire list at the end of this section is the part to re-check
+first.**
 
 `relays` has the shape of a class and was expected to be one. One child, `on delete cascade`, a
 deleting path that takes the parent first, and a direct child writer — `bucket::take`, run on every
@@ -336,12 +338,27 @@ should read as *this relay is gone* and fall to the next in failover order, whic
 terms — recorded in both places because a ruling whose only carrier is this document is a ruling
 that depends on someone thinking to read it.
 
-**The symmetric gap, named so it is not mistaken for covered:** tripwire 3 fires when the *debit*
-side grows past one statement, and nothing watches the *deletion* side. The argument above is that
-neither order has two waiters, and that rests on `delete_relay` being a single statement too. A
-`delete_relay` that first reads or locks something else, then deletes, is a second waiter and the
-ruling stops holding. There is no test for that because there is no `delete_relay` yet; Task 3
-writes it, and this paragraph is what its reviewer should check it against.
+**The symmetric gap, and what checking it actually showed.** Tripwire 3 fires when the *debit* side
+grows past one statement; the deletion side needs the same test, because the argument above rests
+on `delete_relay` not being a second waiter either.
+
+`delete_relay` now exists and **is three statements** — `authorize`, the delete, then the audit
+write — so the obvious reading is that the ruling has already broken. It has not, and the reason is
+worth stating precisely, because the obvious reading was mine and it was wrong:
+
+- `authorize` is a bare `select` on `memberships`. A plain read takes no row lock.
+- `record` inserts into `audit_log`, and **`audit_log` has no foreign keys at all** (`0001`). An
+  insert into a table with no parents takes `RowExclusiveLock` on that table and asks for nothing
+  from any other. Verified against `pg_constraint`, which returns only `audit_log_pkey`, and
+  measured: the whole three-statement path holds nothing on `workspaces`, `users` or `api_keys`,
+  while an `insert into relays` in the same probe does take `RowShare` on `workspaces` — the
+  control that shows the probe would have seen such a lock had one been taken.
+
+So the deletion is still terminal. **The right test is not "is it one statement" but "does it take
+a row lock on, or wait on, anything else"** — and `delete_relay` does neither. Every audited writer
+in this codebase has exactly this shape, so this reasoning covers all of them at once rather than
+relay-by-relay, and `tests/lock_order.rs`'s graph-closure test fails on any migration that adds a
+foreign key to `audit_log`. The gap is therefore mechanically watched, not merely written down.
 
 Last, the `40P01` half from the other side: can a deletion wait forever on a bucket row a debit
 holds? It cannot, for the same reason — the holder is asking for nothing back, which is the
