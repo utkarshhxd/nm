@@ -14,6 +14,7 @@ pub mod error;
 pub mod forms;
 pub mod http;
 pub mod lists;
+pub mod mail;
 pub mod openapi;
 pub mod pagination;
 pub mod public;
