@@ -346,6 +346,22 @@ async fn the_password_round_trips_through_secrets(pool: PgPool) {
         "the column holds the password in the clear"
     );
 
+    // `implicit_tls` goes in and comes out as the other variant: the one place the enum's
+    // other spelling is exercised, on the wire and through sqlx.
+    let mut tls = body("tls", None);
+    tls["security"] = json!("implicit_tls");
+    tls["port"] = json!(465);
+    let r = t.admin.post(&relays_path(t.id)).json(&tls).await;
+    r.assert_status(StatusCode::CREATED);
+    assert_eq!(r.json::<Value>()["security"], json!("implicit_tls"));
+    let relays = nm::relay::enabled_relays(&pool, t.id).await.unwrap();
+    let securities: Vec<_> = relays
+        .iter()
+        .map(|r| (r.name.as_str(), r.security))
+        .collect();
+    assert!(securities.contains(&("tls", nm::relay::Security::ImplicitTls)));
+    assert!(securities.contains(&("primary", nm::relay::Security::StartTls)));
+
     // Scoped by workspace, like every read here: another workspace's id finds nothing.
     let other = tenant(&pool, "globex").await;
     let err = nm::relay::password(&pool, &t.admin.state.secrets, other.id, id).await;
@@ -519,19 +535,21 @@ async fn enabled_relays_orders_by_failover_then_id(pool: PgPool) {
     // Index scans off, so the query cannot lean on `relays_failover` handing the rows back in
     // `id` order for free: with it in play, dropping `, id` from the `order by` changes nothing
     // here, and this would pass on a query that is not total.
-    let mut conn = pool.acquire().await.unwrap();
+    // Local to a transaction that is dropped (rolled back), so a later test on this pooled
+    // connection cannot inherit the setting.
+    let mut tx = pool.begin().await.unwrap();
     for setting in [
         "enable_indexscan",
         "enable_bitmapscan",
         "enable_indexonlyscan",
     ] {
-        sqlx::query("select set_config($1, 'off', false)")
+        sqlx::query("select set_config($1, 'off', true)")
             .bind(setting)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .unwrap();
     }
-    let names: Vec<String> = nm::relay::enabled_relays(&mut *conn, ws)
+    let names: Vec<String> = nm::relay::enabled_relays(&mut *tx, ws)
         .await
         .unwrap()
         .into_iter()
@@ -548,6 +566,23 @@ async fn relay_writes_take_admin_and_bad_input_is_422(pool: PgPool) {
         .json(&body("primary", None))
         .await
         .assert_status(StatusCode::FORBIDDEN);
+    // The other two writes, against a relay that exists, and then proof they did nothing.
+    let id = add_relay(&t, "kept", Some(SECRET)).await;
+    t.viewer
+        .patch(&relay_path(t.id, id))
+        .json(&json!({"enabled": false}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    t.viewer
+        .delete(&relay_path(t.id, id))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    let kept: (i64, bool) =
+        sqlx::query_as("select count(*), bool_and(enabled) from relays where name = 'kept'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, (1, true));
 
     let (url, admin) = (relays_path(t.id), &t.admin);
     let post = |v: Value| {
@@ -564,6 +599,15 @@ async fn relay_writes_take_admin_and_bad_input_is_422(pool: PgPool) {
     post(unknown)
         .await
         .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Whitespace is not a name, a username or a password.
+    for (key, blank) in [("name", "   "), ("username", "  "), ("password", " 	")] {
+        let mut v = body("blank", None);
+        v[key] = json!(blank);
+        post(v)
+            .await
+            .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
     add_relay(&t, "primary", None).await;
     post(body("primary", None))

@@ -175,12 +175,14 @@ fn positive(field: &'static str, v: i32) -> Result<i32, FieldError> {
     Ok(v)
 }
 
-/// A username or password that is present must have something in it; `null` is how to say none.
-fn not_empty(field: &'static str, v: &str) -> Result<(), FieldError> {
-    if v.is_empty() {
+/// A username or password that is present must have something in it, and whitespace is not
+/// something; `null` is how to say none. Judged trimmed but stored as sent: a password's edges may
+/// be part of it, so the value is never trimmed.
+fn not_blank(field: &'static str, v: &str) -> Result<(), FieldError> {
+    if v.trim().is_empty() {
         return Err(FieldError::new(
             field,
-            "cannot be empty; send null to clear",
+            "cannot be empty or only whitespace; send null to clear",
         ));
     }
     Ok(())
@@ -329,7 +331,7 @@ pub async fn create_relay(
     );
     for (field, v) in [("username", &input.username), ("password", &input.password)] {
         if let Some(v) = v {
-            keep(not_empty(field, v), &mut errors);
+            keep(not_blank(field, v), &mut errors);
         }
     }
     let (Some(name), Some(host), Some(port), Some(rate), Some(max_connections), true) =
@@ -451,7 +453,7 @@ pub async fn update_relay(
     let security = not_null("security", security, &mut errors);
     for (field, v) in [("username", &username), ("password", &password)] {
         if let Some(Some(v)) = v {
-            keep(not_empty(field, v), &mut errors);
+            keep(not_blank(field, v), &mut errors);
         }
     }
     if !errors.is_empty() {
