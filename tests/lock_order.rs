@@ -1376,8 +1376,10 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
 ///
 /// **Say what this does and does not show, because the obvious reading of it is wrong.** It is
 /// tempting to explain the `23503` by "the row the debit holds is uncommitted and so invisible to
-/// the cascade". That mechanism is real and it is what rules out a cycle, but it is *not* in this
-/// test's causal chain: `delete from relays` locks the parent and runs its cascade scan inside one
+/// the cascade". That is not what rules out a cycle — a cycle needs two waiting transactions, and
+/// the debit is a terminal node that asks for nothing after its one statement — and the mechanism
+/// is *not* in this
+/// test's causal chain either: `delete from relays` locks the parent and runs its cascade scan inside one
 /// statement, and that statement completed before the debit inserted anything. The cascade found
 /// nothing because nothing was there yet, not because it could not see it. The invisibility
 /// argument only ever matters for the interleaving neither test can stage — and that is exactly
@@ -1423,7 +1425,8 @@ async fn a_relay_deletion_and_a_first_debit_do_not_deadlock(pool: PgPool) {
     assert_eq!(
         sqlstate(&err),
         "23503",
-        "an insert the cascade cannot see is a foreign key violation, never a deadlock: {err}"
+        "the cascade ran before this row existed, so the debit's own check finds the parent \
+         gone: a foreign key violation, never a deadlock: {err}"
     );
     assert_eq!(
         err.as_database_error().and_then(|e| e.constraint()),

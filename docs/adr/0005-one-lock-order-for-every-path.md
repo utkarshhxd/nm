@@ -239,7 +239,7 @@ a migration that adds an eleventh parent, a second child to an existing one, or 
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
 | `workspaces` | not a class | fifteen children since `0028` — it was thirteen — and no exclusive taker (below) |
 | `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
-| `relays` | **not a class** — the evidence is three tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
+| `relays` | **not a class** — the evidence is four tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
 | `sending_domains` | not a parent at all | nothing references it, so no cascade reaches rows through it and the inversion this enumeration is over has nowhere to form. It is a child of `workspaces` and nothing else |
 
 **Two measured properties this rests on, worth re-checking rather than re-deriving.** The "no
@@ -329,8 +329,16 @@ draws the wrong conclusion about why.
 `sqlx::Result<bool>`, so the violation reaches its caller as an `Err`, and the caller is Task 11's
 tick. A tick that treats it as fatal turns an operator deleting a relay into a failed batch; it
 should read as *this relay is gone* and fall to the next in failover order, which is the behaviour
-`enabled_relays` already orders for. Recorded here because the path is reachable, cheap to handle,
-and currently assigned to nobody.
+`enabled_relays` already orders for. **Task 11 owns this**, and its plan section says so in those
+terms — recorded in both places because a ruling whose only carrier is this document is a ruling
+that depends on someone thinking to read it.
+
+**The symmetric gap, named so it is not mistaken for covered:** tripwire 3 fires when the *debit*
+side grows past one statement, and nothing watches the *deletion* side. The argument above is that
+neither order has two waiters, and that rests on `delete_relay` being a single statement too. A
+`delete_relay` that first reads or locks something else, then deletes, is a second waiter and the
+ruling stops holding. There is no test for that because there is no `delete_relay` yet; Task 3
+writes it, and this paragraph is what its reviewer should check it against.
 
 Last, the `40P01` half from the other side: can a deletion wait forever on a bucket row a debit
 holds? It cannot, for the same reason — the holder is asking for nothing back, which is the
