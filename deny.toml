@@ -77,6 +77,16 @@ allow = [
 [bans]
 multiple-versions = "warn"
 
+# `lettre`'s `tracing` feature logs every line written to the relay at DEBUG, and one of those
+# lines is `AUTH PLAIN <base64>`. That is the relay's password, trivially decodable, in a log file
+# — spec §8 invariant 7 defeated by a feature nobody chose. Feature unification can turn it on
+# from any future dependency with nobody touching our `lettre` line, so this is a gate failure
+# rather than a comment asking people not to. If it ever has to be enabled, the password has to
+# stop reaching lettre as a credential first.
+[[bans.features]]
+crate = "lettre"
+deny = ["tracing"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

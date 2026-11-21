@@ -112,8 +112,9 @@ struct Key {
     security: Security,
     username: Option<String>,
     max_connections: i32,
-    /// The password's digest, never the password: this is held for as long as the process runs,
-    /// and spec §8 invariant 7 keeps a relay's password out of everything but the SMTP session.
+    /// The password's digest. Not a way to keep the secret out of memory — the client this key
+    /// belongs to holds the plaintext in lettre's `Credentials` for exactly as long — but a key
+    /// that can be compared, cloned and kept without copying the password around to do it.
     password: Option<[u8; 32]>,
 }
 
@@ -182,8 +183,7 @@ impl Transports {
     ) -> Outcome {
         let transport = match self.client(relay, password) {
             Ok(transport) => transport,
-            // The relay cannot be connected to as configured. Offering it again changes nothing.
-            Err(reason) => return Outcome::Failed(reason),
+            Err(outcome) => return outcome,
         };
         match tokio::time::timeout(self.session_timeout, transport.send_raw(envelope, bytes)).await
         {
@@ -220,7 +220,7 @@ impl Transports {
         &self,
         relay: &Relay,
         password: Option<&str>,
-    ) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
+    ) -> Result<AsyncSmtpTransport<Tokio1Executor>, Outcome> {
         let key = Key::of(relay, password);
         // A `std::sync::Mutex` on an async worker: the critical section builds a client and clones
         // an `Arc`, and never awaits. A poisoned lock means another send panicked, which says
@@ -243,21 +243,28 @@ impl Transports {
     }
 }
 
+/// A client for `relay`, or the outcome to record instead.
+///
+/// The two ways this fails are not the same failure. A port outside `u16` is a relay that cannot
+/// be connected to however often it is tried. Building the TLS parameters reads the machine's
+/// certificate store and its crypto provider, and that can fail for reasons that have nothing to
+/// do with this message — recording `Failed` there would destroy a message over an environment
+/// hiccup, since `Failed` means never offer it again.
 fn build(
     relay: &Relay,
     password: Option<&str>,
     plaintext: bool,
-) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
-    let port =
-        u16::try_from(relay.port).map_err(|_| format!("port {} is not a port", relay.port))?;
+) -> Result<AsyncSmtpTransport<Tokio1Executor>, Outcome> {
+    let port = u16::try_from(relay.port)
+        .map_err(|_| Outcome::Failed(format!("port {} is not a port", relay.port)))?;
     // The fence under `plaintext_for_tests`: in the clear, this reaches the loopback interface and
     // nothing else. A relay's password on an open socket to another machine is the one way that
     // constructor could do harm, and it cannot be reached from here.
     if plaintext && !is_loopback(&relay.host) {
-        return Err(format!(
+        return Err(Outcome::Failed(format!(
             "{} is not loopback: a plaintext transport may not leave this machine",
             relay.host
-        ));
+        )));
     }
     let mut builder = if plaintext {
         AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&relay.host)
@@ -266,13 +273,17 @@ fn build(
             Security::ImplicitTls => AsyncSmtpTransport::<Tokio1Executor>::relay(&relay.host),
             Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&relay.host),
         }
-        .map_err(|e| format!("{} cannot be connected to: {e}", relay.host))?
+        .map_err(|e| Outcome::Transient(format!("{} cannot be connected to: {e}", relay.host)))?
     };
     builder = builder
         .port(port)
         // lettre uses this for the connect, and for nothing else in the async client: everything
         // after it is bounded by `SESSION_TIMEOUT` in `send`.
         .timeout(Some(CONNECT_TIMEOUT))
+        // This does not cap concurrent sessions, whatever the column is called: lettre opens a
+        // new connection whenever the parked list is empty, and `max_size` only bounds how many
+        // are kept on recycle. What holds the product to what a relay will take is the token
+        // bucket, not this.
         .pool_config(PoolConfig::new().max_size(relay.max_connections.max(1) as u32));
     // No username, no AUTH. A username with no password is a half-configured relay, and offering
     // an empty password in its place would just turn that into a credential error.
@@ -401,6 +412,19 @@ mod tests {
         );
     }
 
+    /// A port that is not a port will never become one; the certificate store that the TLS
+    /// parameters are built from can be a bad minute on this machine. Only the first is `Failed`.
+    /// The second is not exercised here: making it fail means breaking the host's cert store.
+    #[test]
+    fn a_port_that_is_not_a_port_is_failed_not_transient() {
+        let mut relay = relay();
+        relay.port = 70_000;
+        assert!(matches!(
+            build(&relay, None, false),
+            Err(Outcome::Failed(_))
+        ));
+    }
+
     #[test]
     fn a_plaintext_transport_is_fenced_to_this_machine() {
         for here in ["127.0.0.1", "::1", "localhost"] {
@@ -411,7 +435,7 @@ mod tests {
             let mut relay = relay();
             relay.host = away.to_owned();
             assert!(
-                build(&relay, Some("pw"), true).is_err(),
+                matches!(build(&relay, Some("pw"), true), Err(Outcome::Failed(_))),
                 "a plaintext transport was built for {away}"
             );
         }
