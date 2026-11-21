@@ -607,7 +607,30 @@ async fn relay_writes_take_admin_and_bad_input_is_422(pool: PgPool) {
         post(v)
             .await
             .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        // PATCH validates too. Without this the rule is enforced on one verb of two, which is the
+        // shape of the defect this test already had once for the role gate.
+        let mut patched = json!({});
+        patched[key] = json!(blank);
+        t.admin
+            .patch(&relay_path(t.id, id))
+            .json(&patched)
+            .await
+            .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     }
+
+    // A credential is stored exactly as sent. Rejecting an all-whitespace password and trimming a
+    // real one are one `.trim()` apart, and the second silently breaks every login against a relay
+    // whose password genuinely has an edge space — a failure that looks like a wrong password.
+    let padded = "  s3cret  ";
+    let spaced = add_relay(&t, "padded", Some(padded)).await;
+    assert_eq!(
+        nm::relay::password(&t.admin.pool, &t.admin.state.secrets, t.id, spaced)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(padded),
+        "the stored password was altered on the way in"
+    );
 
     add_relay(&t, "primary", None).await;
     post(body("primary", None))

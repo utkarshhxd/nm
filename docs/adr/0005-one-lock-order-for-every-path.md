@@ -131,13 +131,15 @@ holds its row across its whole cascade).
 | `contacts::selection::tag` | the `tags` row (`for key share`), `contact_tags` |
 | `suppressions::routes::create_suppression` / `lift_suppression` | S, C (through `record_workspace_optout`) |
 
-**The rows below are M2a's writers, and none of them exists in code yet.** At the time this was
-written `src/` contains no `relay`, `sending_domains` or `worker` module — `grep -rn relay src/`
-returns nothing. They are listed because the ruling in the next section is about them, and a
-reader must not take their presence in this table for evidence that anybody read them. Plan tasks
-3, 4, 8, 9 and 10 own them; whoever lands each one re-reads its row rather than assuming it.
+**The rows below are M2a's writers, and most of them do not exist in code yet.** `src/relay/`'s
+CRUD handlers have landed (task 3) and their rows have been checked against the real code; `take`,
+`sending_domains` and `worker` have not — `grep -rn 'mod sending_domains\|mod worker' src/` returns
+nothing. An unchecked row is listed because the ruling in the next section is about it, and **a
+reader must not take a row's presence in this table for evidence that anybody read the code**. Plan
+tasks 4, 8, 9 and 10 own what is left; whoever lands each one re-reads its row rather than assuming
+it, and moves it across the line below.
 
-| path (M2a, not yet written) | order it takes |
+| path (M2a; `relay::routes::*` checked, the rest not yet written) | order it takes |
 |---|---|
 | `relay::routes::create_relay` / `update_relay` | the `relays` row alone. A rename writes `name`, which `relays_workspace_name_key` makes a key column, so it takes `for update` and **not** `for no key update` |
 | `relay::routes::delete_relay` | the `relays` row, then `relay_buckets` (cascade) |

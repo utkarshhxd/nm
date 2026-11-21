@@ -60,8 +60,19 @@ async fn blocked(probe: &mut sqlx::PgConnection) -> i64 {
 /// because fourteen concurrent `sqlx::test` databases made 400 ms too short. Waiting on the
 /// condition instead is both deterministic and loud: if the interleaving does not form, this
 /// panics saying so.
+/// **The budget is 30 seconds and it has been raised twice; raise it again rather than deleting a
+/// test.** It was 400 ms, which was too short once fourteen concurrent `sqlx::test` databases
+/// existed; then 6 s, which was enough while the machine was CPU-capped to two cores. Uncapped on
+/// sixteen, `cargo test` runs every integration binary at once and the whole box saturates, so the
+/// blocked session takes longer to appear than it ever did on a slower machine — a result that
+/// reads backwards until you see why.
+///
+/// This costs nothing when it works: the loop returns the moment the condition holds, so the
+/// budget is only ever spent on a run that was going to fail anyway. The failure it exists to
+/// prevent is the opposite trade, and far worse — a budget too small fails OPEN in effect, because
+/// the honest panic it produces is indistinguishable from flakiness and gets re-run until green.
 async fn settle(probe: &mut sqlx::PgConnection, n: i64) {
-    for _ in 0..240 {
+    for _ in 0..1200 {
         if blocked(probe).await >= n {
             return;
         }
@@ -1275,11 +1286,20 @@ async fn relay_fixture(pool: &PgPool, bucket: bool) -> (Uuid, Uuid) {
     .await
     .expect("relay");
     if bucket {
-        // Forty and not the relay's limit of sixty, so that the two arms of `DEBIT` return
-        // different numbers: the update arm answers 30 from here, the insert arm would answer 50.
-        // Seeded at the limit they answer the same thing and the assertion cannot tell them apart.
+        // Ten, and the reason is a bug this seeding has already had. `DEBIT`'s update arm answers
+        // `least(60, seeded + elapsed_seconds) - 10`, because the relay's limit of 60 a minute is
+        // exactly one token a second. Seeded at 40 it answers 30 only while the test is
+        // instantaneous, drifts up by one a second, and **reaches the insert arm's 50 after twenty
+        // seconds** — at which point the assertion that tells the two arms apart silently stops
+        // telling them apart. It passed only because the machine was CPU-capped at the time.
+        //
+        // Seeded at 10 the update arm answers `elapsed` — nought to a handful — against the insert
+        // arm's unchanging 50, so the two are forty apart and stay that way for the best part of a
+        // minute. The assertions below are written as bounds rather than equalities for the same
+        // reason: the quantity genuinely is time-dependent, and a test that pretends otherwise is
+        // a test that passes on a fast machine and fails on a slow one.
         sqlx::query(
-            "insert into relay_buckets (relay_id, workspace_id, tokens) values ($1, $2, 40)",
+            "insert into relay_buckets (relay_id, workspace_id, tokens) values ($1, $2, 10)",
         )
         .bind(relay)
         .bind(ws)
@@ -1550,10 +1570,11 @@ async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) 
          the parent, so `relays` IS a lock class and ADR 0005's ruling on it is wrong",
     )
     .expect("the debit");
-    assert_eq!(
-        left, 30,
-        "the forty the bucket held less the ten this tick took. 50 would mean the INSERT arm ran \
-         — a different statement taking a different lock, and not the one under test here"
+    assert!(
+        left < 40,
+        "the ten the bucket held, plus a second's refill per second elapsed, less the ten this \
+         tick took — so a small number. 50 would mean the INSERT arm ran: a different statement \
+         taking a different lock, and not the one under test here. Got {left}"
     );
 
     held.commit().await.expect("release the wedge");
@@ -1586,9 +1607,10 @@ async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool
         .fetch_one(&mut *debiting)
         .await
         .expect("the debit");
-    assert_eq!(
-        left, 30,
-        "the premise: the UPDATE arm ran and took its tokens. 50 would be the insert arm"
+    assert!(
+        left < 40,
+        "the premise: the UPDATE arm ran and took its tokens. 50 would be the insert arm. \
+         Got {left}"
     );
 
     let deleting = tokio::spawn({
