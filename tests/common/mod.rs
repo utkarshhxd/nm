@@ -3,6 +3,9 @@
 // Each test binary uses a different subset of the harness.
 #![allow(dead_code)]
 
+/// An in-process SMTP server, for `tests/relay_transport.rs`.
+pub mod smtp_sink;
+
 use std::net::SocketAddr;
 
 use axum::Router;

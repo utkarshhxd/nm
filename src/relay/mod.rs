@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{crypto::secrets::Secrets, error::ApiResult};
 
 pub mod routes;
+pub mod transport;
 
 /// How the connection to the relay is secured. Stored as text under a `check` constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
