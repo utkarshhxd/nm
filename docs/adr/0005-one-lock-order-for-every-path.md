@@ -304,9 +304,12 @@ database and neither of them exercises it**:
 | **A** — the deletion's statement completes first | `delete from relays` locks the parent **and** runs its cascade scan inside one statement, and it did both before the debit inserted anything. The cascade found no bucket row because none existed yet, not because it could not see one. The debit then queues on the parent, the deletion commits | **`23503`** on `relay_buckets_relay_fk` |
 | **B** — the debit's statement completes first | the debit holds its new bucket row *and* the `for key share` its insert arm took. The deletion blocks on the **parent** row — measured at 2.51 s in the review's harness, which is that harness's hold time and not a property of anything — then the debit commits, the deletion takes the relay, and its cascade now sees a committed child row and takes that too | **no error at all**, both commit |
 
-So the honest statement of the ruling is not about invisibility. It is this: **the insert arm holds
-nothing the deletion can queue behind, and once its one statement is done it asks for nothing
-further.** A cycle needs every node to be both a holder and a waiter. In order B the debit is a
+So the honest statement of the ruling is not about invisibility. It is this: **once its one
+statement is done, the insert arm asks for nothing further.** Note what that does *not* say: the
+deletion certainly can and does queue behind it — on the parent row, for the 2.51 s of order B
+above. Queuing behind the debit is fine. What matters is that the debit is not itself queued behind
+anything, so the wait is one-directional. A cycle needs every node to be both a holder and a
+waiter. In order B the debit is a
 terminal node in the wait-for graph — it has the parent lock and wants nothing — so the deletion
 waits and that is the end of it. In order A the debit is the only waiter. Neither order has two
 waiters, so neither can cycle.
