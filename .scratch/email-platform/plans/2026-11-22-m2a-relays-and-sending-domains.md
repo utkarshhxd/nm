@@ -640,7 +640,12 @@ arm, and add `a_take_larger_than_the_limit_returns_false_rather_than_raising` to
   query in `0023`, and re-deriving it is how the last milestone's defects happened.**
 - Produces:
   ```rust
-  pub const LEASE_SECS: i64 = 120;
+  // IMPORT the lease; do not declare a second one. Task 7 put `JOB_LEASE` in
+  // `src/relay/transport.rs` so that its compile-time assertion
+  // (`SESSION_TIMEOUT < JOB_LEASE`) and its hang test share one value. A second constant here
+  // would let the two drift, and the failure that follows is a tick outliving its lease — the
+  // double send this milestone's whole outcome table exists to prevent.
+  pub use crate::relay::transport::JOB_LEASE;
   pub const BATCH: i64 = 16;
   pub const POLL: Duration = Duration::from_secs(1);   // with jitter
   pub struct Claimed {
