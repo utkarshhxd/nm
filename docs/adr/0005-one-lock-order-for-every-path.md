@@ -131,6 +131,21 @@ holds its row across its whole cascade).
 | `contacts::selection::tag` | the `tags` row (`for key share`), `contact_tags` |
 | `suppressions::routes::create_suppression` / `lift_suppression` | S, C (through `record_workspace_optout`) |
 
+**The rows below are M2a's writers, and none of them exists in code yet.** At the time this was
+written `src/` contains no `relay`, `sending_domains` or `worker` module — `grep -rn relay src/`
+returns nothing. They are listed because the ruling in the next section is about them, and a
+reader must not take their presence in this table for evidence that anybody read them. Plan tasks
+3, 4, 8, 9 and 10 own them; whoever lands each one re-reads its row rather than assuming it.
+
+| path (M2a, not yet written) | order it takes |
+|---|---|
+| `relay::routes::create_relay` / `update_relay` | the `relays` row alone. A rename writes `name`, which `relays_workspace_name_key` makes a key column, so it takes `for update` and **not** `for no key update` |
+| `relay::routes::delete_relay` | the `relays` row, then `relay_buckets` (cascade) |
+| `relay::bucket::take` | `relay_buckets`, then `relays` (`for key share`) — **on its insert arm only**. The update arm writes `tokens` and `refilled_at`, so no referential trigger fires and it takes nothing on `relays` |
+| `sending_domains::routes::*` and the DNS checker's write-back | the `sending_domains` row alone; nothing references it |
+| `worker::claim` / `complete` / `fail` / `defer` | `jobs` rows alone, `for update skip locked`. `jobs` is a child of `lists` and `contacts` and is a parent of nothing |
+| `worker::confirmation::handle` | none of these. It reads `suppressions`, `sending_domains` and `relays`, and every write it makes goes through the four rows above |
+
 ## The rule for new code
 
 If you write `list_memberships` or `consent_log`, call `lists::lock_lists` with the list ids you
@@ -156,7 +171,60 @@ the route that is not guesswork.
 rows through a parent's `on delete` action.** The cascading path takes the parent first; the direct
 writer takes the child first and the parent last, through its own foreign key at the end of its
 statement. That is the inversion, every time. So the enumeration is over **foreign key parents**,
-because that is what bounds the set of cascades — there are nine, and every one is ruled on:
+because that is what bounds the set of cascades.
+
+**This is the query that produces the set, and the next milestone runs this one rather than
+inventing its own.** It is derived from the catalog, not from the migrations and not from this
+document — reading the document is how it was wrong twice.
+
+```sql
+select confrelid::regclass::text as parent,
+       count(*) as fks,
+       string_agg(distinct conrelid::regclass::text || ' (' || confdeltype::text || ')', ', ')
+         as children
+from pg_constraint
+where contype = 'f' and connamespace = 'public'::regnamespace
+group by 1
+order by 1;
+```
+
+`confdeltype` is the `on delete` action and is the half that matters: `c` cascades, `n` nulls the
+column, `a` and `r` refuse. Against a database migrated from nothing:
+
+```
+bash scripts/dev.sh bash -c 'export DATABASE_URL=postgres://nm:nm@postgres:5432/nm_enum; \
+  sqlx database create && sqlx migrate run --source ./migrations'
+docker compose -f docker-compose.dev.yml -p nm exec -T postgres psql -U nm -d nm_enum -c "<query>"
+```
+
+`psql` is in the `postgres` service, not in the dev container, which is why the second line does
+not go through `scripts/dev.sh`. As of `0028` it answers:
+
+```
+      parent         | fks | children
+---------------------+-----+---------------------------------------------------------------
+ api_keys            |   1 | selection_snapshots (n)
+ contacts            |   4 | consent_log (c), contact_tags (c), jobs (c), list_memberships (c)
+ forms               |   1 | form_lists (c)
+ imports             |   1 | import_errors (c)
+ lists               |   6 | consent_log (n), form_lists (c), imports (n), jobs (c),
+                     |     | list_memberships (c), suppressions (n)
+ relays              |   1 | relay_buckets (c)
+ selection_snapshots |   1 | selection_snapshot_members (c)
+ tags                |   1 | contact_tags (c)
+ users               |  12 | api_keys (n), auth_challenges (c), imports (n), invites (n),
+                     |     | memberships (c), passkeys (c), recovery_codes (c), segments (n),
+                     |     | selection_snapshots (n), sessions (c), suppressions (n)
+ workspaces          |  15 | api_keys (c), contacts (c), custom_fields (c), forms (c),
+                     |     | imports (c), invites (c), jobs (c), lists (c), memberships (c),
+                     |     | relays (c), segments (c), selection_snapshots (c),
+                     |     | sending_domains (c), suppressions (c), tags (c)
+```
+
+**Ten parents, and every one is ruled on.** `0028` added exactly one, `relays`. `sending_domains`
+is listed below the ten although it is not a parent, because it was the other table asked about
+and the answer is load-bearing. `tests/lock_order.rs` asserts this set has not moved, so the
+migration that adds an eleventh fails there rather than being noticed by somebody.
 
 | parent | ruling | why |
 |---|---|---|
@@ -167,8 +235,10 @@ because that is what bounds the set of cascades — there are nine, and every on
 | `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
 | `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
-| `workspaces` | not a class | thirteen children and no exclusive taker (below) |
-| `users` | not a class | twelve children and no exclusive taker (below) |
+| `workspaces` | not a class | fifteen children since `0028` — it was thirteen — and no exclusive taker (below) |
+| `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
+| `relays` | **not a class** — the evidence is three tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
+| `sending_domains` | not a parent at all | nothing references it, so no cascade reaches rows through it and the inversion this enumeration is over has nowhere to form. It is a child of `workspaces` and nothing else |
 
 **Two measured properties this rests on, worth re-checking rather than re-deriving.** The "no
 cycle" result for `selection::tag` depends on Postgres granting a compatible `FOR KEY SHARE` past
@@ -180,7 +250,7 @@ below it already took that same row through its own foreign key and held it to c
 change moves the acquisition point by microseconds and closes a window, rather than extending a
 hold.
 
-**"No exclusive taker" is the load-bearing phrase for the last three**, and it rests on a Postgres
+**"No exclusive taker" is the load-bearing phrase for `api_keys`, `workspaces` and `users`**, and it rests on a Postgres
 rule rather than on a count: an `UPDATE` that changes no column of a candidate key takes
 `FOR NO KEY UPDATE`, which does **not** conflict with the `FOR KEY SHARE` a foreign key check
 takes. Every update to these three touches non-key columns only, and `src/` contains no
@@ -189,6 +259,62 @@ update starts changing a key column, they become classes the same day.
 
 `audit_log` is outside all of this: it has no foreign keys, nothing deletes from it, and it is
 append-only.
+
+### Why `relays` is not a class, and the three tests that are the evidence
+
+`relays` has the shape of a class and was expected to be one. One child, `on delete cascade`, a
+deleting path that takes the parent first, and a direct child writer — `bucket::take`, run on every
+worker tick — that takes the child first and the parent last through its own foreign key. That is
+the inversion in the paragraph above this table, word for word. It is still not a class, and the
+reason is in the statement rather than in the shape, so it is written down here with what measured
+it. A ruling with no evidence is what this section exists to prevent.
+
+`take` is one `insert … on conflict (relay_id) do update`, and **its two arms take different
+locks**:
+
+- **The insert arm** — a relay's first tick, when no bucket row exists — writes the foreign key
+  columns, so the referential check takes `for key share` on the `relays` row at the end of the
+  statement. Child first, parent last: the inversion. It cannot close a cycle, because the bucket
+  row it is holding is one it has just inserted, and an uncommitted insert is invisible to a
+  concurrent deletion's cascade. There is nothing for the deletion to wait on, so it commits and
+  the referential check finds the parent gone. That is the `23503` half of the split, not `40P01`,
+  and `a_relay_deletion_and_a_first_debit_do_not_deadlock` asserts the exact SQLSTATE and the
+  constraint name — reached through a real interleaving, with `settle` failing the test if the
+  debit never blocks on the deletion.
+- **The update arm** — every tick after the first — writes `tokens` and `refilled_at` only.
+  Neither is part of the foreign key, so Postgres fires no referential trigger and the statement
+  takes **nothing at all** on `relays`. The path that would invert simply does not take the second
+  lock. `a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay` holds the `relays` row
+  `for update` and shows the debit completing anyway, with a control on the same wedge proving the
+  wedge is real: the `for key share` the *insert* arm would take does block.
+
+So the only remaining question is whether a deletion can wait forever on a bucket row the debit
+holds, which is the `40P01` half. It cannot: the holder is asking for nothing back, which is the
+same reason the ADR gives for `tags`' unlocked writers.
+`a_relay_deletion_waits_for_a_debit_rather_than_deadlocking` runs exactly that — a committed bucket
+row, held mid-transaction, with a relay deletion queued behind the cascade — and the deletion waits
+and then commits.
+
+**Measured, and worth not re-deriving: an `UPDATE` that writes a foreign key column back to the
+value it already held takes no lock on the parent either.** Postgres's referential trigger
+short-circuits on unchanged keys, which was found by trying to break the update-arm test with
+`set workspace_id = $2` and watching it stay green. So the ruling survives a future `take` that
+restates `workspace_id` redundantly. It does **not** survive one that changes it.
+
+**The tripwire, written as the thing to check rather than as a prediction.** `relays` becomes a
+class the day any of these is true, and each is a one-line check against the schema or `src/`:
+
+- a second child is added to `relays`, so that two paths can reach its rows by different routes;
+- any path **updates** an existing `relay_buckets` row's `workspace_id` or `relay_id`, which makes
+  the update arm take the parent and closes the cycle the insert arm cannot;
+- `relay_buckets` gains a writer other than `take` — a reset, a backfill, an operator "clear the
+  bucket" endpoint — that holds the bucket row across more than its own statement.
+
+`sending_domains` has no tripwire of this kind because it has no children; it has the other one.
+The day anything references it — a campaign naming the domain it sends as is the obvious candidate
+— it becomes a parent, the enumeration is ten plus one, and it is ruled on then. `0028` already
+carries the `unique (workspace_id, id)` such a reference would point at, so the intent is on the
+record even though the reference is not.
 
 ### The tripwire on `tags`, and what to check rather than predict
 
@@ -220,9 +346,10 @@ as a known gap rather than as a new finding.
 **The honest warning, since this document has now been wrong twice.** The claim above that a path
 obeying this cannot deadlock with another that obeys it is only as good as the enumeration. It said
 that while `contacts` was missing and while `form_lists` was listed as covered. What is different
-now is that the enumeration is **closed and mechanical**: nine parents, all ruled on, each with a
-reason that can be re-checked against the schema rather than against somebody's memory. If a tenth
-parent appears, it is a new row in that table. If a class appears that is not reachable from any of
-the nine, the method itself is unsound and that is a bigger conversation than another round.
-`issues/38` is the enforcement story that would stop any of this depending on somebody remembering
-to ask.
+now is that the enumeration is **closed and mechanical**: ten parents, all ruled on, each with a
+reason that can be re-checked against the schema rather than against somebody's memory. If an
+eleventh parent appears, it is a new row in that table — and since `0028` that no longer depends on
+anybody remembering, because `the_foreign_key_parents_are_the_ten_the_adr_rules_on` in
+`tests/lock_order.rs` fails on the migration that adds one. If a class appears that is not
+reachable from any of the ten, the method itself is unsound and that is a bigger conversation than
+another round. `issues/38` is the enforcement story this test is the first instalment of.

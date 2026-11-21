@@ -1217,3 +1217,268 @@ async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
     no_server_error("the list deletion", &deleted);
     no_server_error("the import start", &started);
 }
+
+// ---- M2a: the new foreign-key parents, re-enumerated ------------------------------------------
+//
+// Migration `0028` added `relays`, `sending_domains` and `relay_buckets`, so ADR 0005's
+// enumeration was re-run against `pg_constraint` rather than re-read. It found **one** new parent,
+// `relays`, whose only child is `relay_buckets`; `sending_domains` is referenced by nothing and so
+// is not a parent at all. Both are ruled "not a class", and the four tests below are what that
+// ruling rests on — a ruling with no evidence is the thing that section of the ADR exists to stop.
+
+/// The shape Task 8's `bucket::take` will have: one `insert … on conflict do update` that refills
+/// by elapsed time, caps at the relay's per-minute limit and subtracts `n`.
+///
+/// One thing about it is load-bearing here and the whole ruling rests on it. The **insert** arm
+/// writes the foreign-key columns, so it takes `for key share` on the `relays` row at the end of
+/// the statement. The **update** arm writes `tokens` and `refilled_at` only — neither is part of
+/// the foreign key — so the referential trigger does not fire and it takes nothing on the parent.
+const DEBIT: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+     values ($1, $2, $3::int - $4::int, now())
+     on conflict (relay_id) do update
+        set tokens = least($3::int, relay_buckets.tokens
+              + floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)::int)
+              - $4::int,
+            refilled_at = now()
+      where least($3::int, relay_buckets.tokens
+              + floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)::int)
+              >= $4::int
+     returning tokens";
+
+fn sqlstate(err: &sqlx::Error) -> String {
+    err.as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()))
+        .unwrap_or_else(|| format!("not a database error: {err}"))
+}
+
+/// A workspace and one relay. `bucket` seeds the `relay_buckets` row, which is what tells the two
+/// arms of `DEBIT` apart: absent is a relay's first tick, present is every tick after it.
+async fn relay_fixture(pool: &PgPool, bucket: bool) -> (Uuid, Uuid) {
+    let ws = Uuid::now_v7();
+    sqlx::query("insert into workspaces (id, slug, name) values ($1, 'acme', 'acme')")
+        .bind(ws)
+        .execute(pool)
+        .await
+        .expect("workspace");
+    let relay = Uuid::now_v7();
+    sqlx::query(
+        "insert into relays (id, workspace_id, name, host, port, security, rate_limit_per_minute)
+         values ($1, $2, 'primary', 'smtp.example.com', 587, 'starttls', 60)",
+    )
+    .bind(relay)
+    .bind(ws)
+    .execute(pool)
+    .await
+    .expect("relay");
+    if bucket {
+        sqlx::query(
+            "insert into relay_buckets (relay_id, workspace_id, tokens) values ($1, $2, 60)",
+        )
+        .bind(relay)
+        .bind(ws)
+        .execute(pool)
+        .await
+        .expect("bucket");
+    }
+    (ws, relay)
+}
+
+/// **The enumeration is closed, and this is what closes it.** ADR 0005 ruled on nine foreign-key
+/// parents; `0028` made it ten. `issues/38` records the method the ADR's own history argues for —
+/// a new parent, or a new cascade, means re-running the enumeration rather than merely obeying the
+/// order — and nothing enforced it, which is how `form_lists` got through once already.
+///
+/// So this fails on the migration that adds the eleventh, and names what to do about it. It is
+/// deliberately an equality and not a superset: a parent that *disappears* also invalidates the
+/// ruling written about it.
+#[sqlx::test]
+async fn the_foreign_key_parents_are_the_ten_the_adr_rules_on(pool: PgPool) {
+    let parents: Vec<String> = sqlx::query_scalar(
+        "select distinct confrelid::regclass::text from pg_constraint \
+         where contype = 'f' and connamespace = 'public'::regnamespace order by 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read pg_constraint");
+
+    assert_eq!(
+        parents,
+        [
+            "api_keys",
+            "contacts",
+            "forms",
+            "imports",
+            "lists",
+            "relays",
+            "selection_snapshots",
+            "tags",
+            "users",
+            "workspaces",
+        ],
+        "the set of foreign key parents has moved. ADR 0005's enumeration is over exactly this \
+         set, so it is now out of date: re-run the query in its \"The method\" section and rule \
+         on what changed, rather than editing this list to match"
+    );
+}
+
+/// **A relay deleted under its first debit raises `23503`, not `40P01`, and that is the whole
+/// reason the insert arm is not a class.** The debit holds a `relay_buckets` row it has just
+/// inserted and then asks for the `relays` row through `relay_buckets_relay_fk` — child first,
+/// parent last, which is the inversion shape every class in the ADR has. It cannot cycle, because
+/// the row it holds is uncommitted and so invisible to the deletion's cascade: there is nothing
+/// for the deletion to wait on, so it commits and the referential check finds the parent gone.
+///
+/// The `settle` is what stops this passing vacuously — without it the deletion could commit before
+/// the debit ever looked, and the `23503` would be a plain sequence rather than an interleaving.
+#[sqlx::test]
+async fn a_relay_deletion_and_a_first_debit_do_not_deadlock(pool: PgPool) {
+    let (ws, relay) = relay_fixture(&pool, false).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let mut deleting = pool.begin().await.unwrap();
+    sqlx::query("delete from relays where id = $1")
+        .bind(relay)
+        .execute(&mut *deleting)
+        .await
+        .expect("delete the relay");
+
+    let debiting = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>(DEBIT)
+                .bind(relay)
+                .bind(ws)
+                .bind(60i32)
+                .bind(10i32)
+                .fetch_optional(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    deleting.commit().await.expect("commit the deletion");
+    let err = debiting
+        .await
+        .expect("the debit")
+        .expect_err("the relay is gone, so its bucket row cannot be written");
+    assert_eq!(
+        sqlstate(&err),
+        "23503",
+        "an insert the cascade cannot see is a foreign key violation, never a deadlock: {err}"
+    );
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.constraint()),
+        Some("relay_buckets_relay_fk"),
+        "the violation names the relay reference, not some other constraint: {err}"
+    );
+}
+
+/// **Every debit after the first takes no lock on its relay at all.** This is the measured fact
+/// behind the ruling, and the one the ADR would be wrong without: the update arm writes `tokens`
+/// and `refilled_at`, so Postgres fires no referential trigger and an exclusive holder of the
+/// `relays` row does not stand in its way.
+///
+/// The control is the half that keeps this honest. A wedge that silently failed to take the row
+/// would let the debit through for the wrong reason and the test would still go green, so the same
+/// `for key share` the **insert** arm takes is raced against the same wedge first and must block.
+/// Break the ruling — make the update arm write `workspace_id` or `relay_id` — and the debit
+/// blocks behind the wedge until the timeout names it.
+#[sqlx::test]
+async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) {
+    let (ws, relay) = relay_fixture(&pool, true).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    // Stands for every exclusive taker of a relay row: the delete, and a rename, whose `name` is
+    // part of `relays_workspace_name_key` and so takes `for update`, not `for no key update`.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from relays where id = $1 for update")
+        .bind(relay)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the relay");
+
+    let control = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query("select 1 from relays where id = $1 for key share")
+                .bind(relay)
+                .fetch_all(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    let left = tokio::time::timeout(
+        Duration::from_secs(10),
+        sqlx::query_scalar::<_, i32>(DEBIT)
+            .bind(relay)
+            .bind(ws)
+            .bind(60i32)
+            .bind(10i32)
+            .fetch_one(&pool),
+    )
+    .await
+    .expect(
+        "the debit blocked behind an exclusive lock on its relay row: the update arm DOES take \
+         the parent, so `relays` IS a lock class and ADR 0005's ruling on it is wrong",
+    )
+    .expect("the debit");
+    assert_eq!(left, 50, "sixty tokens less the ten this tick took");
+
+    held.commit().await.expect("release the wedge");
+    control
+        .await
+        .expect("the control")
+        .expect("the lock the insert arm would have taken");
+}
+
+/// **A relay deletion waits for a debit in flight; it does not deadlock with one.** This is the
+/// `40P01` half of the ADR's split, and it is unreachable here: the debit holds a bucket row the
+/// cascade *can* see, which is exactly the condition that closes the cycle everywhere else, and
+/// still nothing cycles — because the holder is asking for nothing back.
+///
+/// What this pins beyond the ruling: that the cascade really does wait on a committed child row.
+/// Weaken `relay_buckets_relay_fk` to `no action`, or drop it, and the deletion stops blocking and
+/// `settle` says so, rather than the test passing on a race it never ran.
+#[sqlx::test]
+async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool) {
+    let (ws, relay) = relay_fixture(&pool, true).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let mut debiting = pool.begin().await.unwrap();
+    let left: i32 = sqlx::query_scalar(DEBIT)
+        .bind(relay)
+        .bind(ws)
+        .bind(60i32)
+        .bind(10i32)
+        .fetch_one(&mut *debiting)
+        .await
+        .expect("the debit");
+    assert_eq!(left, 50, "the premise: this tick took its tokens");
+
+    let deleting = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query("delete from relays where id = $1")
+                .bind(relay)
+                .execute(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    debiting.commit().await.expect("commit the debit");
+    deleting
+        .await
+        .expect("the deletion")
+        .expect("a cycle here would abort one side with 40P01");
+
+    let buckets: i64 = sqlx::query_scalar("select count(*) from relay_buckets")
+        .fetch_one(&pool)
+        .await
+        .expect("count the buckets");
+    assert_eq!(buckets, 0, "the bucket went with its relay");
+}
