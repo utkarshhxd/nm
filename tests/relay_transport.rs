@@ -18,13 +18,9 @@ use common::smtp_sink::{AfterData, Script, Sink};
 use lettre::address::Envelope;
 use nm::relay::{
     Relay, Security,
-    transport::{Outcome, Transports},
+    transport::{JOB_LEASE, Outcome, Transports},
 };
 use uuid::Uuid;
-
-/// How long a worker holds a claimed job before another worker may take the row (Task 8). A
-/// `send` that outlives this is how a message goes twice without a bug in the retry logic.
-const LEASE: Duration = Duration::from_secs(120);
 
 fn relay(addr: SocketAddr) -> Relay {
     Relay {
@@ -51,6 +47,11 @@ fn envelope() -> Envelope {
     )
     .expect("envelope")
 }
+
+/// What the two tests that have to watch a session elapse bound it at, in place of the minute the
+/// product uses. Long enough that a loopback connection is established first, short enough that
+/// the suite does not wait.
+const INJECTED_SESSION: Duration = Duration::from_secs(1);
 
 const BYTES: &[u8] =
     b"From: news@brand.test\r\nTo: reader@dest.test\r\nSubject: hi\r\n\r\nthe body\r\n";
@@ -162,24 +163,100 @@ async fn a_refused_connection_is_transient() {
 /// another worker re-claims the job row, and the message goes twice — the one outcome the spec
 /// names as worse than not sending, arriving by way of a hang rather than a retry bug.
 ///
+/// The session is injected at one second so the suite does not spend a real minute watching a
+/// socket. Three things hold that honest and all three must stay: this test, which proves a
+/// session is bounded at all; `a_transports_bounds_a_session_at_the_shipped_constant` in the
+/// module's own tests, which proves the default is `SESSION_TIMEOUT` and not whatever a test
+/// asked for; and a `const` assertion beside the constants, which proves `SESSION_TIMEOUT` is
+/// under [`JOB_LEASE`] at compile time.
+///
 /// The assertion is a bound, not an equality: how long the send takes depends on the machine, and
 /// the only quantity that carries meaning is whether it finished before the lease ran out.
 #[tokio::test]
 async fn a_relay_that_never_replies_does_not_outlive_the_lease() {
     let sink = Sink::start(Script::Silence).await;
+    let transports = Transports::plaintext_for_tests().with_session_timeout(INJECTED_SESSION);
     let started = Instant::now();
     let outcome = tokio::time::timeout(
-        LEASE,
-        Transports::plaintext_for_tests().send(&relay(sink.addr), None, &envelope(), BYTES),
+        JOB_LEASE,
+        transports.send(&relay(sink.addr), None, &envelope(), BYTES),
     )
     .await
     .expect("send outlived the 120 s job lease: another worker would re-claim the row");
     let elapsed = started.elapsed();
-    assert!(elapsed < LEASE, "{elapsed:?}");
+    assert!(elapsed < JOB_LEASE, "{elapsed:?}");
     assert!(
         matches!(outcome, Outcome::Unknown(_)),
         "a hang could have been a hang after DATA, and so could have been accepted: {outcome:?}"
     );
+}
+
+/// **A stalled session must not take the next message down with it.** When the wrapper fires, the
+/// connection is abandoned mid-conversation and lettre parks it back in its pool. The next
+/// message is then handed a connection that owes an answer to the last one, and times out too:
+/// one stalled send becomes a run of them, and every one of those is an `Unknown` that is never
+/// retried.
+///
+/// The sink takes the first message and then owes its answer forever — the stall has to come
+/// after `DATA`, because a connection that never finished being opened is dropped rather than
+/// parked, and there is nothing stale to inherit. The second connection answers.
+#[tokio::test]
+async fn a_timed_out_session_is_not_left_in_the_pool() {
+    let sink = Sink::start(Script::FirstThen(
+        AfterData::Hang,
+        AfterData::Reply("250 2.0.0 Ok: second"),
+    ))
+    .await;
+    let transports = Transports::plaintext_for_tests().with_session_timeout(INJECTED_SESSION);
+    let relay = relay(sink.addr);
+
+    let first = transports.send(&relay, None, &envelope(), BYTES).await;
+    assert!(matches!(first, Outcome::Unknown(_)), "{first:?}");
+
+    // lettre parks an abandoned connection from a task of its own, so without this the next send
+    // simply outruns it and the pool is empty for a reason that has nothing to do with the fix.
+    // The stale connection would then be waiting for message three instead. This is a wait for
+    // another task to run, not a measurement: a slow machine makes the test pass for the wrong
+    // reason, never fail for one.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second = transports.send(&relay, None, &envelope(), BYTES).await;
+    assert!(
+        matches!(&second, Outcome::Sent { response } if response.contains("second")),
+        "the stalled connection was reused and took this message with it: {second:?}"
+    );
+}
+
+/// **Invariant 5**, and the reason it is written down: `254` is a positive reply, so lettre hands
+/// it over as an acceptance and nothing but the suppression check stands between it and a row
+/// saying the message was delivered. The code is not matched on — the phrase is — so OCI
+/// answering `250` or `254` makes no difference to what is recorded.
+#[tokio::test]
+async fn a_254_naming_a_suppression_is_failed() {
+    let reply = "254 4.7.1 Suppression for user reader@dest.test";
+    let outcome = send_to(Script::Smtp(AfterData::Reply(reply))).await;
+    assert!(
+        !matches!(outcome, Outcome::Sent { .. }),
+        "a 254 suppression was recorded as a delivery: {outcome:?}"
+    );
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert!(
+        text(&outcome).contains("Suppression for user reader@dest.test"),
+        "{outcome:?}"
+    );
+}
+
+/// `plaintext_for_tests` is fenced to this machine, so the constructor cannot put a relay's
+/// password on an open socket to somewhere else even if something called it.
+#[tokio::test]
+async fn a_plaintext_transport_refuses_a_host_that_is_not_loopback() {
+    let mut relay = relay(Sink::unused_addr().await);
+    relay.host = "smtp.example.test".to_owned();
+    let outcome = Transports::plaintext_for_tests()
+        .send(&relay, Some("hunter2"), &envelope(), BYTES)
+        .await;
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert!(!text(&outcome).contains("hunter2"));
 }
 
 /// The transport keeps one pooled client per relay id. If the operator moves the relay to another

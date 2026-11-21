@@ -25,6 +25,10 @@ pub enum AfterData {
     /// Close the connection without answering. The message was read, and the sender cannot know
     /// whether it was queued.
     Drop,
+    /// Hold the connection open and never answer. Same ambiguity as `Drop`, except that the
+    /// sender is left waiting rather than told anything, and the session is already established —
+    /// which is the state a pooled connection can be abandoned in.
+    Hang,
 }
 
 /// How a connection to the sink goes.
@@ -34,6 +38,10 @@ pub enum Script {
     Smtp(AfterData),
     /// Accept the connection and say nothing at all, forever — not even the greeting.
     Silence,
+    /// Do the first thing on the first connection and the second on every one after it: a relay
+    /// that stalls one message and then recovers, which is what tells a stale pooled connection
+    /// from a stale relay.
+    FirstThen(AfterData, AfterData),
 }
 
 pub struct Sink {
@@ -57,14 +65,23 @@ impl Sink {
         let addr = listener.local_addr().expect("the sink's address");
         let accepting = tokio::spawn(async move {
             let mut connections = JoinSet::new();
+            let mut accepted = 0u32;
             while let Ok((stream, _)) = listener.accept().await {
-                match script {
-                    Script::Silence => connections.spawn(async move {
+                accepted += 1;
+                let speaking = match script {
+                    Script::Silence => None,
+                    Script::Smtp(after) => Some(after),
+                    Script::FirstThen(first, rest) => {
+                        Some(if accepted == 1 { first } else { rest })
+                    }
+                };
+                match speaking {
+                    None => connections.spawn(async move {
                         // Held, not closed: a closed socket is a different outcome entirely.
                         let _silent = stream;
                         std::future::pending::<()>().await;
                     }),
-                    Script::Smtp(after) => connections.spawn(async move {
+                    Some(after) => connections.spawn(async move {
                         let _ = serve(stream, after).await;
                     }),
                 };
@@ -127,6 +144,8 @@ async fn serve(stream: TcpStream, after: AfterData) -> std::io::Result<()> {
                     continue;
                 }
                 AfterData::Drop => return Ok(()),
+                // Open, read, and owing an answer forever.
+                AfterData::Hang => std::future::pending().await,
             }
         } else {
             b"500 5.5.1 unknown command\r\n"

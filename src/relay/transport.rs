@@ -43,11 +43,22 @@ use super::{Relay, Security};
 /// How long the TCP connection and the TLS handshake get.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a whole submission gets, greeting to final reply. Under the worker's 120-second job
-/// lease with room to spare: a send that outlives the lease has its row re-claimed by another
-/// worker, and the message goes twice. lettre's async client puts **no** timeout on a read, so
-/// without this a relay that accepts the connection and then says nothing waits forever.
+/// How long a whole submission gets, greeting to final reply. Under [`JOB_LEASE`] with room to
+/// spare: a send that outlives the lease has its row re-claimed by another worker, and the
+/// message goes twice. lettre's async client puts **no** timeout on a read, so without this a
+/// relay that accepts the connection and then says nothing waits forever.
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a worker holds a claimed job before another worker may take the row. Named here
+/// because [`SESSION_TIMEOUT`] means nothing except against it, and the two cannot be allowed to
+/// cross: a test can be told to use a shorter session, but nothing can ship one that is longer
+/// than the lease.
+pub const JOB_LEASE: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    SESSION_TIMEOUT.as_secs() < JOB_LEASE.as_secs(),
+    "a session may not outlive the job lease: the row would be re-claimed mid-send"
+);
 
 /// The phrase OCI puts in the reply when the recipient is on its suppression list, whatever the
 /// code in front of it. Matched case-insensitively against the whole reply.
@@ -82,6 +93,8 @@ pub struct Transports {
     /// Connects in the clear, whatever the relay's `Security` says. Tests only; see
     /// [`Transports::plaintext_for_tests`].
     plaintext: bool,
+    /// [`SESSION_TIMEOUT`] everywhere but the test that has to watch one elapse.
+    session_timeout: Duration,
     clients: Mutex<HashMap<Uuid, Client>>,
 }
 
@@ -127,7 +140,21 @@ impl Transports {
     pub fn new() -> Transports {
         Transports {
             plaintext: false,
+            session_timeout: SESSION_TIMEOUT,
             clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Bounds a session at something other than [`SESSION_TIMEOUT`].
+    ///
+    /// For the one test that has to watch a session elapse, which would otherwise take a real
+    /// minute. `a_transports_bounds_a_session_at_the_shipped_constant` holds the other end: the
+    /// default is the constant, so this cannot quietly become the duration the product ships.
+    #[doc(hidden)]
+    pub fn with_session_timeout(self, session_timeout: Duration) -> Transports {
+        Transports {
+            session_timeout,
+            ..self
         }
     }
 
@@ -158,17 +185,33 @@ impl Transports {
             // The relay cannot be connected to as configured. Offering it again changes nothing.
             Err(reason) => return Outcome::Failed(reason),
         };
-        match tokio::time::timeout(SESSION_TIMEOUT, transport.send_raw(envelope, bytes)).await {
+        match tokio::time::timeout(self.session_timeout, transport.send_raw(envelope, bytes)).await
+        {
             Ok(Ok(response)) => accepted(&response),
             Ok(Err(e)) => refused(&e),
-            // Where it hung is not visible from out here: it could have been the greeting, and it
-            // could have been the reply to a message the relay had already queued.
-            Err(_elapsed) => Outcome::Unknown(format!(
-                "{} did not answer within {} s; the message may have been accepted",
-                relay.host,
-                SESSION_TIMEOUT.as_secs()
-            )),
+            Err(_elapsed) => {
+                // The connection was abandoned mid-conversation, and lettre parks it back in its
+                // pool none the wiser. The next message would be handed that connection, answered
+                // by whatever the relay still owes this one, and time out as well — one stalled
+                // send becoming a run of them. Dropping the client drops the pool with it.
+                self.evict(relay.id);
+                // Where it hung is not visible from out here: it could have been the greeting,
+                // and it could have been the reply to a message the relay had already queued.
+                Outcome::Unknown(format!(
+                    "{} did not answer within {} s; the message may have been accepted",
+                    relay.host,
+                    self.session_timeout.as_secs()
+                ))
+            }
         }
+    }
+
+    /// Forgets the pooled client for `relay_id`. The next message builds a new one.
+    fn evict(&self, relay_id: Uuid) {
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&relay_id);
     }
 
     /// The pooled client for `relay`, built if this is the first message or if anything about the
@@ -207,6 +250,15 @@ fn build(
 ) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
     let port =
         u16::try_from(relay.port).map_err(|_| format!("port {} is not a port", relay.port))?;
+    // The fence under `plaintext_for_tests`: in the clear, this reaches the loopback interface and
+    // nothing else. A relay's password on an open socket to another machine is the one way that
+    // constructor could do harm, and it cannot be reached from here.
+    if plaintext && !is_loopback(&relay.host) {
+        return Err(format!(
+            "{} is not loopback: a plaintext transport may not leave this machine",
+            relay.host
+        ));
+    }
     let mut builder = if plaintext {
         AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&relay.host)
     } else {
@@ -228,6 +280,15 @@ fn build(
         builder = builder.credentials(Credentials::new(username.to_owned(), password.to_owned()));
     }
     Ok(builder.build())
+}
+
+/// Whether `host` names this machine. A name other than `localhost` is not resolved: a plaintext
+/// transport is for an in-process sink, and anything that needs resolving is not one.
+fn is_loopback(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The relay took the message — unless the reply says it went to a suppressed address.
@@ -266,5 +327,93 @@ fn refused(e: &SmtpError) -> Outcome {
         // before the greeting exactly as it reports one lost after the terminating `.`, so this
         // is read as the second: the relay may have queued the message.
         Outcome::Unknown(reason)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relay() -> Relay {
+        Relay {
+            id: Uuid::now_v7(),
+            workspace_id: Uuid::now_v7(),
+            name: "oci".to_owned(),
+            host: "smtp.email.eu-frankfurt-1.oci.oraclecloud.com".to_owned(),
+            port: 587,
+            security: Security::StartTls,
+            username: Some("ocid1.user.oc1..smtp".to_owned()),
+            max_connections: 4,
+            rate_limit_per_minute: 1800,
+            enabled: true,
+            failover_order: 0,
+        }
+    }
+
+    /// **Everything a connection is made from is in the key.** The client is kept per relay id
+    /// and reused until the key changes, so a part left out of it is a part an operator can
+    /// change to no effect — rotate the password and that workspace's mail stops going out, the
+    /// old secret still being offered, with nothing in the product to explain it. No sink can
+    /// catch this: the cached client is the one thing a test that drives `send` cannot see.
+    #[test]
+    fn everything_a_connection_is_made_from_is_in_the_key() {
+        let base = relay();
+        let key = Key::of(&base, Some("pw"));
+        assert!(
+            key == Key::of(&base, Some("pw")),
+            "an unchanged relay must reuse its client"
+        );
+
+        let moved = |what: &str, change: fn(&mut Relay)| {
+            let mut relay = base.clone();
+            change(&mut relay);
+            assert!(
+                key != Key::of(&relay, Some("pw")),
+                "a changed {what} must build a new client"
+            );
+        };
+        moved("host", |r| r.host = "smtp.example.test".to_owned());
+        moved("port", |r| r.port = 465);
+        moved("security", |r| r.security = Security::ImplicitTls);
+        moved("username", |r| r.username = None);
+        moved("max_connections", |r| r.max_connections = 8);
+
+        // The password is not on the relay row, so it is passed beside it.
+        assert!(
+            key != Key::of(&base, Some("rotated")),
+            "a rotated password must build a new client"
+        );
+        assert!(
+            key != Key::of(&base, None),
+            "a password that was taken away must build a new client"
+        );
+    }
+
+    /// The other end of [`Transports::with_session_timeout`]: whatever a test injects, what the
+    /// product builds for itself is [`SESSION_TIMEOUT`].
+    #[test]
+    fn a_transports_bounds_a_session_at_the_shipped_constant() {
+        assert_eq!(Transports::new().session_timeout, SESSION_TIMEOUT);
+        assert_eq!(Transports::default().session_timeout, SESSION_TIMEOUT);
+        assert_eq!(
+            Transports::plaintext_for_tests().session_timeout,
+            SESSION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn a_plaintext_transport_is_fenced_to_this_machine() {
+        for here in ["127.0.0.1", "::1", "localhost"] {
+            assert!(is_loopback(here), "{here}");
+        }
+        for away in ["smtp.example.test", "10.0.0.4", "0.0.0.0"] {
+            assert!(!is_loopback(away), "{away}");
+            let mut relay = relay();
+            relay.host = away.to_owned();
+            assert!(
+                build(&relay, Some("pw"), true).is_err(),
+                "a plaintext transport was built for {away}"
+            );
+        }
     }
 }
