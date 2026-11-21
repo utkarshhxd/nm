@@ -29,13 +29,48 @@ use uuid::Uuid;
 const ONE_CLICK: &str = "List-Unsubscribe=One-Click";
 
 /// **At most two of these run at once, and that is not tidiness.** Each test holds four
-/// connections at its critical moment — the wedge, the probe, and two routes blocked mid-request —
-/// and fourteen of them at once exhausts what the server will give a test binary. A route that
-/// cannot get a connection does not block, it fails, and the test then reports that the
-/// interleaving never formed. Which is the right answer, loudly: before `settle` existed those
+/// connections at its critical moment — the wedge, the probe, and two routes blocked mid-request.
+/// A route that cannot get a connection does not block, it fails, and the test then reports that
+/// the interleaving never formed. Which is the right answer, loudly: before `settle` existed those
 /// runs went green instead.
+///
+/// **Take it as the FIRST line of every test, before anything else happens.** Seven tests took it
+/// after their fixture and three never took it at all, so ten of them did their setup unthrottled
+/// against the two that held it. Where the connections they compete for actually come from is
+/// `own_pool` below, which is the other half of this.
 static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+/// A pool on this test's own database, **outside the budget `#[sqlx::test]` draws on**. Every test
+/// here takes one and uses it in place of the pool it was handed.
+///
+/// The gate above cannot fit these tests into that budget, and this is the arithmetic that says
+/// so. `#[sqlx::test]` hands each test a pool of 5 whose permits are *stolen* from one
+/// process-wide master pool of **20**, and `DecrementSizeGuard` returns a stolen permit to the
+/// **child's** semaphore, never the master's: the master gets them back only when the child pool
+/// is dropped, at the end of the test. Creating that pool opens one connection eagerly, so on a
+/// sixteen-core box the sixteen tests libtest has in flight have spent sixteen of the twenty
+/// before any of them reaches a wedge — running or parked on the gate, it makes no difference —
+/// and the four left over do not cover two tests needing four apiece.
+///
+/// A route that cannot get a connection waits out sqlx's 30-second `acquire_timeout`, answers
+/// `500`, and so never blocks; `settle` then reports, truthfully, an interleaving that never
+/// formed. That was the whole of this file's intermittent red, and it is why raising Postgres'
+/// `max_connections` and raising `settle`'s budget both changed nothing — neither was the resource
+/// running out. (`--test-threads=2` also makes it pass, for the same reason: fewer live tests,
+/// fewer permits spent. This way the file does not depend on how it is invoked.)
+///
+/// Drawn on its own the ceiling is the server's `max_connections`, which `docker-compose.dev.yml`
+/// already sizes for this file. Six is the four a test holds at its critical moment — wedge,
+/// probe, two routes blocked mid-request — plus slack for the sign-in some of them do between the
+/// two `settle`s.
+async fn own_pool(pool: &PgPool) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a pool on this test's own database")
+}
 
 /// How many sessions in this test's database are waiting on a lock right now.
 ///
@@ -187,6 +222,7 @@ impl Fx {
 #[sqlx::test]
 async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -235,6 +271,7 @@ async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -290,6 +327,7 @@ async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -356,6 +394,7 @@ async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -414,6 +453,7 @@ async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPoo
 #[sqlx::test]
 async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -484,6 +524,7 @@ async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
 #[sqlx::test]
 async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -539,6 +580,7 @@ async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let fresh = lists[1];
@@ -591,6 +633,7 @@ async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
 #[sqlx::test]
 async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let fresh = lists[1];
@@ -643,6 +686,7 @@ async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
 #[sqlx::test]
 async fn a_bulk_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -727,6 +771,7 @@ async fn wedge_the_refusal(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Po
 #[sqlx::test]
 async fn a_list_deletion_and_a_rename_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -778,6 +823,7 @@ async fn a_list_deletion_and_a_rename_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn a_list_deletion_and_a_re_tick_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -851,6 +897,7 @@ async fn wedge_the_memberships(
 #[sqlx::test]
 async fn an_operator_unsubscribe_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -889,6 +936,7 @@ async fn an_operator_unsubscribe_and_a_contact_deletion_do_not_deadlock(pool: Pg
 #[sqlx::test]
 async fn a_confirmation_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -942,6 +990,7 @@ async fn a_confirmation_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn a_one_click_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let _ = lists;
@@ -981,6 +1030,8 @@ async fn a_one_click_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
 /// answer when the list really has gone. No wedge and no race: the list is simply deleted first.
 #[sqlx::test]
 async fn adding_a_member_to_a_deleted_list_is_not_found(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let first = lists[0];
     fx.admin
@@ -1012,6 +1063,8 @@ async fn adding_a_member_to_a_deleted_list_is_not_found(pool: PgPool) {
 /// rather than dressed up by this test.
 #[sqlx::test]
 async fn a_bulk_subscribe_to_a_deleted_list_is_not_found(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
     let fresh = lists[1];
     fx.admin
@@ -1042,8 +1095,9 @@ async fn a_bulk_subscribe_to_a_deleted_list_is_not_found(pool: PgPool) {
 /// module's mappings and falls through to `ApiError::Internal`: a `500` on an Editor route.
 #[sqlx::test]
 async fn a_form_update_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
-    let (fx, lists) = fixture(&pool, &["first"]).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let form = Uuid::now_v7();
@@ -1116,8 +1170,9 @@ async fn a_form_update_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 /// the `404` the guard always meant.
 #[sqlx::test]
 async fn a_bulk_tag_and_a_tag_deletion_do_not_collide(pool: PgPool) {
-    let (fx, _lists) = fixture(&pool, &["first"]).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let tag = Uuid::now_v7();
     sqlx::query("insert into tags (id, workspace_id, name) values ($1, $2, 'vip')")
@@ -1177,8 +1232,9 @@ async fn a_bulk_tag_and_a_tag_deletion_do_not_collide(pool: PgPool) {
 /// guard exists to prevent, through a window two statements wide. Holding the row closes it.
 #[sqlx::test]
 async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
-    let (fx, lists) = fixture(&pool, &["first"]).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let import = Uuid::now_v7();
@@ -1326,6 +1382,8 @@ async fn relay_fixture(pool: &PgPool, bucket: bool) -> (Uuid, Uuid) {
 /// created-by and lifted-by — because a constraint's name is not something a ruling turns on.
 #[sqlx::test]
 async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let edges: Vec<String> = sqlx::query_scalar(
         "select distinct confrelid::regclass::text || ' -> ' || conrelid::regclass::text \
                 || ' (' || confdeltype::text || ')' \
@@ -1412,8 +1470,9 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
 /// the debit ever looked, and the `23503` would be a plain sequence rather than an interleaving.
 #[sqlx::test]
 async fn a_relay_deletion_and_a_first_debit_do_not_deadlock(pool: PgPool) {
-    let (ws, relay) = relay_fixture(&pool, false).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, false).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
 
     let mut deleting = pool.begin().await.unwrap();
@@ -1473,8 +1532,9 @@ async fn a_relay_deletion_and_a_first_debit_do_not_deadlock(pool: PgPool) {
 /// the parent lock, and the final count is what fails if the cascade stops seeing the child.
 #[sqlx::test]
 async fn a_first_debit_then_a_relay_deletion_both_commit(pool: PgPool) {
-    let (ws, relay) = relay_fixture(&pool, false).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, false).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
 
     let mut debiting = pool.begin().await.unwrap();
@@ -1531,8 +1591,9 @@ async fn a_first_debit_then_a_relay_deletion_both_commit(pool: PgPool) {
 /// blocks behind the wedge until the timeout names it.
 #[sqlx::test]
 async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) {
-    let (ws, relay) = relay_fixture(&pool, true).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, true).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
 
     // Stands for every exclusive taker of a relay row: the delete, and a rename, whose `name` is
@@ -1594,8 +1655,9 @@ async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) 
 /// `settle` says so, rather than the test passing on a race it never ran.
 #[sqlx::test]
 async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool) {
-    let (ws, relay) = relay_fixture(&pool, true).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, true).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
 
     let mut debiting = pool.begin().await.unwrap();
