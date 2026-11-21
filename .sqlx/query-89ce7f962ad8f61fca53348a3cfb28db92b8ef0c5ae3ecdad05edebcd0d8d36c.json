@@ -1,0 +1,148 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, workspace_id, name, host, port, security as \"security: Security\", username,\n                  max_connections, rate_limit_per_minute, enabled, failover_order\n           from relays\n           where workspace_id = $1 and enabled\n           order by failover_order, id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "host"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "port",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "port"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "security: Security",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "security"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "max_connections",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "max_connections"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "rate_limit_per_minute",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "rate_limit_per_minute"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "failover_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "failover_order"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "89ce7f962ad8f61fca53348a3cfb28db92b8ef0c5ae3ecdad05edebcd0d8d36c"
+}

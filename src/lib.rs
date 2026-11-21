@@ -17,6 +17,7 @@ pub mod lists;
 pub mod openapi;
 pub mod pagination;
 pub mod public;
+pub mod relay;
 pub mod segments;
 pub mod suppressions;
 pub mod tags;

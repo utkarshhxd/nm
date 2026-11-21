@@ -103,6 +103,11 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::suppressions::routes::list_instance_suppressions,
         crate::suppressions::routes::create_instance_suppression,
         crate::suppressions::routes::lift_instance_suppression,
+        crate::relay::routes::list_relays,
+        crate::relay::routes::get_relay,
+        crate::relay::routes::create_relay,
+        crate::relay::routes::update_relay,
+        crate::relay::routes::delete_relay,
     ),
     components(schemas(
         crate::auth::login::LoginRequest,
@@ -198,6 +203,10 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::suppressions::NewSuppression,
         crate::suppressions::Reason,
         crate::suppressions::Scope,
+        crate::relay::Security,
+        crate::relay::routes::RelayView,
+        crate::relay::routes::NewRelay,
+        crate::relay::routes::UpdateRelay,
     ))
 )]
 struct ApiDoc;

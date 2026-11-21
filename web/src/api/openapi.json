@@ -3871,6 +3871,261 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/relays": {
+      "get": {
+        "tags": [
+          "crate::relay::routes"
+        ],
+        "operationId": "list_relays",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first. Never carries a password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_RelayView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::relay::routes"
+        ],
+        "summary": "Where mail leaves through, and with what credential, so writing it takes admin.",
+        "operationId": "create_relay",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRelay"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: configuring a relay takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "relay-name-taken"
+          },
+          "422": {
+            "description": "an invalid or missing field, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/relays/{id}": {
+      "get": {
+        "tags": [
+          "crate::relay::routes"
+        ],
+        "operationId": "get_relay",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Relay id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such relay in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::relay::routes"
+        ],
+        "summary": "A hard delete. The relay's token bucket goes with it.",
+        "operationId": "delete_relay",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Relay id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "insufficient-role: configuring a relay takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such relay in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::relay::routes"
+        ],
+        "operationId": "update_relay",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Relay id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRelay"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: configuring a relay takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such relay in this workspace"
+          },
+          "409": {
+            "description": "relay-name-taken"
+          },
+          "422": {
+            "description": "an invalid field, an explicit null for a field that cannot be cleared, or an unknown field"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/segments": {
       "get": {
         "tags": [
@@ -6367,6 +6622,75 @@
           }
         }
       },
+      "NewRelay": {
+        "type": "object",
+        "required": [
+          "name",
+          "host",
+          "port",
+          "security",
+          "rate_limit_per_minute"
+        ],
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default `true`."
+          },
+          "failover_order": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Lower is tried first. Default 0."
+          },
+          "host": {
+            "type": "string"
+          },
+          "max_connections": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Concurrent connections one sender process may hold open. Default 4."
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace."
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stored encrypted and never returned."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1 to 65535."
+          },
+          "rate_limit_per_minute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "What the relay's operator says it allows. At least 1."
+          },
+          "security": {
+            "$ref": "#/components/schemas/Security"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "NewSegment": {
         "type": "object",
         "required": [
@@ -7428,6 +7752,89 @@
           }
         }
       },
+      "Page_RelayView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A relay as the API shows it. There is no password field, on purpose: `has_password` is all an\noperator may learn about it.",
+              "required": [
+                "id",
+                "workspace_id",
+                "name",
+                "host",
+                "port",
+                "security",
+                "has_password",
+                "max_connections",
+                "rate_limit_per_minute",
+                "enabled",
+                "failover_order"
+              ],
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "failover_order": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "has_password": {
+                  "type": "boolean",
+                  "description": "Whether a password is stored. The password itself is never returned."
+                },
+                "host": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "max_connections": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "name": {
+                  "type": "string",
+                  "description": "Unique in the workspace."
+                },
+                "port": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "rate_limit_per_minute": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "security": {
+                  "$ref": "#/components/schemas/Security"
+                },
+                "username": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Segment": {
         "type": "object",
         "required": [
@@ -7764,6 +8171,72 @@
           "gdpr_erasure"
         ]
       },
+      "RelayView": {
+        "type": "object",
+        "description": "A relay as the API shows it. There is no password field, on purpose: `has_password` is all an\noperator may learn about it.",
+        "required": [
+          "id",
+          "workspace_id",
+          "name",
+          "host",
+          "port",
+          "security",
+          "has_password",
+          "max_connections",
+          "rate_limit_per_minute",
+          "enabled",
+          "failover_order"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "failover_order": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "has_password": {
+            "type": "boolean",
+            "description": "Whether a password is stored. The password itself is never returned."
+          },
+          "host": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "max_connections": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique in the workspace."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "rate_limit_per_minute": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "security": {
+            "$ref": "#/components/schemas/Security"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "Role": {
         "type": "string",
         "description": "A member's role, stored as lowercase text. Variants run from least to most privileged:\n`authorize` compares roles with `<`, so the order here is load-bearing.",
@@ -7798,6 +8271,14 @@
             ]
           }
         }
+      },
+      "Security": {
+        "type": "string",
+        "description": "How the connection to the relay is secured. Stored as text under a `check` constraint.",
+        "enum": [
+          "implicit_tls",
+          "starttls"
+        ]
       },
       "Segment": {
         "type": "object",
@@ -8198,6 +8679,55 @@
           "visibility": {
             "$ref": "#/components/schemas/Visibility",
             "description": "Cannot be `null`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateRelay": {
+        "type": "object",
+        "description": "A field left out is left alone. `username` and `password` may be `null`, which clears them; on\nany other field `null` is `422`, because there is nothing to clear it to.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "failover_order": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "host": {
+            "type": "string"
+          },
+          "max_connections": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absent keeps the stored password; `null` removes it; a string replaces it."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "rate_limit_per_minute": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "security": {
+            "$ref": "#/components/schemas/Security"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears it."
           }
         },
         "additionalProperties": false

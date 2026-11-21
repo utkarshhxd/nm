@@ -1054,6 +1054,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/relays": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_relays"];
+        put?: never;
+        /** Where mail leaves through, and with what credential, so writing it takes admin. */
+        post: operations["create_relay"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/relays/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_relay"];
+        put?: never;
+        post?: never;
+        /** A hard delete. The relay's token bucket goes with it. */
+        delete: operations["delete_relay"];
+        options?: never;
+        head?: never;
+        patch: operations["update_relay"];
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/segments": {
         parameters: {
             query?: never;
@@ -1952,6 +1986,37 @@ export interface components {
         NewPasskey: {
             name: string;
         };
+        NewRelay: {
+            /** @description Default `true`. */
+            enabled?: boolean | null;
+            /**
+             * Format: int32
+             * @description Lower is tried first. Default 0.
+             */
+            failover_order?: number | null;
+            host: string;
+            /**
+             * Format: int32
+             * @description Concurrent connections one sender process may hold open. Default 4.
+             */
+            max_connections?: number | null;
+            /** @description Unique in the workspace. */
+            name: string;
+            /** @description Stored encrypted and never returned. */
+            password?: string | null;
+            /**
+             * Format: int32
+             * @description 1 to 65535.
+             */
+            port: number;
+            /**
+             * Format: int32
+             * @description What the relay's operator says it allows. At least 1.
+             */
+            rate_limit_per_minute: number;
+            security: components["schemas"]["Security"];
+            username?: string | null;
+        };
         NewSegment: {
             description?: string | null;
             /** @description Unique in the workspace. */
@@ -2353,6 +2418,31 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_RelayView: {
+            data: {
+                enabled: boolean;
+                /** Format: int32 */
+                failover_order: number;
+                /** @description Whether a password is stored. The password itself is never returned. */
+                has_password: boolean;
+                host: string;
+                /** Format: uuid */
+                id: string;
+                /** Format: int32 */
+                max_connections: number;
+                /** @description Unique in the workspace. */
+                name: string;
+                /** Format: int32 */
+                port: number;
+                /** Format: int32 */
+                rate_limit_per_minute: number;
+                security: components["schemas"]["Security"];
+                username?: string | null;
+                /** Format: uuid */
+                workspace_id: string;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Segment: {
             data: {
                 /** Format: date-time */
@@ -2468,6 +2558,32 @@ export interface components {
          */
         Reason: "unsubscribed_all" | "bounced" | "complained" | "manual" | "gdpr_erasure";
         /**
+         * @description A relay as the API shows it. There is no password field, on purpose: `has_password` is all an
+         *     operator may learn about it.
+         */
+        RelayView: {
+            enabled: boolean;
+            /** Format: int32 */
+            failover_order: number;
+            /** @description Whether a password is stored. The password itself is never returned. */
+            has_password: boolean;
+            host: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: int32 */
+            max_connections: number;
+            /** @description Unique in the workspace. */
+            name: string;
+            /** Format: int32 */
+            port: number;
+            /** Format: int32 */
+            rate_limit_per_minute: number;
+            security: components["schemas"]["Security"];
+            username?: string | null;
+            /** Format: uuid */
+            workspace_id: string;
+        };
+        /**
          * @description A member's role, stored as lowercase text. Variants run from least to most privileged:
          *     `authorize` compares roles with `<`, so the order here is load-bearing.
          * @enum {string}
@@ -2480,6 +2596,11 @@ export interface components {
             code?: string | null;
             recovery_code?: string | null;
         };
+        /**
+         * @description How the connection to the relay is secured. Stored as text under a `check` constraint.
+         * @enum {string}
+         */
+        Security: "implicit_tls" | "starttls";
         Segment: {
             /** Format: date-time */
             created_at: string;
@@ -2673,6 +2794,28 @@ export interface components {
             name?: string;
             /** @description Cannot be `null`. */
             visibility?: components["schemas"]["Visibility"];
+        };
+        /**
+         * @description A field left out is left alone. `username` and `password` may be `null`, which clears them; on
+         *     any other field `null` is `422`, because there is nothing to clear it to.
+         */
+        UpdateRelay: {
+            enabled?: boolean;
+            /** Format: int32 */
+            failover_order?: number;
+            host?: string;
+            /** Format: int32 */
+            max_connections?: number;
+            name?: string;
+            /** @description Absent keeps the stored password; `null` removes it; a string replaces it. */
+            password?: string | null;
+            /** Format: int32 */
+            port?: number;
+            /** Format: int32 */
+            rate_limit_per_minute?: number;
+            security?: components["schemas"]["Security"];
+            /** @description `null` clears it. */
+            username?: string | null;
         };
         /**
          * @description A merge patch (RFC 7386) of everything but `rules`: a field left out is left alone, `null`
@@ -6112,6 +6255,226 @@ export interface operations {
             };
             /** @description not a member, or the contact was never on this list */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_relays: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first. Never carries a password. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_RelayView"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_relay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewRelay"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelayView"];
+                };
+            };
+            /** @description insufficient-role: configuring a relay takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description relay-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid or missing field, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_relay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Relay id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelayView"];
+                };
+            };
+            /** @description not a member, or no such relay in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_relay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Relay id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: configuring a relay takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such relay in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_relay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Relay id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRelay"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelayView"];
+                };
+            };
+            /** @description insufficient-role: configuring a relay takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such relay in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description relay-name-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid field, an explicit null for a field that cannot be cleared, or an unknown field */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

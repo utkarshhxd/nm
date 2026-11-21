@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select password_encrypted from relays where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "password_encrypted",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "password_encrypted"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c7d529ff6fb3d01c589b519608ebac665dc12bc3e1e0e51b97227805a6858c33"
+}
