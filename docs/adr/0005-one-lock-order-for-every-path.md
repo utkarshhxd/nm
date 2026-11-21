@@ -223,8 +223,10 @@ not go through `scripts/dev.sh`. As of `0028` it answers:
 
 **Ten parents, and every one is ruled on.** `0028` added exactly one, `relays`. `sending_domains`
 is listed below the ten although it is not a parent, because it was the other table asked about
-and the answer is load-bearing. `tests/lock_order.rs` asserts this set has not moved, so the
-migration that adds an eleventh fails there rather than being noticed by somebody.
+and the answer is load-bearing. `tests/lock_order.rs` asserts that every **edge** of this graph —
+each `(parent, child, on delete action)` triple, not merely the set of parents — is unchanged, so
+a migration that adds an eleventh parent, a second child to an existing one, or that turns a
+`cascade` into a `set null`, fails there rather than being noticed by somebody.
 
 | parent | ruling | why |
 |---|---|---|
@@ -260,7 +262,13 @@ update starts changing a key column, they become classes the same day.
 `audit_log` is outside all of this: it has no foreign keys, nothing deletes from it, and it is
 append-only.
 
-### Why `relays` is not a class, and the three tests that are the evidence
+### Why `relays` is not a class, and the four tests that are the evidence
+
+**None of the code this section rules on exists yet.** `src/` contains no `relay` module; the
+`take` described below is the plan's wording for Task 8, reconstructed as the `DEBIT` constant in
+`tests/lock_order.rs`, and the CRUD handlers are Task 3's. The same caveat is on the path table
+above, repeated here because this is the section somebody reads in a hurry. If Task 8 writes `take`
+differently, the tripwire list at the end of this section is the part to re-check first.
 
 `relays` has the shape of a class and was expected to be one. One child, `on delete cascade`, a
 deleting path that takes the parent first, and a direct child writer — `bucket::take`, run on every
@@ -274,13 +282,7 @@ locks**:
 
 - **The insert arm** — a relay's first tick, when no bucket row exists — writes the foreign key
   columns, so the referential check takes `for key share` on the `relays` row at the end of the
-  statement. Child first, parent last: the inversion. It cannot close a cycle, because the bucket
-  row it is holding is one it has just inserted, and an uncommitted insert is invisible to a
-  concurrent deletion's cascade. There is nothing for the deletion to wait on, so it commits and
-  the referential check finds the parent gone. That is the `23503` half of the split, not `40P01`,
-  and `a_relay_deletion_and_a_first_debit_do_not_deadlock` asserts the exact SQLSTATE and the
-  constraint name — reached through a real interleaving, with `settle` failing the test if the
-  debit never blocks on the deletion.
+  statement. Child first, parent last: the inversion.
 - **The update arm** — every tick after the first — writes `tokens` and `refilled_at` only.
   Neither is part of the foreign key, so Postgres fires no referential trigger and the statement
   takes **nothing at all** on `relays`. The path that would invert simply does not take the second
@@ -288,12 +290,54 @@ locks**:
   `for update` and shows the debit completing anyway, with a control on the same wedge proving the
   wedge is real: the `for key share` the *insert* arm would take does block.
 
-So the only remaining question is whether a deletion can wait forever on a bucket row the debit
-holds, which is the `40P01` half. It cannot: the holder is asking for nothing back, which is the
-same reason the ADR gives for `tags`' unlocked writers.
-`a_relay_deletion_waits_for_a_debit_rather_than_deadlocking` runs exactly that — a committed bucket
-row, held mid-transaction, with a relay deletion queued behind the cascade — and the deletion waits
-and then commits.
+#### Why the insert arm cannot be half of a cycle, and the two orders that were raced
+
+The first version of this section gave the right ruling for a reason that is not in the causal
+chain — "a right ruling on a false reason", which is what this document says above let `form_lists`
+through in the first place. It said the deletion
+"has nothing to wait on" because the debit's bucket row is uncommitted and invisible to the
+cascade. That mechanism is real, but **both arrival orders were then raced against a live `0028`
+database and neither of them exercises it**:
+
+| order | what happens | outcome |
+|---|---|---|
+| **A** — the deletion's statement completes first | `delete from relays` locks the parent **and** runs its cascade scan inside one statement, and it did both before the debit inserted anything. The cascade found no bucket row because none existed yet, not because it could not see one. The debit then queues on the parent, the deletion commits | **`23503`** on `relay_buckets_relay_fk` |
+| **B** — the debit's statement completes first | the debit holds its new bucket row *and* the `for key share` its insert arm took. The deletion blocks on the **parent** row — measured at 2.51 s in the review's harness, which is that harness's hold time and not a property of anything — then the debit commits, the deletion takes the relay, and its cascade now sees a committed child row and takes that too | **no error at all**, both commit |
+
+So the honest statement of the ruling is not about invisibility. It is this: **the insert arm holds
+nothing the deletion can queue behind, and once its one statement is done it asks for nothing
+further.** A cycle needs every node to be both a holder and a waiter. In order B the debit is a
+terminal node in the wait-for graph — it has the parent lock and wants nothing — so the deletion
+waits and that is the end of it. In order A the debit is the only waiter. Neither order has two
+waiters, so neither can cycle.
+
+The invisibility argument survives, but only in the job it is actually needed for: ruling out the
+third interleaving, the one neither test can stage, where the deletion has locked the parent and is
+mid-cascade while the debit has inserted and is asking for the parent. That one would cycle if the
+cascade could see the debit's row. It cannot, so it does not. It is written here rather than in a
+test comment because **no test measured it**, and a comment claiming otherwise is how this went
+wrong the first time.
+
+`a_relay_deletion_and_a_first_debit_do_not_deadlock` is order A and asserts the exact SQLSTATE and
+the constraint name; `a_first_debit_then_a_relay_deletion_both_commit` is order B and asserts that
+the deletion blocks, that both commit, and that the bucket row went with its relay. Both use
+`settle`, so both fail rather than pass if the interleaving never forms. **One order is not an
+answer here** — they differ in outcome *and* in mechanism, and a reader given only one of them
+draws the wrong conclusion about why.
+
+**The `23503` of order A is a real error path and nothing owns it today.** `take`'s signature is
+`sqlx::Result<bool>`, so the violation reaches its caller as an `Err`, and the caller is Task 11's
+tick. A tick that treats it as fatal turns an operator deleting a relay into a failed batch; it
+should read as *this relay is gone* and fall to the next in failover order, which is the behaviour
+`enabled_relays` already orders for. Recorded here because the path is reachable, cheap to handle,
+and currently assigned to nobody.
+
+Last, the `40P01` half from the other side: can a deletion wait forever on a bucket row a debit
+holds? It cannot, for the same reason — the holder is asking for nothing back, which is the
+argument this document already makes for `tags`' unlocked writers.
+`a_relay_deletion_waits_for_a_debit_rather_than_deadlocking` runs exactly that, with a *committed*
+bucket row held mid-transaction and a relay deletion queued behind the cascade, and the deletion
+waits and then commits.
 
 **Measured, and worth not re-deriving: an `UPDATE` that writes a foreign key column back to the
 value it already held takes no lock on the parent either.** Postgres's referential trigger
@@ -304,11 +348,20 @@ restates `workspace_id` redundantly. It does **not** survive one that changes it
 **The tripwire, written as the thing to check rather than as a prediction.** `relays` becomes a
 class the day any of these is true, and each is a one-line check against the schema or `src/`:
 
-- a second child is added to `relays`, so that two paths can reach its rows by different routes;
+- a second child is added to `relays`, so that two paths can reach its rows by different routes.
+  This one is enforced: `the_foreign_key_graph_is_the_one_the_adr_rules_on` fails on the migration
+  that adds it;
 - any path **updates** an existing `relay_buckets` row's `workspace_id` or `relay_id`, which makes
   the update arm take the parent and closes the cycle the insert arm cannot;
-- `relay_buckets` gains a writer other than `take` — a reset, a backfill, an operator "clear the
-  bucket" endpoint — that holds the bucket row across more than its own statement.
+- **any transaction holds a `relay_buckets` row across more than one statement.** The whole ruling
+  above is about a statement, and it stops being about a statement the moment the statement stops
+  being the transaction. That is not only a new writer — a reset, a backfill, an operator "clear
+  the bucket" endpoint — it is also `take` *itself* called inside a longer one, which is exactly
+  what Task 11's tick would do if it ran `begin; take(…); …send…; complete(…); commit`. Then the
+  insert arm's `for key share` on the relay is held across the sends, an operator's relay deletion
+  blocks for the length of a tick rather than for one statement, and whatever else the tick takes
+  joins the cycle candidates. **So the tick passes the pool to `take`, not a transaction**, and if
+  it ever cannot, this section is re-derived rather than re-read.
 
 `sending_domains` has no tripwire of this kind because it has no children; it has the other one.
 The day anything references it — a campaign naming the domain it sends as is the obvious candidate
@@ -332,7 +385,7 @@ Today's writers of `contact_tags` are `tags::apply`, `tags::remove`, `selection:
 importer", which is what this section used to say. The ruling survives on `on conflict do nothing`,
 not on the writer count. And `jobs` is not a parent at all: nothing references it.
 
-### Known and open: the importer's tag race
+### Known and open: the importer's tag race (`issues/39`)
 
 `write_memberships_and_tags` still raises `23503` on `contact_tags_workspace_id_tag_id_fkey` when a
 tag is deleted while it runs, failing the whole import. Its `known` CTE reads `tags` under the
@@ -349,7 +402,29 @@ that while `contacts` was missing and while `form_lists` was listed as covered. 
 now is that the enumeration is **closed and mechanical**: ten parents, all ruled on, each with a
 reason that can be re-checked against the schema rather than against somebody's memory. If an
 eleventh parent appears, it is a new row in that table — and since `0028` that no longer depends on
-anybody remembering, because `the_foreign_key_parents_are_the_ten_the_adr_rules_on` in
+anybody remembering, because `the_foreign_key_graph_is_the_one_the_adr_rules_on` in
 `tests/lock_order.rs` fails on the migration that adds one. If a class appears that is not
 reachable from any of the ten, the method itself is unsound and that is a bigger conversation than
 another round. `issues/38` is the enforcement story this test is the first instalment of.
+
+**Be exact about how much of this is enforced, because "no longer depends on anybody remembering"
+is the kind of sentence that gets believed further than it is true.** What that test pins is the
+*shape of the schema*: every foreign key edge and its `on delete` action. What it does not pin is
+anything about the code.
+
+- **Enforced.** A new parent, a new child, a removed edge, a changed cascade action.
+- **Not enforced, and this is the bigger half.** Three of the ten rulings — `api_keys`,
+  `workspaces` and `users` — rest on "`src/` contains no `delete from` for this table", which is a
+  grep somebody ran once. Nothing fails if a delete is added. They become classes the day one is,
+  and the only thing standing between here and there is a reviewer noticing. The same is true of
+  every statement-shape claim in the `relays` section above: no test sees a `take` that grows a
+  second statement.
+
+### Known and open, carried rather than fixed
+
+- **The `delete from` grep has no enforcement**, as above. A test asserting that `src/` contains no
+  `delete from workspaces|users|api_keys` would close it and is a smaller job than it sounds; it is
+  not done here because this round's scope is `0028`'s parents.
+- **The importer's tag race**, `issues/39`, two sections above. Still open, still reproduced,
+  still raising `23503` on `contact_tags_workspace_id_tag_id_fkey` when a tag is deleted
+  mid-import, and still failing the whole import when it does.

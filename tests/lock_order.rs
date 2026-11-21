@@ -1223,8 +1223,12 @@ async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
 // Migration `0028` added `relays`, `sending_domains` and `relay_buckets`, so ADR 0005's
 // enumeration was re-run against `pg_constraint` rather than re-read. It found **one** new parent,
 // `relays`, whose only child is `relay_buckets`; `sending_domains` is referenced by nothing and so
-// is not a parent at all. Both are ruled "not a class", and the four tests below are what that
+// is not a parent at all. Both are ruled "not a class", and the five tests below are what that
 // ruling rests on — a ruling with no evidence is the thing that section of the ADR exists to stop.
+//
+// Three of the five are a relay deletion against a bucket debit, because **one arrival order is
+// not an answer**: the two orders produce different outcomes (`23503` and no error at all) by
+// different mechanisms, and a reader given only one of them draws the wrong conclusion about why.
 
 /// The shape Task 8's `bucket::take` will have: one `insert … on conflict do update` that refills
 /// by elapsed time, caps at the relay's per-minute limit and subtracts `n`.
@@ -1271,8 +1275,11 @@ async fn relay_fixture(pool: &PgPool, bucket: bool) -> (Uuid, Uuid) {
     .await
     .expect("relay");
     if bucket {
+        // Forty and not the relay's limit of sixty, so that the two arms of `DEBIT` return
+        // different numbers: the update arm answers 30 from here, the insert arm would answer 50.
+        // Seeded at the limit they answer the same thing and the assertion cannot tell them apart.
         sqlx::query(
-            "insert into relay_buckets (relay_id, workspace_id, tokens) values ($1, $2, 60)",
+            "insert into relay_buckets (relay_id, workspace_id, tokens) values ($1, $2, 40)",
         )
         .bind(relay)
         .bind(ws)
@@ -1283,18 +1290,26 @@ async fn relay_fixture(pool: &PgPool, bucket: bool) -> (Uuid, Uuid) {
     (ws, relay)
 }
 
-/// **The enumeration is closed, and this is what closes it.** ADR 0005 ruled on nine foreign-key
-/// parents; `0028` made it ten. `issues/38` records the method the ADR's own history argues for —
-/// a new parent, or a new cascade, means re-running the enumeration rather than merely obeying the
-/// order — and nothing enforced it, which is how `form_lists` got through once already.
+/// **The enumeration is closed, and this is what closes it.** `issues/38` records the method ADR
+/// 0005's own history argues for — a new parent, **or a new cascade**, means re-running the
+/// enumeration rather than merely obeying the order — and nothing enforced it, which is how
+/// `form_lists` got through once already.
 ///
-/// So this fails on the migration that adds the eleventh, and names what to do about it. It is
-/// deliberately an equality and not a superset: a parent that *disappears* also invalidates the
-/// ruling written about it.
+/// It pins the whole edge, `(parent, child, on delete action)`, and not the set of parents. The
+/// set of parents alone would be enforcement of one half of the method and silence on the other:
+/// a second child on `relays`, or a `cascade` quietly becoming a `set null`, moves nothing in the
+/// set of parents and moves everything in the ruling. ADR 0005's rulings are written per child and
+/// per action, so this is the granularity they are written at.
+///
+/// It is deliberately an equality and not a superset: an edge that *disappears* also invalidates
+/// the ruling written about it. Duplicate edges collapse — `suppressions` points at `users` twice,
+/// created-by and lifted-by — because a constraint's name is not something a ruling turns on.
 #[sqlx::test]
-async fn the_foreign_key_parents_are_the_ten_the_adr_rules_on(pool: PgPool) {
-    let parents: Vec<String> = sqlx::query_scalar(
-        "select distinct confrelid::regclass::text from pg_constraint \
+async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
+    let edges: Vec<String> = sqlx::query_scalar(
+        "select distinct confrelid::regclass::text || ' -> ' || conrelid::regclass::text \
+                || ' (' || confdeltype::text || ')' \
+         from pg_constraint \
          where contype = 'f' and connamespace = 'public'::regnamespace order by 1",
     )
     .fetch_all(&pool)
@@ -1302,31 +1317,74 @@ async fn the_foreign_key_parents_are_the_ten_the_adr_rules_on(pool: PgPool) {
     .expect("read pg_constraint");
 
     assert_eq!(
-        parents,
+        edges,
         [
-            "api_keys",
-            "contacts",
-            "forms",
-            "imports",
-            "lists",
-            "relays",
-            "selection_snapshots",
-            "tags",
-            "users",
-            "workspaces",
+            "api_keys -> selection_snapshots (n)",
+            "contacts -> consent_log (c)",
+            "contacts -> contact_tags (c)",
+            "contacts -> jobs (c)",
+            "contacts -> list_memberships (c)",
+            "forms -> form_lists (c)",
+            "imports -> import_errors (c)",
+            "lists -> consent_log (n)",
+            "lists -> form_lists (c)",
+            "lists -> imports (n)",
+            "lists -> jobs (c)",
+            "lists -> list_memberships (c)",
+            "lists -> suppressions (n)",
+            "relays -> relay_buckets (c)",
+            "selection_snapshots -> selection_snapshot_members (c)",
+            "tags -> contact_tags (c)",
+            "users -> api_keys (n)",
+            "users -> auth_challenges (c)",
+            "users -> imports (n)",
+            "users -> invites (n)",
+            "users -> memberships (c)",
+            "users -> passkeys (c)",
+            "users -> recovery_codes (c)",
+            "users -> segments (n)",
+            "users -> selection_snapshots (n)",
+            "users -> sessions (c)",
+            "users -> suppressions (n)",
+            "workspaces -> api_keys (c)",
+            "workspaces -> contacts (c)",
+            "workspaces -> custom_fields (c)",
+            "workspaces -> forms (c)",
+            "workspaces -> imports (c)",
+            "workspaces -> invites (c)",
+            "workspaces -> jobs (c)",
+            "workspaces -> lists (c)",
+            "workspaces -> memberships (c)",
+            "workspaces -> relays (c)",
+            "workspaces -> segments (c)",
+            "workspaces -> selection_snapshots (c)",
+            "workspaces -> sending_domains (c)",
+            "workspaces -> suppressions (c)",
+            "workspaces -> tags (c)",
         ],
-        "the set of foreign key parents has moved. ADR 0005's enumeration is over exactly this \
-         set, so it is now out of date: re-run the query in its \"The method\" section and rule \
-         on what changed, rather than editing this list to match"
+        "the foreign key graph has moved. ADR 0005's enumeration is over exactly these edges, so \
+         it is now out of date: re-run the query in its \"The method\" section and rule on what \
+         changed, rather than editing this list to match"
     );
 }
 
-/// **A relay deleted under its first debit raises `23503`, not `40P01`, and that is the whole
-/// reason the insert arm is not a class.** The debit holds a `relay_buckets` row it has just
-/// inserted and then asks for the `relays` row through `relay_buckets_relay_fk` — child first,
-/// parent last, which is the inversion shape every class in the ADR has. It cannot cycle, because
-/// the row it holds is uncommitted and so invisible to the deletion's cascade: there is nothing
-/// for the deletion to wait on, so it commits and the referential check finds the parent gone.
+/// **Order A: the deletion's statement lands first, and the first debit raises `23503`.** The
+/// debit writes a `relay_buckets` row and then asks for the `relays` row through
+/// `relay_buckets_relay_fk` — child first, parent last, which is the inversion shape every class
+/// in the ADR has. The deletion is holding that parent row, so the debit queues behind it; when it
+/// commits, the referential check finds the parent gone.
+///
+/// **Say what this does and does not show, because the obvious reading of it is wrong.** It is
+/// tempting to explain the `23503` by "the row the debit holds is uncommitted and so invisible to
+/// the cascade". That mechanism is real and it is what rules out a cycle, but it is *not* in this
+/// test's causal chain: `delete from relays` locks the parent and runs its cascade scan inside one
+/// statement, and that statement completed before the debit inserted anything. The cascade found
+/// nothing because nothing was there yet, not because it could not see it. The invisibility
+/// argument only ever matters for the interleaving neither test can stage — and that is exactly
+/// why it belongs in the ADR's prose and not in a comment claiming this test measured it.
+///
+/// `a_first_debit_then_a_relay_deletion_both_commit` is the other arrival order, and it produces
+/// no error at all. Neither order is the whole answer; the pair is.
 ///
 /// The `settle` is what stops this passing vacuously — without it the deletion could commit before
 /// the debit ever looked, and the `23503` would be a plain sequence rather than an interleaving.
@@ -1371,6 +1429,70 @@ async fn a_relay_deletion_and_a_first_debit_do_not_deadlock(pool: PgPool) {
         err.as_database_error().and_then(|e| e.constraint()),
         Some("relay_buckets_relay_fk"),
         "the violation names the relay reference, not some other constraint: {err}"
+    );
+}
+
+/// **Order B: the debit's statement lands first, and nothing fails.** The debit holds its new
+/// bucket row *and* the `for key share` its insert arm took on the relay, so the deletion blocks
+/// on the **parent** row — not on the child, which is the distinction the whole ruling turns on.
+/// When the debit commits, the deletion takes the relay and its cascade, now looking at a
+/// committed child row, takes the bucket with it. Two transactions, both commit, no error of any
+/// kind: neither the `40P01` of a cycle nor the `23503` of Order A.
+///
+/// **This is the order the sibling test does not reach, and it is the one that shows the insert
+/// arm cannot be half of a cycle.** A cycle needs each side to hold something the other wants. The
+/// debit holds the parent lock and, having finished its only statement, wants nothing further — a
+/// terminal node in the wait-for graph. The deletion waits, and that is all it can do.
+///
+/// The deletion's wait is as long as the debit's transaction stays open, which here is however
+/// long the test holds it, so no duration is asserted. What is asserted is that it waits at all:
+/// `settle` panics if it never blocks, which is what it would do if the insert arm stopped taking
+/// the parent lock, and the final count is what fails if the cascade stops seeing the child.
+#[sqlx::test]
+async fn a_first_debit_then_a_relay_deletion_both_commit(pool: PgPool) {
+    let (ws, relay) = relay_fixture(&pool, false).await;
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let mut debiting = pool.begin().await.unwrap();
+    let left: i32 = sqlx::query_scalar(DEBIT)
+        .bind(relay)
+        .bind(ws)
+        .bind(60i32)
+        .bind(10i32)
+        .fetch_one(&mut *debiting)
+        .await
+        .expect("the debit");
+    assert_eq!(
+        left, 50,
+        "the premise: the INSERT arm ran, so this transaction holds the relay `for key share`"
+    );
+
+    let deleting = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query("delete from relays where id = $1")
+                .bind(relay)
+                .execute(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    debiting.commit().await.expect("commit the debit");
+    let deleted = deleting
+        .await
+        .expect("the deletion")
+        .expect("neither 40P01 nor anything else: this order produces no error");
+    assert_eq!(deleted.rows_affected(), 1, "the relay really did go");
+
+    let buckets: i64 = sqlx::query_scalar("select count(*) from relay_buckets")
+        .fetch_one(&pool)
+        .await
+        .expect("count the buckets");
+    assert_eq!(
+        buckets, 0,
+        "the cascade re-scanned after the wait and took the now-committed bucket row"
     );
 }
 
@@ -1425,7 +1547,11 @@ async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) 
          the parent, so `relays` IS a lock class and ADR 0005's ruling on it is wrong",
     )
     .expect("the debit");
-    assert_eq!(left, 50, "sixty tokens less the ten this tick took");
+    assert_eq!(
+        left, 30,
+        "the forty the bucket held less the ten this tick took. 50 would mean the INSERT arm ran \
+         — a different statement taking a different lock, and not the one under test here"
+    );
 
     held.commit().await.expect("release the wedge");
     control
@@ -1457,7 +1583,10 @@ async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool
         .fetch_one(&mut *debiting)
         .await
         .expect("the debit");
-    assert_eq!(left, 50, "the premise: this tick took its tokens");
+    assert_eq!(
+        left, 30,
+        "the premise: the UPDATE arm ran and took its tokens. 50 would be the insert arm"
+    );
 
     let deleting = tokio::spawn({
         let pool = pool.clone();
