@@ -46,8 +46,11 @@ comment on table relays is
   'and `relay_buckets` is what makes us keep to it.';
 
 comment on column relays.max_connections is
-  'Concurrent SMTP connections the sender may hold open to this relay, across all workers. A relay '
-  'that caps connections per client refuses the extras at connect time; this keeps us under it.';
+  'Concurrent SMTP connections ONE sender process may hold open to this relay. Per process, not '
+  'shared: the connection pool lives in the process, unlike relay_buckets, which is shared through '
+  'this database precisely because a rate limit cannot be held per process. Two worker processes '
+  'may therefore hold twice this many open, and an operator running more than one must size it '
+  'with that in mind. A relay that caps connections per client refuses the extras at connect time.';
 comment on column relays.failover_order is
   'Lower is tried first. Ties break on id, so the order is always total and never flips between '
   'two runs of the same query.';
@@ -68,6 +71,16 @@ create table sending_domains (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint sending_domains_workspace_domain_key unique (workspace_id, domain),
+  -- Same guard `0026` puts on `jobs.payload` and on a form's `fields`: jsonb accepts a bare
+  -- scalar or a null as happily as an object, and every reader here indexes into it by key. A
+  -- `checks` of `7` or `"ok"` would deserialize to an error at the one moment the DNS checker's
+  -- result is being read, which is while an operator is waiting on the settings page.
+  constraint sending_domains_checks_is_object check (jsonb_typeof(checks) = 'object'),
+  -- The composite parent key, for the same reason `relays` carries one: a later table that
+  -- references a sending domain must carry `workspace_id` into the reference, and Postgres needs
+  -- a unique on exactly these two columns to point at. M2c's per-recipient `messages` rows are
+  -- the expected first child. Free now, a migration later.
+  constraint sending_domains_workspace_id_id_key unique (workspace_id, id),
   -- An app-signed domain without a key cannot sign anything, so it cannot exist. The API refuses
   -- it with a field error first; this is the backstop for every writer that is not the API.
   constraint sending_domains_app_signing_has_key
@@ -106,4 +119,10 @@ comment on table relay_buckets is
   'processes and not per process. This bucket is the only thing standing between us and a `455` '
   'the relay publishes no `Retry-After` for: once a relay throttles us there is no signal telling '
   'us when to try again, so we must not get throttled. Taking a token and refilling are one '
-  'statement on this row; `refilled_at` is when `tokens` was last topped up.';
+  'statement on this row; `refilled_at` is when `tokens` was last topped up. '
+  'relay_buckets_tokens_non_negative is what makes a mistake in that arithmetic loud: subtracting '
+  'more than the balance holds -- a take not predicated on the balance, or one predicated on the '
+  'pre-refill value -- would otherwise leave a negative balance that refuses nobody, which is the '
+  'exact failure this table exists to prevent, with nothing going red. A refill that overshoots '
+  'is the opposite mistake and this constraint does not catch it; the cap belongs in the taking '
+  'statement.';
