@@ -209,6 +209,33 @@ mod tests {
         );
     }
 
+    /// **The message goes to the person it was addressed to, and says what it was asked to say.**
+    ///
+    /// This looks too obvious to test, and it was missed for exactly that reason. Every other test
+    /// here checks a header the module is *interesting* about — the unsubscribe pair, `Feedback-ID`,
+    /// `Message-ID` — and none checked the two that carry the actual message. A review hunting for
+    /// a mutation nothing would catch found it in seconds: replace the recipient with the sender's
+    /// own mailbox, *after* validating the real one, and all eleven tests still pass. A message
+    /// delivered to the wrong person, with the suite green.
+    ///
+    /// The plain part is asserted through the body rather than `header`, since in a
+    /// `multipart/alternative` it is not in the header block.
+    #[test]
+    fn the_recipient_subject_and_body_are_the_ones_asked_for() {
+        let u = url();
+        let o = outgoing(&u);
+        let w = wire(&o);
+        assert_eq!(header(&w, "To").as_deref(), Some("reader@dest.test"), "{w}");
+        assert_eq!(header(&w, "Subject").as_deref(), Some("Hello"), "{w}");
+        assert!(w.contains("plain body"), "the text part is missing: {w}");
+        // And not quietly sent from the recipient, nor to the sender.
+        assert_eq!(
+            header(&w, "From").as_deref(),
+            Some("news@brand.test"),
+            "{w}"
+        );
+    }
+
     #[test]
     fn signed_headers_covers_both_unsubscribe_headers() {
         for want in ["List-Unsubscribe", "List-Unsubscribe-Post"] {
