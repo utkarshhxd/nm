@@ -22,6 +22,7 @@ use crate::{
     auth::{Principal, authorize},
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
+    mail::dkim,
     pagination::{Page, PageParams},
     workspaces::roles::Role,
 };
@@ -179,8 +180,12 @@ fn display_name(v: &str) -> Result<String, FieldError> {
     Ok(v.to_owned())
 }
 
-/// The DER inside a PEM private key. This unwraps the armour and nothing more: that the bytes are
-/// a key this product can sign with is for the DKIM signer to say, not this route.
+/// The DER inside a PEM private key, once the signer has said it can sign with it.
+///
+/// The armour is unwrapped here and the bytes are handed to [`dkim::key_from_der`] — the stored
+/// form, not the PEM, because the armour is not stored and the bytes are what a worker will load
+/// later. A key that cannot be signed with is a field error at save time rather than a surprise
+/// in a sender.
 ///
 /// The refusal never echoes the input, which is a key when it is anything.
 fn pem_to_der(v: &str) -> Result<Zeroizing<Vec<u8>>, FieldError> {
@@ -200,9 +205,7 @@ fn pem_to_der(v: &str) -> Result<Zeroizing<Vec<u8>>, FieldError> {
         return Err(refuse());
     }
     let der = Zeroizing::new(STANDARD.decode(body.concat()).map_err(|_| refuse())?);
-    if der.is_empty() {
-        return Err(refuse());
-    }
+    dkim::key_from_der(&der).map_err(|e| FieldError::new("dkim_private_key", e.to_string()))?;
     Ok(der)
 }
 
@@ -661,8 +664,22 @@ pub async fn check_sending_domain(
             .into_response());
     }
     let row = load(&state.pool, workspace_id, id).await?;
-    // `expected_p` is `None` until the DKIM signer exists to derive it from the stored key.
-    let checks = dns::check(&state.resolver, &row.domain(), None).await;
+    // What the selector must publish, for a domain this product signs: the public half of the
+    // key it signs with, as the bare base64 `p=` carries — `dns::check` compares that value, not
+    // the whole record, and giving it the record would fail a correctly configured domain. A
+    // relay-signed domain publishes the relay's key, which this product cannot know, so any key
+    // passes there.
+    let expected_p = match row.signing {
+        Signing::App => super::dkim_private_key(&state.pool, &state.secrets, workspace_id, id)
+            .await?
+            .map(|der| dkim::key_from_der(&der).map(|key| dkim::public_key_p(&key)))
+            .transpose()
+            .map_err(|e| {
+                anyhow::anyhow!("sending domain {id}: the stored DKIM key cannot be read: {e}")
+            })?,
+        Signing::Relay => None,
+    };
+    let checks = dns::check(&state.resolver, &row.domain(), expected_p.as_deref()).await;
     // Only if the configuration is the one that was checked: an edit that landed during the
     // lookups has reset `checks`, and writing the old answer over that would put a verdict on a
     // selector nobody uses any more.

@@ -47,12 +47,16 @@ struct Zone(Arc<Mutex<Records>>);
 type Records = HashMap<(String, RecordType), Vec<RData>>;
 
 impl Zone {
+    /// A TXT record, in the character-strings a nameserver would hold it as: one record, split
+    /// at 255 bytes, which is where DNS makes a 2048-bit DKIM key go. The checker joins them
+    /// back without a separator, as SPF and DKIM both say to.
     fn txt(&self, name: &str, text: &str) -> &Zone {
-        self.add(
-            name,
-            RecordType::TXT,
-            RData::TXT(TXT::new(vec![text.to_owned()])),
-        )
+        let strings = text
+            .as_bytes()
+            .chunks(255)
+            .map(|c| String::from_utf8(c.to_vec()).unwrap())
+            .collect();
+        self.add(name, RecordType::TXT, RData::TXT(TXT::new(strings)))
     }
 
     fn cname(&self, name: &str, target: &str) -> &Zone {
@@ -160,32 +164,42 @@ fn complete_zone() -> Zone {
 // ---------------------------------------------------------------------------------------------
 // The API.
 
-/// The bytes the stored "key" is, and the PEM an operator would paste. Not a real RSA key: the
-/// route unwraps the PEM and the signer (a later task) is what judges the bytes. They are ASCII
-/// and distinctive so that a copy of them in any response, row or log line is findable.
-const KEY_DER: &[u8] =
-    b"NMKEY-s3kr1t-dkim-7f3a9c-NMKEY-s3kr1t-dkim-7f3a9c-NMKEY-s3kr1t-dkim-7f3a9c";
+/// The PEM an operator pastes. A real 2048-bit RSA key, because the route now hands the bytes to
+/// the signer before it stores them: a stand-in would be refused. Throwaway, and the fixture
+/// directory's README says so.
+const KEY_PEM: &str = include_str!("fixtures/dkim/signing-2048-pkcs8.pem");
+/// The same key in the other armour. The stored DER does not record which it was, so a key saved
+/// either way has to come back out signable.
+const KEY_PEM_PKCS1: &str = include_str!("fixtures/dkim/signing-2048-pkcs1.pem");
+/// A different key, for the selector that publishes the wrong one.
+const OTHER_PEM: &str = include_str!("fixtures/dkim/other-2048-pkcs8.pem");
+const TOO_SMALL_PEM: &str = include_str!("fixtures/dkim/too-small-1024-pkcs1.pem");
 
-fn pem(der: &[u8]) -> String {
-    let body = STANDARD.encode(der);
-    let lines: Vec<&str> = body
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect();
-    format!(
-        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        lines.join("\n")
-    )
+/// The DER a PEM carries: what the column holds once the armour is off.
+fn der(pem: &str) -> Vec<u8> {
+    STANDARD
+        .decode(
+            pem.trim()
+                .lines()
+                .filter(|l| !l.starts_with("-----"))
+                .map(str::trim)
+                .collect::<String>(),
+        )
+        .unwrap()
 }
 
-/// Every form the key takes on its way through: the bytes, their base64, and the PEM.
+/// The base64 `p=` the key signs with, as the DKIM record publishes it.
+fn published_p(pem: &str) -> String {
+    nm::mail::dkim::public_key_p(&nm::mail::dkim::key_from_pem(pem).unwrap())
+}
+
+/// Every form the key takes on its way through: the whole base64 of the DER, and one line of the
+/// PEM body. That line is a slice of the same base64, so it catches an echo of the PEM a request
+/// carried as well as a re-encoding of the stored bytes.
 fn key_forms() -> Vec<String> {
     vec![
-        String::from_utf8(KEY_DER.to_vec()).unwrap(),
-        STANDARD.encode(KEY_DER),
-        // A slice well inside the base64, in case a response line-wrapped or truncated it.
-        STANDARD.encode(KEY_DER)[8..40].to_owned(),
+        STANDARD.encode(der(KEY_PEM)),
+        KEY_PEM.lines().nth(2).unwrap().trim().to_owned(),
     ]
 }
 
@@ -238,7 +252,7 @@ fn check_path(ws: Uuid, id: Uuid) -> String {
 fn body(domain: &str, signing: &str) -> Value {
     let mut v = json!({"domain": domain, "signing": signing});
     if signing == "app" {
-        v["dkim_private_key"] = json!(pem(KEY_DER));
+        v["dkim_private_key"] = json!(KEY_PEM);
     }
     v
 }
@@ -284,7 +298,7 @@ async fn a_sending_domain_hides_its_private_key(pool: PgPool) {
     let patched = t
         .admin
         .patch(&domain_path(t.id, id))
-        .json(&json!({"dkim_private_key": pem(KEY_DER), "from_name": "Acme"}))
+        .json(&json!({"dkim_private_key": KEY_PEM, "from_name": "Acme"}))
         .await;
     patched.assert_status_ok();
 
@@ -328,7 +342,7 @@ async fn a_sending_domain_hides_its_private_key(pool: PgPool) {
 
     // An error that quotes its input is a leak too: a PEM the route refuses is still a key.
     let mut bad = body("bad.example.com", "app");
-    bad["dkim_private_key"] = json!(pem(KEY_DER).replace("END PRIVATE KEY", "END WRONG KEY"));
+    bad["dkim_private_key"] = json!(KEY_PEM.replace("END PRIVATE KEY", "END WRONG KEY"));
     let refused = t.admin.post(&domains_path(t.id)).json(&bad).await;
     refused.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     for form in key_forms() {
@@ -375,7 +389,7 @@ async fn the_audit_rows_name_the_domain_and_what_changed(pool: PgPool) {
     let id = add_domain(&t, body("example.com", "app")).await;
     t.admin
         .patch(&domain_path(t.id, id))
-        .json(&json!({"dkim_selector": "s2", "dkim_private_key": pem(KEY_DER)}))
+        .json(&json!({"dkim_selector": "s2", "dkim_private_key": KEY_PEM}))
         .await
         .assert_status_ok();
     t.admin
@@ -421,7 +435,7 @@ async fn the_key_round_trips_through_secrets_and_stays_in_its_workspace(pool: Pg
     let keyless = add_domain(&t, body("plain.example.com", "relay")).await;
 
     // The signer gets the DER the PEM held, and nothing for a domain with no key.
-    assert_eq!(stored_key(&t, keyed).await.as_deref(), Some(KEY_DER));
+    assert_eq!(stored_key(&t, keyed).await, Some(der(KEY_PEM)));
     assert_eq!(stored_key(&t, keyless).await, None);
 
     // Round-tripping alone passes on a column holding the key in the clear.
@@ -434,7 +448,7 @@ async fn the_key_round_trips_through_secrets_and_stays_in_its_workspace(pool: Pg
     assert!(
         !blob
             .windows(16)
-            .any(|w| KEY_DER.windows(16).any(|k| k == w)),
+            .any(|w| der(KEY_PEM).windows(16).any(|k| k == w)),
         "the column holds the key in the clear"
     );
 
@@ -563,7 +577,7 @@ async fn app_signing_without_a_key_is_refused_by_the_api_with_a_field_error(pool
     // The legal moves around those: supply the key in the same request, or leave app first.
     t.admin
         .patch(&domain_path(t.id, relay))
-        .json(&json!({"signing": "app", "dkim_private_key": pem(KEY_DER)}))
+        .json(&json!({"signing": "app", "dkim_private_key": KEY_PEM}))
         .await
         .assert_status_ok();
     t.admin
@@ -746,7 +760,7 @@ async fn patch_keeps_what_it_is_not_sent_and_clears_on_null(pool: PgPool) {
     let mut v = body("example.com", "relay");
     v["from_name"] = json!("Acme");
     v["return_path_domain"] = json!("bounce.example.com");
-    v["dkim_private_key"] = json!(pem(KEY_DER));
+    v["dkim_private_key"] = json!(KEY_PEM);
     let id = add_domain(&t, v).await;
     let url = domain_path(t.id, id);
 
@@ -762,7 +776,7 @@ async fn patch_keeps_what_it_is_not_sent_and_clears_on_null(pool: PgPool) {
     assert_eq!(shown["from_name"], json!("Acme"));
     assert_eq!(shown["return_path_domain"], json!("bounce.example.com"));
     assert_eq!(shown["has_dkim_key"], json!(true));
-    assert_eq!(stored_key(&t, id).await.as_deref(), Some(KEY_DER));
+    assert_eq!(stored_key(&t, id).await, Some(der(KEY_PEM)));
 
     // `null` clears the three that can be, and says so.
     let r = t
@@ -787,14 +801,13 @@ async fn patch_keeps_what_it_is_not_sent_and_clears_on_null(pool: PgPool) {
         "cleared means NULL, not an encrypted empty string"
     );
 
-    // A new key replaces it.
-    let replacement = b"a-different-key-9e1d-a-different-key-9e1d";
+    // A new key replaces it, in the other armour: what is stored is the DER the PEM carried.
     t.admin
         .patch(&url)
-        .json(&json!({"dkim_private_key": pem(replacement)}))
+        .json(&json!({"dkim_private_key": OTHER_PEM}))
         .await
         .assert_status_ok();
-    assert_eq!(stored_key(&t, id).await.as_deref(), Some(&replacement[..]));
+    assert_eq!(stored_key(&t, id).await, Some(der(OTHER_PEM)));
 }
 
 #[sqlx::test]
@@ -824,7 +837,7 @@ async fn editing_what_was_checked_resets_the_verdict(pool: PgPool) {
     for patch in [
         json!({"dkim_selector": "s2"}),
         json!({"return_path_domain": null}),
-        json!({"dkim_private_key": pem(KEY_DER)}),
+        json!({"dkim_private_key": KEY_PEM}),
         // Whose key must be published at the selector changes with the mode.
         json!({"signing": "app"}),
     ] {
@@ -897,6 +910,115 @@ async fn a_check_stores_each_verdict_and_when_it_ran(pool: PgPool) {
         checks_of(&t, plain).await["checks"]["return_path"],
         json!({"status": "not_checked"})
     );
+}
+
+/// **A domain this product signs must publish the key it signs with.** Publishing somebody
+/// else's leaves SPF and DMARC passing and DKIM failing at the receiver, which is the failure an
+/// operator cannot see from in here.
+#[sqlx::test]
+async fn an_app_signed_domain_must_publish_the_key_it_signs_with(pool: PgPool) {
+    let publish = |zone: &Zone, name: &str, pem: &str| {
+        zone.clear(name, RecordType::TXT);
+        zone.txt(name, &format!("v=DKIM1; k=rsa; p={}", published_p(pem)));
+    };
+    let zone = complete_zone();
+    // A real DKIM record for a real key, and not this domain's.
+    publish(&zone, "nm1._domainkey.example.com", OTHER_PEM);
+    let ns = nameserver(zone.clone()).await;
+    let t = tenant_with(&pool, "acme", |p| {
+        TestApp::with_resolver(p, resolver_for(&ns))
+    })
+    .await;
+    let id = add_domain(&t, body("example.com", "app")).await;
+
+    let shown = checks_of(&t, id).await;
+    let reason = shown["checks"]["dkim"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the wrong key passed: {shown}"));
+    assert!(reason.contains("does not match"), "{reason}");
+    // Neither key is named, whole or in part: this reason is stored and shown to an operator.
+    for p in [published_p(KEY_PEM), published_p(OTHER_PEM)] {
+        for window in p.as_bytes().windows(8) {
+            let w = std::str::from_utf8(window).unwrap();
+            assert!(!reason.contains(w), "the reason leaks {w:?}: {reason}");
+        }
+    }
+    assert_eq!(
+        shown["checks"]["spf"]["status"],
+        json!("pass"),
+        "the other checks are unaffected: {shown}"
+    );
+
+    // The key it does sign with, published: the check passes. Without this half the test above
+    // would pass just as well on a checker that failed every app-signed domain — which is what
+    // handing `expected_p` the whole `v=DKIM1; …` record instead of the bare `p=` value does.
+    publish(&zone, "nm1._domainkey.example.com", KEY_PEM);
+    assert_eq!(
+        checks_of(&t, id).await["checks"]["dkim"],
+        json!({"status": "pass"})
+    );
+
+    // And a key saved in the other armour. The stored DER does not record which armour it came
+    // in, so this is the half that breaks if loading it back guesses.
+    let mut v = body("pkcs1.example.com", "app");
+    v["dkim_private_key"] = json!(KEY_PEM_PKCS1);
+    let pkcs1 = add_domain(&t, v).await;
+    publish(&zone, "nm1._domainkey.pkcs1.example.com", KEY_PEM_PKCS1);
+    assert_eq!(
+        checks_of(&t, pkcs1).await["checks"]["dkim"],
+        json!({"status": "pass"})
+    );
+
+    // Hand that same domain to the relay and the comparison stops: what is published is then the
+    // relay's key, which this product has no way to know, and holding it to the key still stored
+    // here would fail a domain that is set up correctly.
+    t.admin
+        .patch(&domain_path(t.id, pkcs1))
+        .json(&json!({"signing": "relay"}))
+        .await
+        .assert_status_ok();
+    publish(&zone, "nm1._domainkey.pkcs1.example.com", OTHER_PEM);
+    assert_eq!(
+        checks_of(&t, pkcs1).await["checks"]["dkim"],
+        json!({"status": "pass"})
+    );
+}
+
+/// A key the signer cannot use is a field error while it is being saved, and never a panic in a
+/// worker holding a campaign.
+#[sqlx::test]
+async fn a_key_the_signer_cannot_use_is_refused_when_it_is_saved(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let mut v = body("example.com", "app");
+    v["dkim_private_key"] = json!(TOO_SMALL_PEM);
+    let r = t.admin.post(&domains_path(t.id)).json(&v).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["dkim_private_key"]);
+    // It says what is wrong with the key without quoting it.
+    let text = r.text();
+    assert!(text.to_lowercase().contains("small"), "{text}");
+    for line in TOO_SMALL_PEM.lines().filter(|l| !l.starts_with("-----")) {
+        assert!(
+            line.trim().is_empty() || !text.contains(line.trim()),
+            "the refusal echoed the key: {text}"
+        );
+    }
+    // The same refusal on the other verb, and nothing was stored by either.
+    let id = add_domain(&t, body("ok.example.com", "app")).await;
+    let patched = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"dkim_private_key": TOO_SMALL_PEM}))
+        .await;
+    patched.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&patched), ["dkim_private_key"]);
+    let stored: Vec<Vec<u8>> =
+        sqlx::query_scalar("select dkim_private_key_encrypted from sending_domains")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.len(), 1, "a refused key was stored");
+    assert_eq!(stored_key(&t, id).await, Some(der(KEY_PEM)));
 }
 
 #[sqlx::test]

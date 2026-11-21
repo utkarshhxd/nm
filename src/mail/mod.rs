@@ -8,9 +8,11 @@
 //! can see. So every message carries an HTTPS `List-Unsubscribe` pointing at this product, with
 //! `List-Unsubscribe-Post` for RFC 8058 one-click.
 //!
-//! DKIM signing lives beside this module and signs [`SIGNED_HEADERS`]. lettre's own `dkim`
+//! DKIM signing is [`dkim`], which signs [`SIGNED_HEADERS`]. lettre's own `dkim`
 //! feature stays off: it reaches RSA private-key operations through the `rsa` crate, and
 //! `deny.toml`'s RUSTSEC-2023-0071 ignore rests on this product performing none.
+
+pub mod dkim;
 
 use lettre::{
     Address, Message,
