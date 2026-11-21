@@ -320,6 +320,11 @@ null, and `deny_unknown_fields`.
           -> DnsChecks;
   }
   ```
+- **`expected_p` has no caller yet in this task.** Deriving it from the stored key needs
+  `mail::dkim::public_key_txt`, which Task 6 builds. This task implements and tests the comparison
+  against literal values and passes `None` from the route; **Task 6 Step 5 is where the route starts
+  supplying it.** Do not stub `public_key_txt` here — two implementations of the same derivation is
+  how a mismatch becomes invisible.
 
 What each check asserts: **SPF** — a `v=spf1` TXT record exists at the domain and is the only one.
 **DKIM** — a TXT record at `{selector}._domainkey.{domain}` parses as `v=DKIM1` with a `p=`, and
@@ -459,8 +464,12 @@ SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }, BIT STRING { … } }`); write it an
   with `cargo tree -d -i ring` after adding it, then run `cargo deny check`.
 - [ ] **Step 4: Implement** canonicalization, the SPKI helpers, `key_from_pem` (accepting both
   PKCS#1 `BEGIN RSA PRIVATE KEY` and PKCS#8 `BEGIN PRIVATE KEY` PEM), and `signed_bytes`.
-- [ ] **Step 5: Wire the key check into Task 4's save path** — `key_from_pem` is called before the
-  key is encrypted, so an unusable key is a field error at save time, never a panic in a worker.
+- [ ] **Step 5: Wire both directions into Task 4.** `key_from_pem` is called before the key is
+  encrypted, so an unusable key is a field error at save time, never a panic in a worker. And the
+  check route now derives `expected_p` from the stored key with `public_key_txt` instead of passing
+  `None`, so a published record that does not match the key we sign with becomes a failing check.
+  Add the integration test that proves it: save a key, publish a *different* `p=` in the test
+  resolver, assert the DKIM check fails and that the failure text names neither key.
 - [ ] **Step 6: Run the tests and the full gate.** Commit.
 
 ---
@@ -560,7 +569,9 @@ is predicated on the refilled value being `>= n`, `returning` whether a row came
 
 ---
 
-### Task 9: The worker — the claim loop
+### Task 9: The worker — claim, lease, completion and backoff
+
+*(The tick that calls these is Task 11's `worker::run`; this task builds the primitives it uses.)*
 
 **Files:**
 - Create: `src/worker/mod.rs`
@@ -635,11 +646,14 @@ The sequence, in order:
    means `fail` with the reason, not a send. **Not `mailable_list_members`** — the view matches
    plaintext and is blind to erasure tombstones, which keep a hash and no plaintext (spec §5.7).
 4. Resolve the sending domain for the workspace, then the relays in failover order.
-5. `bucket::take` once for the batch, before the first send of that tick.
-6. Build with `mail::build`, sign with `mail::dkim::signed_bytes` when the domain is `app`-signed,
-   submit with `Transports::send`.
-7. Record: `Sent` → `complete`; `Transient` → `defer`; `Failed` and `Unknown` → `fail`, with the
+5. Build with `mail::build`, sign with `mail::dkim::signed_bytes` when the domain is `app`-signed —
+   otherwise take `lettre::Message::formatted()` — and submit with `Transports::send`.
+6. Record: `Sent` → `complete`; `Transient` → `defer`; `Failed` and `Unknown` → `fail`, with the
    reason. **`Unknown` is never retried** (§5.8).
+
+**The handler does not touch the token bucket.** The bucket is debited once per claimed batch
+(spec §5.4), which is a property of the tick, not of one message; `handle` runs with the debit
+already spent. Task 11's loop owns that call.
 
 - [ ] **Step 1: Write the failing tests:**
   - `a_suppressed_address_is_never_mailed` — **invariant 2**: suppress the address, run the handler
@@ -682,6 +696,14 @@ API does not thereby multiply their send rate, and an API host's pool cannot be 
 sending. New config: `worker_pool_size` (default 5) and `worker_concurrency` (default 4, how many
 messages one tick sends at once). `Config`'s hand-written `Debug` destructures without `..`, so both
 new fields must be named there — that is deliberate, and it forces a redaction decision.
+
+**The tick has a budget, and it is half the lease.** `BATCH` is 16 and `worker_concurrency` is 4, so
+a tick of four waves against a relay that burns the full 60-second `SESSION_TIMEOUT` each wave takes
+240 seconds — twice `LEASE_SECS`. A tick that outlives its own lease is the double-send in Review
+Focus 1 arriving by arithmetic rather than by a hang. So `run` stops *starting* new sends once the
+tick's elapsed time passes `LEASE_SECS / 2`, and explicitly `defer`s every claimed job it did not
+start, with a reason. A job that was never attempted is always safe to retry; one that was started
+is governed by its own outcome.
 
 - [ ] **Step 1: Write the failing tests:**
   - Config unit tests: both new fields default as above and are overridable by `NM_*`.
