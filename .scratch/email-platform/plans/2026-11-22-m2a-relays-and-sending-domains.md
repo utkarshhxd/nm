@@ -553,6 +553,26 @@ One statement: `insert … on conflict (relay_id) do update` that refills by
 is predicated on the refilled value being `>= n`, `returning` whether a row came back. Debited
 **once per claimed batch**, never per message (spec §5.4).
 
+**This statement is load-bearing outside this task, and the plan owes you the reason.** ADR 0005's
+ruling that `relays` is *not* a lock class was derived against this exact shape, and
+`tests/lock_order.rs` carries a reconstruction of it. The ruling turns on two properties:
+
+- the **insert arm** takes `for key share` on the `relays` row and holds nothing else waitable, so
+  it asks for one lock and cannot be half of a cycle;
+- the **update arm** writes only `tokens` and `refilled_at`, which are not key columns, so it fires
+  no referential trigger and takes nothing on the parent at all.
+
+**If your `take` departs from that — if it reads or locks a `relays` row, if it writes a
+foreign-key column on conflict, or if it becomes more than one statement — the ruling no longer
+describes your code and ADR 0005's enumeration must be re-run before you commit.** Say in your
+report which of the two arms you wrote and whether either property changed. `limit_per_minute` is
+a parameter precisely so `take` never has to read `relays`; keep it that way.
+
+**Carried from Task 1's review:** a *first* take with `n > limit_per_minute` inserts
+`limit_per_minute - n`, which is negative, and `0028`'s `relay_buckets_tokens_non_negative` now
+makes that a `23514` rather than the `false` the signature promises. Clamp or predicate the insert
+arm, and add `a_take_larger_than_the_limit_returns_false_rather_than_raising` to the tests below.
+
 - [ ] **Step 1: Write the failing tests:**
   - `a_fresh_bucket_allows_up_to_the_limit_and_then_refuses`.
   - `tokens_refill_with_time`: set `refilled_at` back 30 seconds on a limit of 60, assert exactly 30
