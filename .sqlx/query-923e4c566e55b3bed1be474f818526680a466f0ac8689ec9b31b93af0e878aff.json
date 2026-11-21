@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update suppressions set lifted_at = now() where workspace_id = $1 and scope = 'address' and email_hmac = $2 and reason = 'unsubscribed_all' and lifted_at is null returning id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "suppressions",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "923e4c566e55b3bed1be474f818526680a466f0ac8689ec9b31b93af0e878aff"
+}

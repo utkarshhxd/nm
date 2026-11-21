@@ -1,15 +1,15 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, workspace_id, scope as \"scope: Scope\", email, domain,\n                  reason as \"reason: Reason\", note, created_at, created_by_user_id,\n                  lifted_at, lifted_by_user_id\n           from suppressions where id = $2 and workspace_id is not distinct from $1",
+  "query": "select id as \"id!\", workspace_id, scope as \"scope!: Scope\", email, domain,\n                  reason as \"reason!: Reason\", note, created_at as \"created_at!\",\n                  created_by_user_id, lifted_at, lifted_by_user_id\n           from address_suppressions where id = $2 and workspace_id is not distinct from $1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "id"
           }
         }
@@ -20,18 +20,18 @@
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "workspace_id"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "scope: Scope",
+        "name": "scope!: Scope",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "scope"
           }
         }
@@ -42,7 +42,7 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "email"
           }
         }
@@ -53,18 +53,18 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "domain"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "reason: Reason",
+        "name": "reason!: Reason",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "reason"
           }
         }
@@ -75,18 +75,18 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "note"
           }
         }
       },
       {
         "ordinal": 7,
-        "name": "created_at",
+        "name": "created_at!",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "created_at"
           }
         }
@@ -97,7 +97,7 @@
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "created_by_user_id"
           }
         }
@@ -108,7 +108,7 @@
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "lifted_at"
           }
         }
@@ -119,7 +119,7 @@
         "type_info": "Uuid",
         "origin": {
           "Table": {
-            "table": "suppressions",
+            "table": "address_suppressions",
             "name": "lifted_by_user_id"
           }
         }
@@ -132,18 +132,18 @@
       ]
     },
     "nullable": [
-      false,
-      true,
-      false,
       true,
       true,
-      false,
       true,
-      false,
+      true,
+      true,
+      true,
+      true,
+      true,
       true,
       true,
       true
     ]
   },
-  "hash": "21a9087e23f1c76fc939b715f04f0ecc46b0d1cfc3eb353354b902091e9b1d3f"
+  "hash": "65f18ec22990f80d698bc7019672bbe4fcb97e123e9273af53f81ec67859b006"
 }

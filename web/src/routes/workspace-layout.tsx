@@ -68,6 +68,7 @@ export default function WorkspaceLayout() {
       <nav className="mt-4 flex flex-wrap gap-4" aria-label="Workspace">
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/contacts" label="Contacts" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/lists" label="Lists" />
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/forms" label="Forms" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/imports" label="Import" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/segments" label="Segments" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/tags" label="Tags" />
@@ -101,6 +102,7 @@ function WorkspaceLink({
   to:
     | "/w/$slug/contacts"
     | "/w/$slug/lists"
+    | "/w/$slug/forms"
     | "/w/$slug/imports"
     | "/w/$slug/segments"
     | "/w/$slug/tags"

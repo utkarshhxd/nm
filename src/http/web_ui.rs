@@ -76,12 +76,20 @@ pub fn serve_web(source: &dyn AssetSource, path: &str, accept_encoding: Option<&
 /// would otherwise be served `index.html` with a 200. The health checks are real routes and
 /// cannot reach this handler, but `serve_web` is public and must not contradict them.
 ///
+/// `crate::public::owns_path` covers `/c`, `/u` and `/f` — the subscriber's server-rendered
+/// pages, bare prefix included. That one is shared rather than spelled out twice, because for
+/// those three the two ideas below really are one: see the reasoning on `owns_path`.
+///
 /// This happens to list the same paths as `security_headers::uncacheable`, which are two
 /// different ideas that coincide — "never the SPA" and "never cached by a shared cache" — so
 /// they are deliberately NOT one function. `security_headers`'s tests assert the two agree, so
 /// a path added to only one of them fails loudly instead of drifting quietly.
 pub(crate) fn is_reserved(path: &str) -> bool {
-    path == "/api" || path.starts_with("/api/") || path == "/healthz" || path == "/readyz"
+    path == "/api"
+        || path.starts_with("/api/")
+        || path == "/healthz"
+        || path == "/readyz"
+        || crate::public::owns_path(path)
 }
 
 /// The precompressed variant the client accepts, else the raw file; `None` if neither exists.
@@ -273,6 +281,34 @@ mod tests {
             assert_eq!(header_of(&res, "cache-control"), Some(NO_CACHE), "{path}");
             assert_eq!(header_of(&res, "content-encoding"), None, "{path}");
             assert_eq!(body_of(res), INDEX, "{path}");
+        }
+    }
+
+    /// The subscriber's token-authenticated pages are server-rendered territory, bare prefix
+    /// included: `/u` with the token lost must be a 404, not a sign-in app with a `200`.
+    ///
+    /// **Written as its own list rather than against `public::owns_path`.**
+    /// `security_headers::uncacheable_and_is_reserved_agree` compares the two predicates, and both
+    /// of them now delegate to `owns_path` for these paths, so for this half that test compares a
+    /// function with itself. This is the independent pin: change `owns_path` and this fails.
+    #[test]
+    fn the_subscribers_pages_are_never_the_spa() {
+        let src = Map::new(&[("index.html", INDEX)]);
+        for path in ["/c", "/c/", "/c/abc.def", "/u", "/u/", "/f", "/f/signup"] {
+            assert_eq!(
+                serve_web(&src, path, None).status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        // Near misses, which are the SPA's and must stay the SPA's: the character after a prefix
+        // has to be a `/` or nothing at all.
+        for path in ["/contacts", "/forms", "/customers"] {
+            assert_eq!(
+                serve_web(&src, path, None).status(),
+                StatusCode::OK,
+                "{path}"
+            );
         }
     }
 

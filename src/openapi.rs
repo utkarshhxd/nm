@@ -38,6 +38,7 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::workspaces::invites::preview,
         crate::workspaces::invites::accept,
         crate::audit::routes::list,
+        crate::consent::routes::list_consent,
         crate::auth::api_keys::create,
         crate::auth::api_keys::list,
         crate::auth::api_keys::revoke,
@@ -78,6 +79,11 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::lists::routes::list_contact_lists,
         crate::lists::routes::add_contact_to_list,
         crate::lists::routes::unsubscribe_contact_from_list,
+        crate::forms::routes::list_forms,
+        crate::forms::routes::get_form,
+        crate::forms::routes::create_form,
+        crate::forms::routes::update_form,
+        crate::forms::routes::delete_form,
         crate::segments::routes::list_segments,
         crate::segments::routes::get_segment,
         crate::segments::routes::create_segment,
@@ -127,6 +133,9 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::workspaces::invites::AcceptInvite,
         crate::workspaces::invites::Accepted,
         crate::audit::routes::AuditEntry,
+        crate::consent::Action,
+        crate::consent::Source,
+        crate::consent::routes::ConsentEntry,
         crate::auth::api_keys::NewApiKey,
         crate::auth::api_keys::CreatedApiKey,
         crate::auth::api_keys::ApiKeySummary,
@@ -170,6 +179,11 @@ const DOCS_PATH: &str = "/api/v1/docs";
         crate::lists::routes::NewContactList,
         crate::lists::routes::Membership,
         crate::lists::routes::MailableCount,
+        crate::forms::Form,
+        crate::forms::FormField,
+        crate::forms::FormTarget,
+        crate::forms::routes::NewForm,
+        crate::forms::routes::UpdateForm,
         crate::segments::Segment,
         crate::segments::routes::NewSegment,
         crate::segments::routes::UpdateSegment,
@@ -243,6 +257,85 @@ mod tests {
             duplicates.is_empty(),
             "duplicate operationId {duplicates:?} — utoipa derives it from the handler's function \
              name, so give each one an explicit `operation_id = \"…\"` in its `#[utoipa::path(…)]`"
+        );
+    }
+
+    /// A schema name must be unique too, and **the document cannot be walked to find out.**
+    ///
+    /// utoipa derives a schema's name from the Rust type's name, and `components.schemas` is one
+    /// flat map keyed by it. Two registered types that share a name — `consent::Action` and a
+    /// future `audit::Action`, say — do not collide loudly: the second insert replaces the first,
+    /// the map still holds one well-formed entry under that key, and every `$ref` to it still
+    /// resolves. One of the two types then ships to every client with the other's shape, and the
+    /// generated TypeScript compiles, because `Action` exists and is a valid type. Nothing in the
+    /// Rust build, the document, or `openapi-typescript` says a word.
+    ///
+    /// So this reads the registration list rather than the result. The name utoipa uses is the
+    /// type path's last segment, which is checked rather than assumed: every name derived here
+    /// must appear as a key in the generated document. That second assertion is what keeps the
+    /// first honest — if the derivation rule ever stops holding (a `#[schema(as = "…")]` rename,
+    /// or a utoipa change), the names compared above would be the wrong strings and this fails
+    /// instead of passing silently.
+    ///
+    /// The reverse containment is deliberately not asserted: `Page_Form` and its siblings are
+    /// generated from `body = Page<Form>` on an operation and are in no list.
+    #[test]
+    fn schema_names_are_unique() {
+        let source = include_str!("openapi.rs");
+        let list = source
+            .split_once("components(schemas(")
+            .expect("the schema registration list is spelt `components(schemas(`")
+            .1;
+        let list = &list[..list.find("))").expect("the list is closed with `))`")];
+        let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        // **Split on the comma, not on the newline.** One registration per line is a hand
+        // convention and nothing enforces it: `components(schemas(…))` is an attribute token tree
+        // and rustfmt does not reformat it. Parsing by line, two paths written on one line —
+        // `crate::consent::Action, crate::audit::Action,` — collapsed into a single entry whose
+        // `rsplit("::")` yields `Action`, so the pair recorded as one name, no duplicate was seen,
+        // and the collision this test exists to catch shipped. The cross-check below did not
+        // catch it either: the collapsed key `Action` *is* a published schema name — the
+        // surviving one of the two — so the one case it was written for is the one case it
+        // passed. Comments are cut at `//` first, whole-line and trailing alike, because a type
+        // path never contains one.
+        for path in list
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .flat_map(|line| line.split(','))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            seen.entry(path.rsplit("::").next().expect("rsplit yields one part"))
+                .or_default()
+                .push(path);
+        }
+        assert!(
+            seen.len() > 50,
+            "only {} schemas parsed out of the registration list: the parse is wrong, not the list",
+            seen.len()
+        );
+
+        let doc = serde_json::to_value(spec()).expect("the spec serialises");
+        let schemas = doc["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas is an object");
+        let unpublished: Vec<_> = seen
+            .keys()
+            .filter(|name| !schemas.contains_key(**name))
+            .collect();
+        assert!(
+            unpublished.is_empty(),
+            "{unpublished:?} are registered but are not keys of components.schemas, so a schema's \
+             published name is no longer its type path's last segment — the uniqueness check below \
+             would be comparing the wrong strings. Teach this test the new rule before trusting it."
+        );
+
+        let duplicates: Vec<_> = seen.iter().filter(|(_, paths)| paths.len() > 1).collect();
+        assert!(
+            duplicates.is_empty(),
+            "two types share a schema name {duplicates:?} — one of them silently replaced the \
+             other in components.schemas and is shipping with the wrong shape. Rename one with \
+             `#[schema(as = …)]`."
         );
     }
 }

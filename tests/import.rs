@@ -2241,6 +2241,248 @@ async fn skip_existing_writes_no_tags_and_no_membership_either(pool: PgPool) {
         "the row that was not skipped is subscribed as normal"
     );
 }
+// ---- C-1/C-4: a per-list unsubscribe that a deletion cannot erase ------------------------------
+
+/// The subscriber's own per-list refusal, through the writer the preference center uses. Not a
+/// hand-written row: the point of these tests is that what that page writes is what the importer
+/// honours, and a row built here by hand would only prove this file's reading of the schema.
+async fn refuse_list(conn: &mut PgConnection, ws: Uuid, list: Uuid, email: &str) {
+    nm::suppressions::unsubscribe_list(conn, &secrets(), ws, list, email)
+        .await
+        .expect("refuse one list");
+}
+
+/// Every live `list`-scope refusal in the workspace, as `(email, list_id, list_name)`.
+async fn refusals(
+    conn: &mut PgConnection,
+    ws: Uuid,
+) -> Vec<(Option<String>, Option<Uuid>, Option<String>)> {
+    sqlx::query_as(
+        "select email, list_id, list_name from suppressions \
+          where workspace_id = $1 and scope = 'list' and lifted_at is null order by id",
+    )
+    .bind(ws)
+    .fetch_all(conn)
+    .await
+    .expect("read list refusals")
+}
+
+/// **Deleting a contact is not erasing one**, so no tombstone is written and nothing refuses the
+/// address afterwards: `list_memberships` and `consent_log` both cascade away with the contact
+/// row, and before `0027` the unsubscribe went with them. The next import then put the person
+/// back on the list they had left, and the log could not say they had ever left it.
+#[sqlx::test]
+async fn deleting_a_contact_and_importing_it_again_does_not_undo_the_list_it_left(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    unsubscribe(&mut tx, ws, list, "ada@example.com").await;
+    refuse_list(&mut tx, ws, list, "ada@example.com").await;
+
+    sqlx::query("delete from contacts where workspace_id = $1 and email = 'ada@example.com'")
+        .bind(ws)
+        .execute(&mut *tx)
+        .await
+        .expect("delete the contact");
+    assert_eq!(
+        membership(&mut tx, ws, list, "ada@example.com").await,
+        None,
+        "the premise: the membership row this used to live in is gone"
+    );
+
+    let j = job_for_list(import, ws, name_columns(), list);
+    let counts = import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Ada,Byron,UTC\n",
+    )
+    .await;
+
+    assert_eq!(
+        counts.imported, 1,
+        "the contact comes back, because deleting one is not erasing one"
+    );
+    assert_eq!(
+        membership(&mut tx, ws, list, "ada@example.com").await,
+        None,
+        "but not onto the list she left: the refusal outlived the row it used to live in"
+    );
+    assert_eq!(
+        counts.memberships_declined, 1,
+        "and the operator is told the subscription was declined"
+    );
+}
+
+/// **The one the importer's own list-matching makes worse.** A file's list is resolved by NAME, so
+/// deleting a list and recreating it under the same name used to resurrect everyone who had ever
+/// left it — in one import, silently, for every address at once.
+#[sqlx::test]
+async fn deleting_a_list_and_recreating_it_by_name_does_not_resurrect_who_left_it(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let old = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    unsubscribe(&mut tx, ws, old, "ada@example.com").await;
+    refuse_list(&mut tx, ws, old, "ada@example.com").await;
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(old)
+        .execute(&mut *tx)
+        .await
+        .expect("delete the list");
+    assert_eq!(
+        refusals(&mut tx, ws).await,
+        [(
+            Some("ada@example.com".to_owned()),
+            None,
+            Some("news".to_owned())
+        )],
+        "the refusal survives with its id gone and its name kept: that is how it says the list \
+         it was about no longer exists"
+    );
+    let new = insert_list(&mut tx, ws, "news", false).await;
+    assert_eq!(
+        refusals(&mut tx, ws).await,
+        [(
+            Some("ada@example.com".to_owned()),
+            Some(new),
+            Some("news".to_owned())
+        )],
+        "and a list born with that name adopts it, which is what lets every reader match on the \
+         id alone"
+    );
+
+    let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
+    let counts = import_csv(&mut tx, &j, "email,tags,lists\nada@example.com,,news\n").await;
+
+    assert_eq!(
+        membership(&mut tx, ws, new, "ada@example.com").await,
+        None,
+        "the file names the list she left, by the name she left it under"
+    );
+    assert!(!is_mailable(&mut tx, ws, new, "ada@example.com").await);
+    assert_eq!(counts.memberships_declined, 1);
+}
+
+/// **Renaming is the move that defeats a name-keyed refusal**, and it is why the snapshot is kept
+/// current by a trigger rather than by a line in the rename handler. The import below runs against
+/// the new name after the renamed list has itself been deleted and remade, because that is the
+/// only sequence in which the stored NAME is what decides the answer: while the list lives, the
+/// refusal still carries its id and would be honoured whatever the name said.
+#[sqlx::test]
+async fn a_refusal_follows_a_list_through_a_rename(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let old = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    refuse_list(&mut tx, ws, old, "ada@example.com").await;
+
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(old)
+        .execute(&mut *tx)
+        .await
+        .expect("rename the list");
+    assert_eq!(
+        refusals(&mut tx, ws).await,
+        [(
+            Some("ada@example.com".to_owned()),
+            Some(old),
+            Some("bulletin".to_owned())
+        )],
+        "the snapshot follows the name it is a snapshot of"
+    );
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(old)
+        .execute(&mut *tx)
+        .await
+        .expect("delete the renamed list");
+    let new = insert_list(&mut tx, ws, "bulletin", false).await;
+
+    let j = job_with(import, ws, tag_and_list_columns(), vec![], Dedup::default());
+    import_csv(&mut tx, &j, "email,tags,lists\nada@example.com,,bulletin\n").await;
+
+    assert_eq!(
+        membership(&mut tx, ws, new, "ada@example.com").await,
+        None,
+        "a rename, a deletion and a recreation are three moves; none of them is consent"
+    );
+}
+
+/// **The direction that would turn a consent feature into a trap.** An import is an operator
+/// naming an address; only the person, through a token delivered to that address, may clear their
+/// own refusal. `tests/public_pages.rs` holds the other direction.
+#[sqlx::test]
+async fn an_import_never_lifts_a_per_list_refusal(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let mut tx = pool.begin().await.unwrap();
+    let list = insert_list(&mut tx, ws, "news", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    refuse_list(&mut tx, ws, list, "ada@example.com").await;
+
+    let j = job_for_list(import, ws, name_columns(), list);
+    import_csv(
+        &mut tx,
+        &j,
+        "email,first_name,last_name,timezone\nada@example.com,Ada,Byron,UTC\n",
+    )
+    .await;
+
+    assert_eq!(
+        refusals(&mut tx, ws).await,
+        [(
+            Some("ada@example.com".to_owned()),
+            Some(list),
+            Some("news".to_owned())
+        )],
+        "the refusal is still live, so the next import declines as well"
+    );
+}
+
+/// **A refusal of one list is not a block on the address**, which is the whole risk of giving
+/// `suppressions` a third scope: every reader written before it assumed a live row for an address
+/// meant that address was blocked outright, and being wrong here stops all mail to somebody who
+/// left one list.
+#[sqlx::test]
+async fn a_refusal_of_one_list_leaves_every_other_list_mailable(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let mut tx = pool.begin().await.unwrap();
+    let news = insert_list(&mut tx, ws, "news", false).await;
+    let offers = insert_list(&mut tx, ws, "offers", false).await;
+    insert_contact(&mut tx, ws, "ada@example.com", "Ada", "Lovelace").await;
+    subscribe(&mut tx, ws, news, "ada@example.com").await;
+    subscribe(&mut tx, ws, offers, "ada@example.com").await;
+    refuse_list(&mut tx, ws, news, "ada@example.com").await;
+
+    assert!(
+        is_mailable(&mut tx, ws, offers, "ada@example.com").await,
+        "the list she did not leave still reaches her"
+    );
+    // The membership on `news` is left `subscribed` here on purpose: an operator who re-adds her
+    // writes exactly that row, and the view is what has to refuse it.
+    assert!(
+        !is_mailable(&mut tx, ws, news, "ada@example.com").await,
+        "and the one she left does not, whatever the membership row says"
+    );
+    assert!(
+        !nm::suppressions::is_suppressed(&mut *tx, &secrets(), ws, "ada@example.com")
+            .await
+            .unwrap(),
+        "nothing address-level may read it: this is what the contact detail screen asks"
+    );
+    assert_eq!(
+        nm::suppressions::blocking_suppression(&mut *tx, &secrets(), ws, "ada@example.com")
+            .await
+            .unwrap(),
+        None,
+        "and it shows no block on her page"
+    );
+}
 
 #[sqlx::test]
 async fn a_padded_custom_cell_is_stored_without_its_padding(pool: PgPool) {
@@ -3890,4 +4132,71 @@ async fn an_upload_past_the_per_minute_limit_is_429(pool: PgPool) {
     // not refused - and the same caller, the same app and the same limiter are what prove it.
     uploaded(&app, other, "fine.csv", "email\nada@example.com\n").await;
     assert_eq!(count(&pool, "imports").await, 1);
+}
+
+/// **The importer's half of `docs/adr/0005-one-lock-order-for-every-path.md`**, and the one path
+/// whose position-2 lock could not be hoisted into the statement it protects: `wanted` is a
+/// `union`, and a locking clause is not allowed with one, so the lock is a statement of its own.
+///
+/// It lives here rather than in `tests/lock_order.rs` because the import is driven by this file's
+/// fixtures, and it needs a different wedge from its five siblings there. They hold the `contacts`
+/// row, which stops a route between its membership write and the consent rows that follow; the
+/// import does both in one statement, so there is no point between them to stop at. Instead the
+/// deletion is what is held open, and the question is which side blocks on it. With the lock, the
+/// import waits for the deletion, sees no list afterwards and writes no membership. Without it,
+/// the big statement's own snapshot still sees the list, inserts against it, and the foreign key
+/// check that runs at the end of the statement — with a fresh snapshot — finds the list gone:
+/// `23503`, which fails the whole import.
+#[sqlx::test]
+async fn an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let list = {
+        let mut conn = pool.acquire().await.unwrap();
+        insert_list(&mut conn, ws, "news", false).await
+    };
+
+    // The operator's deletion, begun and held open: it has the list row and its cascade.
+    let mut deleting = pool.begin().await.unwrap();
+    sqlx::query("delete from lists where id = $1")
+        .bind(list)
+        .execute(&mut *deleting)
+        .await
+        .expect("delete the list");
+
+    let importing = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let j = job_for_list(import, ws, name_columns(), list);
+            let staged = copy_into_staging(
+                &mut tx,
+                &secrets(),
+                &j,
+                &b"email,first_name,last_name,timezone\nada@example.com,Ada,Byron,UTC\n"[..],
+            )
+            .await
+            .expect("staging");
+            let counts = upsert_from_staging(&mut tx, &j, staged.failed).await;
+            tx.commit().await.expect("commit the import");
+            counts
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    deleting.commit().await.expect("commit the deletion");
+    let counts = importing
+        .await
+        .expect("the import task")
+        .expect("the import must not fail because a list it named was deleted");
+
+    assert_eq!(counts.imported, 1, "the contact is still imported");
+    let memberships: i64 = sqlx::query_scalar("select count(*) from list_memberships")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        memberships, 0,
+        "and put on no list, because the one the job named no longer exists"
+    );
 }

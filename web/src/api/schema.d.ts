@@ -499,11 +499,10 @@ export interface paths {
          * Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in
          *     list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
          *     promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
-         * @description This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
-         *     back in. One admin re-adding one named person is a considered act they answer for; a bulk
-         *     action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
-         *     gets a sender blocklisted. Adding someone to a list is what makes them mailable, and an
-         *     unsubscribe afterwards does not un-send. Do not "fix" the asymmetry.
+         * @description `POST /lists/{id}/members` behaves the same way, and so does every other route an operator can
+         *     reach: one admin re-adding one named person is still the operator asserting consent on the
+         *     subscriber's behalf, and being accountable for it does not make it consent. Only the subscriber
+         *     reverses their own unsubscribe, through a link sent to their own address.
          */
         post: operations["bulk_subscribe_contacts"];
         delete?: never;
@@ -633,6 +632,30 @@ export interface paths {
         options?: never;
         head?: never;
         patch: operations["update_contact"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/consent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One contact's consent history, newest first.
+         * @description **Ordered and paged by `id`, not `created_at`.** `created_at` ties — Postgres `now()` is
+         *     transaction-start time, a membership write and its consent row share a transaction, and the
+         *     set-based writers insert a whole batch in one statement — so paging on it would skip or
+         *     repeat the rows that share a value. `id` is UUID v7, so `id desc` is both a total order and
+         *     newest-first; `0024_consent_log_paging_index.sql` is the index that serves it.
+         */
+        get: operations["list_consent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
@@ -793,6 +816,39 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/forms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_forms"];
+        put?: never;
+        post: operations["create_form"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/forms/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_form"];
+        put?: never;
+        post?: never;
+        /** A hard delete. The form's `form_lists` rows go with it; the lists and their members stay. */
+        delete: operations["delete_form"];
+        options?: never;
+        head?: never;
+        patch: operations["update_form"];
         trace?: never;
     };
     "/api/v1/workspaces/{workspace_id}/imports": {
@@ -970,8 +1026,9 @@ export interface paths {
         get: operations["list_list_members"];
         put?: never;
         /**
-         * Adding someone who is already `pending` or `subscribed` changes nothing; adding an
-         *     `unsubscribed` one subscribes them again.
+         * Adding someone who is already on the list changes nothing, whatever their status: a confirmed
+         *     subscriber is not demoted to `pending`, and someone who unsubscribed stays unsubscribed. The
+         *     response carries the status the membership has, which may not be the one the add asked for.
          */
         post: operations["add_list_member"];
         delete?: never;
@@ -1164,6 +1221,12 @@ export interface components {
             /** Format: uuid */
             workspace_id: string;
         };
+        /**
+         * @description What changed — and for `requested`, what did not: the person was **asked** and has not
+         *     agreed. Stored as text under a `check` constraint, as `lists::MembershipStatus` is.
+         * @enum {string}
+         */
+        Action: "requested" | "subscribed" | "confirmed" | "unsubscribed" | "resubscribed" | "suppressed";
         /** @description A key as listed: its prefix identifies it, nothing in it can authenticate. */
         ApiKeySummary: {
             /** Format: date-time */
@@ -1348,6 +1411,47 @@ export interface components {
             /** @description Shown only here. */
             recovery_codes: string[];
         };
+        /**
+         * @description One row of the log, with the list's name joined on.
+         *
+         *     **The evidence columns are the point of the row**, not decoration on it: a row that says
+         *     `subscribed` without saying how is what this milestone exists to prevent. `ip` and
+         *     `user_agent` are the subscriber's own, written only by the public routes where the request
+         *     really was theirs; an operator or API change carries neither and names the actor in
+         *     `source_ref` instead.
+         */
+        ConsentEntry: {
+            /**
+             * @description `requested` means the person was **asked** and has not agreed — a double opt-in that is
+             *     still pending. It is not a softer `subscribed`.
+             */
+            action: components["schemas"]["Action"];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            /** @description The subscriber's own address, on the public routes only. */
+            ip?: string | null;
+            /**
+             * Format: uuid
+             * @description Null for a workspace-wide change, and for a row whose list has since been deleted —
+             *     `0020_consent_log.sql` nulls the pointer and keeps the evidence.
+             */
+            list_id?: string | null;
+            /** @description The list's name now. Null whenever `list_id` is. */
+            list_name?: string | null;
+            /**
+             * @description The code path the change arrived by, never who made it: a session-authenticated operator
+             *     using bulk subscribe is recorded as `api`.
+             */
+            source: components["schemas"]["Source"];
+            /** @description Whatever caused the change: the form id, the import id, the user or API key id. */
+            source_ref?: string | null;
+            /** @description The nonce of the public token that authorised the change: *which* link was clicked. */
+            token_jti?: string | null;
+            /** @description The subscriber's own, on the public routes only. */
+            user_agent?: string | null;
+        };
         Contact: {
             /** @description Custom field values by field key. Values of archived fields stay readable here. */
             attributes: unknown;
@@ -1462,6 +1566,75 @@ export interface components {
             challenge_id: string;
             /** @description The browser's `PublicKeyCredential`, in WebAuthn JSON form. */
             credential: Record<string, never>;
+        };
+        Form: {
+            button_label: string;
+            /** Format: date-time */
+            created_at: string;
+            fields: components["schemas"]["FormField"][];
+            headline: string;
+            /** Format: uuid */
+            id: string;
+            /**
+             * @description The lists one submission subscribes to, ascending. The Rust-side projection of the
+             *     `form_lists` rows, so it is a set: the order a client sent is not kept.
+             */
+            list_ids: string[];
+            /** @description The operator's own name for it; never shown to a submitter. */
+            name: string;
+            /**
+             * @description Where a successful submission is to be sent. Absolute `http`/`https` only; see
+             *     [`validate_redirect_url`].
+             */
+            redirect_url?: string | null;
+            /** @description Unique in the workspace. It is what names the form in its public URL. */
+            slug: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: uuid */
+            workspace_id: string;
+        };
+        /** @description One input on the page. */
+        FormField: {
+            /** @description What the page prints beside the input. */
+            label: string;
+            required: boolean;
+            target: components["schemas"]["FormTarget"];
+        };
+        /**
+         * @description What one field of a form collects.
+         *
+         *     This is deliberately **not** `contacts::import::ContactField`, which the CSV importer uses.
+         *     That enum carries `Lists`, and a public form field targeting it would let whoever fills the
+         *     form in name the lists they join — the form's lists are the operator's decision, not the
+         *     submitter's. It also has no custom-field case, which spec §7.3 requires.
+         *
+         *     There is therefore no `Lists` variant here and there must never be one. Serde refuses an
+         *     unknown tag, so a hand-written body naming `"lists"` fails to deserialise and the request is
+         *     refused before any handler sees it; `tests/forms.rs` pins that through the API, because no
+         *     Rust-level test can exercise a variant that does not exist.
+         */
+        FormTarget: {
+            /** @enum {string} */
+            kind: "email";
+        } | {
+            /** @enum {string} */
+            kind: "first_name";
+        } | {
+            /** @enum {string} */
+            kind: "last_name";
+        } | {
+            /** @enum {string} */
+            kind: "timezone";
+        } | {
+            /** @enum {string} */
+            kind: "custom";
+            /**
+             * @description A custom field, by its `custom_fields.key`. Checked against the workspace's live
+             *     definitions at write time: a form collecting into a field that is not there collects into
+             *     nowhere, and the operator would find out only once the submissions had happened.
+             */
+            value: string;
         };
         /**
          * @description One rejected row, as the operator has to read it: which row, which column, why, and the cell
@@ -1621,7 +1794,11 @@ export interface components {
             name: string;
             /** Format: date-time */
             updated_at: string;
-            /** @description Unused until the preference center, which shows the `public` lists as topics. */
+            /**
+             * @description Whether the preference center offers this list to somebody who is not on it. A `private`
+             *     list is still shown there to its own members, so hiding one never leaves a subscriber
+             *     unable to leave it (`public::unsubscribe::topics`).
+             */
             visibility: components["schemas"]["Visibility"];
         };
         /** @description A contact's standing on one list. */
@@ -1733,6 +1910,20 @@ export interface components {
             label: string;
             /** @description Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind. */
             options?: string[] | null;
+        };
+        NewForm: {
+            button_label: string;
+            /** @description The page's inputs. Exactly one must target `email`. */
+            fields: components["schemas"]["FormField"][];
+            headline: string;
+            /** @description At least one, at most 25. Each must be a list of this workspace. */
+            list_ids: string[];
+            /** @description The operator's name for it. */
+            name: string;
+            /** @description Absolute `http`/`https` only. Absent or `null` means the form has no redirect. */
+            redirect_url?: string | null;
+            /** @description Unique in the workspace. It is what names the form in its public URL. */
+            slug: string;
         };
         /** @description The request body, for the document: the one part, named `file`. */
         NewImport: {
@@ -1856,6 +2047,41 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_ConsentEntry: {
+            data: {
+                /**
+                 * @description `requested` means the person was **asked** and has not agreed — a double opt-in that is
+                 *     still pending. It is not a softer `subscribed`.
+                 */
+                action: components["schemas"]["Action"];
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                id: string;
+                /** @description The subscriber's own address, on the public routes only. */
+                ip?: string | null;
+                /**
+                 * Format: uuid
+                 * @description Null for a workspace-wide change, and for a row whose list has since been deleted —
+                 *     `0020_consent_log.sql` nulls the pointer and keeps the evidence.
+                 */
+                list_id?: string | null;
+                /** @description The list's name now. Null whenever `list_id` is. */
+                list_name?: string | null;
+                /**
+                 * @description The code path the change arrived by, never who made it: a session-authenticated operator
+                 *     using bulk subscribe is recorded as `api`.
+                 */
+                source: components["schemas"]["Source"];
+                /** @description Whatever caused the change: the form id, the import id, the user or API key id. */
+                source_ref?: string | null;
+                /** @description The nonce of the public token that authorised the change: *which* link was clicked. */
+                token_jti?: string | null;
+                /** @description The subscriber's own, on the public routes only. */
+                user_agent?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Contact: {
             data: {
                 /** @description Custom field values by field key. Values of archived fields stay readable here. */
@@ -1900,6 +2126,36 @@ export interface components {
                 label: string;
                 /** @description The allowed values of a `select` or `multi_select` field; empty for every other kind. */
                 options: string[];
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_Form: {
+            data: {
+                button_label: string;
+                /** Format: date-time */
+                created_at: string;
+                fields: components["schemas"]["FormField"][];
+                headline: string;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * @description The lists one submission subscribes to, ascending. The Rust-side projection of the
+                 *     `form_lists` rows, so it is a set: the order a client sent is not kept.
+                 */
+                list_ids: string[];
+                /** @description The operator's own name for it; never shown to a submitter. */
+                name: string;
+                /**
+                 * @description Where a successful submission is to be sent. Absolute `http`/`https` only; see
+                 *     [`validate_redirect_url`].
+                 */
+                redirect_url?: string | null;
+                /** @description Unique in the workspace. It is what names the form in its public URL. */
+                slug: string;
+                /** Format: date-time */
+                updated_at: string;
+                /** Format: uuid */
+                workspace_id: string;
             }[];
             next_cursor?: string | null;
         };
@@ -2045,7 +2301,11 @@ export interface components {
                 name: string;
                 /** Format: date-time */
                 updated_at: string;
-                /** @description Unused until the preference center, which shows the `public` lists as topics. */
+                /**
+                 * @description Whether the preference center offers this list to somebody who is not on it. A `private`
+                 *     list is still shown there to its own members, so hiding one never leaves a subscriber
+                 *     unable to leave it (`public::unsubscribe::topics`).
+                 */
                 visibility: components["schemas"]["Visibility"];
             }[];
             next_cursor?: string | null;
@@ -2285,6 +2545,12 @@ export interface components {
             /** @description Base32 secret, shown only here. */
             secret: string;
         };
+        /**
+         * @description What caused the change. **The code path, never the actor**: a session-authenticated operator
+         *     using bulk subscribe is `Api`, because that is the writer the change went through.
+         * @enum {string}
+         */
+        Source: "form" | "import" | "api" | "operator" | "one_click" | "preference_center" | "bounce" | "complaint";
         /** @description The confirmed mapping, and the run. */
         StartImport: {
             /**
@@ -2373,6 +2639,22 @@ export interface components {
             kind?: components["schemas"]["FieldKind"] | null;
             label?: string | null;
             options?: string[] | null;
+        };
+        UpdateForm: {
+            /** @description Cannot be `null`. */
+            button_label?: string;
+            /** @description Replaces the fields outright. Cannot be `null`. */
+            fields?: components["schemas"]["FormField"][];
+            /** @description Cannot be `null`. */
+            headline?: string;
+            /** @description Replaces the lists outright. Cannot be `null` or empty. */
+            list_ids?: string[];
+            /** @description Cannot be `null`. */
+            name?: string;
+            /** @description `null` clears it, leaving the form with no redirect. */
+            redirect_url?: string | null;
+            /** @description Cannot be `null`. */
+            slug?: string;
         };
         /**
          * @description A field left out is left alone. `null` clears `description` to an empty string; on any other
@@ -4401,6 +4683,50 @@ export interface operations {
             };
         };
     };
+    list_consent: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Contact id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every consent row for this contact, newest first, paged by row id */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_ConsentEntry"];
+                };
+            };
+            /** @description not a member, or no such contact in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     contact_eligibility: {
         parameters: {
             query?: never;
@@ -4531,7 +4857,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            /** @description The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4933,6 +5259,226 @@ export interface operations {
             };
             /** @description field-not-archived, or field-in-use: a segment still names it, and the problem lists which */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_forms: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_Form"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewForm"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Form"];
+                };
+            };
+            /** @description insufficient-role: creating a form takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description form-slug-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid input, an unknown field, or an unknown list */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Form id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Form"];
+                };
+            };
+            /** @description not a member, or no such form in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Form id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, with its list links; the lists and their members stay */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a form takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such form in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_form: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Form id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateForm"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Form"];
+                };
+            };
+            /** @description insufficient-role: editing a form takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such form in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description form-slug-taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description invalid input, an unknown field, or an unknown list */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5509,7 +6055,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `subscribed` on a single-opt-in list, `pending` on a double-opt-in one */
+            /** @description The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had */
             200: {
                 headers: {
                     [name: string]: unknown;

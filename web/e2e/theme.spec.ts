@@ -97,6 +97,20 @@ test("a_theme_can_be_scoped_to_a_subtree", async ({ page, app }) => {
   expect(colours.nested).toBe(colours.wholePage);
 });
 
+/**
+ * **This prints `axe could not decide: color-contrast×4` on the closed-dialog scan in each theme,
+ * and that is expected.** `incomplete` is axe's third bucket — the rule ran and could not reach a
+ * verdict — and `support/axe.ts` started printing it on 2026-11-20 because it had been dropped on
+ * the floor until then, which made a name like this one's claim more than the scan established.
+ *
+ * The four are the decorative `span[aria-hidden="true"]` glyphs inside the status badges
+ * (`.bg-success-subtle`, `.bg-warning-subtle`, `.bg-danger-subtle`, and the muted
+ * `.bg-sunken.text-fg-muted` one), every one of them reported as "Element content contains only
+ * non-text characters". axe declining to judge the contrast of something that is not text is the
+ * right answer, so there is nothing to fix here. What would **not** be expected is a colour axe
+ * could not resolve: `oklch()` is not that case — `web/e2e/preference-center.spec.ts` sweeps pages
+ * written entirely in it and has `color-contrast` in `passes` by name on all twenty scans.
+ */
 test("both_themes_pass_axe_on_a_sample_page", async ({ browser, app }) => {
   for (const theme of ["light", "dark"] as const) {
     // The OS says the opposite, so only the stored choice can produce the right theme.

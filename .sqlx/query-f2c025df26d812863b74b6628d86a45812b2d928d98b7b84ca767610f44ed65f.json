@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from suppressions where workspace_id = $1 and email_hmac = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f2c025df26d812863b74b6628d86a45812b2d928d98b7b84ca767610f44ed65f"
+}

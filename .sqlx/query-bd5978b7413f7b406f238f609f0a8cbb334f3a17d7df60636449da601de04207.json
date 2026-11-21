@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select email from contacts where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "contacts",
+            "name": "email"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bd5978b7413f7b406f238f609f0a8cbb334f3a17d7df60636449da601de04207"
+}

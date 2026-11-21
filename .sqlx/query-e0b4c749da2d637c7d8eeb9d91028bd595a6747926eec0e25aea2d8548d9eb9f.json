@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "with l as materialized (\n               select id, name from lists where workspace_id = $2 and id = $5 for key share\n           ), written as (\n               insert into suppressions (id, workspace_id, scope, email, email_hmac, reason,\n                                         source, list_id, list_name)\n               select $1, $2, 'list', $3, $4, 'unsubscribed_list', 'preference_center', l.id,\n                      l.name\n                 from l\n               on conflict (workspace_id, email_hmac, list_id)\n                 where lifted_at is null and scope = 'list' and list_id is not null\n               do nothing\n               returning id\n           )\n           select exists (select 1 from l) as \"list_exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "list_exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e0b4c749da2d637c7d8eeb9d91028bd595a6747926eec0e25aea2d8548d9eb9f"
+}

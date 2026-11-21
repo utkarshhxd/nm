@@ -14,7 +14,7 @@ use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
-    contacts,
+    consent, contacts,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
     pagination::{Page, PageParams},
@@ -384,6 +384,40 @@ pub async fn delete_list(
 ) -> ApiResult<StatusCode> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, &principal, workspace_id, Role::Editor).await?;
+    // **Position 3, taken by hand, because the cascade takes it last.** Deleting the row below
+    // reaches `list_memberships` first and `suppressions` last — foreign key actions fire in the
+    // order the constraints were created, and `0027`'s is the newest on this table. That put this
+    // path at `list_memberships` → `suppressions` while `erase_contact` runs `suppressions` →
+    // `list_memberships` (its tombstone has to exist before the contact dies), and the two
+    // deadlocked: reproduced on Postgres 16.15, victim either a GDPR erasure or this deletion.
+    //
+    // A lock rather than an `update … set list_id = null`, so the foreign key keeps owning what a
+    // deleted list does to a refusal; this only decides when the row is taken.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // **Position 2 first, and this line is the whole of what was wrong with the version that
+    // introduced the pre-lock below.** Taking the refusals and only then deleting the row is
+    // `suppressions` before `lists` — the one path that broke the order the ADR derives, in the
+    // commit that derived it. A rename goes `lists` then `suppressions` through its trigger and
+    // the preference centre's re-tick takes the list and then updates the refusal, so both inverted
+    // against this; reproduced through both routes on Postgres 16.15, and half the time the victim
+    // was `POST /u/{token}`, which may not answer differently. The `delete` below needs this row
+    // exclusively anyway, so taking it here costs nothing but the order.
+    sqlx::query!(
+        "select 1 as one from lists where workspace_id = $1 and id = $2 for update",
+        workspace_id,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query!(
+        "select 1 as one from suppressions \
+          where workspace_id = $1 and list_id = $2 order by id for update",
+        workspace_id,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
     let deleted = sqlx::query!(
         "delete from lists where workspace_id = $1 and id = $2",
         workspace_id,
@@ -493,8 +527,9 @@ pub async fn mailable_count(
     }))
 }
 
-/// Adding someone who is already `pending` or `subscribed` changes nothing; adding an
-/// `unsubscribed` one subscribes them again.
+/// Adding someone who is already on the list changes nothing, whatever their status: a confirmed
+/// subscriber is not demoted to `pending`, and someone who unsubscribed stays unsubscribed. The
+/// response carries the status the membership has, which may not be the one the add asked for.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/lists/{id}/members",
@@ -505,7 +540,7 @@ pub async fn mailable_count(
     ),
     request_body = NewMember,
     responses(
-        (status = 200, description = "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one", body = Membership),
+        (status = 200, description = "The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had", body = Membership),
         (status = 403, description = "insufficient-role: changing a list's members takes editor"),
         (status = 404, description = "not a member, or no such list or contact in this workspace"),
     ),
@@ -574,6 +609,7 @@ async fn add_audited(
         list_id,
         contact_id,
         MembershipSource::of_single_add(principal),
+        &consent::Context::of_principal(principal),
     )
     .await?;
     audit::record(
@@ -608,7 +644,8 @@ async fn unsubscribe_audited(
 ) -> ApiResult<()> {
     let mut tx = state.pool.begin().await?;
     authorize(&mut *tx, principal, workspace_id, Role::Editor).await?;
-    unsubscribe_member(&mut tx, workspace_id, list_id, contact_id).await?;
+    let cx = consent::Context::of_principal(principal);
+    unsubscribe_member(&mut tx, workspace_id, list_id, contact_id, &cx).await?;
     audit::record(
         &mut *tx,
         meta,
@@ -680,7 +717,7 @@ pub async fn list_contact_lists(
     ),
     request_body = NewContactList,
     responses(
-        (status = 200, description = "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one", body = Membership),
+        (status = 200, description = "The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had", body = Membership),
         (status = 403, description = "insufficient-role: changing a contact's lists takes editor"),
         (status = 404, description = "not a member, or no such contact or list in this workspace"),
     ),

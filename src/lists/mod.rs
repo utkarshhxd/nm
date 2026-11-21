@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::Principal;
+use crate::consent;
 use crate::error::{ApiError, ApiResult, FieldError};
 
 pub mod routes;
@@ -43,9 +44,17 @@ impl MembershipStatus {
     }
 }
 
-/// How a membership was created, for the consent log. `form` has no writer yet (M1d) and is
-/// therefore not a variant; the table's `check` already admits it. A row written before the column
-/// existed reads as NULL, never as one of these.
+/// How a membership was created, for the consent log. A row written before the column existed
+/// reads as NULL, never as one of these.
+///
+/// `Form` is the hosted signup page (`public::forms`), added by Task 9. `0018` reserved the
+/// string from the start, so it needed no migration.
+///
+/// `PreferenceCenter` was added by `0022`, with the reasoning in that migration: the subscriber
+/// changing their own preferences is not `ui` (nobody signed in), not `api`, and not a NULL,
+/// which would assert the row predates `0018`. It is deliberately not `form` either — a form
+/// follows the list's `double_optin` and may write `pending`, where the preference center never
+/// does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum MembershipSource {
@@ -53,6 +62,8 @@ pub enum MembershipSource {
     Api,
     Bulk,
     Import,
+    PreferenceCenter,
+    Form,
 }
 
 impl MembershipSource {
@@ -74,7 +85,9 @@ pub struct List {
     /// `true`: a new member is `pending` until they confirm. `false`: a new member is
     /// `subscribed` at once.
     pub double_optin: bool,
-    /// Unused until the preference center, which shows the `public` lists as topics.
+    /// Whether the preference center offers this list to somebody who is not on it. A `private`
+    /// list is still shown there to its own members, so hiding one never leaves a subscriber
+    /// unable to leave it (`public::unsubscribe::topics`).
     pub visibility: Visibility,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -141,23 +154,74 @@ pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResu
     .map_err(Into::into)
 }
 
-/// Puts the contact on the list and returns the status that was written: `Subscribed` on a
-/// single-opt-in list, `Pending` on a double-opt-in one. The caller passes the transaction and has
-/// already authorised the actor. `404` if either id is not in this workspace.
+/// **Position 2 of the one lock order (`docs/adr/0005-one-lock-order-for-every-path.md`).** Takes
+/// `for key share` on every list in `ids` that exists in this workspace, by `id` ascending, and
+/// returns the ones it got.
 ///
-/// A contact who is already `pending` or `subscribed` is left as it is: adding someone twice must
-/// not demote a confirmed subscriber back to `pending`. An `unsubscribed` one is let back in, as a
-/// fresh member (so `unsubscribed_at` is cleared and `source` is the new add's; the audit log keeps
-/// the history).
+/// **Call this before writing a `list_memberships` or a `consent_log` row naming any of them.**
+/// Both of those tables carry a foreign key to `lists`, and a foreign key check runs at the END of
+/// the statement that triggered it — so a path that just writes the row takes the `lists` row
+/// *after* the membership row, which is the opposite of the order `delete_list` and the rename
+/// trigger take them in. That is an ABBA cycle, and M1d shipped four of them before the order was
+/// written down. Taking the rows here, first, is what makes a path obey the order rather than
+/// argue about one pair of it.
+///
+/// **The returned ids are the ones that still exist**, and a caller that writes memberships should
+/// narrow itself to them rather than trusting the ids it was given: a list deleted between the
+/// caller reading it and this call is gone, and naming it anyway is a foreign key violation —
+/// which on the public form route reached an anonymous submitter as a `500`. A list deleted
+/// *after* this call cannot be, because the deletion blocks on the lock this took.
+///
+/// `for key share` and not something stronger: it conflicts with deleting the row and with
+/// renaming it (`name` belongs to `lists_workspace_id_name_key`, so a rename is a key update), and
+/// with nothing else. Two callers of this never block each other.
+pub async fn lock_lists(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    ids: &[Uuid],
+) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar!(
+        // `order by` before the locking clause, so two transactions locking overlapping sets take
+        // them in the same sequence and cannot cycle within the class.
+        r#"select id as "id!" from lists where workspace_id = $1 and id = any($2)
+            order by id for key share"#,
+        workspace_id,
+        ids,
+    )
+    .fetch_all(db)
+    .await
+}
+
+/// Puts the contact on the list and returns the membership's status — for a new member the one
+/// just written, `Subscribed` on a single-opt-in list and `Pending` on a double-opt-in one; for a
+/// contact already on the list, the status it already had, which may not be the one asked for. The
+/// caller passes the transaction and has already authorised the actor. `404` if either id is not
+/// in this workspace.
+///
+/// A membership that already exists is left exactly as it is, whatever it says, and the status it
+/// already has is what comes back. Adding someone twice must not demote a confirmed subscriber
+/// back to `pending`, and an `unsubscribed` one stays `unsubscribed` (spec §8.1, M1d invariant 1):
+/// an operator naming one address is still the operator asserting consent on the subscriber's
+/// behalf, which is the thing consent law exists to forbid. Only the subscriber can undo their own
+/// unsubscribe, through a token delivered to their own address — the preference center.
+///
+/// A write is a consent row, `Source::Operator`, in the same transaction: `requested` when the
+/// status written is `pending`, `subscribed` otherwise. Leaving a membership as it is records
+/// nothing.
 pub async fn add_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
     list_id: Uuid,
     contact_id: Uuid,
     source: MembershipSource,
+    cx: &consent::Context,
 ) -> ApiResult<MembershipStatus> {
+    // `for key share` on the read this already does: position 2 of the lock order, before the
+    // membership and consent rows below take the same row through their foreign keys. One word
+    // rather than a call to [`lock_lists`], because the row was being read here anyway.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
     let double_optin = sqlx::query_scalar!(
-        "select double_optin from lists where workspace_id = $1 and id = $2",
+        "select double_optin from lists where workspace_id = $1 and id = $2 for key share",
         workspace_id,
         list_id,
     )
@@ -168,13 +232,16 @@ pub async fn add_member(
     } else {
         MembershipStatus::Subscribed
     };
-    let written = sqlx::query_scalar!(
+    // Position 4, before the membership and consent rows that both carry a foreign key to it.
+    // A contact deleted in the meantime is the `404` the insert's own foreign key would have
+    // produced anyway, taken a statement earlier and in order.
+    if !crate::contacts::lock_contact(&mut *db, workspace_id, contact_id).await? {
+        return Err(ApiError::NotFound);
+    }
+    let written = sqlx::query!(
         r#"insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source)
            values ($1, $2, $3, $4, case when $4::text = 'subscribed' then now() end, $5)
-           on conflict (contact_id, list_id) do update
-           set status = excluded.status, subscribed_at = excluded.subscribed_at,
-               unsubscribed_at = null, source = excluded.source
-           where list_memberships.status = 'unsubscribed'
+           on conflict (contact_id, list_id) do nothing
            returning status as "status: MembershipStatus""#,
         workspace_id,
         contact_id,
@@ -190,7 +257,38 @@ pub async fn add_member(
         _ => e.into(),
     })?;
     match written {
-        Some(s) => Ok(s),
+        Some(w) => {
+            // The action follows the status that was WRITTEN, not the `double_optin` flag it came
+            // from: on a double-opt-in list the person has only been asked, not agreed.
+            // Exhaustive on purpose, so a status added later must be given an action here before
+            // this compiles rather than being logged as something it is not.
+            let action = match w.status {
+                MembershipStatus::Pending => consent::Action::Requested,
+                MembershipStatus::Subscribed => consent::Action::Subscribed,
+                // Unreachable: this arm's row was just inserted with `status` above, which is only
+                // ever `Pending` or `Subscribed`, and `do nothing` returns nothing on conflict.
+                // It fails instead of naming an action, because the compile-time guard is the
+                // point and a consent row saying the wrong thing outlives the `500` that would
+                // have been noticed. `record` is append-only, so a wrong row cannot be corrected.
+                MembershipStatus::Unsubscribed => {
+                    return Err(ApiError::Internal(anyhow::anyhow!(
+                        "add_member inserted a membership with an unwritable status"
+                    )));
+                }
+            };
+            let source = consent::Source::Operator;
+            consent::record(
+                db,
+                workspace_id,
+                contact_id,
+                Some(list_id),
+                action,
+                source,
+                cx,
+            )
+            .await?;
+            Ok(w.status)
+        }
         None => Ok(sqlx::query_scalar!(
             r#"select status as "status: MembershipStatus" from list_memberships
                where workspace_id = $1 and contact_id = $2 and list_id = $3"#,
@@ -204,29 +302,73 @@ pub async fn add_member(
 }
 
 /// Marks the membership `unsubscribed` and stamps `unsubscribed_at`; the row stays. Doing it again
-/// keeps the first stamp. `404` if the contact was never on this list, or it is not in this
-/// workspace.
+/// keeps the first stamp and records nothing: only a change is a consent row (`unsubscribed`,
+/// `Source::Operator`, same transaction). `404` if the contact was never on this list, or it is
+/// not in this workspace.
+///
+/// **Writes no `list`-scope suppression, so this unsubscribe does not survive deleting the contact
+/// or the list.** That is the whole of what a durable refusal is for (`0027`), and it is withheld
+/// here on the same rule `docs/adr/0001` applies to the workspace-wide one: a suppression row
+/// keyed on the address, outliving every row it is about, is the subscriber's own act and no
+/// operator's. `public::unsubscribe::save` is the only writer, and `lift_unsubscribed_list` is
+/// reachable only through a token delivered to the address. `issues/35` carries what that leaves
+/// open and what closing it would cost.
 pub async fn unsubscribe_member(
     db: &mut PgConnection,
     workspace_id: Uuid,
     list_id: Uuid,
     contact_id: Uuid,
+    cx: &consent::Context,
 ) -> ApiResult<()> {
+    // Position 2, before the membership row below and the consent row after it, both of which take
+    // this same list row through their foreign keys. `docs/adr/0005-one-lock-order-for-every-path.md`.
+    lock_lists(&mut *db, workspace_id, &[list_id]).await?;
+    // Position 4. A contact that is gone has no membership either, which is the same `404` the
+    // statement below would reach on its own.
+    if !crate::contacts::lock_contact(&mut *db, workspace_id, contact_id).await? {
+        return Err(ApiError::NotFound);
+    }
+    // One statement, so one snapshot: "did this change anything" and "is there a membership at
+    // all" cannot disagree. Asking separately let a membership another transaction committed in
+    // between turn a 404 into a `204` over a contact who is still subscribed.
     let done = sqlx::query!(
-        "update list_memberships \
-         set status = 'unsubscribed', \
-             unsubscribed_at = case when status = 'unsubscribed' then unsubscribed_at else now() end \
-         where workspace_id = $1 and list_id = $2 and contact_id = $3",
+        r#"with changed as (
+               update list_memberships
+                  set status = 'unsubscribed', unsubscribed_at = now()
+                where workspace_id = $1 and list_id = $2 and contact_id = $3
+                  and status <> 'unsubscribed'
+               returning 1
+           )
+           select exists (select 1 from changed) as "changed!",
+                  exists (select 1 from list_memberships
+                           where workspace_id = $1 and list_id = $2
+                             and contact_id = $3) as "member!""#,
         workspace_id,
         list_id,
         contact_id,
     )
-    .execute(db)
+    .fetch_one(&mut *db)
     .await?;
-    if done.rows_affected() == 0 {
-        return Err(ApiError::NotFound);
+    if done.changed {
+        let source = consent::Source::Operator;
+        let action = consent::Action::Unsubscribed;
+        return consent::record(
+            db,
+            workspace_id,
+            contact_id,
+            Some(list_id),
+            action,
+            source,
+            cx,
+        )
+        .await;
     }
-    Ok(())
+    // Nothing changed: it was already unsubscribed (fine) or was never a member (404).
+    if done.member {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 #[cfg(test)]

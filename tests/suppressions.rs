@@ -536,3 +536,500 @@ async fn create_validates_its_input(pool: PgPool) {
         .unwrap();
     assert_eq!(rows, 0);
 }
+
+/// **The consent log could say that somebody opted out of everything and could never say that it
+/// ended.** `public::unsubscribe::one_click` writes `suppressed` with a null `list_id` when a
+/// subscriber opts out of everything; the identical fact set through this API wrote an `audit_log`
+/// row and no consent row, and ending it wrote nothing in either log — the public routes write no
+/// audit rows by design, and this route wrote no consent row. Both directions are recorded now,
+/// `Resubscribed` with a null `list_id` being spec §7.1's word for the end of one.
+///
+/// Three negatives in the same fixture, because each is a reason the row must NOT be written and
+/// each would otherwise be a silent over-reach: a reason that is not a workspace-wide opt-out, an
+/// address that is nobody's contact here, and a domain-scope block, which is about no one person.
+#[sqlx::test]
+async fn an_operator_setting_or_ending_a_workspace_wide_opt_out_writes_a_consent_row(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let contact: Uuid = sqlx::query_scalar(
+        "insert into contacts (id, workspace_id, email) values ($1, $2, 'a@ex.test') returning id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(w.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let rows = |action: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from consent_log where contact_id = $1 and list_id is null \
+                 and action = $2 and source = 'operator'",
+            )
+            .bind(contact)
+            .bind(action)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let id = add_address(&w.editor, &path(w.id), "a@ex.test", "unsubscribed_all").await;
+    assert_eq!(rows("suppressed").await, 1, "the opt-out was set");
+    w.admin.post(&lift_path(w.id, id)).await.assert_status_ok();
+    assert_eq!(rows("resubscribed").await, 1, "and the log says it ended");
+
+    // Not every suppression is a consent decision about one person in one workspace.
+    let bounced = add_address(&w.editor, &path(w.id), "a@ex.test", "bounced").await;
+    w.admin
+        .post(&lift_path(w.id, bounced))
+        .await
+        .assert_status_ok();
+    add_address(&w.editor, &path(w.id), "nobody@ex.test", "unsubscribed_all").await;
+    w.editor
+        .post(&path(w.id))
+        .json(&json!({"scope": "domain", "domain": "ex.test", "reason": "unsubscribed_all"}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let total: i64 = sqlx::query_scalar("select count(*) from consent_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        total, 2,
+        "a bounce, an address with no contact and a domain block write no consent row"
+    );
+}
+
+// ---- C-1/C-4 fix round 1: the two triggers that keep `list_name` honest ------------------------
+
+use std::time::Duration;
+
+use nm::{
+    config::SecretKey,
+    crypto::secrets::Secrets,
+    suppressions::{lift_unsubscribed_list, unsubscribe_list},
+};
+use sqlx::PgConnection;
+
+fn secrets() -> Secrets {
+    Secrets::new(&SecretKey([7u8; 32]))
+}
+
+const ADA: &str = "ada@example.com";
+
+async fn make_list(conn: &mut PgConnection, ws: Uuid, name: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query("insert into lists (id, workspace_id, name) values ($1, $2, $3)")
+        .bind(id)
+        .bind(ws)
+        .bind(name)
+        .execute(conn)
+        .await
+        .expect("insert list");
+    id
+}
+
+/// Every live `list`-scope refusal, as `(list_id, list_name)`, oldest first.
+async fn refusals(pool: &PgPool, ws: Uuid) -> Vec<(Option<Uuid>, Option<String>)> {
+    sqlx::query_as(
+        "select list_id, list_name from suppressions \
+          where workspace_id = $1 and scope = 'list' and lifted_at is null order by id",
+    )
+    .bind(ws)
+    .fetch_all(pool)
+    .await
+    .expect("read refusals")
+}
+
+/// **A rename that commits while somebody is unticking the box must not leave the old name
+/// behind.** The refusal still carries `list_id`, so nothing looks wrong while the list lives —
+/// and then deleting that list and recreating it under its current name finds no refusal of that
+/// name to adopt, and the next import puts the person back on it. That is the defect the whole
+/// `list` scope exists to close, and a plain `select … from lists` reintroduced it: the statement's
+/// READ COMMITTED snapshot does not see the uncommitted rename, and the rename's trigger has
+/// already run and will not come back for the row.
+///
+/// Deterministic in both directions. With `for key share` the save blocks until the rename commits
+/// and then re-reads, so the stored name is necessarily the committed one; without it the save
+/// does not block at all and stores the old name well before the rename lands.
+#[sqlx::test]
+async fn a_rename_that_commits_mid_save_does_not_leave_the_old_name_on_the_refusal(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let list = make_list(&mut conn, w.id, "news").await;
+    drop(conn);
+
+    // The operator's rename, begun and held open.
+    let mut renaming = pool.begin().await.unwrap();
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(list)
+        .execute(&mut *renaming)
+        .await
+        .expect("rename the list");
+
+    // The subscriber unticking the box, on its own connection.
+    let saving = tokio::spawn({
+        let pool = pool.clone();
+        let ws = w.id;
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            unsubscribe_list(&mut tx, &secrets(), ws, list, ADA)
+                .await
+                .expect("refuse one list");
+            tx.commit().await.unwrap();
+        }
+    });
+
+    // What makes the two overlap, so the check below is about a rename that landed mid-save and
+    // not about one that was over before the save began. There is no assertion here: the save
+    // blocks under both the fixed and the broken statement — at `for key share`, or later at the
+    // foreign key's own check, which runs after the row has been built from the stale read and so
+    // cannot change what it stored. The stored name is the only thing that tells them apart, which
+    // is what the mutation check shows.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    renaming.commit().await.expect("commit the rename");
+    saving.await.expect("the save");
+
+    assert_eq!(
+        refusals(&pool, w.id).await,
+        [(Some(list), Some("bulletin".to_owned()))],
+        "the refusal stored a name the list no longer has"
+    );
+}
+
+/// **A rename cannot collide with anything, whatever else the address has refused.** No unique
+/// index covering a live list refusal mentions `list_name`, so moving a snapshot is not a key
+/// update and the trigger has no case to carve out. It used to: the live key was the name, so a
+/// rename onto a name another live refusal by that address already held failed the operator with
+/// `duplicate key value violates unique constraint "suppressions_live"`, and every attempt to
+/// guard that left stale names behind that the next rename choked on.
+///
+/// The second refusal is made to hold the incoming name directly, because keying on the list means
+/// nothing in the product produces that state any more — and the property is about the state, not
+/// about one route to it.
+#[sqlx::test]
+async fn a_rename_cannot_collide_with_the_addresss_other_refusals(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let news = make_list(&mut conn, w.id, "news").await;
+    let other = make_list(&mut conn, w.id, "other").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse news");
+    unsubscribe_list(&mut conn, &secrets(), w.id, other, ADA)
+        .await
+        .expect("refuse other");
+    drop(conn);
+    sqlx::query("update suppressions set list_name = 'bulletin' where list_id = $1")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("make one refusal stale");
+
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("the operator's rename must not fail");
+
+    // The refusal follows its list — no skipping, no stale snapshot left behind — and the other
+    // refusal keeps its own `list_id`, which is the only thing any reader matches on, so neither
+    // list stops being refused.
+    assert_eq!(
+        refusals(&pool, w.id).await,
+        [
+            (Some(news), Some("bulletin".to_owned())),
+            (Some(other), Some("bulletin".to_owned()))
+        ],
+        "the renamed list's refusal must carry the name that list now has"
+    );
+}
+
+/// **Important 2's sequence: a second untick after a rename must not steal the orphan that holds
+/// the new name.** `unsubscribe_list` used to conflict on `list_name`, which cannot see the live
+/// refusal already sitting on this list under a different name, so it conflicted with the ORPHAN
+/// instead and re-pointed it. Two harms in one statement: two live refusals on one list, after
+/// which every later rename of it failed permanently — and the address's refusal of the *deleted*
+/// list of that name silently gone, so recreating one no longer restored it. That last part is the
+/// delete-and-recreate resurrection this whole scope exists to close.
+///
+/// Step 4 is a second untick with the first refusal still live, which is what a re-subscribe by any
+/// path that does not lift leaves behind — an operator adding the member, an import, a form
+/// submission. The subscriber's own re-tick lifts, which is why this needs an operator to reach.
+#[sqlx::test]
+async fn a_second_untick_after_a_rename_does_not_steal_the_orphan_of_the_new_name(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let news = make_list(&mut conn, w.id, "News").await;
+    let newsletter = make_list(&mut conn, w.id, "Newsletter").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse News");
+    unsubscribe_list(&mut conn, &secrets(), w.id, newsletter, ADA)
+        .await
+        .expect("refuse Newsletter");
+    drop(conn);
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(newsletter)
+        .execute(&pool)
+        .await
+        .expect("delete Newsletter");
+    sqlx::query("update lists set name = 'Newsletter' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("rename News");
+
+    let mut conn = pool.acquire().await.unwrap();
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("untick it again");
+    drop(conn);
+
+    let rows = refusals(&pool, w.id).await;
+    assert_eq!(
+        rows.iter().filter(|(l, _)| *l == Some(news)).count(),
+        1,
+        "two live refusals on one list: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(None, Some("Newsletter".to_owned()))),
+        "the refusal of the DELETED list of that name was taken over: {rows:?}"
+    );
+
+    // Both harms, from the other side: the list is still renamable, and recreating a list of the
+    // orphan's name still restores the refusal that was waiting for it.
+    sqlx::query("update lists set name = 'Digest' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("the list must still be renamable");
+    let mut conn = pool.acquire().await.unwrap();
+    let reborn = make_list(&mut conn, w.id, "Newsletter").await;
+    drop(conn);
+    assert!(
+        refusals(&pool, w.id)
+            .await
+            .contains(&(Some(reborn), Some("Newsletter".to_owned()))),
+        "a list recreated under the orphan's name must adopt the refusal waiting for it"
+    );
+}
+
+/// **Two renames over an orphaned refusal, which is where this used to leave debris that the next
+/// rename choked on.** The first rename moves the refusal onto the name the orphan already holds;
+/// if the orphan were then adopted onto the same list, the address would have two live refusals on
+/// one list, which is what `suppressions_live_list` forbids and what the adoption's `not exists`
+/// is there to keep satisfiable. The second rename is the one that used to fail.
+#[sqlx::test]
+async fn renaming_a_list_twice_over_an_orphaned_refusal_does_not_fail(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    // A refusal of a list called `bulletin`, whose list is then deleted: an orphan.
+    let gone = make_list(&mut conn, w.id, "bulletin").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, gone, ADA)
+        .await
+        .expect("refuse bulletin");
+    let news = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse news");
+    drop(conn);
+    sqlx::query("delete from lists where id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("delete the list");
+
+    for name in ["bulletin", "digest"] {
+        sqlx::query("update lists set name = $2 where id = $1")
+            .bind(news)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the operator's rename to {name} must not fail: {e}"));
+    }
+
+    let rows = refusals(&pool, w.id).await;
+    assert_eq!(
+        rows.iter().filter(|(l, _)| *l == Some(news)).count(),
+        1,
+        "one live refusal per address per list, or the next rename collides: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(None, Some("bulletin".to_owned()))),
+        "and the orphan is still waiting for a list of its own name: {rows:?}"
+    );
+}
+
+/// **A rename never restates the past.** `0014` keeps a lifted row rather than deleting it so the
+/// blocklist can say what was once blocked, and for a list-scope row that is *which named list*
+/// somebody refused and later rejoined. Renaming the list afterwards must not rewrite it.
+#[sqlx::test]
+async fn a_rename_does_not_rewrite_a_refusal_the_subscriber_already_lifted(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let list = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, list, ADA)
+        .await
+        .expect("refuse news");
+    lift_unsubscribed_list(&mut conn, &secrets(), w.id, list, ADA)
+        .await
+        .expect("the subscriber comes back");
+    drop(conn);
+
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(list)
+        .execute(&pool)
+        .await
+        .expect("rename the list");
+
+    let history: Vec<(String,)> = sqlx::query_as(
+        "select list_name from suppressions where workspace_id = $1 and lifted_at is not null",
+    )
+    .bind(w.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        history,
+        [("news".to_owned(),)],
+        "the lifted row says which named list was refused, and a later rename is not that history"
+    );
+}
+
+/// **Two orphans of one name for one address are allowed, and exactly one of them is adopted.**
+/// They arise honestly: an address holding both a refusal of a dead list called X and a refusal of
+/// a live list later renamed to X orphans into two rows named X when that list is deleted too.
+/// Making that a unique violation would fail the operator's deletion from inside
+/// `on delete set null`; adopting both would put two refusals on one list and violate
+/// `suppressions_live_list` from inside the creation trigger. Neither may happen.
+#[sqlx::test]
+async fn a_list_born_over_two_orphans_of_its_name_adopts_one_of_them(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    let gone = make_list(&mut conn, w.id, "bulletin").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, gone, ADA)
+        .await
+        .expect("refuse bulletin");
+    let news = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse news");
+    drop(conn);
+    sqlx::query("delete from lists where id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("delete bulletin");
+    // The pair: a live refusal of `news`, now also called bulletin, beside the orphan of the dead
+    // bulletin. The adoption declines here, which is what leaves two refusals naming one thing.
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("rename news to bulletin");
+    sqlx::query("delete from lists where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("deleting the list must not fail over two orphans of one name");
+
+    let orphans = refusals(&pool, w.id).await;
+    assert_eq!(
+        orphans.len(),
+        2,
+        "the premise: two live orphans of one name for one address: {orphans:?}"
+    );
+    assert!(
+        orphans
+            .iter()
+            .all(|(l, n)| l.is_none() && n.as_deref() == Some("bulletin")),
+        "{orphans:?}"
+    );
+
+    let mut conn = pool.acquire().await.unwrap();
+    let reborn = make_list(&mut conn, w.id, "bulletin").await;
+    drop(conn);
+
+    let rows = refusals(&pool, w.id).await;
+    assert_eq!(
+        rows.iter().filter(|(l, _)| *l == Some(reborn)).count(),
+        1,
+        "exactly one orphan is adopted, or the list could not have been created: {rows:?}"
+    );
+    assert_eq!(rows.len(), 2, "and the other keeps waiting: {rows:?}");
+}
+
+/// **A re-tick answers "the list called X", so every refusal of the list called X goes.** Lifting
+/// only the row carrying the list's id left a duplicate orphan of that name still waiting: adopt
+/// one onto a recreated list, let the subscriber re-tick it, delete and recreate the list again,
+/// and the second orphan is adopted and refuses the list they explicitly asked for. Narrow — four
+/// operator actions around one subscriber action — and it errs toward not mailing, which is why it
+/// took a sweep rather than a report to find it.
+#[sqlx::test]
+async fn a_re_tick_clears_every_refusal_of_that_lists_name_not_only_the_adopted_one(pool: PgPool) {
+    let w = workspace(&pool, "acme").await;
+    let mut conn = pool.acquire().await.unwrap();
+    // Two orphans named `bulletin`, by the route `a_list_born_over_two_orphans_of_its_name…` pins.
+    let gone = make_list(&mut conn, w.id, "bulletin").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, gone, ADA)
+        .await
+        .expect("refuse bulletin");
+    let news = make_list(&mut conn, w.id, "news").await;
+    unsubscribe_list(&mut conn, &secrets(), w.id, news, ADA)
+        .await
+        .expect("refuse news");
+    drop(conn);
+    sqlx::query("delete from lists where id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await
+        .expect("delete bulletin");
+    sqlx::query("update lists set name = 'bulletin' where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("rename news to bulletin");
+    sqlx::query("delete from lists where id = $1")
+        .bind(news)
+        .execute(&pool)
+        .await
+        .expect("delete it too");
+    let mut conn = pool.acquire().await.unwrap();
+    let reborn = make_list(&mut conn, w.id, "bulletin").await;
+    assert_eq!(
+        refusals(&pool, w.id).await.len(),
+        2,
+        "the premise: one orphan adopted onto the new list, one still waiting"
+    );
+
+    // The subscriber asks for the list called `bulletin`.
+    lift_unsubscribed_list(&mut conn, &secrets(), w.id, reborn, ADA)
+        .await
+        .expect("the subscriber comes back");
+    drop(conn);
+    assert_eq!(
+        refusals(&pool, w.id).await,
+        [],
+        "a refusal of that name survived the re-tick"
+    );
+
+    // Which is what it is for: delete and recreate again, and nothing is adopted back.
+    sqlx::query("delete from lists where id = $1")
+        .bind(reborn)
+        .execute(&pool)
+        .await
+        .expect("delete the reborn list");
+    let mut conn = pool.acquire().await.unwrap();
+    let again = make_list(&mut conn, w.id, "bulletin").await;
+    drop(conn);
+    assert_eq!(
+        refusals(&pool, w.id).await,
+        [],
+        "the list the subscriber asked for is refused again, by a row they never wrote"
+    );
+    assert!(!again.is_nil());
+}

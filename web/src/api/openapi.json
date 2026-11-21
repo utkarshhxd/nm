@@ -1598,7 +1598,7 @@
           "crate::contacts::routes"
         ],
         "summary": "Adds every contact in the selection who is not on a list yet: `pending` on a double-opt-in\nlist, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not\npromoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.",
-        "description": "This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact\nback in. One admin re-adding one named person is a considered act they answer for; a bulk\naction over thousands involves no per-person judgement, and reviving opt-outs en masse is what\ngets a sender blocklisted. Adding someone to a list is what makes them mailable, and an\nunsubscribe afterwards does not un-send. Do not \"fix\" the asymmetry.",
+        "description": "`POST /lists/{id}/members` behaves the same way, and so does every other route an operator can\nreach: one admin re-adding one named person is still the operator asserting consent on the\nsubscriber's behalf, and being accountable for it does not make it consent. Only the subscriber\nreverses their own unsubscribe, through a link sent to their own address.",
         "operationId": "bulk_subscribe_contacts",
         "parameters": [
           {
@@ -2069,6 +2069,76 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/contacts/{id}/consent": {
+      "get": {
+        "tags": [
+          "crate::consent::routes"
+        ],
+        "summary": "One contact's consent history, newest first.",
+        "description": "**Ordered and paged by `id`, not `created_at`.** `created_at` ties — Postgres `now()` is\ntransaction-start time, a membership write and its consent row share a transaction, and the\nset-based writers insert a whole batch in one statement — so paging on it would skip or\nrepeat the rows that share a value. `id` is UUID v7, so `id desc` is both a total order and\nnewest-first; `0024_consent_log_paging_index.sql` is the index that serves it.",
+        "operationId": "list_consent",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Contact id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every consent row for this contact, newest first, paged by row id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ConsentEntry"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such contact in this workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts/{id}/eligibility": {
       "get": {
         "tags": [
@@ -2263,7 +2333,7 @@
         },
         "responses": {
           "200": {
-            "description": "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one",
+            "description": "The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had",
             "content": {
               "application/json": {
                 "schema": {
@@ -2762,6 +2832,260 @@
           },
           "409": {
             "description": "field-not-archived, or field-in-use: a segment still names it, and the problem lists which"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/forms": {
+      "get": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "list_forms",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_Form"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "create_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Form"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: creating a form takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "409": {
+            "description": "form-slug-taken"
+          },
+          "422": {
+            "description": "invalid input, an unknown field, or an unknown list"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/forms/{id}": {
+      "get": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "get_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Form id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Form"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such form in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "summary": "A hard delete. The form's `form_lists` rows go with it; the lists and their members stay.",
+        "operationId": "delete_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Form id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, with its list links; the lists and their members stay"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a form takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such form in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::forms::routes"
+        ],
+        "operationId": "update_form",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Form id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Form"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: editing a form takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such form in this workspace"
+          },
+          "409": {
+            "description": "form-slug-taken"
+          },
+          "422": {
+            "description": "invalid input, an unknown field, or an unknown list"
           }
         }
       }
@@ -3441,7 +3765,7 @@
         "tags": [
           "crate::lists::routes"
         ],
-        "summary": "Adding someone who is already `pending` or `subscribed` changes nothing; adding an\n`unsubscribed` one subscribes them again.",
+        "summary": "Adding someone who is already on the list changes nothing, whatever their status: a confirmed\nsubscriber is not demoted to `pending`, and someone who unsubscribed stays unsubscribed. The\nresponse carries the status the membership has, which may not be the one the add asked for.",
         "operationId": "add_list_member",
         "parameters": [
           {
@@ -3477,7 +3801,7 @@
         },
         "responses": {
           "200": {
-            "description": "`subscribed` on a single-opt-in list, `pending` on a double-opt-in one",
+            "description": "The membership's status: `subscribed` on a single-opt-in list and `pending` on a double-opt-in one for a new member, or the status it already had",
             "content": {
               "application/json": {
                 "schema": {
@@ -4325,6 +4649,18 @@
           }
         }
       },
+      "Action": {
+        "type": "string",
+        "description": "What changed — and for `requested`, what did not: the person was **asked** and has not\nagreed. Stored as text under a `check` constraint, as `lists::MembershipStatus` is.",
+        "enum": [
+          "requested",
+          "subscribed",
+          "confirmed",
+          "unsubscribed",
+          "resubscribed",
+          "suppressed"
+        ]
+      },
       "ApiKeySummary": {
         "type": "object",
         "description": "A key as listed: its prefix identifies it, nothing in it can authenticate.",
@@ -4784,6 +5120,77 @@
           }
         }
       },
+      "ConsentEntry": {
+        "type": "object",
+        "description": "One row of the log, with the list's name joined on.\n\n**The evidence columns are the point of the row**, not decoration on it: a row that says\n`subscribed` without saying how is what this milestone exists to prevent. `ip` and\n`user_agent` are the subscriber's own, written only by the public routes where the request\nreally was theirs; an operator or API change carries neither and names the actor in\n`source_ref` instead.",
+        "required": [
+          "id",
+          "action",
+          "source",
+          "created_at"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/Action",
+            "description": "`requested` means the person was **asked** and has not agreed — a double opt-in that is\nstill pending. It is not a softer `subscribed`."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "ip": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The subscriber's own address, on the public routes only."
+          },
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Null for a workspace-wide change, and for a row whose list has since been deleted —\n`0020_consent_log.sql` nulls the pointer and keeps the evidence."
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The list's name now. Null whenever `list_id` is."
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source",
+            "description": "The code path the change arrived by, never who made it: a session-authenticated operator\nusing bulk subscribe is recorded as `api`."
+          },
+          "source_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Whatever caused the change: the form id, the import id, the user or API key id."
+          },
+          "token_jti": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The nonce of the public token that authorised the change: *which* link was clicked."
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The subscriber's own, on the public routes only."
+          }
+        }
+      },
       "Contact": {
         "type": "object",
         "required": [
@@ -5096,6 +5503,177 @@
           }
         }
       },
+      "Form": {
+        "type": "object",
+        "required": [
+          "id",
+          "workspace_id",
+          "slug",
+          "name",
+          "list_ids",
+          "fields",
+          "headline",
+          "button_label",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "button_label": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FormField"
+            }
+          },
+          "headline": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The lists one submission subscribes to, ascending. The Rust-side projection of the\n`form_lists` rows, so it is a set: the order a client sent is not kept."
+          },
+          "name": {
+            "type": "string",
+            "description": "The operator's own name for it; never shown to a submitter."
+          },
+          "redirect_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where a successful submission is to be sent. Absolute `http`/`https` only; see\n[`validate_redirect_url`]."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Unique in the workspace. It is what names the form in its public URL."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "FormField": {
+        "type": "object",
+        "description": "One input on the page.",
+        "required": [
+          "target",
+          "required",
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "What the page prints beside the input."
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "target": {
+            "$ref": "#/components/schemas/FormTarget"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FormTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "email"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "first_name"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "last_name"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "timezone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A custom field, by its `custom_fields.key`. Checked against the workspace's live\ndefinitions at write time: a form collecting into a field that is not there collects into\nnowhere, and the operator would find out only once the submissions had happened.",
+            "required": [
+              "value",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "custom"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "description": "A custom field, by its `custom_fields.key`. Checked against the workspace's live\ndefinitions at write time: a form collecting into a field that is not there collects into\nnowhere, and the operator would find out only once the submissions had happened."
+              }
+            }
+          }
+        ],
+        "description": "What one field of a form collects.\n\nThis is deliberately **not** `contacts::import::ContactField`, which the CSV importer uses.\nThat enum carries `Lists`, and a public form field targeting it would let whoever fills the\nform in name the lists they join — the form's lists are the operator's decision, not the\nsubmitter's. It also has no custom-field case, which spec §7.3 requires.\n\nThere is therefore no `Lists` variant here and there must never be one. Serde refuses an\nunknown tag, so a hand-written body naming `\"lists\"` fails to deserialise and the request is\nrefused before any handler sees it; `tests/forms.rs` pins that through the API, because no\nRust-level test can exercise a variant that does not exist."
+      },
       "ImportErrorRow": {
         "type": "object",
         "description": "One rejected row, as the operator has to read it: which row, which column, why, and the cell\nthat did it.",
@@ -5332,7 +5910,7 @@
           },
           "visibility": {
             "$ref": "#/components/schemas/Visibility",
-            "description": "Unused until the preference center, which shows the `public` lists as topics."
+            "description": "Whether the preference center offers this list to somebody who is not on it. A `private`\nlist is still shown there to its own members, so hiding one never leaves a subscriber\nunable to leave it (`public::unsubscribe::topics`)."
           }
         }
       },
@@ -5645,6 +6223,56 @@
               "type": "string"
             },
             "description": "Required (1-200 distinct values) for `select` and `multi_select`; omit for every other kind."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewForm": {
+        "type": "object",
+        "required": [
+          "slug",
+          "name",
+          "list_ids",
+          "fields",
+          "headline",
+          "button_label"
+        ],
+        "properties": {
+          "button_label": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FormField"
+            },
+            "description": "The page's inputs. Exactly one must target `email`."
+          },
+          "headline": {
+            "type": "string"
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "At least one, at most 25. Each must be a list of this workspace."
+          },
+          "name": {
+            "type": "string",
+            "description": "The operator's name for it."
+          },
+          "redirect_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute `http`/`https` only. Absent or `null` means the form has no redirect."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Unique in the workspace. It is what names the form in its public URL."
           }
         },
         "additionalProperties": false
@@ -6028,6 +6656,94 @@
           }
         }
       },
+      "Page_ConsentEntry": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One row of the log, with the list's name joined on.\n\n**The evidence columns are the point of the row**, not decoration on it: a row that says\n`subscribed` without saying how is what this milestone exists to prevent. `ip` and\n`user_agent` are the subscriber's own, written only by the public routes where the request\nreally was theirs; an operator or API change carries neither and names the actor in\n`source_ref` instead.",
+              "required": [
+                "id",
+                "action",
+                "source",
+                "created_at"
+              ],
+              "properties": {
+                "action": {
+                  "$ref": "#/components/schemas/Action",
+                  "description": "`requested` means the person was **asked** and has not agreed — a double opt-in that is\nstill pending. It is not a softer `subscribed`."
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "ip": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The subscriber's own address, on the public routes only."
+                },
+                "list_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid",
+                  "description": "Null for a workspace-wide change, and for a row whose list has since been deleted —\n`0020_consent_log.sql` nulls the pointer and keeps the evidence."
+                },
+                "list_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The list's name now. Null whenever `list_id` is."
+                },
+                "source": {
+                  "$ref": "#/components/schemas/Source",
+                  "description": "The code path the change arrived by, never who made it: a session-authenticated operator\nusing bulk subscribe is recorded as `api`."
+                },
+                "source_ref": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Whatever caused the change: the form id, the import id, the user or API key id."
+                },
+                "token_jti": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The nonce of the public token that authorised the change: *which* link was clicked."
+                },
+                "user_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The subscriber's own, on the public routes only."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Contact": {
         "type": "object",
         "required": [
@@ -6186,6 +6902,91 @@
                     "type": "string"
                   },
                   "description": "The allowed values of a `select` or `multi_select` field; empty for every other kind."
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_Form": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "workspace_id",
+                "slug",
+                "name",
+                "list_ids",
+                "fields",
+                "headline",
+                "button_label",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "button_label": {
+                  "type": "string"
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "fields": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FormField"
+                  }
+                },
+                "headline": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "list_ids": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "description": "The lists one submission subscribes to, ascending. The Rust-side projection of the\n`form_lists` rows, so it is a set: the order a client sent is not kept."
+                },
+                "name": {
+                  "type": "string",
+                  "description": "The operator's own name for it; never shown to a submitter."
+                },
+                "redirect_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Where a successful submission is to be sent. Absolute `http`/`https` only; see\n[`validate_redirect_url`]."
+                },
+                "slug": {
+                  "type": "string",
+                  "description": "Unique in the workspace. It is what names the form in its public URL."
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "format": "uuid"
                 }
               }
             }
@@ -6468,7 +7269,7 @@
                 },
                 "visibility": {
                   "$ref": "#/components/schemas/Visibility",
-                  "description": "Unused until the preference center, which shows the `public` lists as topics."
+                  "description": "Whether the preference center offers this list to somebody who is not on it. A `private`\nlist is still shown there to its own members, so hiding one never leaves a subscriber\nunable to leave it (`public::unsubscribe::topics`)."
                 }
               }
             }
@@ -7113,6 +7914,20 @@
           }
         }
       },
+      "Source": {
+        "type": "string",
+        "description": "What caused the change. **The code path, never the actor**: a session-authenticated operator\nusing bulk subscribe is `Api`, because that is the writer the change went through.",
+        "enum": [
+          "form",
+          "import",
+          "api",
+          "operator",
+          "one_click",
+          "preference_center",
+          "bounce",
+          "complaint"
+        ]
+      },
       "StartImport": {
         "type": "object",
         "description": "The confirmed mapping, and the run.",
@@ -7313,6 +8128,50 @@
             "items": {
               "type": "string"
             }
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateForm": {
+        "type": "object",
+        "properties": {
+          "button_label": {
+            "type": "string",
+            "description": "Cannot be `null`."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FormField"
+            },
+            "description": "Replaces the fields outright. Cannot be `null`."
+          },
+          "headline": {
+            "type": "string",
+            "description": "Cannot be `null`."
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Replaces the lists outright. Cannot be `null` or empty."
+          },
+          "name": {
+            "type": "string",
+            "description": "Cannot be `null`."
+          },
+          "redirect_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears it, leaving the form with no redirect."
+          },
+          "slug": {
+            "type": "string",
+            "description": "Cannot be `null`."
           }
         },
         "additionalProperties": false

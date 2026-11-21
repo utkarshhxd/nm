@@ -24,6 +24,7 @@ use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
+    consent,
     custom_fields::definitions_for,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
@@ -1084,11 +1085,10 @@ pub async fn bulk_untag_contacts(
 /// list, `subscribed` otherwise. An existing membership is left exactly as it is: `pending` is not
 /// promoted, and `unsubscribed` is never flipped back. A suppression is not lifted either.
 ///
-/// This deliberately differs from `POST /lists/{id}/members`, which lets an unsubscribed contact
-/// back in. One admin re-adding one named person is a considered act they answer for; a bulk
-/// action over thousands involves no per-person judgement, and reviving opt-outs en masse is what
-/// gets a sender blocklisted. Adding someone to a list is what makes them mailable, and an
-/// unsubscribe afterwards does not un-send. Do not "fix" the asymmetry.
+/// `POST /lists/{id}/members` behaves the same way, and so does every other route an operator can
+/// reach: one admin re-adding one named person is still the operator asserting consent on the
+/// subscriber's behalf, and being accountable for it does not make it consent. Only the subscriber
+/// reverses their own unsubscribe, through a link sent to their own address.
 // Deliberately not a doc comment: this is for whoever edits the route, not for a client reading
 // the published document. The `409 selection-widened` this route declares cannot happen over a
 // frozen set; the guard is kept, as `bulk/delete` keeps it, because it costs one comparison and
@@ -1126,7 +1126,8 @@ pub async fn bulk_subscribe_contacts(
         MembershipStatus::Subscribed
     };
     let excluded = &target.excluded_ids;
-    let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status).await?;
+    let who = consent::principal_ref(&principal);
+    let n = selection::subscribe(&mut tx, &sel, excluded, list_id, status, Some(&who)).await?;
     refuse_if_widened(&sel, n, ("nobody was added to the list", "adding"))?;
     let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_SUBSCRIBED;
@@ -1171,7 +1172,8 @@ pub async fn bulk_unsubscribe_contacts(
     let (mut tx, sel) = begin_bulk(&state, &principal, workspace_id, &target).await?;
     lists::get(&mut tx, workspace_id, list_id).await?;
     let excluded = &target.excluded_ids;
-    let n = selection::unsubscribe(&mut tx, &sel, excluded, list_id).await?;
+    let who = consent::principal_ref(&principal);
+    let n = selection::unsubscribe(&mut tx, &sel, excluded, list_id, Some(&who)).await?;
     let extra = json!({ "list_id": list_id });
     let action = actions::CONTACTS_BULK_UNSUBSCRIBED;
     finish_bulk(

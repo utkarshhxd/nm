@@ -22,14 +22,23 @@ const MAX_FAILURES_PER_IP: i64 = 100;
 /// allocation cannot rotate through 2^64 addresses to dodge the per-IP limit. An IPv4-mapped
 /// address (`::ffff:a.b.c.d`, as a dual-stack listener or proxy may report) is keyed as the IPv4
 /// address it carries: masking it would put every IPv4 client in one `::` bucket.
-pub(crate) fn bucket(ip: Option<IpAddr>) -> Option<IpAddr> {
-    ip.map(|ip| match ip {
+///
+/// **Every per-IP counter in the product keys through this**, sign-in and the public pages alike
+/// (`http::rate_limit::Key`'s `From<IpAddr>`). A limiter that counts raw addresses is not a limiter
+/// against anyone holding an allocation, which is everyone it exists to stop.
+pub(crate) fn bucket_of(ip: IpAddr) -> IpAddr {
+    match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
         },
         v4 => v4,
-    })
+    }
+}
+
+/// [`bucket_of`] for a caller that may have no address at all.
+pub(crate) fn bucket(ip: Option<IpAddr>) -> Option<IpAddr> {
+    ip.map(bucket_of)
 }
 
 /// 429 when the email has 10 or more failures, or the IP 100 or more, in the last 15 minutes.

@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select l.id, l.name, m.status as \"status?: MembershipStatus\"\n             from lists l\n             left join list_memberships m\n               on m.workspace_id = l.workspace_id and m.list_id = l.id and m.contact_id = $2\n            where l.workspace_id = $1 and (l.visibility = 'public' or m.contact_id is not null)\n            order by lower(l.name), l.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "lists",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status?: MembershipStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "list_memberships",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e478ae40f3a95f2f23c55773b0a5711b04f6321e5e1d698c6dc36e55d9bba540"
+}

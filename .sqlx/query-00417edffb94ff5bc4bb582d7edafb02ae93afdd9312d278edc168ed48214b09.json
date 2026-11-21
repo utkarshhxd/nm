@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select double_optin from lists where workspace_id = $1 and id = $2",
+  "query": "select double_optin from lists where workspace_id = $1 and id = $2 for key share",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "2c0df16685034e47356c9847d9bbed4155e64e33ee093e5b64163e78ffe79766"
+  "hash": "00417edffb94ff5bc4bb582d7edafb02ae93afdd9312d278edc168ed48214b09"
 }

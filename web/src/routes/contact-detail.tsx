@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
-import { type ReactNode, useState } from "react";
+import { Fragment, type ReactNode, useState } from "react";
 
 import { api, problemText } from "../api/client";
 import type { components } from "../api/schema";
@@ -101,6 +101,7 @@ function Detail({
           <Lists ws={ws} slug={slug} contactId={contactId} canEdit={canEdit} />
           <Tags ws={ws} contactId={contactId} canEdit={canEdit} />
           <CustomFields ws={ws} contact={contact.data} />
+          <ConsentHistory ws={ws} contactId={contactId} />
         </>
       )}
     </section>
@@ -404,10 +405,12 @@ function Lists({
     onSuccess: refresh,
   });
 
-  // A list the contact is already pending or subscribed on is not offered: adding again does
-  // nothing. An unsubscribed one is, because adding it subscribes them again.
+  // A list the contact already has a membership on is not offered, whatever it says: adding again
+  // does nothing, and an unsubscribed one is not reopened by an operator at all — only by the
+  // subscriber, through the link in their own mail. Offering it would be a button that silently
+  // does nothing.
   const joinable = (all.data ?? []).filter(
-    (l) => !lists.data?.some((m) => m.list_id === l.id && m.status !== "unsubscribed"),
+    (l) => !lists.data?.some((m) => m.list_id === l.id),
   );
 
   return (
@@ -512,8 +515,9 @@ function Lists({
             <p className="mt-3 text-fg-muted">
               Unsubscribing sets the membership to unsubscribed and keeps it: the row stays here
               and is not deleted, so the opt-out is not lost the next time this contact is
-              imported. Adding the list again subscribes them, or marks them pending on a
-              double opt-in list, which cannot be mailed until they confirm.
+              imported. Adding a list this contact already has a membership on does nothing,
+              whatever it says — an unsubscribe can only be undone by the contact themselves,
+              through the link in their own mail.
             </p>
           ) : null}
           {lists.data.some((l) => l.status === "pending") ? (
@@ -748,5 +752,193 @@ function FieldRow({ def, children }: { def: Definition; children: ReactNode }) {
         {def.archived_at ? <span className="ms-2 text-fg-muted">(archived field)</span> : null}
       </dd>
     </>
+  );
+}
+
+const ACTION: Record<string, string> = {
+  // `requested` is NOT a softer "subscribed": it says the person was asked and has not agreed.
+  // Do not relabel it into something that asserts more than the row does.
+  requested: "Requested",
+  subscribed: "Subscribed",
+  confirmed: "Confirmed",
+  unsubscribed: "Unsubscribed",
+  resubscribed: "Resubscribed",
+  suppressed: "Suppressed",
+};
+
+/** The code path a change arrived by, in words. It is never who made it. */
+const SOURCE: Record<string, string> = {
+  form: "Signup form",
+  import: "Import",
+  api: "API",
+  operator: "Operator",
+  one_click: "One-click unsubscribe",
+  preference_center: "Preference centre",
+  bounce: "Bounce",
+  complaint: "Complaint",
+};
+
+const moment = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+
+const CONSENT_PAGE = 50;
+
+/**
+ * The consent log for this contact: the answer to "did this person agree, and how?".
+ *
+ * **Not an activity feed.** Every row says what changed, how the change arrived, when, and —
+ * where the row has them — which list, the address it came from, the browser that sent it and
+ * the link that authorised it. A row saying "subscribed" without saying how is the thing this
+ * record exists to prevent, so the evidence is shown beside the action rather than hidden behind
+ * a disclosure.
+ *
+ * It is read-only for every role, including an admin: `consent_log` is append-only and nothing in
+ * the product can edit or delete a row. The database enforces both halves of that —
+ * `0020_consent_log.sql` refuses the update, `0026` refuses the delete and the truncate — rather
+ * than this screen being the only thing that declines to offer it. An erasure takes the rows with
+ * the contact, which is why there is no "clear history" here and must never be one.
+ */
+function ConsentHistory({ ws, contactId }: { ws: string; contactId: string }) {
+  const history = useInfiniteQuery({
+    queryKey: ["contact-consent", ws, contactId],
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam }) => {
+      const { data } = await api.GET(
+        "/api/v1/workspaces/{workspace_id}/contacts/{id}/consent",
+        {
+          params: {
+            path: { workspace_id: ws, id: contactId },
+            query: { limit: CONSENT_PAGE, cursor: pageParam },
+          },
+        },
+      );
+      // `failed`, not `problemText(…, KNOWN, …)`: reading this takes viewer, which every member
+      // has, so there is no insufficient-role answer for KNOWN's wording to misdescribe.
+      if (!data) throw failed("The consent history");
+      return data;
+    },
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    retry: false,
+  });
+  const rows = history.data?.pages.flatMap((p) => p.data) ?? [];
+
+  return (
+    <Panel id="consent" title="Consent history">
+      {history.isPending ? (
+        <Skeleton label="Loading consent history" rows={3} />
+      ) : history.isError && rows.length === 0 ? (
+        <Alert>{history.error.message} Do not assume this contact agreed to anything.</Alert>
+      ) : rows.length === 0 ? (
+        <p className="text-fg-muted">
+          Nothing recorded. Memberships written before this workspace kept a consent log have no
+          row here.
+        </p>
+      ) : (
+        <>
+          <TableScroller label="Consent history table"><table className="w-full">
+            <thead>
+              <tr className="border-b border-border">
+                <th scope="col" className="py-2 pe-3 text-start font-medium">
+                  When
+                </th>
+                <th scope="col" className="py-2 pe-3 text-start font-medium">
+                  What
+                </th>
+                <th scope="col" className="py-2 pe-3 text-start font-medium">
+                  List
+                </th>
+                <th scope="col" className="py-2 pe-3 text-start font-medium">
+                  How
+                </th>
+                <th scope="col" className="py-2 text-start font-medium">
+                  Evidence
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="border-b border-border align-top">
+                  <td className="py-2 pe-3 tabular-nums text-fg-muted">
+                    {moment.format(new Date(r.created_at))}
+                  </td>
+                  <td className="py-2 pe-3">{ACTION[r.action] ?? r.action}</td>
+                  {/* ONE LABEL FOR BOTH CASES, BECAUSE THE ROW CANNOT TELL THEM APART. A
+                      workspace-wide change is written with a null `list_id`, and
+                      `0020_consent_log.sql`'s `on delete set null (list_id)` nulls it again when
+                      the list is deleted — the row keeps its action, source and evidence and
+                      loses only the pointer. `list_name` comes from a left join on that column,
+                      so it is null in exactly the same rows.
+
+                      There was a `r.list_id ? "A deleted list" : "Whole workspace"` here. It was
+                      unreachable: by the time `list_id` is null there is nothing left to branch
+                      on, so every deleted list's row read as a workspace-wide one — a one-list
+                      unsubscribe shown as if the person had left everything. Do not re-add it in
+                      any form, including one keyed on `action`: a new writer would make it wrong
+                      again, silently, in the record that exists to be trusted. Telling the two
+                      apart needs the list's name snapshotted at write time, by every writer. */}
+                  <td className="py-2 pe-3 wrap-anywhere">
+                    {r.list_name ?? "Whole workspace, or a list since deleted"}
+                  </td>
+                  <td className="py-2 pe-3">{SOURCE[r.source] ?? r.source}</td>
+                  <td className="py-2">
+                    <Evidence row={r} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table></TableScroller>
+          {history.isFetchNextPageError ? (
+            <p role="alert" className="mt-3">
+              More of the history could not be loaded.
+            </p>
+          ) : null}
+          {history.hasNextPage ? (
+            <Button
+              className="mt-3"
+              busy={history.isFetchingNextPage}
+              onClick={() => void history.fetchNextPage()}
+            >
+              Load more history
+            </Button>
+          ) : null}
+          <p className="mt-3 text-fg-muted">
+            <strong>Requested</strong> means this person was asked and has not agreed yet — a
+            double opt-in nobody has confirmed. <strong>How</strong> is the code path the change
+            arrived by, not who made it: an operator subscribing people in bulk is recorded as
+            API, and the address and browser are only ever the subscriber&rsquo;s own, from a page
+            they opened themselves.
+          </p>
+          <p className="mt-3 text-fg-muted">
+            A row with no list named is either a change across the whole workspace or one to a
+            list that has since been deleted. Deleting a list clears the pointer from these rows
+            and keeps everything else, and nothing recorded at the time says which of the two it
+            was, so this will not guess.
+          </p>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+type ConsentRow = components["schemas"]["ConsentEntry"];
+
+/** What the row has, and nothing for what it does not: an absent IP is not an unknown one. */
+function Evidence({ row }: { row: ConsentRow }) {
+  const facts: [string, string][] = [
+    ["IP address", row.ip ?? ""],
+    ["Browser", row.user_agent ?? ""],
+    ["Link", row.token_jti ?? ""],
+    ["Reference", row.source_ref ?? ""],
+  ];
+  const shown = facts.filter(([, value]) => value !== "");
+  if (shown.length === 0) return <span className="text-fg-muted">—</span>;
+  return (
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-3">
+      {shown.map(([label, value]) => (
+        <Fragment key={label}>
+          <dt className="text-fg-muted">{label}</dt>
+          <dd className="wrap-anywhere">{value}</dd>
+        </Fragment>
+      ))}
+    </dl>
   );
 }

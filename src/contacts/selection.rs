@@ -25,12 +25,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, QueryBuilder, SqlSafeStr};
 use uuid::Uuid;
 
 use super::{ContactFilter, push_filter};
 use crate::{
     audit::Actor,
+    consent,
+    contacts::import::staging::SQL_UUID_V7,
     crypto::{secrets::Secrets, tokens},
     error::{ApiError, ApiResult, FieldError},
     lists::{MembershipSource, MembershipStatus},
@@ -589,14 +591,42 @@ fn statement(
     excluded: &[Uuid],
     action: impl FnOnce(&mut QueryBuilder<Postgres>),
 ) -> QueryBuilder<Postgres> {
+    statement_logging(sel, excluded, action, "1", |_| {})
+}
+
+/// [`statement`] with the action's `returning` column named, and `log` free to append further
+/// CTEs that read `done` — for an action that has to write something else for every row it
+/// changed, in the one statement that changed them.
+fn statement_logging(
+    sel: &Selection,
+    excluded: &[Uuid],
+    action: impl FnOnce(&mut QueryBuilder<Postgres>),
+    returning: &str,
+    log: impl FnOnce(&mut QueryBuilder<Postgres>),
+) -> QueryBuilder<Postgres> {
+    // **`for key share` on `sel`: position 4, in the only place a set-based action can take it.**
+    // The membership rows this statement writes and the `consent_log` rows beside them both carry
+    // a foreign key to `contacts`, so without it the statement takes every contact row LAST, at
+    // its own end, while `delete_contact` and `selection::delete` take them first and cascade into
+    // those same memberships. `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // It is the rows this statement is already scanning, so it adds no reads; what it adds is a
+    // tuple lock per selected contact, which `MAX_SELECTION` bounds the same way it bounds
+    // everything else here. `statement` delegates here, so `tag`, `untag` and `delete` get it too:
+    // the first two need no `consent_log` row and the third takes the rows exclusively a moment
+    // later, so for them it is the `order by` that earns its place — two concurrent bulk deletes
+    // over overlapping selections now take the contact rows in the same sequence.
     let mut q = QueryBuilder::<Postgres>::new("with sel as (select id from contacts where ");
     push_selected(&mut q, sel, excluded);
-    q.push("), done as (");
+    q.push(" order by id for key share), done as (");
     action(&mut q);
-    q.push(
-        " returning 1) \
-         select (select count(*) from sel)::bigint, (select count(*) from done)::bigint",
-    );
+    // `AssertSqlSafe`: `returning` is one of the two literals this private function is called
+    // with, and nothing a client sent reaches it. `QueryBuilder::push` takes any `Display` and
+    // would not have stopped it either way, which is why the audit is written down here.
+    let tail = AssertSqlSafe(format!(" returning {returning})")).into_sql_str();
+    q.push(tail.as_str());
+    log(&mut q);
+    q.push(" select (select count(*) from sel)::bigint, (select count(*) from done)::bigint");
     q
 }
 
@@ -616,12 +646,46 @@ async fn run(
 }
 
 /// Puts the tag on every selected contact that lacks it; `affected` is how many were newly tagged.
+///
+/// **The tag is taken `for key share` first, and `404` if it is gone.** Its single-row sibling
+/// `tags::apply` maps the same foreign key violation to `404`, and this one let it reach
+/// `ApiError::Internal` — two routes answering differently for one cause. The route's own
+/// `tags::get` guard makes that rare but not impossible: it is an unlocked read, so a tag deleted
+/// between it and the insert below still fires `contact_tags_workspace_id_tag_id_fkey`.
+///
+/// **A pre-lock rather than a second mapping, and that is a choice worth stating.** Mapping the
+/// violation would have made the two answers agree while leaving which one you get decided by
+/// timing. Holding the row makes the tag unable to vanish inside this transaction, so the
+/// violation is unreachable from here rather than translated — the same shape `lists::lock_lists`
+/// gives every list writer, which is one rule instead of two. It is not an ordering fix: a tag
+/// deletion cascades into `contact_tags` and this statement inserts rows it cannot see, so there
+/// was never a cycle, only a race. `docs/adr/0005-one-lock-order-for-every-path.md`.
+///
+/// **The cost, measured rather than guessed, because the obvious statement of it understates.**
+/// It is not "one row for the length of the insert": against a 6 s hold, `delete_tag` waited 4.98 s
+/// and `update_tag` 4.88 s — the latter because `tags` carries `unique (workspace_id, name)`, so a
+/// rename is a key update and conflicts. Worse, the bulk action can itself be blocked meanwhile, on
+/// the `contacts` rows a concurrent erase or bulk delete holds (measured 4.19 s), so what a tag
+/// deleter waits for is that **chain**, not this statement's own duration. Never a cycle — this
+/// holds nothing those paths need — but an operator renaming a tag during a large bulk action is
+/// waiting on work that has nothing to do with the tag.
 pub async fn tag(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     tag_id: Uuid,
 ) -> ApiResult<Counts> {
+    if sqlx::query_scalar!(
+        "select 1 as one from tags where workspace_id = $1 and id = $2 for key share",
+        sel.workspace_id(),
+        tag_id,
+    )
+    .fetch_optional(&mut *db)
+    .await?
+    .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
     run(db, sel, excluded, |q| {
         q.push("insert into contact_tags (workspace_id, contact_id, tag_id) select ")
             .push_bind(sel.workspace_id())
@@ -649,6 +713,57 @@ pub async fn untag(
     .await
 }
 
+/// Runs a membership-changing action and records `action` in the consent log for every contact it
+/// changed — in the same statement, as a `logged` CTE over the rows the change returned. The log
+/// names exactly the rows that moved, is in the caller's transaction by construction rather than
+/// by convention, and a bulk action over `MAX_SELECTION` contacts sends no id back to Rust and
+/// none out again.
+///
+/// **The `logged` insert binds no `ip` and no `user_agent` — and must never be made to.** An
+/// request address and browser are not the subscriber's evidence (`Context::of_principal` makes
+/// the same choice for the single-row writers), so both columns are left null. That is also why
+/// [`consent::scrub`] has no work here: with no evidence bound, a failing row's DETAIL echoes no
+/// personal data. Do not "fix" either half.
+///
+/// Which is why this takes a `source_ref` and not a whole [`consent::Context`]: a parameter that
+/// accepts evidence it will silently drop is a rule held by this comment alone, and a comment is
+/// not an enforcement. The type now says exactly what reaches the row.
+async fn run_recorded(
+    db: &mut PgConnection,
+    sel: &Selection,
+    excluded: &[Uuid],
+    list_id: Uuid,
+    (action, source_ref): (consent::Action, Option<&str>),
+    change: impl FnOnce(&mut QueryBuilder<Postgres>),
+) -> ApiResult<Counts> {
+    let mut q = statement_logging(sel, excluded, change, "contact_id", |q| {
+        // `Source::Api` is the code path, not the actor: a session-authenticated operator using
+        // bulk subscribe is logged `api` while the same operator adding one member is logged
+        // `operator`. `consent_log.source` says how a change arrived, never who made it.
+        q.push(
+            ", logged as (insert into consent_log \
+               (id, workspace_id, contact_id, list_id, action, source, source_ref) select ",
+        )
+        .push(SQL_UUID_V7)
+        .push(", ")
+        .push_bind(sel.workspace_id())
+        .push(", contact_id, ")
+        .push_bind(list_id)
+        .push(", ")
+        .push_bind(action)
+        .push(", ")
+        .push_bind(consent::Source::Api)
+        .push(", ")
+        .push_bind(source_ref.map(str::to_owned))
+        .push(" from done)");
+    });
+    let (selected, affected): (i64, i64) = q.build_query_as().fetch_one(&mut *db).await?;
+    Ok(Counts {
+        selected: selected.unsigned_abs(),
+        affected: affected.unsigned_abs(),
+    })
+}
+
 /// Adds every selected contact who is not on the list yet, with `status` (`pending` on a
 /// double-opt-in list). A membership that exists is never touched: `pending` is not promoted past
 /// the confirmation the list requires, and `unsubscribed` is not reversed, because nobody has
@@ -658,19 +773,53 @@ pub async fn untag(
 /// **Freezing the set is safe here only because this is `on conflict do nothing`** (section 8.3).
 /// Somebody who unsubscribes between the selection and the action is still in the frozen set, so
 /// this statement does run against them; doing nothing to the row they already have is the whole
-/// reason that is harmless. `lists::add_member` is `do update … where status = 'unsubscribed'` —
-/// it revives an unsubscribed membership deliberately, for one named person an admin answers for.
-/// Anyone who later "fixes the asymmetry" by aligning this to that turns freezing into a bulk
-/// re-subscription of people who opted out, with nothing in the tests or the types to object.
+/// reason that is harmless. There is no asymmetry left to "fix": no writer in the tree revives an
+/// unsubscribed membership — `lists::add_member` is `do nothing` too, since Task 7 — and only the
+/// subscriber can reverse their own unsubscribe, through a token delivered to their own address,
+/// in the preference center. Anyone who makes any of these an `on conflict … do update` turns a
+/// bulk action into a re-subscription of people who opted out (M1d invariant 1, spec §8.1).
 /// Section 15.3 carries the same question to the importer.
+///
+/// Each contact it adds gets a consent row, `Source::Api`, in the same transaction — `requested`
+/// when `status` is `pending`, `subscribed` otherwise; a contact it skips gets none.
+///
+/// `source_ref` and not a [`consent::Context`], for the reason [`run_recorded`] gives: this writes
+/// one row per contact in a selection of up to `MAX_SELECTION`, and no request's IP, user agent or
+/// token nonce is evidence about all of them. A `Context` parameter here would accept all three
+/// and drop them. A subscriber recording their own evidence does it one contact at a time, through
+/// `lists::add_member` and `lists::unsubscribe_member`, which do take a whole `Context`.
 pub async fn subscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
     status: MembershipStatus,
+    source_ref: Option<&str>,
 ) -> ApiResult<Counts> {
-    run(db, sel, excluded, |q| {
+    // One `status` for the whole statement, so one action for the whole statement — read off what
+    // is about to be written, never off the list's `double_optin` flag, which is mutable.
+    // Exhaustive on purpose: a status added later must be given an action here before this
+    // compiles, rather than falling into a wildcard and being logged as something it is not.
+    let action = match status {
+        MembershipStatus::Pending => consent::Action::Requested,
+        MembershipStatus::Subscribed => consent::Action::Subscribed,
+        MembershipStatus::Unsubscribed => consent::Action::Unsubscribed,
+    };
+    // Position 2: one row, however many contacts the statement below covers, taken before the
+    // membership and consent rows that name it. `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // **And the answer is used, which the other callers of `lock_lists` do and this one did not.**
+    // It is the only one of them that INSERTS: a list deleted before the lock was still named by
+    // the insert, its foreign key failed, and `ApiError::Internal` answered `500` where the honest
+    // answer is that the list is not there. `confirm` and `unsubscribe_member` discard it safely
+    // because they only update, so a vanished list matches nothing and they already answer `404`.
+    if crate::lists::lock_lists(&mut *db, sel.workspace_id(), &[list_id])
+        .await?
+        .is_empty()
+    {
+        return Err(ApiError::NotFound);
+    }
+    run_recorded(db, sel, excluded, list_id, (action, source_ref), |q| {
         q.push("insert into list_memberships (workspace_id, contact_id, list_id, status, subscribed_at, source) \
                 select ")
             .push_bind(sel.workspace_id())
@@ -688,14 +837,35 @@ pub async fn subscribe(
 }
 
 /// Marks every selected member of the list `unsubscribed`; a contact not on the list, or already
-/// unsubscribed, is not counted in `affected` and keeps its first `unsubscribed_at`.
+/// unsubscribed, is not counted in `affected` and keeps its first `unsubscribed_at`. Each one it
+/// changes gets an `unsubscribed` consent row, `Source::Api`, in the same transaction.
+///
+/// `source_ref` and not a [`consent::Context`], for the reason [`subscribe`] gives.
+///
+/// **Writes no `list`-scope suppression, so none of these unsubscribes survives deleting the
+/// contact or the list**, the same as [`lists::unsubscribe_member`](crate::lists::unsubscribe_member)
+/// and for the same reason: a row keyed on the address that outlives everything it is about is the
+/// subscriber's own act (`docs/adr/0001`, `0027`). There is a second reason here that is this
+/// function's alone, and it would have to be answered before anyone changes the first: the hash a
+/// suppression is keyed on is derived in Rust from the instance secret, `contacts` stores no hash
+/// column, and this statement covers up to [`MAX_SELECTION`] contacts in one transaction — so a
+/// set-based insert is impossible without sending that key to the database, and the row-by-row
+/// alternative takes N advisory locks in one transaction, which is the failure the SHORTCUT on
+/// `suppressions::lock_address` names. `issues/35`.
 pub async fn unsubscribe(
     db: &mut PgConnection,
     sel: &Selection,
     excluded: &[Uuid],
     list_id: Uuid,
+    source_ref: Option<&str>,
 ) -> ApiResult<Counts> {
-    run(db, sel, excluded, |q| {
+    let recorded = (consent::Action::Unsubscribed, source_ref);
+    // Position 2, as in [`subscribe`]: this statement updates existing membership rows and then
+    // writes a consent row per changed one, so without it the order is `list_memberships` →
+    // `lists`, which is the cycle `delete_list` closes.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    crate::lists::lock_lists(&mut *db, sel.workspace_id(), &[list_id]).await?;
+    run_recorded(db, sel, excluded, list_id, recorded, |q| {
         q.push(
             "update list_memberships set status = 'unsubscribed', unsubscribed_at = now() \
              where status <> 'unsubscribed' and workspace_id = ",
@@ -773,9 +943,10 @@ mod tests {
             "with sel as (select id from contacts where workspace_id = $1 and id in (select \
              m.contact_id from selection_snapshot_members m join selection_snapshots s on \
              s.workspace_id = m.workspace_id and s.id = m.snapshot_id where m.workspace_id = $2 \
-             and m.snapshot_id = $3 and s.expires_at > now()) and id <> all($4)), done as (delete \
-             from contacts where id in (select id from sel) returning 1) select (select count(*) \
-             from sel)::bigint, (select count(*) from done)::bigint"
+             and m.snapshot_id = $3 and s.expires_at > now()) and id <> all($4) order by id for \
+             key share), done as (delete from contacts where id in (select id from sel) \
+             returning 1) select (select count(*) from sel)::bigint, (select count(*) from \
+             done)::bigint"
         );
     }
 

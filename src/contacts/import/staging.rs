@@ -49,6 +49,7 @@ use super::{
     routes::MAX_IMPORT_COLUMNS,
 };
 use crate::{
+    consent,
     contacts::{validate_attributes, validate_name},
     crypto::{secrets::Secrets, suppression_hmac},
     custom_fields::{Definition, FieldKind},
@@ -302,7 +303,9 @@ pub struct UpsertCounts {
     /// The `COPY`'s refusals, plus every row refused for an erasure here.
     pub failed: i64,
     /// **Not one of the five.** Subscriptions this import asked for and did not get, because the
-    /// address is already `unsubscribed` on that list (spec 7.5). The row itself is still an
+    /// address is already `unsubscribed` on that list (spec 7.5) — whether that is recorded in the
+    /// membership row or, once the contact or the list has been deleted and remade, in the
+    /// `list`-scope suppression that outlived it. The row itself is still an
     /// `imported` or an `updated` one — only the subscription was declined — so adding this to the
     /// five would count that row twice and break the sum above.
     pub memberships_declined: i64,
@@ -359,6 +362,29 @@ pub async fn upsert_from_staging(
 ) -> ApiResult<UpsertCounts> {
     let table = staging_table(import.id);
     let ws = import.workspace_id;
+
+    // **Position 2, here rather than beside the statement it protects, because the contacts upsert
+    // below is position 4.** The membership and consent rows this job writes take `for key share`
+    // on their list through a foreign key at the end of their statement, so without this the
+    // importer ran `list_memberships` before `lists` while `delete_list` runs `lists` before
+    // `list_memberships`. It cannot be hoisted INTO that statement -- `wanted` is a `union`, and a
+    // locking clause is not allowed with one -- so it is a statement of its own, and it belongs
+    // ahead of the contacts it also takes.
+    //
+    // The set is the job's own list plus every list the FILE names, which is why it reads the
+    // staging table. An import holds these for its whole run, so a list it names cannot be renamed
+    // or deleted until it finishes -- which is the honest answer anyway.
+    // `docs/adr/0005-one-lock-order-for-every-path.md`.
+    //
+    // `AssertSqlSafe`: the only interpolation is `staging_table`'s fixed prefix with the import id
+    // in hex, as everywhere else in this file.
+    sqlx::query(AssertSqlSafe(format!(
+        "select 1 from lists l           where l.workspace_id = $1             and (l.id = $2                  or l.name in (select btrim(e->>'name')                                  from {table} s, lateral jsonb_array_elements(s.lists) e))           order by l.id for key share"
+    )))
+    .bind(ws)
+    .bind(import.list_id)
+    .fetch_all(&mut *conn)
+    .await?;
 
     // `fail on duplicate` is a pre-flight and not an `on conflict` arm: the operator asked for
     // their file back untouched, and a per-row importer would already have written every row
@@ -533,7 +559,10 @@ pub async fn upsert_from_staging(
 /// A tag is the only row this module creates whose count is not known before the statement runs.
 /// Minting these ids in Rust would mean reading every distinct tag name in the file into memory
 /// first, which is the one thing this module refuses to do (see [`MAX_RECORD_BYTES`]).
-const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) * 1000)::bigint), \
+///
+/// `contacts::selection` mints consent-log ids with it for the same reason: the rows are made
+/// inside the statement, so their ids must be too.
+pub(crate) const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) * 1000)::bigint), \
                             12, '0') || '7' || substr(md5(random()::text), 1, 3) \
                             || '8' || substr(md5(random()::text), 1, 15))::uuid";
 
@@ -576,6 +605,43 @@ const SQL_UUID_V7: &str = "(lpad(to_hex((extract(epoch from clock_timestamp()) *
 ///    without the `:unsubscribed` marker, would then subscribe it, where a preserved
 ///    `unsubscribed` row would have been protected by the `do nothing` above. Nobody becomes
 ///    mailable by the import that drops the entry; what is lost is the protection on the next one.
+///
+/// **The `refused` CTE is the heart of the durable per-list unsubscribe, and it is why this
+/// statement reads `suppressions` for more than a count.** `declined` catches an address that
+/// still has an `unsubscribed` membership row; it catches nothing once that row is gone, and two
+/// routine Editor actions destroy it — deleting the contact and deleting the list. Because rule 1
+/// above resolves a file's list by NAME, delete-recreate-import then resurrected everyone who had
+/// ever left that list. A `list`-scope suppression (`0027_list_scope_suppressions.sql`) is keyed
+/// on the address and survives both, and `refused` is where it is honoured: those rows are not
+/// inserted and are counted in `memberships_declined`, which is what that count has always meant.
+///
+/// **It reads only. An import must never lift one** — an import is not the person, and the whole
+/// value of this row is that nothing but a token delivered to their own address clears it.
+/// `tests/import.rs` pins that direction as well as this one.
+///
+/// It matches on `list_id` alone. `0027`'s two triggers keep that column filled for every list
+/// that exists — a list created or renamed into a refusal's name adopts it — so there is no
+/// second, name-shaped branch here to get wrong.
+///
+/// **The consent rows are written by the `logged` CTE inside the same statement**, one per
+/// membership this statement actually wrote (`do nothing` touched nothing, so records nothing),
+/// as `contacts::selection::run_recorded` does. That is not a style choice:
+///
+/// - **The action is per row.** `added` writes `pending` or `subscribed` per row, because one
+///   import can reach a double-opt-in list and a single-opt-in one at once (the job's list and a
+///   list the file names). The `case` over the status it just wrote is the only place that
+///   distinction survives; a Rust-side helper taking one action for the batch cannot carry it.
+///   **That `case` has no `else`, deliberately.** Its value is a legal claim about a person, so a
+///   status this code has not been taught yields NULL and is refused by `action not null` — the
+///   same refusal `selection::subscribe`'s exhaustive match gets from the compiler. An `else
+///   'subscribed'` would log "they agreed" for a status nobody checked.
+/// - **No id crosses the process boundary.** The previous shape sent both id arrays back to Rust
+///   and in again — a per-row cost on a million-row import, for rows Postgres already had.
+///
+/// **It binds no `ip` and no `user_agent`, and must never be made to.** The importing operator's
+/// request is not the subscriber's evidence, so both are left null rather than invented; the
+/// `source_ref` naming the import is the provenance. With no evidence bound, a failing row's
+/// DETAIL echoes no personal data, which is why [`consent::scrub`] has no work here.
 async fn write_memberships_and_tags(
     conn: &mut PgConnection,
     import: &ImportJob,
@@ -611,22 +677,30 @@ async fn write_memberships_and_tags(
               where {written} \
          ), \
          named as ( \
-             select t.contact_id, btrim(e->>'name') as name \
+             select t.contact_id, t.email, btrim(e->>'name') as name \
                from target t, lateral jsonb_array_elements(t.lists) e \
               where lower(btrim(coalesce(e->>'status', ''))) <> 'unsubscribed' \
          ), \
          wanted as ( \
-             select t.contact_id, l.id as list_id, l.double_optin \
+             select t.contact_id, t.email, l.id as list_id, l.double_optin \
                from target t join lists l on l.workspace_id = $1 and l.id = $2 \
              union \
-             select n.contact_id, l.id, l.double_optin \
+             select n.contact_id, n.email, l.id, l.double_optin \
                from named n join lists l on l.workspace_id = $1 and l.name = n.name \
          ), \
+         refused as ( \
+             select w.contact_id, w.list_id from wanted w \
+              where exists (select 1 from suppressions s where s.lifted_at is null \
+                              and s.workspace_id = $1 and s.scope = 'list' \
+                              and s.email = w.email and s.list_id = w.list_id) \
+         ), \
          declined as ( \
-             select 1 from wanted w \
+             select w.contact_id, w.list_id from wanted w \
                join list_memberships m on m.workspace_id = $1 \
                     and m.contact_id = w.contact_id and m.list_id = w.list_id \
               where m.status = 'unsubscribed' \
+             union \
+             select contact_id, list_id from refused \
          ), \
          added as ( \
              insert into list_memberships \
@@ -635,8 +709,20 @@ async fn write_memberships_and_tags(
                     case when w.double_optin then 'pending' else 'subscribed' end, \
                     case when w.double_optin then null else now() end, $3 \
                from wanted w \
+              where not exists (select 1 from refused r \
+                                 where r.contact_id = w.contact_id \
+                                   and r.list_id = w.list_id) \
              on conflict (contact_id, list_id) do nothing \
-             returning 1 \
+             returning contact_id, list_id, status \
+         ), \
+         logged as ( \
+             insert into consent_log \
+                 (id, workspace_id, contact_id, list_id, action, source, source_ref) \
+             select {SQL_UUID_V7}, $1, a.contact_id, a.list_id, \
+                    case when a.status = 'pending' then 'requested' \
+                         when a.status = 'subscribed' then 'subscribed' end, \
+                    $4, $5 \
+               from added a \
          ), \
          row_tags as ( \
              select t.contact_id, btrim(v.value) as name \
@@ -676,6 +762,8 @@ async fn write_memberships_and_tags(
     .bind(import.workspace_id)
     .bind(import.list_id)
     .bind(MembershipSource::Import)
+    .bind(consent::Source::Import)
+    .bind(import.id.to_string())
     .fetch_one(&mut *conn)
     .await?;
     Ok((declined, suppressed))

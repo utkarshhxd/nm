@@ -168,18 +168,48 @@ fn canonical_value(d: &Definition, v: &Value) -> Result<Value, &'static str> {
     }
 }
 
-/// Inserts a contact and returns its id. The caller passes the transaction (so the audit row
-/// commits with it) and has already authorised the actor. `409 email-taken` if the normalised
-/// address exists in this workspace, `409 address-erased` if it was erased; `422` per invalid field.
+/// A [`NewContact`] whose every field [`create`] would check, checked — and nothing else. It says
+/// what was submitted is well formed; it says nothing about whether the address may be a contact
+/// here, which is [`create_checked`]'s erasure guard and the unique index.
 ///
-/// Every write path into `contacts` must go through this function or re-check `suppressions::is_erased`
-/// itself: the erasure guard lives here, so a bulk `INSERT` elsewhere bypasses it silently.
-pub async fn create(
+/// It exists so that a caller which may or may not go on to insert can run **the same** checks
+/// either way. `public::forms` is that caller: a public form answers a malformed submission the
+/// same way whether or not the address is already a contact, or the difference between the two
+/// answers is an address-existence oracle in one request (M1d invariant 7). Validating by
+/// attempting the insert cannot work there, because the oracle's third leg is a suppressed
+/// address, which never reaches an insert at all.
+///
+/// **How much of that the types hold, exactly.** The fields are private and [`check`] is the only
+/// constructor, so the normalised address a caller needs for a suppression or a contact lookup
+/// can only be had by validating first: *moving* the check later in `public::forms` does not
+/// compile, which is worth knowing because that is the mistake that was made once already.
+/// That is the whole of the guarantee. It does **not** stop someone re-deriving the address
+/// another way - `users::normalize_email` is public and one line - and putting a lookup in front
+/// of the check. The type makes the mistake inconvenient and visible in review; it is not a
+/// proof, and `tests/public_pages.rs` is where the property is tested.
+pub struct Checked {
+    email: String,
+    first: String,
+    last: String,
+    tz: Option<String>,
+    attrs: Value,
+}
+
+impl Checked {
+    /// The normalised address — what `contacts.email` holds, and what a suppression lookup has to
+    /// be given rather than the raw string the submitter typed.
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+}
+
+/// Validates every field of a `NewContact` against this workspace's custom field definitions.
+/// `422` per invalid field, as [`create`] gives.
+pub async fn check(
     db: &mut PgConnection,
-    secrets: &Secrets,
     workspace_id: Uuid,
     new: NewContact,
-) -> ApiResult<Uuid> {
+) -> ApiResult<Checked> {
     let email = normalize_email(&new.email);
     let first = validate_name("first_name", new.first_name.as_deref().unwrap_or(""));
     let last = validate_name("last_name", new.last_name.as_deref().unwrap_or(""));
@@ -196,6 +226,47 @@ pub async fn create(
         errors.extend(attrs.err().into_iter().flatten());
         return Err(ApiError::Validation(errors));
     };
+    Ok(Checked {
+        email: email.clone(),
+        first: first.clone(),
+        last: last.clone(),
+        tz: tz.map(str::to_owned),
+        attrs: attrs.clone(),
+    })
+}
+
+/// Inserts a contact and returns its id. The caller passes the transaction (so the audit row
+/// commits with it) and has already authorised the actor. `409 email-taken` if the normalised
+/// address exists in this workspace, `409 address-erased` if it was erased; `422` per invalid field.
+///
+/// Every write path into `contacts` must go through this function or re-check `suppressions::is_erased`
+/// itself: the erasure guard lives in [`create_checked`], so a bulk `INSERT` elsewhere bypasses it
+/// silently.
+pub async fn create(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    new: NewContact,
+) -> ApiResult<Uuid> {
+    let checked = check(&mut *db, workspace_id, new).await?;
+    create_checked(db, secrets, workspace_id, &checked).await
+}
+
+/// [`create`] once the fields are known good. Split out for the caller that has to validate
+/// before it knows whether it will insert; see [`Checked`].
+pub async fn create_checked(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    workspace_id: Uuid,
+    checked: &Checked,
+) -> ApiResult<Uuid> {
+    let Checked {
+        email,
+        first,
+        last,
+        tz,
+        attrs,
+    } = checked;
     // Erasure is permanent: a tombstoned address never becomes a contact again, however it
     // arrives. This is what stops the next import re-creating the person.
     if is_erased(&mut *db, secrets, workspace_id, email).await? {
@@ -226,6 +297,38 @@ pub async fn create(
 }
 
 /// The contact, or `404` if it is not in this workspace.
+/// **Position 4 of the one lock order (`docs/adr/0005-one-lock-order-for-every-path.md`).** Takes
+/// `for key share` on the contact and says whether it is still there.
+///
+/// **Call this before writing a `list_memberships` or a `consent_log` row about it.** Both tables
+/// carry `foreign key (workspace_id, contact_id) references contacts`, and a foreign key check
+/// runs at the END of the statement that triggered it — so a writer that does not take the row
+/// itself takes it *last*, after the membership rows, while `contacts::routes::delete_contact`,
+/// `selection::delete` and `erase_contact` take it **first**, exclusively, and then cascade into
+/// those same membership rows. That is the `lists` inversion again on a second class, and it is
+/// the one the order did not name until it had produced three more cycles: the operator's per-list
+/// unsubscribe, `GET /c/{token}` and the RFC 8058 one-click, the last two unauthenticated.
+///
+/// The advisory address lock is no help here, because none of the three deleting paths takes it.
+///
+/// `false` means the contact is gone, and a caller that writes memberships should stop rather than
+/// name it: a list of reasons it might be gone is not worth as much as not writing a row whose
+/// foreign key is about to fail.
+pub async fn lock_contact(
+    db: &mut PgConnection,
+    workspace_id: Uuid,
+    id: Uuid,
+) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar!(
+        "select 1 as one from contacts where workspace_id = $1 and id = $2 for key share",
+        workspace_id,
+        id,
+    )
+    .fetch_optional(db)
+    .await?
+    .is_some())
+}
+
 pub async fn get(db: &mut PgConnection, workspace_id: Uuid, id: Uuid) -> ApiResult<Contact> {
     sqlx::query_as!(
         Contact,
