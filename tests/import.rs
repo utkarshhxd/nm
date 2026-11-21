@@ -4133,3 +4133,70 @@ async fn an_upload_past_the_per_minute_limit_is_429(pool: PgPool) {
     uploaded(&app, other, "fine.csv", "email\nada@example.com\n").await;
     assert_eq!(count(&pool, "imports").await, 1);
 }
+
+/// **The importer's half of `docs/adr/0005-one-lock-order-for-every-path.md`**, and the one path
+/// whose position-2 lock could not be hoisted into the statement it protects: `wanted` is a
+/// `union`, and a locking clause is not allowed with one, so the lock is a statement of its own.
+///
+/// It lives here rather than in `tests/lock_order.rs` because the import is driven by this file's
+/// fixtures, and it needs a different wedge from its five siblings there. They hold the `contacts`
+/// row, which stops a route between its membership write and the consent rows that follow; the
+/// import does both in one statement, so there is no point between them to stop at. Instead the
+/// deletion is what is held open, and the question is which side blocks on it. With the lock, the
+/// import waits for the deletion, sees no list afterwards and writes no membership. Without it,
+/// the big statement's own snapshot still sees the list, inserts against it, and the foreign key
+/// check that runs at the end of the statement — with a fresh snapshot — finds the list gone:
+/// `23503`, which fails the whole import.
+#[sqlx::test]
+async fn an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let ws = workspace(&pool, "acme").await;
+    let import = insert_import(&pool, ws).await;
+    let list = {
+        let mut conn = pool.acquire().await.unwrap();
+        insert_list(&mut conn, ws, "news", false).await
+    };
+
+    // The operator's deletion, begun and held open: it has the list row and its cascade.
+    let mut deleting = pool.begin().await.unwrap();
+    sqlx::query("delete from lists where id = $1")
+        .bind(list)
+        .execute(&mut *deleting)
+        .await
+        .expect("delete the list");
+
+    let importing = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let j = job_for_list(import, ws, name_columns(), list);
+            let staged = copy_into_staging(
+                &mut tx,
+                &secrets(),
+                &j,
+                &b"email,first_name,last_name,timezone\nada@example.com,Ada,Byron,UTC\n"[..],
+            )
+            .await
+            .expect("staging");
+            let counts = upsert_from_staging(&mut tx, &j, staged.failed).await;
+            tx.commit().await.expect("commit the import");
+            counts
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    deleting.commit().await.expect("commit the deletion");
+    let counts = importing
+        .await
+        .expect("the import task")
+        .expect("the import must not fail because a list it named was deleted");
+
+    assert_eq!(counts.imported, 1, "the contact is still imported");
+    let memberships: i64 = sqlx::query_scalar("select count(*) from list_memberships")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        memberships, 0,
+        "and put on no list, because the one the job named no longer exists"
+    );
+}

@@ -332,3 +332,286 @@ async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPoo
     unsubscribed.assert_status(StatusCode::NO_CONTENT);
     deleted.assert_status(StatusCode::NO_CONTENT);
 }
+
+// ---- The other paths that take position 2 through the same mechanism -------------------------
+//
+// `an_operator_unsubscribe_…` above was written to stand for this class. Standing for a class is
+// not holding it, so each of these is held on its own — and writing them out turned up a
+// distinction nobody had made: **two of the six fail as deadlocks and four as foreign key
+// violations**, because a cascade can only block on a membership row it can SEE. A path that
+// updates an existing row holds something the deletion needs, and the cycle closes; a path that
+// inserts a new one holds nothing visible, so the deletion commits out from under it and the
+// foreign key check that follows finds no list. Both are reached by the same missing lock and both
+// red here, but only the first kind is a deadlock, and a reviewer looking only for `40P01` would
+// have called the other four safe.
+
+/// `POST /f/…` against a list deleted while the submission is in flight.
+///
+/// The wedge here is the **address advisory lock** rather than the contact row: this route takes
+/// that lock first on every path, and holding it stops the submission after it has read the form's
+/// lists and before it writes anything. Spec §8.9 is what makes the failure interesting — this
+/// route may not answer differently — so the mutation does not merely lose a membership, it
+/// answers an anonymous submitter `500` where every other outcome is the same success page.
+#[sqlx::test]
+async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let first = lists[0];
+    let form = Uuid::now_v7();
+    sqlx::query(
+        "insert into forms (id, workspace_id, slug, name, fields, headline, button_label) \
+         values ($1, $2, 'join', 'Signup', $3::jsonb, 'Join', 'Join')",
+    )
+    .bind(form)
+    .bind(fx.workspace)
+    .bind(
+        serde_json::json!([{"target": {"kind": "email"}, "required": true, "label": "Email"}])
+            .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .expect("form");
+    sqlx::query("insert into form_lists (workspace_id, form_id, list_id) values ($1, $2, $3)")
+        .bind(fx.workspace)
+        .bind(form)
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("form list");
+
+    // The route's own first lock, derived the way `suppressions::lock_address` derives it.
+    let hmac = nm::crypto::suppression_hmac(
+        &fx.app.state.secrets,
+        &nm::users::normalize_email("new@ex.test").unwrap(),
+    );
+    let key = i64::from_be_bytes(hmac[..8].try_into().unwrap());
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(key)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the address lock");
+
+    let submitting = tokio::spawn({
+        let app = TestApp::new(pool.clone()).await;
+        async move {
+            app.post("/f/acme/join")
+                .content_type("application/x-www-form-urlencoded")
+                .text("email=new@ex.test")
+                .await
+        }
+    });
+    tokio::time::sleep(SETTLE).await;
+
+    let path = fx.delete_list_path(first);
+    fx.admin
+        .delete(&path)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    held.commit().await.expect("release the wedge");
+
+    let answered = submitting.await.expect("the submission");
+    answered.assert_status_ok();
+    let memberships: i64 = sqlx::query_scalar("select count(*) from list_memberships")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(memberships, 0, "the list it named is gone; nothing is owed");
+}
+
+/// `GET /c/{token}` against a list deletion. A confirmation promotes an EXISTING membership, so
+/// the deletion's cascade can see the row and wait for it: this one is a true cycle.
+#[sqlx::test]
+async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let first = lists[0];
+    sqlx::query("update list_memberships set status = 'pending', subscribed_at = null")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let link = issue(
+        &fx.app.state.secrets,
+        &Token {
+            workspace_id: fx.workspace,
+            contact_id: fx.contact,
+            purpose: Purpose::Confirm,
+            list_id: Some(first),
+            issued_at: Utc::now().timestamp(),
+            nonce: "c1".to_owned(),
+            kid: None,
+            ref_id: None,
+        },
+    );
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from contacts where id = $1 for update")
+        .bind(fx.contact)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the contact row");
+
+    let confirming = tokio::spawn({
+        let app = TestApp::new(pool.clone()).await;
+        async move { app.get(&format!("/c/{link}")).await }
+    });
+    tokio::time::sleep(SETTLE).await;
+
+    let path = fx.delete_list_path(first);
+    let deleting = tokio::spawn({
+        let admin = fx.admin;
+        async move { admin.delete(&path).await }
+    });
+    tokio::time::sleep(SETTLE).await;
+
+    held.commit().await.expect("release the wedge");
+    let (confirmed, deleted) = (
+        confirming.await.expect("the confirmation"),
+        deleting.await.expect("the deletion"),
+    );
+    confirmed.assert_status_ok();
+    deleted.assert_status(StatusCode::NO_CONTENT);
+}
+
+/// An operator adding a member against a list deletion. A new membership row is invisible to the
+/// cascade, so this is the foreign key kind: the deletion commits out from under it.
+#[sqlx::test]
+async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
+    let fresh = lists[1];
+    sqlx::query("delete from list_memberships where list_id = $1")
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from contacts where id = $1 for update")
+        .bind(fx.contact)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the contact row");
+
+    let add_path = format!("/api/v1/workspaces/{}/lists/{fresh}/members", fx.workspace);
+    let delete_path = fx.delete_list_path(fresh);
+    let contact = fx.contact;
+    let adding = tokio::spawn({
+        let admin = fx.admin;
+        async move {
+            admin
+                .post(&add_path)
+                .json(&serde_json::json!({"contact_id": contact}))
+                .await
+        }
+    });
+    tokio::time::sleep(SETTLE).await;
+
+    let mut deleter = TestApp::new(pool.clone()).await;
+    deleter.login("owner@example.com", PW).await;
+    let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
+    tokio::time::sleep(SETTLE).await;
+
+    held.commit().await.expect("release the wedge");
+    let (added, deleted) = (
+        adding.await.expect("the add"),
+        deleting.await.expect("the deletion"),
+    );
+    assert!(
+        added.status_code().is_success(),
+        "adding a member answered {}",
+        added.status_code()
+    );
+    deleted.assert_status(StatusCode::NO_CONTENT);
+}
+
+/// Bulk subscribe against a list deletion: the foreign key kind, as the single-member add above.
+#[sqlx::test]
+async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
+    let fresh = lists[1];
+    sqlx::query("delete from list_memberships where list_id = $1")
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from contacts where id = $1 for update")
+        .bind(fx.contact)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the contact row");
+
+    let bulk_path = format!(
+        "/api/v1/workspaces/{}/contacts/bulk/subscribe",
+        fx.workspace
+    );
+    let delete_path = fx.delete_list_path(fresh);
+    let contact = fx.contact;
+    let subscribing = tokio::spawn({
+        let admin = fx.admin;
+        async move {
+            admin
+                .post(&bulk_path)
+                .json(&serde_json::json!({"ids": [contact], "list_id": fresh}))
+                .await
+        }
+    });
+    tokio::time::sleep(SETTLE).await;
+
+    let mut deleter = TestApp::new(pool.clone()).await;
+    deleter.login("owner@example.com", PW).await;
+    let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
+    tokio::time::sleep(SETTLE).await;
+
+    held.commit().await.expect("release the wedge");
+    let (subscribed, deleted) = (
+        subscribing.await.expect("the bulk subscribe"),
+        deleting.await.expect("the deletion"),
+    );
+    subscribed.assert_status_ok();
+    deleted.assert_status(StatusCode::NO_CONTENT);
+}
+
+/// Bulk unsubscribe against a list deletion. It updates existing membership rows and records each
+/// one in the same statement, so the cascade can see what it holds: the deadlock kind.
+#[sqlx::test]
+async fn a_bulk_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
+    let (fx, lists) = fixture(&pool, &["first"]).await;
+    let first = lists[0];
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from contacts where id = $1 for update")
+        .bind(fx.contact)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the contact row");
+
+    let bulk_path = format!(
+        "/api/v1/workspaces/{}/contacts/bulk/unsubscribe",
+        fx.workspace
+    );
+    let delete_path = fx.delete_list_path(first);
+    let contact = fx.contact;
+    let unsubscribing = tokio::spawn({
+        let admin = fx.admin;
+        async move {
+            admin
+                .post(&bulk_path)
+                .json(&serde_json::json!({"ids": [contact], "list_id": first}))
+                .await
+        }
+    });
+    tokio::time::sleep(SETTLE).await;
+
+    let mut deleter = TestApp::new(pool.clone()).await;
+    deleter.login("owner@example.com", PW).await;
+    let deleting = tokio::spawn(async move { deleter.delete(&delete_path).await });
+    tokio::time::sleep(SETTLE).await;
+
+    held.commit().await.expect("release the wedge");
+    let (unsubscribed, deleted) = (
+        unsubscribing.await.expect("the bulk unsubscribe"),
+        deleting.await.expect("the deletion"),
+    );
+    unsubscribed.assert_status_ok();
+    deleted.assert_status(StatusCode::NO_CONTENT);
+}
