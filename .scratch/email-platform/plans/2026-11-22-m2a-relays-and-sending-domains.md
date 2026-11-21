@@ -461,8 +461,13 @@ SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }, BIT STRING { … } }`); write it an
 - [ ] **Step 1: Write the failing tests:**
   - `relaxed_header_canonicalization_matches_rfc_6376`: the §3.4.5 example input canonicalizes to the
     published output, byte for byte.
-  - `relaxed_body_canonicalization_matches_rfc_6376`: same, including that a body of only CRLFs
-    canonicalizes to a single CRLF and an empty body to the empty string.
+  - `relaxed_body_canonicalization_matches_rfc_6376`: same, including that under **relaxed**
+    canonicalization a body of only CRLFs and an empty body **both** canonicalize to the empty
+    string — RFC 6376 §3.4.4, *"a completely empty or missing body is canonicalized as a null
+    input"*. An earlier version of this line said a CRLF-only body gives a single CRLF; that is
+    **simple** canonicalization (§3.4.3), and implementing it here would have produced a wrong `bh`
+    for every message with trailing blank lines — which is most of them. Corroborate with the
+    empty-body hash `47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=`, the base64 SHA-256 of nothing.
   - `h_covers_both_unsubscribe_headers`: sign a message built by Task 5; the emitted `h=` tag,
     lowercased and split on `:`, contains `list-unsubscribe` and `list-unsubscribe-post`.
   - `a_signature_verifies_against_the_published_public_key`: sign, then verify `b=` with
