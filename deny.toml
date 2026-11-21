@@ -39,6 +39,13 @@ private = { ignore = true } # exempts our own unpublished crate
 unused-allowed-license = "allow"
 allow = [
   "MIT",
+  # 0BSD arrives with `quoted_printable`, through `lettre`, which M2a needs for SMTP and MIME.
+  # It is the BSD Zero Clause License: OSI approved, FSF approved, and strictly MORE permissive
+  # than MIT, which is already on this list — it drops even the attribution and notice
+  # requirements, so anything MIT allows this allows. Added deliberately rather than by widening
+  # the list to "anything permissive": the next unfamiliar licence should fail this gate too and
+  # get its own line and its own sentence.
+  "0BSD",
   "Apache-2.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
