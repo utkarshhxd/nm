@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update sending_domains set from_name = case when $3 then $4 else from_name end, signing = coalesce($5, signing), dkim_selector = coalesce($6, dkim_selector), return_path_domain = case when $7 then $8 else return_path_domain end, dkim_private_key_encrypted = case when $9 then $10 else dkim_private_key_encrypted end, dkim_public_txt = case when $9 then $14 else dkim_public_txt end, checks = case when $11 then '{}'::jsonb else checks end, checked_at = case when $11 then null else checked_at end, send_unverified_acknowledged_at = case when $12 then (case when $13 then now() end) when $11 then null else send_unverified_acknowledged_at end, updated_at = now() where workspace_id = $1 and id = $2 returning domain",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "domain"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bool",
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Text",
+        "Bool",
+        "Bytea",
+        "Bool",
+        "Bool",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "89231a37b46e06072eb30f4ae5addf462dc9770e92905b411746f68d69ded88a"
+}

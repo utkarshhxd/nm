@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted,\n                  return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  send_unverified_acknowledged_at, updated_at\n           from sending_domains\n           where workspace_id = $1 and ($2::uuid is null or id < $2)\n           order by id desc limit $3",
+  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted is not null as \"has_dkim_key!\",\n                  dkim_public_txt, return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  send_unverified_acknowledged_at, updated_at\n           from sending_domains where workspace_id = $1 and id = $2",
   "describe": {
     "columns": [
       {
@@ -71,17 +71,23 @@
       },
       {
         "ordinal": 6,
-        "name": "dkim_private_key_encrypted",
-        "type_info": "Bytea",
+        "name": "has_dkim_key!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "dkim_public_txt",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "sending_domains",
-            "name": "dkim_private_key_encrypted"
+            "name": "dkim_public_txt"
           }
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "return_path_domain",
         "type_info": "Text",
         "origin": {
@@ -92,7 +98,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "checks: SqlJson<DnsChecks>",
         "type_info": "Jsonb",
         "origin": {
@@ -103,7 +109,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "checked_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -114,7 +120,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "send_unverified_acknowledged_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -125,7 +131,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -139,8 +145,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -150,6 +155,7 @@
       true,
       false,
       false,
+      null,
       true,
       true,
       false,
@@ -158,5 +164,5 @@
       false
     ]
   },
-  "hash": "976641f9cc61ae1257bf7f35d4313d187397ea38f7a4141a5b10dd162d3f9556"
+  "hash": "e150b8311b2514353064400349f732a1cff75bd6d56d2d5fe10c7611eb8c3c2d"
 }

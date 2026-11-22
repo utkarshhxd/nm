@@ -1082,6 +1082,127 @@ async fn the_view_publishes_the_public_half_of_the_stored_key_and_only_that(pool
         .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[sqlx::test]
+async fn reading_a_domain_never_decrypts_its_key(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let mut v = body("example.com", "app");
+    v["dkim_private_key"] = json!(KEY_PEM);
+    let r = t.admin.post(&domains_path(t.id)).json(&v).await;
+    r.assert_status(StatusCode::CREATED);
+    let id: Uuid = r.json::<Value>()["id"].as_str().unwrap().parse().unwrap();
+    let published = r.json::<Value>()["dkim_public_txt"].clone();
+    let record = nm::mail::dkim::public_key_txt(&nm::mail::dkim::key_from_pem(KEY_PEM).unwrap());
+    assert_eq!(published, json!(record));
+
+    // The record is stored beside the key, and stored as the signer's own derivation made it.
+    let column: Option<String> =
+        sqlx::query_scalar("select dkim_public_txt from sending_domains where id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(column.as_deref(), Some(record.as_str()));
+
+    // Now make the stored key undecryptable. A read that decrypted it would fail or lose the
+    // record; these three do neither, because none of them touches the key.
+    sqlx::query("update sending_domains set dkim_private_key_encrypted = '\\x00112233'::bytea")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let one = t.viewer.get(&domain_path(t.id, id)).await;
+    one.assert_status_ok();
+    assert_eq!(one.json::<Value>()["dkim_public_txt"], published);
+    assert_eq!(one.json::<Value>()["has_dkim_key"], json!(true));
+    let list = t.viewer.get(&domains_path(t.id)).await;
+    assert_eq!(
+        list.json::<Value>()["data"][0]["dkim_public_txt"],
+        published
+    );
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"from_name": "Acme"}))
+        .await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["dkim_public_txt"], published);
+
+    // The record and the key are written by one clause: replacing the key replaces the record,
+    // clearing the key clears it, and a patch that sends neither leaves both.
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"dkim_private_key": OTHER_PEM}))
+        .await;
+    r.assert_status_ok();
+    let other = nm::mail::dkim::public_key_txt(&nm::mail::dkim::key_from_pem(OTHER_PEM).unwrap());
+    assert_eq!(r.json::<Value>()["dkim_public_txt"], json!(other));
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"signing": "relay", "dkim_private_key": null}))
+        .await;
+    assert_eq!(r.json::<Value>()["dkim_public_txt"], Value::Null);
+    let column: Option<String> =
+        sqlx::query_scalar("select dkim_public_txt from sending_domains where id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(column, None);
+
+    // And the table refuses a published record with no key behind it.
+    let err =
+        sqlx::query("update sending_domains set dkim_public_txt = 'v=DKIM1; p=x' where id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|e| e.code().map(|c| c.into_owned()))
+            .as_deref(),
+        Some("23514"),
+        "{err}"
+    );
+}
+
+#[sqlx::test]
+async fn running_a_check_does_not_withdraw_the_acknowledgement(pool: PgPool) {
+    let ns = nameserver(complete_zone()).await;
+    let t = tenant_with(&pool, "acme", |p| {
+        TestApp::with_resolver(p, resolver_for(&ns))
+    })
+    .await;
+    let id = add_domain(&t, body("example.com", "relay")).await;
+    // Acknowledged first, then checked: the order the settings page lets an operator do it in,
+    // and the order no other test had. Every check elsewhere runs before any acknowledgement.
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"send_unverified_acknowledged": true}))
+        .await;
+    r.assert_status_ok();
+    let acknowledged = r.json::<Value>()["send_unverified_acknowledged_at"].clone();
+    assert!(acknowledged.is_string(), "{acknowledged}");
+
+    for _ in 0..2 {
+        let shown = checks_of(&t, id).await;
+        assert_ne!(shown["checked_at"], Value::Null, "the check did not run");
+        assert_eq!(
+            shown["send_unverified_acknowledged_at"], acknowledged,
+            "a check withdrew, or restamped, the acknowledgement"
+        );
+    }
+    let column: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "select send_unverified_acknowledged_at from sending_domains where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(column.is_some());
+}
+
 // ---------------------------------------------------------------------------------------------
 // The checker, through the route.
 

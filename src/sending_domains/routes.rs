@@ -20,7 +20,6 @@ use crate::{
     app::AppState,
     audit::{self, AuditEvent, actions},
     auth::{Principal, authorize},
-    crypto::secrets::Secrets,
     error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult, FieldError},
     http::request_meta::RequestMeta,
     mail::dkim,
@@ -61,9 +60,9 @@ pub struct SendingDomainView {
     /// Whether a DKIM private key is stored. The key itself is never returned.
     pub has_dkim_key: bool,
     /// What to publish as a TXT record at `{dkim_selector}._domainkey.{domain}`: `v=DKIM1; k=rsa;
-    /// p=...`, the public half of the stored key. Null when no key is stored (or the stored key
-    /// cannot be read, which is logged). Derived on the server from the stored key and from nothing
-    /// a client sends; the private key is never returned.
+    /// p=...`, the public half of the stored key. Null when no key is stored. Derived on the
+    /// server when the key is saved and stored beside it, never from anything but that key, so
+    /// reading it does not decrypt the key; the private key is never returned.
     pub dkim_public_txt: Option<String>,
     pub return_path_domain: Option<String>,
     /// The DNS checker's last result; every check is `not_checked` until it has run.
@@ -197,15 +196,17 @@ fn display_name(v: &str) -> Result<String, FieldError> {
     Ok(v.to_owned())
 }
 
-/// The DER inside a PEM private key, once the signer has said it can sign with it.
+/// A PEM private key as it is stored, once the signer has said it can sign with it: the DER inside
+/// it, and the record to publish for it.
 ///
 /// The armour is unwrapped here and the bytes are handed to [`dkim::key_from_der`] — the stored
 /// form, not the PEM, because the armour is not stored and the bytes are what a worker will load
 /// later. A key that cannot be signed with is a field error at save time rather than a surprise
-/// in a sender.
+/// in a sender. The record is derived now, from the key in hand, and stored beside it, so that a
+/// read never has to decrypt the key to show it.
 ///
 /// The refusal never echoes the input, which is a key when it is anything.
-fn pem_to_der(v: &str) -> Result<Zeroizing<Vec<u8>>, FieldError> {
+fn parse_key(v: &str) -> Result<(Zeroizing<Vec<u8>>, String), FieldError> {
     const WHAT: &str = "must be an unencrypted RSA private key in PEM form (BEGIN PRIVATE KEY or \
                         BEGIN RSA PRIVATE KEY)";
     let refuse = || FieldError::new("dkim_private_key", WHAT);
@@ -222,8 +223,9 @@ fn pem_to_der(v: &str) -> Result<Zeroizing<Vec<u8>>, FieldError> {
         return Err(refuse());
     }
     let der = Zeroizing::new(STANDARD.decode(body.concat()).map_err(|_| refuse())?);
-    dkim::key_from_der(&der).map_err(|e| FieldError::new("dkim_private_key", e.to_string()))?;
-    Ok(der)
+    let key =
+        dkim::key_from_der(&der).map_err(|e| FieldError::new("dkim_private_key", e.to_string()))?;
+    Ok((der, dkim::public_key_txt(&key)))
 }
 
 /// The two refusals the table's constraints make, as the API's own.
@@ -248,8 +250,9 @@ struct Row {
     from_name: Option<String>,
     signing: Signing,
     dkim_selector: String,
-    /// The encrypted blob, not the key: it is decrypted in [`Row::into_view`] and nowhere else here.
-    dkim_private_key_encrypted: Option<Vec<u8>>,
+    /// Whether a key is stored. The key is not selected: no read here decrypts it.
+    has_dkim_key: bool,
+    dkim_public_txt: Option<String>,
     return_path_domain: Option<String>,
     checks: SqlJson<DnsChecks>,
     checked_at: Option<DateTime<Utc>>,
@@ -272,23 +275,10 @@ impl Row {
             send_unverified_acknowledged_at: self.send_unverified_acknowledged_at,
         }
     }
+}
 
-    /// The row as the API shows it, with the public half of the key worked out from the stored
-    /// one. A key that cannot be read leaves `dkim_public_txt` null and is logged rather than
-    /// failing the call: one bad row must not take the whole settings list down, and
-    /// `has_dkim_key: true` beside a null record is the sign something is wrong.
-    fn into_view(self, secrets: &Secrets) -> SendingDomainView {
-        let r = self;
-        let dkim_public_txt =
-            r.dkim_private_key_encrypted
-                .as_deref()
-                .and_then(|blob| match public_txt(secrets, blob) {
-                    Ok(txt) => Some(txt),
-                    Err(e) => {
-                        tracing::error!(sending_domain = %r.id, error = %e, "the stored DKIM key cannot be read");
-                        None
-                    }
-                });
+impl From<Row> for SendingDomainView {
+    fn from(r: Row) -> SendingDomainView {
         SendingDomainView {
             id: r.id,
             workspace_id: r.workspace_id,
@@ -296,8 +286,8 @@ impl Row {
             from_name: r.from_name,
             signing: r.signing,
             dkim_selector: r.dkim_selector,
-            has_dkim_key: r.dkim_private_key_encrypted.is_some(),
-            dkim_public_txt,
+            has_dkim_key: r.has_dkim_key,
+            dkim_public_txt: r.dkim_public_txt,
             return_path_domain: r.return_path_domain,
             checks: r.checks.0,
             checked_at: r.checked_at,
@@ -306,19 +296,12 @@ impl Row {
     }
 }
 
-/// The record to publish for a stored key. The decrypted bytes live in `Zeroizing` for this call.
-fn public_txt(secrets: &Secrets, blob: &[u8]) -> Result<String, String> {
-    let der = Zeroizing::new(secrets.decrypt(blob).map_err(|e| e.to_string())?);
-    let key = dkim::key_from_der(&der).map_err(|e| e.to_string())?;
-    Ok(dkim::public_key_txt(&key))
-}
-
 async fn load(db: impl PgExecutor<'_>, workspace_id: Uuid, id: Uuid) -> ApiResult<Row> {
     Ok(sqlx::query_as!(
         Row,
         r#"select id, workspace_id, domain, from_name, signing as "signing: Signing",
-                  dkim_selector, dkim_private_key_encrypted,
-                  return_path_domain, checks as "checks: SqlJson<DnsChecks>", checked_at,
+                  dkim_selector, dkim_private_key_encrypted is not null as "has_dkim_key!",
+                  dkim_public_txt, return_path_domain, checks as "checks: SqlJson<DnsChecks>", checked_at,
                   send_unverified_acknowledged_at, updated_at
            from sending_domains where workspace_id = $1 and id = $2"#,
         workspace_id,
@@ -375,8 +358,8 @@ pub async fn list_sending_domains(
     let rows = sqlx::query_as!(
         Row,
         r#"select id, workspace_id, domain, from_name, signing as "signing: Signing",
-                  dkim_selector, dkim_private_key_encrypted,
-                  return_path_domain, checks as "checks: SqlJson<DnsChecks>", checked_at,
+                  dkim_selector, dkim_private_key_encrypted is not null as "has_dkim_key!",
+                  dkim_public_txt, return_path_domain, checks as "checks: SqlJson<DnsChecks>", checked_at,
                   send_unverified_acknowledged_at, updated_at
            from sending_domains
            where workspace_id = $1 and ($2::uuid is null or id < $2)
@@ -387,10 +370,7 @@ pub async fn list_sending_domains(
     )
     .fetch_all(&state.pool)
     .await?;
-    let views = rows
-        .into_iter()
-        .map(|r| r.into_view(&state.secrets))
-        .collect();
+    let views = rows.into_iter().map(SendingDomainView::from).collect();
     Ok(Json(Page::from_rows(views, limit, |r| r.id)))
 }
 
@@ -414,11 +394,7 @@ pub async fn get_sending_domain(
 ) -> ApiResult<Json<SendingDomainView>> {
     let mut conn = state.pool.acquire().await?;
     authorize(&mut *conn, &principal, workspace_id, Role::Viewer).await?;
-    Ok(Json(
-        load(&mut *conn, workspace_id, id)
-            .await?
-            .into_view(&state.secrets),
-    ))
+    Ok(Json(load(&mut *conn, workspace_id, id).await?.into()))
 }
 
 /// Which addresses a workspace may send as, and with what key, so writing it takes admin.
@@ -467,7 +443,7 @@ pub async fn create_sending_domain(
     let key = input
         .dkim_private_key
         .as_deref()
-        .and_then(|v| keep(pem_to_der(v), &mut errors));
+        .and_then(|v| keep(parse_key(v), &mut errors));
     if input.signing == Signing::App && input.dkim_private_key.is_none() {
         errors.push(FieldError::new(
             "dkim_private_key",
@@ -478,11 +454,14 @@ pub async fn create_sending_domain(
         return Err(ApiError::Validation(errors));
     };
     let id = Uuid::now_v7();
-    let encrypted = key.as_deref().map(|k| state.secrets.encrypt(k));
+    let (encrypted, public_txt) = match &key {
+        Some((der, txt)) => (Some(state.secrets.encrypt(der)), Some(txt.as_str())),
+        None => (None, None),
+    };
     sqlx::query!(
         "insert into sending_domains (id, workspace_id, domain, from_name, signing, \
-         dkim_selector, dkim_private_key_encrypted, return_path_domain) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8)",
+         dkim_selector, dkim_private_key_encrypted, dkim_public_txt, return_path_domain) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         id,
         workspace_id,
         domain,
@@ -490,6 +469,7 @@ pub async fn create_sending_domain(
         input.signing as Signing,
         selector,
         encrypted,
+        public_txt,
         return_path,
     )
     .execute(&mut *tx)
@@ -506,7 +486,7 @@ pub async fn create_sending_domain(
     .await?;
     let created = load(&mut *tx, workspace_id, id).await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(created.into_view(&state.secrets))))
+    Ok((StatusCode::CREATED, Json(created.into())))
 }
 
 #[utoipa::path(
@@ -591,15 +571,19 @@ pub async fn update_sending_domain(
     let key = dkim_private_key
         .as_ref()
         .and_then(|v| v.as_deref())
-        .and_then(|v| keep(pem_to_der(v), &mut errors));
+        .and_then(|v| keep(parse_key(v), &mut errors));
     if !errors.is_empty() {
         return Err(ApiError::Validation(errors));
     }
-    let encrypted = key.as_deref().map(|k| state.secrets.encrypt(k));
+    let (encrypted, public_txt) = match &key {
+        Some((der, txt)) => (Some(state.secrets.encrypt(der)), Some(txt.as_str())),
+        None => (None, None),
+    };
     // `$12` says whether the acknowledgement was sent and `$13` what it was: sent, it wins over
     // the reset beside it, because it speaks for the configuration being saved.
     // `$3`, `$7`, `$9` and `$11` say whether the key was sent; the value beside each is what to
-    // store, and `null` there is what clears. The table's own check refuses a change that leaves
+    // store, and `null` there is what clears. The key and the record published for it (`$10` and
+    // `$14`) are written by the one clause on the one flag, so they cannot be set apart. The table's own check refuses a change that leaves
     // an app-signed domain without a key, and `write_error` turns that into the field error.
     let changed = sqlx::query!(
         "update sending_domains set \
@@ -608,6 +592,7 @@ pub async fn update_sending_domain(
          dkim_selector = coalesce($6, dkim_selector), \
          return_path_domain = case when $7 then $8 else return_path_domain end, \
          dkim_private_key_encrypted = case when $9 then $10 else dkim_private_key_encrypted end, \
+         dkim_public_txt = case when $9 then $14 else dkim_public_txt end, \
          checks = case when $11 then '{}'::jsonb else checks end, \
          checked_at = case when $11 then null else checked_at end, \
          send_unverified_acknowledged_at = case \
@@ -629,6 +614,7 @@ pub async fn update_sending_domain(
         reset_checks,
         acknowledged.is_some(),
         acknowledged.unwrap_or(false),
+        public_txt,
     )
     .fetch_optional(&mut *tx)
     .await
@@ -649,7 +635,7 @@ pub async fn update_sending_domain(
     .await?;
     let updated = load(&mut *tx, workspace_id, id).await?;
     tx.commit().await?;
-    Ok(Json(updated.into_view(&state.secrets)))
+    Ok(Json(updated.into()))
 }
 
 /// A hard delete.
@@ -739,8 +725,10 @@ pub async fn check_sending_domain(
     // key it signs with, as the bare base64 `p=` carries — `dns::check` compares that value, not
     // the whole record, and giving it the record would fail a correctly configured domain. A
     // relay-signed domain publishes the relay's key, which this product cannot know, so any key
-    // passes there. The decrypted key is held in `Zeroizing` for the two statements it is alive:
-    // it is the one place outside the signer where it exists in the clear.
+    // passes there. The decrypted key is held in `Zeroizing` for the two statements it is alive.
+    // This is, deliberately, the one place outside the signer that decrypts it: it is admin-only
+    // and rate-limited, and what it needs is the exact `p=` the signer would publish. Reads show
+    // the record stored beside the key and never come here.
     let expected_p = match row.signing {
         Signing::App => super::dkim_private_key(&state.pool, &state.secrets, workspace_id, id)
             .await?
@@ -771,8 +759,6 @@ pub async fn check_sending_domain(
         load(&state.pool, workspace_id, id).await?;
         return Err(ApiError::Conflict("sending-domain-changed"));
     }
-    let view = load(&state.pool, workspace_id, id)
-        .await?
-        .into_view(&state.secrets);
+    let view: SendingDomainView = load(&state.pool, workspace_id, id).await?.into();
     Ok((quota.headers, Json(view)).into_response())
 }

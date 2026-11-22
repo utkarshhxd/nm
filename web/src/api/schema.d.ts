@@ -2603,9 +2603,9 @@ export interface components {
                 checks: components["schemas"]["DnsChecks"];
                 /**
                  * @description What to publish as a TXT record at `{dkim_selector}._domainkey.{domain}`: `v=DKIM1; k=rsa;
-                 *     p=...`, the public half of the stored key. Null when no key is stored (or the stored key
-                 *     cannot be read, which is logged). Derived on the server from the stored key and from nothing
-                 *     a client sends; the private key is never returned.
+                 *     p=...`, the public half of the stored key. Null when no key is stored. Derived on the
+                 *     server when the key is saved and stored beside it, never from anything but that key, so
+                 *     reading it does not decrypt the key; the private key is never returned.
                  */
                 dkim_public_txt?: string | null;
                 dkim_selector: string;
@@ -2841,9 +2841,9 @@ export interface components {
             checks: components["schemas"]["DnsChecks"];
             /**
              * @description What to publish as a TXT record at `{dkim_selector}._domainkey.{domain}`: `v=DKIM1; k=rsa;
-             *     p=...`, the public half of the stored key. Null when no key is stored (or the stored key
-             *     cannot be read, which is logged). Derived on the server from the stored key and from nothing
-             *     a client sends; the private key is never returned.
+             *     p=...`, the public half of the stored key. Null when no key is stored. Derived on the
+             *     server when the key is saved and stored beside it, never from anything but that key, so
+             *     reading it does not decrypt the key; the private key is never returned.
              */
             dkim_public_txt?: string | null;
             dkim_selector: string;
