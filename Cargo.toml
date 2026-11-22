@@ -35,6 +35,7 @@ lettre = { version = "0.11.24", default-features = false, features = ["builder",
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 mime_guess = "2.0.5"
+mrml = { version = "6.0.1", default-features = false, features = ["parse", "render", "css-inline"] }
 rand = "0.10.3"
 ring = "0.17.14"
 rust-embed = "8.13.0"

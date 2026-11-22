@@ -87,6 +87,35 @@ multiple-versions = "warn"
 crate = "lettre"
 deny = ["tracing"]
 
+# `mrml`'s loader features make the MJML *parser* fetch URLs. `mj-include` names a path or an
+# address, and with any of these enabled that name is resolved at parse time — so an operator
+# composing an email, or anyone who can get MJML in front of this server, chooses what the server
+# requests. That is request forgery reaching whatever the server can reach, including a cloud
+# metadata endpoint and anything else inside the network, and it is driven by content the product
+# exists to let people write.
+#
+# All six are denied, not just `http-loader`: `http-loader-base` is the machinery, the two
+# `-reqwest` variants and `-ureq` are the clients that do the fetching, and `local-loader` reads
+# the filesystem, which is the same problem aimed at files instead of hosts. The alias re-exports
+# one of the others, so denying only the alias would leave the capability reachable.
+#
+# Rendering is NOT the risk and is not banned: `css-inline` builds its inliner with
+# `load_remote_stylesheets(false)` (mrml-6.0.1 `src/mjml/render.rs:85`), so a rendered document
+# fetches nothing. The hazard is strictly at parse time.
+#
+# If an include loader is ever genuinely wanted, it needs an allowlist and a resolver that cannot
+# reach private addresses — not this flag.
+[[bans.features]]
+crate = "mrml"
+deny = [
+  "http-loader",
+  "http-loader-base",
+  "http-loader-async-reqwest",
+  "http-loader-blocking-reqwest",
+  "http-loader-ureq",
+  "local-loader",
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
