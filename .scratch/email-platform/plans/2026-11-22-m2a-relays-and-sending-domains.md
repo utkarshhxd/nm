@@ -788,9 +788,9 @@ lock-order review and would otherwise be rulings with no reader:
 
 **The tick has a budget, and it is half the lease.** `BATCH` is 16 and `worker_concurrency` is 4, so
 a tick of four waves against a relay that burns the full 60-second `SESSION_TIMEOUT` each wave takes
-240 seconds — twice `LEASE_SECS`. A tick that outlives its own lease is the double-send in Review
+240 seconds — twice `JOB_LEASE`. A tick that outlives its own lease is the double-send in Review
 Focus 1 arriving by arithmetic rather than by a hang. So `run` stops *starting* new sends once the
-tick's elapsed time passes `LEASE_SECS / 2`, and explicitly `defer`s every claimed job it did not
+tick's elapsed time passes `JOB_LEASE.as_secs() / 2`, and explicitly `defer`s every claimed job it did not
 start, with a reason. A job that was never attempted is always safe to retry; one that was started
 is governed by its own outcome.
 
