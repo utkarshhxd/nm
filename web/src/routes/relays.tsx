@@ -146,7 +146,7 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                       </td>
                       <td className="py-2 pe-3 text-sm">
                         {r.rate_limit_per_minute} a minute
-                        <div className="text-fg-muted">{r.max_connections} connections</div>
+                        <div className="text-fg-muted">keeps {r.max_connections} connections parked</div>
                       </td>
                       <td className="py-2 pe-3 tabular-nums">{r.failover_order}</td>
                       <td className="py-2 pe-3">
@@ -373,13 +373,13 @@ function RelayDialog({
         />
         <Field
           id="relay-connections"
-          label="Connections"
+          label="Parked connections"
           name="max_connections"
           type="number"
           required
           min={1}
           defaultValue={relay?.max_connections ?? 4}
-          hint="Open at once, per sender process."
+          hint="Kept open for reuse, per sender process. It does not cap how many are open at once: the rate limit is what holds this relay to what it will take."
         />
         <Field
           id="relay-order"

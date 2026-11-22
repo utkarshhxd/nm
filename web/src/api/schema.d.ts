@@ -2104,7 +2104,9 @@ export interface components {
             host: string;
             /**
              * Format: int32
-             * @description Concurrent connections one sender process may hold open. Default 4.
+             * @description How many connections to this relay one sender process keeps parked for reuse.
+             *     Default 4. **Not a cap on concurrent connections** — a send that finds none parked
+             *     opens a new one. `rate_limit_per_minute` is what holds a relay to what it will take.
              */
             max_connections?: number | null;
             /** @description Unique in the workspace. */

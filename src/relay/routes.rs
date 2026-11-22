@@ -65,7 +65,9 @@ pub struct NewRelay {
     pub username: Option<String>,
     /// Stored encrypted and never returned.
     pub password: Option<String>,
-    /// Concurrent connections one sender process may hold open. Default 4.
+    /// How many connections to this relay one sender process keeps parked for reuse.
+    /// Default 4. **Not a cap on concurrent connections** — a send that finds none parked
+    /// opens a new one. `rate_limit_per_minute` is what holds a relay to what it will take.
     pub max_connections: Option<i32>,
     /// What the relay's operator says it allows. At least 1.
     pub rate_limit_per_minute: i32,
