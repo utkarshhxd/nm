@@ -50,7 +50,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     crypto::secrets::Secrets,
-    error::ApiResult,
+    error::{ApiError, ApiResult},
     mail::{self, Outgoing, dkim},
     public::token::{self, Purpose, Token},
     relay::{
@@ -59,6 +59,7 @@ use crate::{
     },
     sending_domains::{CheckResult, DnsChecks, SendingDomain, Signing},
     suppressions::blocking_suppression,
+    users::normalize_email,
     worker::{Claimed, complete, defer, fail},
 };
 
@@ -147,7 +148,20 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
         }
     }
 
-    match blocking_suppression(&ctx.db, &ctx.secrets, job.workspace_id, &payload.email).await {
+    // Normalised here rather than left to `blocking_suppression`, which treats an address it
+    // cannot read as an `Internal` error — and a database error is retried. An address that does
+    // not normalise today will not normalise on the fifth attempt either, so it gives up now
+    // instead of burning `max_attempts` on something that cannot improve. The normalised form is
+    // then what is checked AND what is mailed, which is the form `contacts` stores and every
+    // other path in the product sends to.
+    let Ok(email) = normalize_email(&payload.email) else {
+        return Outcome::Failed(
+            "the queued address is not a usable email address, so it cannot be checked or mailed"
+                .to_owned(),
+        );
+    };
+
+    match blocking_suppression(&ctx.db, &ctx.secrets, job.workspace_id, &email).await {
         // The address is deliberately not quoted: an erasure tombstone exists because the
         // plaintext was destroyed, and `last_error` is stored and shown.
         Ok(Some(block)) => {
@@ -157,17 +171,17 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
             ));
         }
         Ok(None) => {}
-        Err(e) => return Outcome::Transient(format!("the suppression check failed: {e:?}")),
+        Err(e) => return db_error("the suppression check failed", &e),
     }
 
     let domain = match sending_domain(&ctx.db, job.workspace_id).await {
         Ok(Some(domain)) => domain,
+        // A workspace with no sending domain is a configuration error that will not fix itself:
+        // there is no from-address to build a message from, and no retry produces one.
         Ok(None) => {
             return Outcome::Failed("the workspace has no sending domain to send from".to_owned());
         }
-        Err(e) => {
-            return Outcome::Transient(format!("the sending domain could not be read: {e:?}"));
-        }
+        Err(e) => return db_error("the sending domain could not be read", &e),
     };
 
     let unverified = not_passing(&domain.checks);
@@ -183,11 +197,15 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
 
     let relays = match relay::enabled_relays(&ctx.db, job.workspace_id).await {
         Ok(relays) => relays,
-        Err(e) => return Outcome::Transient(format!("the relays could not be read: {e:?}")),
+        Err(e) => return db_error("the relays could not be read", &e),
     };
     if relays.is_empty() {
-        // Not `Failed`: an operator adding a relay is the fix, and the row has to still be there
-        // when they do.
+        // `Transient`, where a missing sending domain is `Failed`, and the difference is what an
+        // operator is plausibly in the middle of: a relay is disabled and re-enabled in the course
+        // of ordinary maintenance, and a confirmation that waited a minute for that is better than
+        // one destroyed by it. It does not wait for ever — `defer` fails the row once `attempts`
+        // reaches `max_attempts`, so a workspace that genuinely has no relay still ends with a row
+        // that says so.
         return Outcome::Transient("the workspace has no enabled relay".to_owned());
     }
 
@@ -199,7 +217,7 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
     let message = match mail::build(&Outgoing {
         from: &from,
         from_name: domain.from_name.as_deref(),
-        to: &payload.email,
+        to: &email,
         subject: SUBJECT,
         text: &text_body(ctx, &payload.token, &unsubscribe_url),
         html: None,
@@ -216,7 +234,7 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
     };
     // Both addresses were parsed once already by `mail::build`; this is lettre's envelope, which
     // takes them again.
-    let envelope = match (from.parse(), payload.email.parse()) {
+    let envelope = match (from.parse(), email.parse()) {
         (Ok(from), Ok(to)) => match Envelope::new(Some(from), vec![to]) {
             Ok(envelope) => envelope,
             Err(e) => return Outcome::Failed(format!("the envelope could not be built: {e}")),
@@ -225,6 +243,17 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
     };
 
     submit(ctx, job.workspace_id, &relays, &envelope, &bytes).await
+}
+
+/// A lookup that failed, recorded as something to try again later.
+///
+/// **The error goes to the log and the bounded `what` goes on the row.** `ApiError` has no
+/// `Display`, and its `Debug` carries an `anyhow::Error` that formats its backtrace when one was
+/// captured: source paths from the build machine, in a `last_error` column an operator reads in a
+/// browser, growing without bound. What the row needs is which lookup failed, which is `what`.
+fn db_error(what: &str, e: &ApiError) -> Outcome {
+    tracing::warn!(error = ?e, "{what}");
+    Outcome::Transient(what.to_owned())
 }
 
 /// Offers the message to each relay in failover order until one of them answers decisively.
@@ -246,10 +275,10 @@ async fn submit(
             Ok(password) => password,
             Err(e) => {
                 // This relay's credential cannot be read; the next one's might be fine.
-                last = Outcome::Transient(format!(
-                    "relay {}'s password could not be read: {e:?}",
-                    relay.name
-                ));
+                last = db_error(
+                    &format!("relay {}'s password could not be read", relay.name),
+                    &e,
+                );
                 continue;
             }
         };
@@ -291,11 +320,7 @@ async fn signed(ctx: &Ctx, domain: &SendingDomain, message: &Message) -> Result<
                 domain.domain
             )));
         }
-        Err(e) => {
-            return Err(Outcome::Transient(format!(
-                "the DKIM key could not be read: {e:?}"
-            )));
-        }
+        Err(e) => return Err(db_error("the DKIM key could not be read", &e)),
     };
     let key = dkim::key_from_der(&der)
         .map_err(|e| Outcome::Failed(format!("the stored DKIM key cannot sign: {e}")))?;
@@ -309,7 +334,13 @@ async fn signed(ctx: &Ctx, domain: &SendingDomain, message: &Message) -> Result<
 /// *which* domain a given message is from — `sending_domains` is a list of the domains a workspace
 /// *may* send as, and M2a has no campaign to carry a choice. Ordering by `domain` rather than by
 /// `created_at` keeps the answer stable across a re-seeded database, and the unique index
-/// `(workspace_id, domain)` serves it. Upgrade when M2c gives a campaign its own from-address.
+/// `(workspace_id, domain)` serves it.
+///
+/// **What that costs, which is the part worth knowing before you add a domain:** adding a second
+/// sending domain that sorts earlier silently moves every confirmation's `From`, `Message-ID` and
+/// DKIM signature onto it, with nothing in the product saying so and no operator action that
+/// chose it. A workspace with one domain — which is every workspace M2a is built for — never
+/// meets this. `issues/41` has it; upgrade when M2c gives a campaign its own from-address.
 async fn sending_domain(
     db: impl PgExecutor<'_> + Copy,
     workspace_id: Uuid,

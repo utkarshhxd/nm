@@ -221,12 +221,34 @@ impl World {
     }
 
     async fn set_checks(&self, status: &str) {
+        self.set_checks_json(all_checks(status)).await;
+    }
+
+    async fn set_checks_json(&self, checks: Value) {
         sqlx::query("update sending_domains set checks = $1 where workspace_id = $2")
-            .bind(all_checks(status))
+            .bind(checks)
             .bind(self.ws)
             .execute(&self.pool)
             .await
             .expect("checks");
+    }
+
+    /// A second relay, tried after or before this world's sink depending on `failover_order`.
+    async fn add_relay(&self, name: &str, addr: std::net::SocketAddr, failover_order: i32) {
+        sqlx::query(
+            "insert into relays (id, workspace_id, name, host, port, security,
+                                 rate_limit_per_minute, failover_order)
+             values ($1, $2, $3, $4, $5, 'starttls', 600, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(self.ws)
+        .bind(name)
+        .bind(addr.ip().to_string())
+        .bind(i32::from(addr.port()))
+        .bind(failover_order)
+        .execute(&self.pool)
+        .await
+        .expect("the second relay");
     }
 
     async fn acknowledge_unverified(&self) {
@@ -272,6 +294,18 @@ fn all_checks(status: &str) -> Value {
         "dmarc": one("DMARC"),
         "return_path": one("Return-Path"),
     })
+}
+
+/// The body with quoted-printable soft line breaks joined up.
+///
+/// lettre encodes the text part and wraps it at 76 columns, so a token-bearing URL is split
+/// across lines with a trailing `=`. The first version of the confirm-link assertion checked only
+/// the `https://…/c/` prefix and passed for that reason — the whole link was never in these bytes
+/// at all. A recipient's mail client joins them; this joins them the same way, so the assertion
+/// is about the link a person would click.
+fn body(wire: &str) -> String {
+    wire.split_once("\r\n\r\n")
+        .map_or_else(|| wire.to_owned(), |(_, body)| body.replace("=\r\n", ""))
 }
 
 /// The value of the first header called `name`, read off the wire bytes.
@@ -447,13 +481,30 @@ async fn a_job_inside_the_confirm_ttl_is_sent(pool: PgPool) {
 #[sqlx::test]
 async fn a_sent_message_carries_our_unsubscribe_link(pool: PgPool) {
     let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
-    let id = w.enqueue_one().await;
+    // Minted here, so the assertions below can name the exact token that was queued rather than
+    // settle for the shape of a link.
+    let queued_token = w.confirm_token();
+    let id = w
+        .enqueue(
+            w.contact,
+            json!({ "email": ADDRESS, "token": queued_token }),
+            0.0,
+        )
+        .await;
 
     let outcome = w.tick_one().await;
     assert!(matches!(outcome, Outcome::Sent { .. }), "{outcome:?}");
     assert!(w.row(id).await.completed_at.is_some());
 
     let wire = w.only_message();
+    // The message goes from the sending domain to the address it was queued for. Obvious, and
+    // unpinned until a mutation swapped the From and the suite stayed green.
+    assert_eq!(
+        header(&wire, "From").as_deref(),
+        Some(format!("no-reply@{SENDING_DOMAIN}").as_str()),
+        "{wire}"
+    );
+    assert_eq!(header(&wire, "To").as_deref(), Some(ADDRESS), "{wire}");
     assert_eq!(
         header(&wire, "List-Unsubscribe-Post").as_deref(),
         Some("List-Unsubscribe=One-Click"),
@@ -483,11 +534,24 @@ async fn a_sent_message_carries_our_unsubscribe_link(pool: PgPool) {
     assert_eq!(parsed.contact_id, w.contact);
     assert_eq!(parsed.list_id, None, "an unsubscribe token names no list");
 
-    // And the confirm link the message exists to deliver is on our origin too.
+    // And the confirm link the message exists to deliver is on our origin and carries **this
+    // job's** token. A prefix assertion alone passes while the handler mails somebody else's
+    // link, or a fresh one it minted itself — and a fresh one would be a second credential for a
+    // row the resend throttle counts as one.
     assert!(
-        wire.contains(&format!("{PUBLIC_URL}/c/")),
-        "the confirmation link is not ours: {wire}"
+        body(&wire).contains(&format!("{PUBLIC_URL}/c/{queued_token}")),
+        "the confirmation link is not the queued one: {wire}"
     );
+    // The unsubscribe link is in the body too, for a reader whose client shows no header.
+    assert!(
+        body(&wire).contains(url.as_str()),
+        "the body's unsubscribe link differs from the header's: {wire}"
+    );
+    let confirmed = token::parse(&w.secrets, &queued_token, Purpose::Confirm)
+        .expect("the queued token is one of ours");
+    assert_eq!(confirmed.workspace_id, w.ws);
+    assert_eq!(confirmed.contact_id, w.contact);
+    assert_eq!(confirmed.list_id, Some(w.list));
     assert!(
         !wire.to_ascii_lowercase().contains("mailto:"),
         "a mailto: unsubscribe was offered: {wire}"
@@ -567,6 +631,48 @@ async fn an_acknowledged_unverified_domain_is_sent_from(pool: PgPool) {
     assert!(w.row(id).await.completed_at.is_some());
 }
 
+/// **Each of the four checks is read, and each one alone closes the gate.** Setting all four
+/// together — which every other gate test does — leaves the gate free to stop considering any one
+/// of them with nothing going red: deleting `Return-Path` from the list passed the whole suite.
+/// So each check is failed on its own here, and the refusal must name that one and **not** the
+/// three that are passing.
+#[sqlx::test]
+async fn every_dns_check_closes_the_gate_on_its_own(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    for (field, named) in [
+        ("spf", "SPF"),
+        ("dkim", "DKIM"),
+        ("dmarc", "DMARC"),
+        ("return_path", "Return-Path"),
+    ] {
+        let mut checks = all_checks("pass");
+        checks[field] = json!({ "status": "fail", "reason": "not published" });
+        w.set_checks_json(checks).await;
+        let id = w.enqueue_one().await;
+
+        let outcome = w.tick_one().await;
+
+        assert!(
+            matches!(outcome, Outcome::Failed(_)),
+            "a failing {named} did not close the gate: {outcome:?}"
+        );
+        let reason = w.row(id).await.last_error.expect("a reason");
+        assert!(
+            reason.contains(named),
+            "the refusal does not name the {named} check: {reason}"
+        );
+        // And names only it: a refusal that listed all four whatever failed would pass the line
+        // above while telling an operator nothing about which record to publish.
+        for other in ["SPF", "DKIM", "DMARC", "Return-Path"] {
+            assert!(
+                other == named || !reason.contains(other),
+                "a failing {named} was reported as a failing {other}: {reason}"
+            );
+        }
+    }
+    assert_eq!(w.sink.connections(), 0, "an unverified domain was dialled");
+}
+
 /// A check that has never run is not a passing check. `not_checked` is what a domain starts with,
 /// so reading "not failing" as "fine" would let every brand-new domain through the gate.
 #[sqlx::test]
@@ -615,6 +721,58 @@ async fn an_unknown_outcome_is_never_retried(pool: PgPool) {
     );
     // It did reach the relay: this is the ambiguous case, not the refused one.
     assert_eq!(w.sink.connections(), 1);
+}
+
+/// **The other half of invariant 4, and the one the single-relay test cannot reach.** An
+/// `Unknown` means the message may already be queued at the first relay. Offering it to the
+/// second is the same double send arriving by failover instead of by retry, and with one relay
+/// configured nothing stops `submit` walking on.
+///
+/// The second sink must see **no connection at all** — not "no message": a handler that dialled
+/// the second relay and then thought better of it has still decided the wrong thing.
+#[sqlx::test]
+async fn an_unknown_outcome_does_not_fail_over_to_the_next_relay(pool: PgPool) {
+    // The world's own relay is `failover_order` 0 and drops after DATA.
+    let w = World::new(pool, Script::Smtp(AfterData::Drop)).await;
+    let second = Sink::start(Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.add_relay("standby", second.addr, 1).await;
+
+    let id = w.enqueue_one().await;
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Unknown(_)), "{outcome:?}");
+    assert_eq!(w.sink.connections(), 1, "the first relay was not tried");
+    assert_eq!(
+        second.connections(),
+        0,
+        "an ambiguous outcome was offered to a second relay: the message may now be queued twice"
+    );
+    assert!(w.row(id).await.failed_at.is_some());
+}
+
+/// And the mirror, so the rule above is "`Unknown` stops" and not "nothing ever fails over": a
+/// `5xx` is equally final at the next relay, which would refuse it for the same reason.
+#[sqlx::test]
+async fn a_permanent_refusal_does_not_fail_over_to_the_next_relay(pool: PgPool) {
+    let w = World::new(
+        pool,
+        Script::Smtp(AfterData::Reply("550 5.1.1 no such user")),
+    )
+    .await;
+    let second = Sink::start(Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.add_relay("standby", second.addr, 1).await;
+
+    let id = w.enqueue_one().await;
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(w.sink.connections(), 1);
+    assert_eq!(
+        second.connections(),
+        0,
+        "a 5xx was offered to a second relay that would refuse it too"
+    );
+    assert!(w.row(id).await.failed_at.is_some());
 }
 
 /// **Invariant 5.** OCI accepts mail to a suppressed address rather than rejecting it, answering
@@ -742,11 +900,71 @@ async fn a_malformed_payload_fails_that_row_only(pool: PgPool) {
     );
 }
 
+/// An address this product cannot read is given up on, not retried.
+///
+/// `blocking_suppression` reports one as an `Internal` error, and every database error here is
+/// `Transient` — rightly, because a dropped connection says nothing about the message. But an
+/// address that does not normalise today will not normalise on the fifth attempt, so without a
+/// check of its own this row burns `max_attempts` over four hours on something that cannot
+/// improve. It also must not be *sent*: the fail-closed reading is refuse, never guess.
+#[sqlx::test]
+async fn an_address_that_cannot_be_normalised_gives_up_rather_than_retrying(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let id = w
+        .enqueue(
+            w.contact,
+            json!({ "email": "no-at-sign", "token": w.confirm_token() }),
+            0.0,
+        )
+        .await;
+
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(w.sink.connections(), 0, "an unreadable address was mailed");
+    let row = w.row(id).await;
+    assert!(
+        row.failed_at.is_some(),
+        "an address that will never be readable was left to be retried"
+    );
+    assert!(row.last_error.is_some());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Configuration that is missing rather than wrong.
 
-/// A workspace with no relay has a message that cannot leave yet, not a message that will never
-/// leave. An operator adding a relay is the fix, and the row must still be there when they do.
+/// **The pair, which is the point: the same shape of operator mistake gets opposite verdicts, and
+/// each one has to be the right verdict for its own reason.**
+///
+/// A workspace with no *sending domain* has no from-address, no `Message-ID` domain and nothing
+/// to sign with. No retry produces one, so the row gives up now and says why, rather than burning
+/// five attempts over four hours on a configuration nobody is about to change by accident.
+#[sqlx::test]
+async fn a_workspace_with_no_sending_domain_gives_up(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("delete from sending_domains where workspace_id = $1")
+        .bind(w.ws)
+        .execute(&w.pool)
+        .await
+        .expect("remove the sending domain");
+    let id = w.enqueue_one().await;
+
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(w.sink.connections(), 0);
+    let row = w.row(id).await;
+    assert!(row.failed_at.is_some(), "the row was left to be retried");
+    let reason = row.last_error.expect("a reason");
+    assert!(
+        reason.contains("sending domain"),
+        "the reason does not say what is missing: {reason}"
+    );
+}
+
+/// A workspace with no *relay*, by contrast, is plausibly mid-edit: a relay is disabled and
+/// re-enabled in the course of ordinary maintenance, and a confirmation that waited a minute for
+/// that is better than one destroyed by it. The row must still be there when the operator is done.
 #[sqlx::test]
 async fn a_workspace_with_no_enabled_relay_defers_rather_than_gives_up(pool: PgPool) {
     let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
@@ -764,6 +982,47 @@ async fn a_workspace_with_no_enabled_relay_defers_rather_than_gives_up(pool: PgP
     let row = w.row(id).await;
     assert!(row.failed_at.is_none(), "a missing relay destroyed the row");
     assert!(row.completed_at.is_none());
+}
+
+/// **And deferring is not waiting for ever.** `Transient` is only defensible if the row
+/// eventually gives up; otherwise a workspace that genuinely has no relay accumulates rows that
+/// are retried hourly and never answer "why did this confirmation never arrive?".
+///
+/// `max_attempts` is set to 1, so the claim's own increment takes `attempts` to its limit and
+/// `defer` fails the row instead of rescheduling it. That is `worker::defer`'s rule, exercised
+/// through this handler rather than assumed from it.
+#[sqlx::test]
+async fn a_deferred_row_gives_up_once_it_runs_out_of_attempts(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("update relays set enabled = false where workspace_id = $1")
+        .bind(w.ws)
+        .execute(&w.pool)
+        .await
+        .expect("disable");
+    let id = w.enqueue_one().await;
+    sqlx::query("update jobs set max_attempts = 1 where id = $1")
+        .bind(id)
+        .execute(&w.pool)
+        .await
+        .expect("one attempt only");
+
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Transient(_)), "{outcome:?}");
+    let row = w.row(id).await;
+    assert!(
+        row.failed_at.is_some(),
+        "the last attempt deferred instead of giving up, so nothing will ever write failed_at"
+    );
+    assert!(
+        row.last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("relay"),
+        "the row does not say why it never went: {:?}",
+        row.last_error
+    );
+    assert!(w.claim().await.is_empty());
 }
 
 /// Failover is what `failover_order` is for. The first relay is an address with nothing
