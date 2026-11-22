@@ -104,3 +104,18 @@ Invariants 4, 7 and 8 are already held by M1 and must not regress.
 new cascade means re-running the ADR's enumeration**, not just obeying the order — that is the
 method recorded in `issues/38`, and the thing that caught `form_lists` after the order was thought
 complete.
+
+## Carried into M2b from M2a's reviews
+
+**`jobs_runnable` does not include `kind`.** M2a added `kind = $1` to the claim predicate so that a
+five-million-row campaign cannot sit in front of every confirmation email (spec §5.3). That buys
+**fairness, not scan cost**: the partial index is still `(run_after, id) where failed_at is null`,
+so a worker claiming `confirmation_email` still walks campaign rows and discards them.
+
+It does not matter today, because `confirmation_email` is the only kind. It starts mattering the
+moment M2c enqueues campaign rows in bulk — which is the first time the table has two kinds and a
+large one. Adding `kind` to that index is a migration, which is why M2a did not do it.
+
+Found by Task 9's review, which also noted the thing that makes this easy to miss: the claim is
+correct either way, so no test fails and nothing goes red. It is a performance cliff with a
+schedule, not a defect.
