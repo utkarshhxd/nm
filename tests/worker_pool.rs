@@ -24,7 +24,10 @@ use nm::{
     crypto::secrets::Secrets,
     db,
     public::token::{self, Purpose, Token},
-    relay::{self, transport::Transports},
+    relay::{
+        self,
+        transport::{SESSION_TIMEOUT, Transports},
+    },
     worker::{self, BATCH, JOB_LEASE, Worker, confirmation::Ctx},
 };
 use serde_json::json;
@@ -96,6 +99,12 @@ async fn the_worker_pool_is_separate_from_the_api_pool(pool: PgPool) {
         api.try_acquire().is_some(),
         "the API pool had no connection left while the worker's was saturated"
     );
+    // A smoke check, and deliberately labelled as one: the API pool is alive and serving while
+    // the worker's is at its ceiling. **It cannot fail under a shared pool**, because two
+    // `PgPool` values never share connections however they are sized — what would actually share
+    // them is `worker::run` reusing `app::serve`'s pool, and the thing that stops *that* is `run`
+    // calling `db::connect_worker`. The assertion above is the one with teeth: it is what goes
+    // red if the worker's pool is not bounded by `worker_pool_size`.
     common::TestApp::with_config(api.clone(), |_| {})
         .await
         .server
@@ -214,12 +223,20 @@ impl World {
 
     /// A worker on this world, talking to the sink in the clear.
     fn worker(&self, concurrency: usize) -> Worker {
+        self.worker_with_session(concurrency, SESSION_TIMEOUT)
+    }
+
+    /// A worker whose sessions are bounded at something other than the shipped minute, for the
+    /// one test that has to watch a send hold the tick up.
+    fn worker_with_session(&self, concurrency: usize, session: Duration) -> Worker {
         Worker::new(
             Ctx {
                 db: self.pool.clone(),
                 secrets: Arc::clone(&self.secrets),
                 config: Arc::clone(&self.config),
-                transports: Arc::new(Transports::plaintext_for_tests()),
+                transports: Arc::new(
+                    Transports::plaintext_for_tests().with_session_timeout(session),
+                ),
             },
             concurrency,
         )
@@ -812,5 +829,59 @@ async fn the_relay_the_tick_paid_for_is_not_charged_twice(pool: PgPool) {
         w.balance(w.relay).await,
         Some(9),
         "one message through one relay must cost one token"
+    );
+}
+
+/// **The budget is read by each send as it starts, not once for the tick.**
+///
+/// `send` documents that, and nothing held it: a mutation that hoists the `Instant::now()` out of
+/// the spawned task and reads it once before the loop passes every other test here, because they
+/// use either a zero budget (everything released under both shapes) or a whole one (everything
+/// sent under both). What that mutation actually costs is the budget itself — read once at a tick
+/// that has just started, it is never spent, so nothing ever stops the tick starting sends and a
+/// slow relay carries it straight past its own lease.
+///
+/// So: one send that holds the session open for longer than the whole budget, and a second job
+/// behind it. The second must be released untouched.
+///
+/// **Two bounds, each with an order of magnitude of slack, and neither an equality.** The first
+/// send must start *inside* the budget — it is three small queries after the tick begins, against
+/// a budget of a second. The second must start *outside* it — it cannot begin until the first
+/// session times out two seconds in, which is past a one-second budget whatever the machine. A
+/// slower machine widens the second bound and only the first is at risk, with a hundredfold
+/// margin.
+#[sqlx::test]
+async fn the_budget_is_read_by_each_send_as_it_starts(pool: PgPool) {
+    // Reads the message and then owes an answer for ever; the transport gives up at the session
+    // timeout below.
+    let w = World::new(pool, Script::Smtp(AfterData::Hang)).await;
+    w.enqueue(2).await;
+
+    w.worker_with_session(1, Duration::from_secs(2))
+        .with_budget(Duration::from_secs(1))
+        .tick()
+        .await
+        .expect("the tick");
+
+    assert_eq!(
+        w.sink.connections(),
+        1,
+        "the second send started although the tick's budget was gone by the time it could"
+    );
+    let rows = w.rows().await;
+    let started: Vec<_> = rows.iter().filter(|r| r.failed_at.is_some()).collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "exactly one job was tried; a hung session is an Unknown and gives up"
+    );
+    let held_back = rows
+        .iter()
+        .find(|r| r.failed_at.is_none())
+        .expect("one job was never started");
+    assert!(held_back.completed_at.is_none());
+    assert_eq!(
+        held_back.attempts, 0,
+        "a job the tick never started must keep its attempt"
     );
 }
