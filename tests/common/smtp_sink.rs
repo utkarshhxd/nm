@@ -9,7 +9,13 @@
 //!
 //! [`Transports::plaintext_for_tests`]: nm::relay::transport::Transports::plaintext_for_tests
 
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -44,9 +50,23 @@ pub enum Script {
     FirstThen(AfterData, AfterData),
 }
 
+/// What the sink saw, shared with the tasks that saw it.
+///
+/// A test that asserts a message was **not** sent needs a witness that no connection was made at
+/// all; asserting on the outcome alone cannot tell "refused before the send" from "sent and then
+/// recorded a failure". `connections` is that witness, and it counts a connection the moment it
+/// is accepted, before a byte is read — so a sender that connects and thinks better of it is
+/// still caught.
+#[derive(Default)]
+struct Seen {
+    connections: AtomicUsize,
+    messages: Mutex<Vec<Vec<u8>>>,
+}
+
 pub struct Sink {
     pub addr: SocketAddr,
     accepting: JoinHandle<()>,
+    seen: Arc<Seen>,
 }
 
 impl Drop for Sink {
@@ -63,11 +83,14 @@ impl Sink {
             .await
             .expect("bind the sink");
         let addr = listener.local_addr().expect("the sink's address");
+        let seen: Arc<Seen> = Arc::default();
+        let watched = Arc::clone(&seen);
         let accepting = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             let mut accepted = 0u32;
             while let Ok((stream, _)) = listener.accept().await {
                 accepted += 1;
+                watched.connections.fetch_add(1, Ordering::Relaxed);
                 let speaking = match script {
                     Script::Silence => None,
                     Script::Smtp(after) => Some(after),
@@ -81,13 +104,36 @@ impl Sink {
                         let _silent = stream;
                         std::future::pending::<()>().await;
                     }),
-                    Some(after) => connections.spawn(async move {
-                        let _ = serve(stream, after).await;
-                    }),
+                    Some(after) => {
+                        let seen = Arc::clone(&watched);
+                        connections.spawn(async move {
+                            let _ = serve(stream, after, &seen).await;
+                        })
+                    }
                 };
             }
         });
-        Sink { addr, accepting }
+        Sink {
+            addr,
+            accepting,
+            seen,
+        }
+    }
+
+    /// How many connections have been accepted, whatever became of them. Zero is the assertion a
+    /// test makes when a message must never have left this process.
+    pub fn connections(&self) -> usize {
+        self.seen.connections.load(Ordering::Relaxed)
+    }
+
+    /// The bytes of each message read to its terminating `.`, in arrival order, dot-stuffing and
+    /// all. What a test reads the headers off.
+    pub fn messages(&self) -> Vec<Vec<u8>> {
+        self.seen
+            .messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// An address with nothing listening on it: the kernel chose the port and we handed it back.
@@ -101,7 +147,7 @@ impl Sink {
 
 /// Answers one connection. An I/O error is the far end going away, which ends the connection and
 /// nothing else.
-async fn serve(stream: TcpStream, after: AfterData) -> std::io::Result<()> {
+async fn serve(stream: TcpStream, after: AfterData, seen: &Seen) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     writer.write_all(b"220 sink.test ESMTP\r\n").await?;
@@ -129,14 +175,21 @@ async fn serve(stream: TcpStream, after: AfterData) -> std::io::Result<()> {
             return Ok(());
         } else if command.starts_with("DATA") {
             writer.write_all(b"354 end with <CRLF>.<CRLF>\r\n").await?;
+            let mut body = Vec::new();
             loop {
                 match read_line(&mut reader).await? {
                     // The sender went away mid-body; there is nothing left to answer.
                     None => return Ok(()),
                     Some(line) if line.as_slice() == b".\r\n" => break,
-                    Some(_) => {}
+                    Some(line) => body.extend_from_slice(&line),
                 }
             }
+            // Recorded before the reply, so a message is on record even where the sink's whole
+            // job is to go quiet afterwards — which is exactly the `Drop` and `Hang` cases.
+            seen.messages
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(body);
             match after {
                 AfterData::Reply(reply) => {
                     writer.write_all(reply.as_bytes()).await?;

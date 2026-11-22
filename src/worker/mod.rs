@@ -28,6 +28,8 @@
 //! `docs/adr/0005` places all four functions here in one lock class: they touch `jobs` rows alone,
 //! and `jobs` is a parent of nothing.
 
+pub mod confirmation;
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
