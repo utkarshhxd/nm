@@ -207,11 +207,12 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
 }
 
 /// Whether `public_url` names this machine — a developer's instance rather than one subscribers
-/// reach. `.localhost` is included because RFC 6761 reserves the whole suffix for loopback, which
+/// reach. `worker::run`'s boot check asks the same question of the same URL, for the same reason:
+/// a refusal or a warning is worth printing only where somebody can act on it. `.localhost` is included because RFC 6761 reserves the whole suffix for loopback, which
 /// is how a local reverse-proxy setup is usually named. A URL with no host at all reads as local:
 /// the consequence of being wrong here is only whether a warning is printed, and a warning nobody
 /// can act on is the thing being avoided.
-fn is_local_url(url: &url::Url) -> bool {
+pub(crate) fn is_local_url(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -220,8 +221,9 @@ fn is_local_url(url: &url::Url) -> bool {
     }
 }
 
-/// Resolves on Ctrl-C or, on Unix, SIGTERM (what container runtimes send).
-async fn shutdown_signal() {
+/// Resolves on Ctrl-C or, on Unix, SIGTERM (what container runtimes send). `pub` because
+/// `nm worker` and `nm all` hand the same signal to `worker::run`: one process, one way to stop.
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await

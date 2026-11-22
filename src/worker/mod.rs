@@ -30,12 +30,26 @@
 
 pub mod confirmation;
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use rand::{TryRng, rngs::SysRng};
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, PgPool};
+use tokio::task::JoinSet;
 use uuid::Uuid;
+
+use self::confirmation::{Ctx, handle};
+use crate::{
+    config::Config,
+    crypto::secrets::Secrets,
+    db,
+    relay::{self, Relay, bucket, transport::Transports},
+};
 
 pub use crate::relay::transport::JOB_LEASE;
 
@@ -203,9 +217,383 @@ fn jitter(span: i64) -> i64 {
     (u64::from_le_bytes(buf) % (span as u64 + 1)) as i64
 }
 
+/// The one kind this worker runs. `kind` is deliberately open (`0023`), so a second kind is a
+/// second match arm here and not a migration.
+const KIND: &str = "confirmation_email";
+
+/// What a job the tick never started carries as its reason. A **deferral**, not a failure: a job
+/// that was never attempted is always safe to retry.
+const BUDGET_SPENT: &str =
+    "the tick's budget (half the job lease) was spent before this job was started";
+
+/// What a job the bucket would not pay for carries. Also a deferral: the relay's limit is about
+/// this minute, and the message is still worth sending in the next one.
+const RATE_LIMITED: &str = "every relay of this workspace is at its rate limit for this minute";
+
+/// The tick: one claimed batch at a time, against a pool of its own.
+///
+/// Built by [`run`] from a [`Config`], and by `tests/worker_pool.rs` from a [`Ctx`] whose
+/// transport talks to an in-process sink.
+pub struct Worker {
+    /// Shared with every send in flight, which is why the tick holds it behind an `Arc` rather
+    /// than building one per message: the DKIM key cache, the pooled SMTP clients and the pool
+    /// itself are all in here, and a per-message copy would throw the connections away.
+    ctx: Arc<Ctx>,
+    concurrency: usize,
+    budget: Duration,
+}
+
+impl Worker {
+    /// `concurrency` is how many messages one tick sends at once; zero reads as one, since a
+    /// worker that sends nothing is not a configuration anyone means.
+    pub fn new(ctx: Ctx, concurrency: usize) -> Worker {
+        Worker {
+            ctx: Arc::new(ctx),
+            concurrency: concurrency.max(1),
+            budget: JOB_LEASE / 2,
+        }
+    }
+
+    /// A budget other than half the lease, for the test that has to watch one run out.
+    /// `a_worker_budgets_its_tick_at_half_the_lease` holds the other end.
+    #[doc(hidden)]
+    pub fn with_budget(self, budget: Duration) -> Worker {
+        Worker { budget, ..self }
+    }
+
+    #[doc(hidden)]
+    pub fn budget(&self) -> Duration {
+        self.budget
+    }
+
+    /// Ticks until `shutdown` resolves, then returns.
+    ///
+    /// The signal is read **between** ticks and never inside one: a send cancelled mid-session is
+    /// exactly the ambiguity [`crate::relay::transport::Outcome::Unknown`] exists for, and a
+    /// shutdown is not worth a message that may have been delivered twice. The tick's budget is
+    /// what bounds how long that makes a stop take.
+    pub async fn run_until(&self, shutdown: impl Future<Output = ()>) {
+        let mut shutdown = std::pin::pin!(shutdown);
+        loop {
+            match self.tick().await {
+                Ok(claimed) => tracing::debug!(claimed, "worker tick"),
+                // Keeping going is the point: a claim that failed is usually the database being
+                // restarted, and a worker that exited would need an operator to notice.
+                Err(e) => tracing::error!(error = %e, "a worker tick could not claim"),
+            }
+            tokio::select! {
+                () = &mut shutdown => return,
+                () = tokio::time::sleep(poll_interval()) => {}
+            }
+        }
+    }
+
+    /// Claims up to [`BATCH`] rows, debits the bucket once for each workspace's share of them,
+    /// and sends. Returns how many rows were claimed.
+    pub async fn tick(&self) -> sqlx::Result<usize> {
+        let started = Instant::now();
+        let claimed = claim(&self.ctx.db, KIND, BATCH, JOB_LEASE.as_secs() as i64).await?;
+        let total = claimed.len();
+        if total == 0 {
+            return Ok(0);
+        }
+        // One batch may span workspaces, and a bucket belongs to a relay of one workspace. So the
+        // debit is per workspace's share, which is what "once per claimed batch" means here.
+        let mut by_workspace: HashMap<Uuid, Vec<Claimed>> = HashMap::new();
+        for job in claimed {
+            by_workspace.entry(job.workspace_id).or_default().push(job);
+        }
+        for (workspace_id, mut jobs) in by_workspace {
+            let allowed = match self.allowance(workspace_id, &jobs).await {
+                Ok(allowed) => allowed,
+                Err(reason) => {
+                    self.defer_all(&jobs, &reason).await;
+                    continue;
+                }
+            };
+            // What the bucket would not pay for waits for the next tick. **A throttle is not a
+            // failure**: the message is still worth sending in a minute.
+            let held_back = jobs.split_off(allowed);
+            self.defer_all(&held_back, RATE_LIMITED).await;
+            self.send(jobs, started).await;
+        }
+        Ok(total)
+    }
+
+    /// Spends this workspace's share of the batch against the token bucket, and returns how many
+    /// of `jobs` may be sent. `Err` is the reason to defer all of them.
+    async fn allowance(&self, workspace_id: Uuid, jobs: &[Claimed]) -> Result<usize, String> {
+        // The error goes to the log and a bounded reason goes on the row: `ApiError` has no
+        // `Display`, and its `Debug` carries an `anyhow::Error` that formats a backtrace when one
+        // was captured — build-machine paths, in a `last_error` an operator reads in a browser.
+        // `confirmation::db_error` makes the same split for the same reason.
+        let relays = match relay::enabled_relays(&self.ctx.db, workspace_id).await {
+            Ok(relays) => relays,
+            Err(e) => {
+                tracing::warn!(error = ?e, "the relays could not be read");
+                return Err("the relays could not be read".to_owned());
+            }
+        };
+        // A workspace with no relay has nothing to debit, and the refusal is already written —
+        // with its reason — in `confirmation::attempt`. Restating it here would be a second copy
+        // of a rule that has one owner.
+        if relays.is_empty() {
+            return Ok(jobs.len());
+        }
+        let n = i32::try_from(jobs.len()).unwrap_or(i32::MAX);
+        match debit(&self.ctx.db, workspace_id, &relays, n).await {
+            Ok(0) => Err(RATE_LIMITED.to_owned()),
+            Ok(granted) => Ok(usize::try_from(granted).unwrap_or(0).min(jobs.len())),
+            Err(e) => Err(format!("the relay bucket could not be debited: {e}")),
+        }
+    }
+
+    /// Sends `jobs`, at most `concurrency` at a time, and **starts nothing once the tick's budget
+    /// is spent**.
+    ///
+    /// THE ARITHMETIC THIS EXISTS FOR. [`BATCH`] is 16 and `worker_concurrency` defaults to 4, so
+    /// a tick is four waves; a relay that burns the whole 60-second
+    /// [`crate::relay::transport::SESSION_TIMEOUT`] on each wave takes 240 seconds, which is
+    /// twice [`JOB_LEASE`]. A tick that outlives its own lease has its rows re-claimed by another
+    /// worker and its messages sent twice — the double send this milestone's outcome table exists
+    /// to prevent, arriving by arithmetic rather than by a hang. The budget is half the lease, so
+    /// a send started at the last moment still finishes its session inside it.
+    ///
+    /// The deadline is read by each send as it starts rather than once per wave: a wave admitted
+    /// at 59 seconds would run until 119, which is inside the lease only by accident.
+    ///
+    /// Every job that was not started is **deferred**, with the reason on the row. A job that was
+    /// never attempted is always safe to retry; one that was started is governed by its own
+    /// outcome.
+    async fn send(&self, jobs: Vec<Claimed>, started: Instant) {
+        let deadline = started + self.budget;
+        let mut running: JoinSet<()> = JoinSet::new();
+        for job in jobs {
+            while running.len() >= self.concurrency {
+                let _ = running.join_next().await;
+            }
+            let ctx = Arc::clone(&self.ctx);
+            running.spawn(async move {
+                if Instant::now() >= deadline {
+                    if let Err(e) = defer(&ctx.db, &job, BUDGET_SPENT).await {
+                        tracing::error!(
+                            job = %job.id,
+                            error = %e,
+                            "a job this tick had no budget for could not be deferred"
+                        );
+                    }
+                    return;
+                }
+                handle(&ctx, &job).await;
+            });
+        }
+        while running.join_next().await.is_some() {}
+    }
+
+    /// Reschedules every one of `jobs`, with the reason on the row. A `defer` that cannot be
+    /// written is logged and nothing else: the lease expires on its own, and the row comes back.
+    async fn defer_all(&self, jobs: &[Claimed], reason: &str) {
+        for job in jobs {
+            if let Err(e) = defer(&self.ctx.db, job, reason).await {
+                tracing::error!(job = %job.id, error = %e, "a job could not be deferred");
+            }
+        }
+    }
+}
+
+/// Takes up to `n` tokens from the first relay in failover order that will part with them, and
+/// returns how many it got. Zero means this workspace sends nothing this tick.
+///
+/// **It asks for at most the relay's whole minute, and that is not an optimisation.**
+/// [`bucket::take`] is all or nothing, so a batch of sixteen asked of a relay rated at ten a
+/// minute is refused by the insert arm's `limit >= wanted` — every tick, for ever. The rows are
+/// deferred until `max_attempts` runs out and the workspace's mail is destroyed slowly, with
+/// every part of the system reporting that it is behaving. A relay rated at 100 an hour is an
+/// ordinary cheap plan, so this is reachable rather than theoretical.
+///
+/// **The pool, never a transaction**, and that is ADR 0005's ruling rather than a preference: its
+/// tripwire fires on any transaction holding a `relay_buckets` row across more than one
+/// statement, and a tick that wrapped this debit and its sends together would be exactly that —
+/// at which point the ruling that `relays` is not a lock class stops describing the code. The
+/// parameter is `&PgPool` and not `impl PgExecutor` so that it cannot be handed one by accident.
+///
+/// `#[doc(hidden)] pub` for `tests/worker_pool.rs`, the way [`CLAIM`] is.
+#[doc(hidden)]
+pub async fn debit(db: &PgPool, workspace_id: Uuid, relays: &[Relay], n: i32) -> sqlx::Result<i32> {
+    for relay in relays {
+        let want = n.min(relay.rate_limit_per_minute);
+        match bucket::take(
+            db,
+            workspace_id,
+            relay.id,
+            relay.rate_limit_per_minute,
+            want,
+        )
+        .await
+        {
+            Ok(true) => return Ok(want),
+            Ok(false) => continue,
+            Err(e) if deleted_relay(&e) => {
+                tracing::info!(
+                    relay = %relay.id,
+                    "the relay was deleted while this tick was debiting it; trying the next"
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(0)
+}
+
+/// A foreign key violation out of [`bucket::take`] means its insert arm pointed at a `relays` row
+/// that is no longer there — **an operator deleted the relay while this tick was debiting it**.
+/// It is a real and reachable path, and nothing else that statement can raise `23503` for:
+/// `relay_buckets`' only foreign key is the composite one onto `relays`.
+///
+/// So it reads as *this relay is gone*: the tick falls to the next relay in failover order, and
+/// the claimed jobs are not failed over a relay the workspace is no longer using.
+fn deleted_relay(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23503"))
+}
+
+/// [`POLL`], **jittered** — which that constant documents as this tick's obligation rather than
+/// as something it already does. Without it a fleet restarted together, which is what a deploy
+/// is, wakes on one cadence for ever: every worker claiming against the same rows at the same
+/// instant, and all but one of them doing a round trip for nothing.
+///
+/// Upwards only, into `POLL..=POLL * 1.5`. The one-second floor on claim latency is a property
+/// worth keeping as written, and a jitter that could shorten the interval would chip at it.
+fn poll_interval() -> Duration {
+    let span = i64::try_from(POLL.as_millis() / 2).unwrap_or(0);
+    POLL + Duration::from_millis(u64::try_from(jitter(span)).unwrap_or(0))
+}
+
+/// What `public_url`'s scheme means for a worker, answered once at boot instead of once per
+/// message.
+///
+/// `Err` refuses to start, `Ok(Some(_))` starts and warns, `Ok(None)` says nothing.
+///
+/// WHY A WORKER CARES ABOUT A URL'S SCHEME. [`crate::mail::build`] refuses a non-`https`
+/// unsubscribe URL, and `Config::public_url` defaults to `http://localhost:8080`. So `nm all` on
+/// defaults fails **every** confirmation email. That refusal is right — an `http` unsubscribe
+/// link in a real inbox is a defect, and spec section 5.5's guarantee rests on the link being
+/// ours and safe to click — but what the operator sees is a worker rejecting everything, once per
+/// message, with no visible cause. This is that failure, moved to boot and named.
+///
+/// THE SPLIT, for which `app::serve`'s `trust_proxy_headers` warning is the precedent on both
+/// halves. The refusal fires only where somebody can act on it: an instance subscribers can
+/// reach, whose every send would fail. On localhost it is a warning instead, because that is the
+/// developer who has every reason to run without TLS and who needs the worker to start anyway —
+/// and a refusal they hit on every run is one they route around, which is worse than none.
+fn public_url_check(public_url: &url::Url) -> Result<Option<String>, String> {
+    if public_url.scheme() == "https" {
+        return Ok(None);
+    }
+    if crate::app::is_local_url(public_url) {
+        return Ok(Some(format!(
+            "NM_PUBLIC_URL is {public_url}, which is not https, so every confirmation email will \
+             be refused: the unsubscribe link this product puts in one must be https. Sending \
+             from this instance needs NM_PUBLIC_URL set to an https origin."
+        )));
+    }
+    Err(format!(
+        "NM_PUBLIC_URL is {public_url}, which is not https. Every confirmation email would be \
+         refused, because the unsubscribe link in it must be https — this worker would claim rows \
+         and fail all of them. Set NM_PUBLIC_URL to the https origin subscribers reach this \
+         instance at."
+    ))
+}
+
+/// Runs the worker until `shutdown` resolves. `nm worker` and `nm all` both call this; **`nm
+/// serve` does not**, which is spec M2a section 5.1: scaling the API must not multiply the send
+/// rate, and an API host's pool must not be drawn down by sending.
+pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
+    match public_url_check(&cfg.public_url) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Err(refusal) => anyhow::bail!(refusal),
+    }
+    let pool = db::connect_worker(&cfg).await?;
+    let concurrency = cfg.worker_concurrency;
+    let ctx = Ctx {
+        db: pool.clone(),
+        secrets: Arc::new(Secrets::new(&cfg.secret_key)),
+        config: Arc::new(cfg),
+        transports: Arc::new(Transports::new()),
+    };
+    tracing::info!(concurrency, batch = BATCH, "worker started");
+    Worker::new(ctx, concurrency).run_until(shutdown).await;
+    pool.close().await;
+    tracing::info!("worker stopped");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The poll interval has to vary, and `POLL`'s own documentation says why.** A fleet
+    /// restarted together — which is what a deploy is — otherwise wakes on one cadence for ever,
+    /// every worker claiming against the same rows at the same instant and all but one of them
+    /// doing a round trip for nothing.
+    ///
+    /// A bound on **variance**, like `backoff_does_not_return_the_same_delay_every_time`, so it
+    /// adds no dependence on elapsed time. Fifty draws from the 501 values of the range: a fixed
+    /// interval yields one distinct value.
+    #[test]
+    fn the_poll_interval_is_jittered() {
+        let seen: std::collections::HashSet<Duration> = (0..50).map(|_| poll_interval()).collect();
+        assert!(
+            seen.len() > 1,
+            "fifty polls came back identical, so a restarted fleet polls in lockstep: {seen:?}"
+        );
+        for interval in seen {
+            assert!(
+                (POLL..=POLL + POLL / 2).contains(&interval),
+                "a poll of {interval:?} is outside POLL..=POLL * 1.5"
+            );
+        }
+    }
+
+    fn check(url: &str) -> Result<Option<String>, String> {
+        public_url_check(&url.parse().expect("a valid url"))
+    }
+
+    /// An `http` public URL on an instance other people reach means every confirmation email is
+    /// refused by `mail::build` — an unsubscribe link must be `https` — and the operator sees a
+    /// worker rejecting everything with no visible cause. Refusing at boot names the variable.
+    #[test]
+    fn an_http_public_url_someone_can_reach_refuses_to_start() {
+        for url in ["http://mail.example.com", "http://203.0.113.10:8080"] {
+            let refusal = check(url).expect_err(url);
+            assert!(
+                refusal.contains("NM_PUBLIC_URL"),
+                "the refusal does not name the variable to change: {refusal}"
+            );
+        }
+    }
+
+    /// On localhost it is a warning and not a refusal, because that is the developer who has
+    /// every reason to run without TLS and needs the worker to start anyway.
+    #[test]
+    fn an_http_public_url_on_localhost_warns_instead() {
+        let warning = check("http://localhost:8080")
+            .expect("a developer's instance must still start")
+            .expect("and must say why its confirmations will fail");
+        assert!(
+            warning.contains("NM_PUBLIC_URL"),
+            "the warning does not name the variable: {warning}"
+        );
+    }
+
+    /// And on an instance that can actually send, nothing at all. A warning printed on every
+    /// correct run is one nobody reads by the end of the week — `app::serve`'s own reasoning
+    /// about the `trust_proxy_headers` warning, applied to the same question.
+    #[test]
+    fn an_https_public_url_says_nothing() {
+        assert_eq!(check("https://mail.example.com"), Ok(None));
+    }
 
     /// The shape of the curve, without a database. Bounds, because of the jitter.
     #[test]

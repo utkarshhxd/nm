@@ -31,6 +31,8 @@ pub fn test_config(database_url: &str) -> Config {
         metrics_listen: None,
         log_format: LogFormat::Pretty,
         preview_timeout_ms: 1500,
+        worker_pool_size: 5,
+        worker_concurrency: 4,
     }
 }
 

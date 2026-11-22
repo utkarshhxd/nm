@@ -37,6 +37,29 @@ echo 'correct horse battery staple' | bash scripts/dev.sh cargo run -q -- \
 bash scripts/dev-serve.sh cargo run -q -- serve
 ```
 
+## The three run modes
+
+Serving and sending are separate processes, and **`nm serve` does not send**:
+
+| command | HTTP API | sends queued mail |
+| --- | --- | --- |
+| `nm serve` (the default when no subcommand is given) | yes | no |
+| `nm worker` | no | yes |
+| `nm all` | yes | yes |
+
+That split is the point. Scaling the API means more `nm serve` replicas, and it must not thereby
+multiply the send rate — four API replicas and one worker send at one worker's rate. The worker
+also has a Postgres pool of its own, `NM_WORKER_POOL_SIZE` (default 5), because `/readyz` reads an
+exhausted pool as not ready: sending drawing on the API's twenty connections would let a batch of
+mail take the API down. `NM_WORKER_CONCURRENCY` (default 4) is how many messages one tick sends at
+once; a tick claims sixteen and stops starting new sends once it has spent half the job lease, so
+it can never outlive the claim it is working under.
+
+**Sending needs `NM_PUBLIC_URL` to be `https`.** Every message carries a one-click unsubscribe
+link built from it, and a non-`https` one is refused — so on the default `http://localhost:8080`
+the worker refuses every confirmation email. Both worker modes say so at startup rather than once
+per message: a warning on localhost, and a refusal to start on any host subscribers could reach.
+
 ## Development
 
 ```sh

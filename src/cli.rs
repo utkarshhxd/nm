@@ -12,8 +12,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the HTTP server (default)
+    /// Run the HTTP server (default). Does NOT send: run `nm worker` or `nm all` for that
     Serve,
+    /// Run the send worker alone
+    Worker,
+    /// Run the HTTP server and the send worker in one process
+    All,
     /// Apply pending database migrations and exit
     Migrate,
     /// Print the OpenAPI spec as JSON and exit

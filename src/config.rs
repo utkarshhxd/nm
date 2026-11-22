@@ -49,6 +49,14 @@ pub struct Config {
     /// planner's estimate (spec M1b section 5 budgets 1500 ms). Tests drive it down so an
     /// expensive document is decisively over the budget instead of merely over it.
     pub preview_timeout_ms: u64,
+    /// How many connections the worker's pool opens, and **it is not `db::connect`'s twenty**.
+    /// The worker has a pool of its own because `/readyz` reads an exhausted pool as not ready:
+    /// drawing sends from the API's pool would make sixteen messages in flight able to take the
+    /// product down. See `db::connect_worker`.
+    pub worker_pool_size: u32,
+    /// How many messages one tick sends at once. Four waves of `worker::BATCH`, which is the
+    /// arithmetic the tick's budget — half of `JOB_LEASE` — is sized against.
+    pub worker_concurrency: usize,
 }
 
 /// Hand-written so the database URL (it carries the password) never reaches logs.
@@ -65,6 +73,8 @@ impl fmt::Debug for Config {
             metrics_listen,
             log_format,
             preview_timeout_ms,
+            worker_pool_size,
+            worker_concurrency,
         } = self;
         f.debug_struct("Config")
             .field("database_url", &"***")
@@ -76,6 +86,10 @@ impl fmt::Debug for Config {
             .field("metrics_listen", metrics_listen)
             .field("log_format", log_format)
             .field("preview_timeout_ms", preview_timeout_ms)
+            // Neither is a secret: a pool size and a fan-out are the two numbers an operator
+            // reads a `Debug` of this struct to check.
+            .field("worker_pool_size", worker_pool_size)
+            .field("worker_concurrency", worker_concurrency)
             .finish()
     }
 }
@@ -123,6 +137,10 @@ struct Raw {
     log_format: LogFormat,
     #[serde(default = "default_preview_timeout_ms")]
     preview_timeout_ms: u64,
+    #[serde(default = "default_worker_pool_size")]
+    worker_pool_size: u32,
+    #[serde(default = "default_worker_concurrency")]
+    worker_concurrency: usize,
 }
 
 fn default_listen() -> SocketAddr {
@@ -144,6 +162,18 @@ fn default_log_format() -> LogFormat {
 /// Spec M1b section 5.
 fn default_preview_timeout_ms() -> u64 {
     1500
+}
+
+/// Small on purpose. A worker is one process claiming batches of `worker::BATCH`, and the pool is
+/// sized for the sends in flight plus the row each one records, not for the API's traffic.
+fn default_worker_pool_size() -> u32 {
+    5
+}
+
+/// Four messages at once: `worker::BATCH / 4` waves, which is what the tick's budget is sized
+/// against (spec M2a section 5.2).
+fn default_worker_concurrency() -> usize {
+    4
 }
 
 /// TOML layer for an explicitly requested config file; a missing or unreadable
@@ -184,6 +214,8 @@ impl Config {
             metrics_listen: raw.metrics_listen,
             log_format: raw.log_format,
             preview_timeout_ms: raw.preview_timeout_ms,
+            worker_pool_size: raw.worker_pool_size,
+            worker_concurrency: raw.worker_concurrency,
         })
     }
 }
@@ -244,6 +276,11 @@ mod tests {
         assert!(c.auto_migrate && !c.trust_proxy_headers && c.metrics_listen.is_none());
         assert_eq!(c.log_format, LogFormat::Json);
         assert_eq!(c.preview_timeout_ms, 1500, "spec M1b section 5's budget");
+        assert_eq!(
+            c.worker_pool_size, 5,
+            "the worker's own pool, not the API's twenty"
+        );
+        assert_eq!(c.worker_concurrency, 4);
         assert_eq!(c.secret_key, SecretKey([1; 32]));
     }
 
@@ -255,11 +292,15 @@ mod tests {
             ("NM_TRUST_PROXY_HEADERS", "true"),
             ("NM_METRICS_LISTEN", "127.0.0.1:9090"),
             ("NM_LOG_FORMAT", "pretty"),
+            ("NM_WORKER_POOL_SIZE", "9"),
+            ("NM_WORKER_CONCURRENCY", "2"),
         ]);
         let c = Config::from_figment(figment_with(&p)).unwrap();
         assert!(!c.auto_migrate && c.trust_proxy_headers);
         assert_eq!(c.metrics_listen, Some("127.0.0.1:9090".parse().unwrap()));
         assert_eq!(c.log_format, LogFormat::Pretty);
+        assert_eq!(c.worker_pool_size, 9);
+        assert_eq!(c.worker_concurrency, 2);
     }
 
     #[test]
@@ -351,6 +392,11 @@ mod tests {
         let dbg = format!("{c:?}");
         assert!(dbg.contains("Config"), "{dbg}");
         assert!(!dbg.contains("hunter2"), "{dbg}");
+        // The destructuring above forces every field to be named; these two are the ones this
+        // milestone added, and naming them is the redaction decision being recorded.
+        for field in ["worker_pool_size", "worker_concurrency"] {
+            assert!(dbg.contains(field), "{field} is missing from {dbg}");
+        }
     }
 
     #[test]

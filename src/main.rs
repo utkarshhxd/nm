@@ -34,10 +34,35 @@ async fn main() -> anyhow::Result<()> {
             let pool = db::connect(&cfg).await?;
             admin(cmd, &pool).await?;
         }
+        // THE THREE MODES, and the split is the point of spec M2a section 5.1: `serve` does not
+        // send. An operator who scales the API to four replicas must not thereby quadruple their
+        // send rate, and an API host's connection pool must not be drawn down by sending.
         Command::Serve => {
             let cfg = Config::load()?;
             telemetry::init_logging(cfg.log_format);
             nm::app::serve(cfg).await?;
+        }
+        Command::Worker => {
+            let cfg = Config::load()?;
+            telemetry::init_logging(cfg.log_format);
+            nm::worker::run(cfg, nm::app::shutdown_signal()).await?;
+        }
+        Command::All => {
+            let cfg = Config::load()?;
+            telemetry::init_logging(cfg.log_format);
+            // One process, two pools (`db::connect` and `db::connect_worker`), and one signal
+            // each: both halves stop on the same Ctrl-C or SIGTERM. `try_join` so that either
+            // half failing — the worker's boot check refusing an `http` public URL, say — takes
+            // the process down rather than leaving half of it serving.
+            //
+            // On a database with no schema yet, the worker's first tick can beat `serve`'s
+            // migration and log a claim it could not make. It polls again a second later and
+            // from then on it is correct; that is noise on one boot, not a state to recover from.
+            let worker_cfg = cfg.clone();
+            tokio::try_join!(
+                nm::app::serve(cfg),
+                nm::worker::run(worker_cfg, nm::app::shutdown_signal()),
+            )?;
         }
     }
     Ok(())
