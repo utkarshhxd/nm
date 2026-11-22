@@ -102,6 +102,35 @@ test("a domain whose checks all pass is not flagged, acknowledged or not", async
   }
 });
 
+test("a domain with no return-path domain is not held to a Return-Path check", async ({ page, app }) => {
+  // What the checker writes for each: no return-path domain means no lookup and `not_checked`,
+  // and `not_checked` is also what a domain nobody has checked carries — so the configured one
+  // must still be stopped by it, or this screen would say "allowed" for a check that never ran.
+  const none = domain({
+    id: "a0000000-0000-4000-8000-000000000005",
+    domain: "no-return-path.example",
+    checks: { spf: pass, dkim: pass, dmarc: pass, return_path: unchecked },
+  });
+  const configured = domain({
+    id: "a0000000-0000-4000-8000-000000000006",
+    domain: "with-return-path.example",
+    return_path_domain: "bounce.with-return-path.example",
+    checks: { spf: pass, dkim: pass, dmarc: pass, return_path: unchecked },
+  });
+  await open(page, app, [none, configured]);
+
+  const clean = row(page, "no-return-path.example");
+  await expect(clean).toBeVisible();
+  await expect(clean.getByText("Not allowed to send")).toHaveCount(0);
+  // And the line is not shown at all: a green badge beside a "Not checked" Return-Path would
+  // read as the screen contradicting itself.
+  await expect(clean.getByText("Return-Path", { exact: true })).toHaveCount(0);
+
+  const held = row(page, "with-return-path.example");
+  await expect(held.getByText("Not allowed to send")).toBeVisible();
+  await expect(held.getByText("Return-Path", { exact: true })).toBeVisible();
+});
+
 test("editing the selector of an acknowledged domain unticks the box and sends only the selector", async ({ page, app }) => {
   await open(page, app, [ACKED]);
   const bodies: unknown[] = [];

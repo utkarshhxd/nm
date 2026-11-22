@@ -60,6 +60,23 @@ const _: () = assert!(
     "a session may not outlive the job lease: the row would be re-claimed mid-send"
 );
 
+// AND THE TIGHTER BOUND, WHICH IS THE ONE THAT ACTUALLY BINDS TODAY. A tick stops starting sends
+// once it has spent half the lease (`worker::Worker`'s budget), so the last send it starts may
+// begin at `JOB_LEASE / 2` and run for a whole `SESSION_TIMEOUT`. For that send to finish inside
+// the lease it claimed under, `SESSION_TIMEOUT <= JOB_LEASE / 2`.
+//
+// At 60 and 120 that holds with **zero slack**: 60 + 60 is the lease exactly, leaving only the
+// round trip that records the outcome. It is to spec and nothing here is being changed to widen
+// it — but it means the next person to raise `SESSION_TIMEOUT`, for a relay that is slow to
+// answer, silently crosses the lease and starts sending some messages twice. This assertion is
+// why that arrives as a compile error with this paragraph attached instead of as a duplicate in
+// somebody's inbox. Raising it means raising `JOB_LEASE` to at least twice it.
+const _: () = assert!(
+    SESSION_TIMEOUT.as_secs() <= JOB_LEASE.as_secs() / 2,
+    "a send started at the end of a tick's budget (half the lease) must still finish inside \
+     that lease: SESSION_TIMEOUT may not exceed JOB_LEASE / 2"
+);
+
 /// The phrase OCI puts in the reply when the recipient is on its suppression list, whatever the
 /// code in front of it. Matched case-insensitively against the whole reply.
 const SUPPRESSION_NOTICE: &str = "suppression for user";

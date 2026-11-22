@@ -207,7 +207,7 @@ impl World {
     async fn tick_one(&self) -> Outcome {
         let claimed = self.claim().await;
         assert_eq!(claimed.len(), 1, "one job was queued");
-        handle(&self.ctx, &claimed[0]).await
+        handle(&self.ctx, &claimed[0], None).await
     }
 
     async fn row(&self, id: Uuid) -> JobRow {
@@ -688,6 +688,57 @@ async fn a_domain_whose_checks_have_never_run_is_treated_as_unverified(pool: PgP
     assert!(w.row(id).await.failed_at.is_some());
 }
 
+/// **A domain with no custom return-path domain sends on the other three checks.** The
+/// Return-Path is the relay's own unless one is configured (spec §9), so there is no record of
+/// ours to look up and the checker writes `not_checked` — the same word it writes for a check
+/// nobody has run yet. Reading those two facts as one made the reference deployment permanently
+/// unverified, and `Failed` destroys a confirmation rather than retrying it.
+#[sqlx::test]
+async fn a_domain_with_no_return_path_configured_sends_on_the_other_three(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    // Exactly what `dns::check` writes for the domain `World` inserts, which has no
+    // `return_path_domain`: three answers, and no lookup for the fourth.
+    let mut checks = all_checks("pass");
+    checks["return_path"] = json!({ "status": "not_checked" });
+    w.set_checks_json(checks).await;
+    let id = w.enqueue_one().await;
+
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Sent { .. }), "{outcome:?}");
+    assert_eq!(w.sink.connections(), 1);
+    let row = w.row(id).await;
+    assert!(row.completed_at.is_some());
+    assert_eq!(row.failed_at, None, "{:?}", row.last_error);
+}
+
+/// The other half, which is what stops the one above from becoming "Return-Path never matters": a
+/// domain that *does* carry a return-path domain is still held to its verdict.
+#[sqlx::test]
+async fn a_configured_return_path_that_fails_still_closes_the_gate(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("update sending_domains set return_path_domain = $1 where workspace_id = $2")
+        .bind("bounce.example.net")
+        .bind(w.ws)
+        .execute(&w.pool)
+        .await
+        .expect("a return-path domain");
+    let mut checks = all_checks("pass");
+    checks["return_path"] = json!({
+        "status": "fail",
+        "reason": "the return-path domain is neither the sending domain nor a subdomain of it",
+    });
+    w.set_checks_json(checks).await;
+    let id = w.enqueue_one().await;
+
+    let outcome = w.tick_one().await;
+
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(w.sink.connections(), 0);
+    let reason = w.row(id).await.last_error.expect("a reason");
+    assert!(reason.contains("Return-Path"), "{reason}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Invariants 4 and 5: what the relay's answer is recorded as.
 
@@ -705,7 +756,7 @@ async fn an_unknown_outcome_is_never_retried(pool: PgPool) {
     // handler must leave alone. Comparing it with itself is exact and reads no clock.
     let leased_until = w.row(id).await.run_after;
 
-    let outcome = handle(&w.ctx, &claimed[0]).await;
+    let outcome = handle(&w.ctx, &claimed[0], None).await;
     assert!(matches!(outcome, Outcome::Unknown(_)), "{outcome:?}");
 
     let row = w.row(id).await;
@@ -871,7 +922,7 @@ async fn a_malformed_payload_fails_that_row_only(pool: PgPool) {
     let claimed = w.claim().await;
     assert_eq!(claimed.len(), 3, "all three were claimed in one tick");
     for job in &claimed {
-        handle(&w.ctx, job).await;
+        handle(&w.ctx, job, None).await;
     }
 
     let bad = w.row(ids[1]).await;

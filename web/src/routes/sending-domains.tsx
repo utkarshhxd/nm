@@ -37,7 +37,16 @@ const CHECKS = [
 ] as const;
 // OpenSSL 1.x writes `BEGIN RSA PRIVATE KEY` and 3.x `BEGIN PRIVATE KEY`; the API takes either.
 const OPENSSL = "openssl genrsa -out dkim-private.pem 2048";
-const allPass = (d: Domain) => CHECKS.every(([key]) => d.checks[key].status === "pass");
+// Return-Path is only a check when a custom return-path domain is configured. Without one the
+// Return-Path is the relay's own, there is no record of ours to look up, and the checker writes
+// `not_checked` — the same word it writes for a check nobody has run, which is why the column and
+// not the status is what tells the two apart. A verdict the checker did record is always shown
+// and always counted, whatever the column says. The send-side gate reads it the same way, in
+// `worker::confirmation::not_passing`.
+const applies = (d: Domain, key: (typeof CHECKS)[number][0]) =>
+  key !== "return_path" || !!d.return_path_domain || d.checks.return_path.status !== "not_checked";
+const allPass = (d: Domain) =>
+  CHECKS.every(([key]) => !applies(d, key) || d.checks[key].status === "pass");
 const when = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const PAGE = 100;
 const th = "py-2 pe-3 text-start font-medium";
@@ -219,7 +228,7 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                       </td>
                       <td className="py-2 pe-3">
                         <ul>
-                          {CHECKS.map(([key, label]) => (
+                          {CHECKS.filter(([key]) => applies(d, key)).map(([key, label]) => (
                             <CheckLine key={key} label={label} result={d.checks[key]} />
                           ))}
                         </ul>

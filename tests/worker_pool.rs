@@ -135,8 +135,11 @@ impl World {
             Uuid::now_v7(),
             Uuid::now_v7(),
         );
-        sqlx::query("insert into workspaces (id, slug, name) values ($1, 'acme', 'Acme')")
+        // Slugged by id: `one_workspace_at_its_limit_does_not_stop_another` builds two of these
+        // on one database, and `workspaces_slug_key` would refuse a second 'acme'.
+        sqlx::query("insert into workspaces (id, slug, name) values ($1, $2, 'Acme')")
             .bind(ws)
+            .bind(format!("ws-{ws}"))
             .execute(&pool)
             .await
             .expect("workspace");
@@ -256,8 +259,9 @@ impl World {
     async fn rows(&self) -> Vec<JobRow> {
         sqlx::query_as::<_, JobRow>(
             "select failed_at, completed_at, last_error, run_after, attempts
-               from jobs order by id",
+               from jobs where workspace_id = $1 order by id",
         )
+        .bind(self.ws)
         .fetch_all(&self.pool)
         .await
         .expect("the job rows")
@@ -424,20 +428,24 @@ async fn an_exhausted_bucket_sends_nothing_and_leaves_the_rows_claimable(pool: P
             row.attempts, 0,
             "a throttled claim spent an attempt, so five of them would destroy the message"
         );
+        let reason = row.last_error.expect("a reason an operator can read");
+        assert!(
+            reason.contains("rate limit"),
+            "the reason does not say the relay was throttled: {reason}"
+        );
+        // A bound with a reason rather than a reading of the clock: `backoff`'s floor is fifteen
+        // seconds, so anything under that cannot be the failure path and must be the short
+        // attempt-free wait a held-back row gets.
+        assert!(
+            row.run_after < Utc::now() + chrono::Duration::seconds(15),
+            "a throttled row waits a backoff, not the short wait: run_after is {}",
+            row.run_after
+        );
     }
     assert_eq!(
         w.balance(w.relay).await,
         Some(0),
         "a refusal spends nothing"
-    );
-    // And claimable is not a figure of speech: the rows come straight back.
-    assert_eq!(
-        worker::claim(&w.pool, "confirmation_email", BATCH, 120)
-            .await
-            .expect("re-claim")
-            .len(),
-        2,
-        "the throttled rows were not offered again"
     );
 }
 
@@ -570,8 +578,9 @@ async fn a_relay_deleted_mid_tick_falls_through_to_the_next(pool: PgPool) {
         .expect("a deleted relay is not an error the batch pays for");
 
     assert_eq!(
-        granted, 4,
-        "the standby relay had the tokens for this batch"
+        granted,
+        Some((standby, 4)),
+        "the batch must be paid for by the standby relay, and know that it was"
     );
     assert_eq!(
         w.balance(standby).await,
@@ -620,4 +629,188 @@ async fn the_loop_drains_the_queue_and_returns_when_shutdown_resolves(pool: PgPo
 
     assert_eq!(w.completed().await, queued);
     assert_eq!(w.sink.messages().len(), queued);
+}
+
+/// **The relay that was debited must be the relay that sends.** `debit` spends on the first relay
+/// that *grants*, and `submit` sends through the first relay that is *reachable* — so with relay
+/// 1 exhausted and relay 2 funded, those are two different relays, and a send through relay 1
+/// against a token taken from relay 2 drives relay 1 past its limit without bound. The bucket
+/// stops meaning anything in exactly the configuration it exists for.
+///
+/// Relay 1 here is perfectly reachable and simply out of tokens. It must not be used, however
+/// willing it is, and the message must leave through the relay that was paid for.
+#[sqlx::test]
+async fn a_send_goes_through_the_relay_the_tick_paid_for(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let funded_sink = Sink::start(Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.add_relay(
+        Uuid::now_v7(),
+        "standby",
+        1,
+        funded_sink.addr.port(),
+        RATE_LIMIT,
+    )
+    .await;
+    // One a minute, and none left: `floor(elapsed * 1 / 60)` is zero for the next sixty seconds.
+    sqlx::query("update relays set rate_limit_per_minute = 1 where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("the primary's limit");
+    sqlx::query(
+        "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+         values ($1, $2, 0, now())",
+    )
+    .bind(w.relay)
+    .bind(w.ws)
+    .execute(&w.pool)
+    .await
+    .expect("an empty bucket on the primary");
+    w.enqueue(1).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(
+        w.sink.connections(),
+        0,
+        "the message went through a relay that had no token for it"
+    );
+    assert_eq!(
+        funded_sink.messages().len(),
+        1,
+        "the message did not go through the relay the tick paid for"
+    );
+    assert!(w.only_row().await.completed_at.is_some());
+}
+
+/// **A workspace with no relay at all is handed to the handler, not quietly held back.**
+///
+/// `allowance`'s relay-less arm is the one that cannot be tested by its effect on the bucket,
+/// because there is no bucket. Turn it into "nothing may be sent" and the jobs are released for
+/// ever: never sent, never failed, no `failed_at` for anyone asking why the confirmation never
+/// arrived. So this asserts the opposite of a release — the attempt **is** spent, and the reason
+/// on the row is the handler's own, not the throttle's.
+#[sqlx::test]
+async fn a_workspace_with_no_relay_reaches_the_handler_and_is_told_so(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("delete from relays where workspace_id = $1")
+        .bind(w.ws)
+        .execute(&w.pool)
+        .await
+        .expect("remove every relay");
+    w.enqueue(1).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    let row = w.only_row().await;
+    assert_eq!(
+        row.attempts, 1,
+        "the job was held back rather than attempted, so nothing will ever record why it failed"
+    );
+    assert!(row.completed_at.is_none() && row.failed_at.is_none());
+    let reason = row.last_error.expect("a reason an operator can read");
+    assert!(
+        reason.contains("no enabled relay"),
+        "the reason is not the handler's: {reason}"
+    );
+}
+
+/// **The debit is per workspace, and one workspace's limit is not another's.** A batch may span
+/// workspaces — the claim orders by `run_after`, not by tenant — and a bucket belongs to a relay
+/// of exactly one of them. Debit once for the whole batch and the first workspace's rate limit
+/// silently becomes everybody's.
+#[sqlx::test]
+async fn one_workspace_at_its_limit_does_not_stop_another(pool: PgPool) {
+    let throttled = World::new(pool.clone(), Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let funded = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("update relays set rate_limit_per_minute = 1 where id = $1")
+        .bind(throttled.relay)
+        .execute(&throttled.pool)
+        .await
+        .expect("the limit");
+    sqlx::query(
+        "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+         values ($1, $2, 0, now())",
+    )
+    .bind(throttled.relay)
+    .bind(throttled.ws)
+    .execute(&throttled.pool)
+    .await
+    .expect("an empty bucket");
+    throttled.enqueue(2).await;
+    funded.enqueue(2).await;
+
+    // One tick, both workspaces: the claim takes all four rows together.
+    throttled.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(
+        throttled.sink.connections(),
+        0,
+        "the throttled workspace was dialled"
+    );
+    assert_eq!(
+        funded.sink.messages().len(),
+        2,
+        "a workspace with tokens was held back by another workspace's rate limit"
+    );
+    assert_eq!(funded.completed().await, 2);
+    for row in throttled.rows().await {
+        assert!(row.completed_at.is_none() && row.failed_at.is_none());
+        assert_eq!(row.attempts, 0, "a throttled claim spent an attempt");
+    }
+}
+
+/// **Zero is not a smaller pool and not a smaller fan-out.** `max_connections(0)` is a pool
+/// nothing can be taken from, so every acquire waits out sqlx's thirty-second timeout and the
+/// worker refuses everything with no cause an operator can see — which is the failure
+/// `worker::run`'s boot check exists to make visible, arriving by a different door. A
+/// concurrency of zero would mean sending nothing at all.
+#[sqlx::test]
+async fn zero_is_read_as_one_for_both_the_pool_and_the_fan_out(pool: PgPool) {
+    let mut cfg = common::test_config(&database_url(&pool));
+    cfg.worker_pool_size = 0;
+    let sending = db::connect_worker(&cfg).await.expect("a worker pool");
+    sending
+        .acquire()
+        .await
+        .expect("a pool of zero is a worker that can do nothing and says nothing");
+    sending.close().await;
+
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.enqueue(1).await;
+
+    w.worker(0).tick().await.expect("the tick");
+
+    assert_eq!(
+        w.completed().await,
+        1,
+        "a concurrency of zero sent nothing at all"
+    );
+}
+
+/// **And the relay the tick paid for is not charged twice.** `submit` takes a token for every
+/// relay but that one; forget which one was paid and every message is billed twice to the relay
+/// it actually goes through, so the product sends at half the rate the operator configured with
+/// nothing to show why.
+#[sqlx::test]
+async fn the_relay_the_tick_paid_for_is_not_charged_twice(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    // Ten a minute: the refill is `floor(elapsed * 10 / 60)`, which stays at zero for six
+    // seconds, so the balance below is exact without reading a clock. This test takes
+    // milliseconds.
+    sqlx::query("update relays set rate_limit_per_minute = 10 where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("the limit");
+    w.enqueue(1).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(w.completed().await, 1, "the message did not go");
+    assert_eq!(
+        w.balance(w.relay).await,
+        Some(9),
+        "one message through one relay must cost one token"
+    );
 }

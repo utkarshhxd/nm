@@ -201,17 +201,26 @@ pub async fn defer(db: impl PgExecutor<'_>, j: &Claimed, reason: &str) -> sqlx::
 /// `tests/worker_pool.rs` holds both ends, that an unstarted job keeps its attempt and that one
 /// which reached a relay spends it.
 ///
-/// `run_after` is `now()`: the row goes back exactly as it was before the claim, and the next
-/// tick — which has a fresh budget and a refilled bucket — may take it immediately. There is no
-/// backoff because nothing failed.
-async fn release(db: impl PgExecutor<'_>, j: &Claimed, reason: &str) -> sqlx::Result<()> {
+/// `wait` is how long the row stays out of reach, and it is not a backoff — nothing failed, so it
+/// does not double and it costs no attempt. A job the tick simply ran out of budget for waits
+/// zero: the next tick has a fresh budget and should take it at once. A job the bucket would not
+/// pay for waits [`RATE_LIMITED_WAIT`], because zero there is a throttled workspace re-claiming
+/// and re-releasing its whole [`BATCH`] every poll, for ever, for no benefit.
+async fn release(
+    db: impl PgExecutor<'_>,
+    j: &Claimed,
+    wait: Duration,
+    reason: &str,
+) -> sqlx::Result<()> {
     // `greatest` rather than a bare subtraction: `jobs_attempts_non_negative` is on the table,
     // and a release of a row claimed by something that did not increment must not violate it.
     sqlx::query(
-        "update jobs set attempts = greatest(0, attempts - 1), run_after = now(), last_error = $2
+        "update jobs set attempts = greatest(0, attempts - 1),
+                         run_after = now() + make_interval(secs => $2), last_error = $3
           where id = $1",
     )
     .bind(j.id)
+    .bind(wait.as_secs_f64())
     .bind(reason)
     .execute(db)
     .await?;
@@ -260,9 +269,30 @@ const KIND: &str = "confirmation_email";
 const BUDGET_SPENT: &str =
     "the tick's budget (half the job lease) was spent before this job was started";
 
-/// What a job the bucket would not pay for carries. Also a deferral: the relay's limit is about
+/// What a job the bucket would not pay for carries. Also unattempted: the relay's limit is about
 /// this minute, and the message is still worth sending in the next one.
 const RATE_LIMITED: &str = "every relay of this workspace is at its rate limit for this minute";
+
+/// How long a job the bucket would not pay for stays out of reach.
+///
+/// **Not a backoff — it is there to stop a spin.** A release with no wait puts the row back at
+/// once, so a throttled workspace re-claims and re-releases its whole [`BATCH`] on every poll:
+/// about thirty row updates a second, indefinitely, for no benefit, since a bucket worth
+/// throttling cannot have refilled in a second. Five seconds is still far below the
+/// fifteen-second floor on [`backoff`], so a row the bucket held back is offered again sooner
+/// than one that actually failed — which is the order these two deserve.
+const RATE_LIMITED_WAIT: Duration = Duration::from_secs(5);
+
+/// What the bucket will let one workspace's share of a batch do this tick.
+enum Allowance {
+    /// The workspace has no relay to debit at all. Everything goes to the handler unpaid, which
+    /// is where the refusal — and its reason — is already written.
+    Unmetered,
+    /// No relay would grant a token. Nothing is sent and every row is released.
+    Throttled,
+    /// `n` jobs may be sent, **through `relay` and no other**.
+    Granted { relay: Uuid, n: usize },
+}
 
 /// The tick: one claimed batch at a time, against a pool of its own.
 ///
@@ -338,8 +368,12 @@ impl Worker {
             by_workspace.entry(job.workspace_id).or_default().push(job);
         }
         for (workspace_id, mut jobs) in by_workspace {
-            let allowed = match self.allowance(workspace_id, &jobs).await {
-                Ok(allowed) => allowed,
+            // `paid_for` travels with every send of this workspace's share: the relay the debit
+            // bought is the relay those messages go through. See `debit`.
+            let (paid_for, allowed) = match self.allowance(workspace_id, &jobs).await {
+                Ok(Allowance::Granted { relay, n }) => (Some(relay), n),
+                Ok(Allowance::Unmetered) => (None, jobs.len()),
+                Ok(Allowance::Throttled) => (None, 0),
                 Err(reason) => {
                     self.defer_all(&jobs, &reason).await;
                     continue;
@@ -351,15 +385,16 @@ impl Worker {
             // that was only ever waiting its turn — which is reachable now that `debit` asks for
             // at most the relay's whole minute and therefore holds rows back routinely.
             let held_back = jobs.split_off(allowed);
-            self.release_all(&held_back, RATE_LIMITED).await;
-            self.send(jobs, started).await;
+            self.release_all(&held_back, RATE_LIMITED_WAIT, RATE_LIMITED)
+                .await;
+            self.send(jobs, paid_for, started).await;
         }
         Ok(total)
     }
 
-    /// Spends this workspace's share of the batch against the token bucket, and returns how many
-    /// of `jobs` may be sent. `Err` is the reason to defer all of them.
-    async fn allowance(&self, workspace_id: Uuid, jobs: &[Claimed]) -> Result<usize, String> {
+    /// Spends this workspace's share of the batch against the token bucket. `Err` is the reason
+    /// to defer all of them.
+    async fn allowance(&self, workspace_id: Uuid, jobs: &[Claimed]) -> Result<Allowance, String> {
         // The error goes to the log and a bounded reason goes on the row: `ApiError` has no
         // `Display`, and its `Debug` carries an `anyhow::Error` that formats a backtrace when one
         // was captured — build-machine paths, in a `last_error` an operator reads in a browser.
@@ -375,12 +410,17 @@ impl Worker {
         // with its reason — in `confirmation::attempt`. Restating it here would be a second copy
         // of a rule that has one owner.
         if relays.is_empty() {
-            return Ok(jobs.len());
+            return Ok(Allowance::Unmetered);
         }
         let n = i32::try_from(jobs.len()).unwrap_or(i32::MAX);
         match debit(&self.ctx.db, workspace_id, &relays, n).await {
-            // Zero is not an error here: it is every job held back, which the caller releases.
-            Ok(granted) => Ok(usize::try_from(granted).unwrap_or(0).min(jobs.len())),
+            // No relay granting is not an error here: it is every job held back, which the
+            // caller releases.
+            Ok(None) => Ok(Allowance::Throttled),
+            Ok(Some((relay, granted))) => Ok(Allowance::Granted {
+                relay,
+                n: usize::try_from(granted).unwrap_or(0).min(jobs.len()),
+            }),
             // A database error, by contrast, is a failure to be recorded with backoff — and one
             // that must eventually give up, which is what spending an attempt buys.
             Err(e) => Err(format!("the relay bucket could not be debited: {e}")),
@@ -404,7 +444,7 @@ impl Worker {
     /// Every job that was not started is **deferred**, with the reason on the row. A job that was
     /// never attempted is always safe to retry; one that was started is governed by its own
     /// outcome.
-    async fn send(&self, jobs: Vec<Claimed>, started: Instant) {
+    async fn send(&self, jobs: Vec<Claimed>, paid_for: Option<Uuid>, started: Instant) {
         let deadline = started + self.budget;
         let mut running: JoinSet<()> = JoinSet::new();
         for job in jobs {
@@ -417,7 +457,9 @@ impl Worker {
                     // `release`, not `defer`: this job was claimed and never submitted, so it
                     // spends no attempt. See `release`'s own note on why that path is the only
                     // one allowed to undo the claim's increment.
-                    if let Err(e) = release(&ctx.db, &job, BUDGET_SPENT).await {
+                    // No wait: the next tick has a whole budget again, and this job is the
+                    // first thing it should spend it on.
+                    if let Err(e) = release(&ctx.db, &job, Duration::ZERO, BUDGET_SPENT).await {
                         tracing::error!(
                             job = %job.id,
                             error = %e,
@@ -426,7 +468,7 @@ impl Worker {
                     }
                     return;
                 }
-                handle(&ctx, &job).await;
+                handle(&ctx, &job, paid_for).await;
             });
         }
         while running.join_next().await.is_some() {}
@@ -445,9 +487,9 @@ impl Worker {
 
     /// Hands every one of `jobs` back unattempted. For jobs this tick **chose** not to start,
     /// where nothing went wrong and nothing was submitted; see [`release`].
-    async fn release_all(&self, jobs: &[Claimed], reason: &str) {
+    async fn release_all(&self, jobs: &[Claimed], wait: Duration, reason: &str) {
         for job in jobs {
-            if let Err(e) = release(&self.ctx.db, job, reason).await {
+            if let Err(e) = release(&self.ctx.db, job, wait, reason).await {
                 tracing::error!(job = %job.id, error = %e, "a job could not be released");
             }
         }
@@ -455,7 +497,16 @@ impl Worker {
 }
 
 /// Takes up to `n` tokens from the first relay in failover order that will part with them, and
-/// returns how many it got. Zero means this workspace sends nothing this tick.
+/// returns **which relay** it spent on and how many it got. `None` means this workspace sends
+/// nothing this tick.
+///
+/// **Which relay is half the answer, not a convenience.** The sends this buys have to go through
+/// the relay the tokens came off: `debit` spends on the first relay that *grants*, while
+/// `confirmation::submit` sends through the first relay that is *reachable*, and with relay 1
+/// exhausted and relay 2 funded those are different relays — a debit of relay 2 followed by a
+/// send through relay 1 drives relay 1 past its limit without bound, which empties the bucket of
+/// meaning in exactly the configuration it exists for. So the id travels with the batch, and
+/// falling over to any other relay takes a token for that one first.
 ///
 /// **It asks for at most the relay's whole minute, and that is not an optimisation.**
 /// [`bucket::take`] is all or nothing, so a batch of sixteen asked of a relay rated at ten a
@@ -472,7 +523,12 @@ impl Worker {
 ///
 /// `#[doc(hidden)] pub` for `tests/worker_pool.rs`, the way [`CLAIM`] is.
 #[doc(hidden)]
-pub async fn debit(db: &PgPool, workspace_id: Uuid, relays: &[Relay], n: i32) -> sqlx::Result<i32> {
+pub async fn debit(
+    db: &PgPool,
+    workspace_id: Uuid,
+    relays: &[Relay],
+    n: i32,
+) -> sqlx::Result<Option<(Uuid, i32)>> {
     for relay in relays {
         let want = n.min(relay.rate_limit_per_minute);
         match bucket::take(
@@ -484,7 +540,7 @@ pub async fn debit(db: &PgPool, workspace_id: Uuid, relays: &[Relay], n: i32) ->
         )
         .await
         {
-            Ok(true) => return Ok(want),
+            Ok(true) => return Ok(Some((relay.id, want))),
             Ok(false) => continue,
             Err(e) if deleted_relay(&e) => {
                 tracing::info!(
@@ -496,7 +552,7 @@ pub async fn debit(db: &PgPool, workspace_id: Uuid, relays: &[Relay], n: i32) ->
             Err(e) => return Err(e),
         }
     }
-    Ok(0)
+    Ok(None)
 }
 
 /// A foreign key violation out of [`bucket::take`] means its insert arm pointed at a `relays` row
@@ -568,6 +624,11 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> anyhow::Res
         Err(refusal) => anyhow::bail!(refusal),
     }
     let pool = db::connect_worker(&cfg).await?;
+    // The same `auto_migrate` every other mode honours. An operator who set it does not expect
+    // one mode to ignore it, and `nm worker` on its own is a whole deployment of this product.
+    if cfg.auto_migrate {
+        db::MIGRATOR.run(&pool).await?;
+    }
     let concurrency = cfg.worker_concurrency;
     let ctx = Ctx {
         db: pool.clone(),

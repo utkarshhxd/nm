@@ -35,9 +35,19 @@
 //! finds no HTTPS one, and a click on *that* link suppresses the person in Oracle's list and
 //! nowhere in ours: no `consent_log` row, nothing a preference centre or a GDPR export can see.
 //!
-//! **This handler does not touch the token bucket.** The bucket is debited once per claimed batch
-//! (spec §5.4), which is a property of the tick and not of one message; `handle` runs with the
-//! debit already spent, and Task 11's loop owns that call.
+//! **The bucket is debited once per claimed batch (spec §5.4), by the tick, and this handler is
+//! told which relay that debit bought.** `handle` takes the relay the tick paid for and
+//! [`submit`] sends through it without spending again.
+//!
+//! **What this handler does own is the token for a relay it falls over to.** The rule the whole
+//! bucket exists for is that *a send is covered by a token taken from the relay it goes through*,
+//! and failover is the one place those two can come apart: the tick spends on the first relay
+//! with tokens, while `submit` sends through the first relay that is reachable. With relay 1
+//! exhausted and relay 2 funded, a debit of relay 2 followed by a send through relay 1 drives
+//! relay 1 past its limit without bound — the bucket stops meaning anything in exactly the
+//! configuration it exists for. So falling through to a relay the tick did not pay for takes a
+//! token for that relay first, and a relay that will not grant one is skipped however reachable
+//! it is. That is what a rate limit is.
 
 use std::sync::Arc;
 
@@ -54,10 +64,10 @@ use crate::{
     mail::{self, Outgoing, dkim},
     public::token::{self, Purpose, Token},
     relay::{
-        self, Relay,
+        self, Relay, bucket,
         transport::{Outcome, Transports},
     },
-    sending_domains::{CheckResult, DnsChecks, SendingDomain, Signing},
+    sending_domains::{CheckResult, SendingDomain, Signing},
     suppressions::blocking_suppression,
     users::normalize_email,
     worker::{Claimed, complete, defer, fail},
@@ -92,10 +102,14 @@ struct Payload {
 
 /// Sends one claimed `confirmation_email`, and records what became of it on the row.
 ///
+/// `paid_for` is the relay the tick has already debited a token on for this message, so this
+/// message may go through it without spending again. `None` means nothing was paid for and every
+/// relay tried takes a token first.
+///
 /// Returns the outcome as well, for the tick's own accounting. It never panics: every refusal is
 /// an [`Outcome`], so one unreadable row cannot take the rest of the batch with it.
-pub async fn handle(ctx: &Ctx, job: &Claimed) -> Outcome {
-    let outcome = attempt(ctx, job).await;
+pub async fn handle(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
+    let outcome = attempt(ctx, job, paid_for).await;
     let recorded = match &outcome {
         Outcome::Sent { .. } => complete(&ctx.db, job.id).await,
         Outcome::Transient(reason) => defer(&ctx.db, job, reason).await,
@@ -122,7 +136,7 @@ pub async fn handle(ctx: &Ctx, job: &Claimed) -> Outcome {
 /// **A database error is [`Outcome::Transient`], never [`Outcome::Failed`].** `Failed` destroys a
 /// message; a connection that dropped while a lookup was in flight says nothing about whether the
 /// message should ever be sent.
-async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
+async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
     let payload: Payload = match serde_json::from_value(job.payload.clone()) {
         Ok(payload) => payload,
         Err(e) => return Outcome::Failed(format!("the payload is not {{email, token}}: {e}")),
@@ -184,7 +198,7 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
         Err(e) => return db_error("the sending domain could not be read", &e),
     };
 
-    let unverified = not_passing(&domain.checks);
+    let unverified = not_passing(&domain);
     if !unverified.is_empty() && domain.send_unverified_acknowledged_at.is_none() {
         return Outcome::Failed(format!(
             "{} has not passed its {} DNS check{}, and no admin has acknowledged sending from it \
@@ -242,7 +256,7 @@ async fn attempt(ctx: &Ctx, job: &Claimed) -> Outcome {
         _ => return Outcome::Failed("the envelope's addresses could not be parsed".to_owned()),
     };
 
-    submit(ctx, job.workspace_id, &relays, &envelope, &bytes).await
+    submit(ctx, job.workspace_id, &relays, paid_for, &envelope, &bytes).await
 }
 
 /// A lookup that failed, recorded as something to try again later.
@@ -256,7 +270,8 @@ fn db_error(what: &str, e: &ApiError) -> Outcome {
     Outcome::Transient(what.to_owned())
 }
 
-/// Offers the message to each relay in failover order until one of them answers decisively.
+/// Offers the message to each relay in failover order until one of them answers decisively, and
+/// **takes a token for every relay but the one the tick already paid for**.
 ///
 /// **Only [`Outcome::Transient`] falls through to the next relay.** A `Failed` is the message
 /// being refused and the next relay would refuse it too; an `Unknown` may already have been
@@ -266,11 +281,50 @@ async fn submit(
     ctx: &Ctx,
     workspace_id: Uuid,
     relays: &[Relay],
+    paid_for: Option<Uuid>,
     envelope: &Envelope,
     bytes: &[u8],
 ) -> Outcome {
     let mut last = Outcome::Transient("no relay was tried".to_owned());
     for relay in relays {
+        // The tick paid for exactly one relay. Any other one this message is offered to takes a
+        // token of its own first, because a send has to be covered by a token from the relay it
+        // actually goes through -- see this module's note on failover. The pool, never a
+        // transaction (ADR 0005): `handle` holds none, and this is one statement.
+        if paid_for != Some(relay.id) {
+            match bucket::take(
+                &ctx.db,
+                workspace_id,
+                relay.id,
+                relay.rate_limit_per_minute,
+                1,
+            )
+            .await
+            {
+                Ok(true) => {}
+                // Reachable or not, it may not be driven any harder this minute. The next relay
+                // may still take it, and if none will, the row is offered again later.
+                Ok(false) => {
+                    last = Outcome::Transient(format!(
+                        "relay {} is at its rate limit for this minute",
+                        relay.name
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        relay = %relay.id,
+                        error = %e,
+                        "the relay bucket could not be debited"
+                    );
+                    last = Outcome::Transient(format!(
+                        "relay {}'s rate limit could not be read",
+                        relay.name
+                    ));
+                    continue;
+                }
+            }
+        }
         let password = match relay::password(&ctx.db, &ctx.secrets, workspace_id, relay.id).await {
             Ok(password) => password,
             Err(e) => {
@@ -364,17 +418,30 @@ async fn sending_domain(
 /// **`NotChecked` counts as not passing.** A new domain's `checks` is `{}`, which reads back as
 /// four `NotChecked`s, so treating "not failing" as "fine" would let every domain nobody has
 /// checked straight through the gate — which is every domain, on the day it is added.
-fn not_passing(checks: &DnsChecks) -> Vec<&'static str> {
-    [
+///
+/// **Which checks a domain is held to is a property of the domain, not of its `checks`**, which
+/// is why this takes the whole [`SendingDomain`]. `CheckResult::NotChecked` carries two different
+/// facts on `return_path`: "nobody has run a check yet", and "there is nothing here to check",
+/// which is what [`dns::check`](crate::sending_domains::dns::check) writes when no return-path
+/// domain is configured. Only `return_path_domain` tells them apart, so the second fact is read
+/// from the column, where it lives, at the moment the question is asked — and not transcribed
+/// into the stored JSON, where it would be a copy that can disagree with the column. A verdict
+/// the checker did record is always honoured, whatever the column says.
+fn not_passing(domain: &SendingDomain) -> Vec<&'static str> {
+    let checks = &domain.checks;
+    let mut required = vec![
         ("SPF", &checks.spf),
         ("DKIM", &checks.dkim),
         ("DMARC", &checks.dmarc),
-        ("Return-Path", &checks.return_path),
-    ]
-    .into_iter()
-    .filter(|(_, result)| **result != CheckResult::Pass)
-    .map(|(name, _)| name)
-    .collect()
+    ];
+    if domain.return_path_domain.is_some() || checks.return_path != CheckResult::NotChecked {
+        required.push(("Return-Path", &checks.return_path));
+    }
+    required
+        .into_iter()
+        .filter(|(_, result)| **result != CheckResult::Pass)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// **The one place an unsubscribe URL comes from.** The origin is this instance's `public_url`
