@@ -25,4 +25,5 @@ pub mod suppressions;
 pub mod tags;
 pub mod telemetry;
 pub mod users;
+pub mod worker;
 pub mod workspaces;
