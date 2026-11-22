@@ -234,7 +234,8 @@ function RelayDialog({
 
   const save = useMutation({
     mutationFn: async () => {
-      if (!form.current) return;
+      // Reached late (a request held while offline) after the form was closed: not a save.
+      if (!form.current) throw new Error("The form was closed before it was sent.");
       const f = new FormData(form.current);
       const str = (k: string) => String(f.get(k) ?? "").trim();
       const password = String(f.get("password") ?? "");
@@ -295,7 +296,8 @@ function RelayDialog({
         ref={form}
         onSubmit={(e) => {
           e.preventDefault();
-          save.mutate();
+          // `busy` does not disable the button, so a second press must be ignored here.
+          if (!save.isPending) save.mutate();
         }}
       >
         <Field id="relay-name" label="Name" name="name" required maxLength={100} defaultValue={relay?.name ?? ""} />

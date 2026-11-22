@@ -86,9 +86,43 @@ test("an acknowledged domain shows when, and the edit form opens with the box ti
   await expect(page.getByRole("checkbox", { name: /Allow sending from this domain/ })).toBeChecked();
 });
 
-test("a domain whose checks all pass is not flagged", async ({ page, app }) => {
-  await open(page, app, [CLEAN]);
-  await expect(row(page, "clean.example").getByText("Not allowed to send")).toHaveCount(0);
+test("a domain whose checks all pass is not flagged, acknowledged or not", async ({ page, app }) => {
+  const acked = domain({
+    id: "a0000000-0000-4000-8000-000000000004",
+    domain: "clean-acked.example",
+    send_unverified_acknowledged_at: "2026-11-21T09:30:00Z",
+  });
+  await open(page, app, [CLEAN, acked]);
+  // The rows must be there, or a count of zero below would pass against an empty page.
+  for (const name of ["clean.example", "clean-acked.example"]) {
+    const r = row(page, name);
+    await expect(r).toBeVisible();
+    await expect(r.getByText("Not allowed to send")).toHaveCount(0);
+    await expect(r.getByText("Sending unverified allowed")).toHaveCount(0);
+  }
+});
+
+test("editing the selector of an acknowledged domain unticks the box and sends only the selector", async ({ page, app }) => {
+  await open(page, app, [ACKED]);
+  const bodies: unknown[] = [];
+  await page.route(/\/api\/v1\/workspaces\/[^/]+\/sending-domains\/[^/?]+$/, (route) => {
+    bodies.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ...ACKED, dkim_selector: "nm2", send_unverified_acknowledged_at: null } });
+  });
+  await page.getByRole("button", { name: "Edit acked.example" }).click();
+  const box = page.getByRole("checkbox", { name: /Allow sending from this domain/ });
+  await expect(box).toBeChecked();
+  await page.getByLabel("DKIM selector").fill("nm2");
+  await expect(box).not.toBeChecked();
+  await expect(box).toBeDisabled();
+  await expect(page.getByText(/This change withdraws the acknowledgement/)).toBeVisible();
+  // Changing it back puts the acknowledgement back: nothing is being withdrawn any more.
+  await page.getByLabel("DKIM selector").fill("nm1");
+  await expect(box).toBeChecked();
+  await page.getByLabel("DKIM selector").fill("nm2");
+  await page.getByRole("button", { name: "Save domain" }).click();
+  await expect(page.getByRole("dialog")).toBeHidden();
+  expect(bodies).toEqual([{ dkim_selector: "nm2" }]);
 });
 
 test("ticking the box sends the acknowledgement alone, and an untouched form sends nothing", async ({ page, app }) => {

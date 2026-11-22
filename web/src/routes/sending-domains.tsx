@@ -226,12 +226,12 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                         <p className="mt-1 text-sm text-fg-muted">
                           {d.checked_at ? `Checked ${when.format(new Date(d.checked_at))}` : "Never checked"}
                         </p>
-                        {d.send_unverified_acknowledged_at ? (
+                        {allPass(d) ? null : d.send_unverified_acknowledged_at ? (
                           <p className="mt-2 text-sm">
                             <Badge variant="warning" glyph="dot">Sending unverified allowed</Badge>{" "}
                             since {when.format(new Date(d.send_unverified_acknowledged_at))}
                           </p>
-                        ) : allPass(d) ? null : (
+                        ) : (
                           <p className="mt-2 text-sm">
                             <Badge variant="danger" glyph="slash">Not allowed to send</Badge> Not every
                             check passes and no admin has accepted that. An admin can allow it by editing the domain.
@@ -320,38 +320,54 @@ function DomainDialog({
   const domain = editing !== null && editing !== "new" ? editing : null;
   const [signing, setSigning] = useState<Signing>("relay");
   const [keyMode, setKeyMode] = useState<KeyMode>("keep");
+  const [ack, setAck] = useState(false);
+  const [, rerender] = useState(0);
   // A key that is not stored cannot be kept.
   const mode: KeyMode = domain?.has_dkim_key ? keyMode : "replace";
 
+  /**
+   * What the form changes on `domain`, and only that: the API resets the DNS verdict and the
+   * acknowledgement for any of the four settings it is sent, even with the value it already has.
+   * A key chosen for replacement but not yet typed changes nothing.
+   */
+  const diff = (f: FormData, d: Domain): UpdateDomain => {
+    const str = (k: string) => String(f.get(k) ?? "").trim();
+    const key = String(f.get("dkim_private_key") ?? "");
+    const body: UpdateDomain = {};
+    if (str("from_name") !== (d.from_name ?? "")) body.from_name = str("from_name") || null;
+    if (signing !== d.signing) body.signing = signing;
+    if (str("dkim_selector") !== d.dkim_selector) body.dkim_selector = str("dkim_selector");
+    if (str("return_path_domain") !== (d.return_path_domain ?? "")) {
+      body.return_path_domain = str("return_path_domain") || null;
+    }
+    if (signing === "app") {
+      if (mode === "clear") body.dkim_private_key = null;
+      if (mode === "replace" && key.trim() !== "") body.dkim_private_key = key;
+    }
+    return body;
+  };
+  const resetsAck = (b: UpdateDomain) =>
+    "signing" in b || "dkim_selector" in b || "return_path_domain" in b || "dkim_private_key" in b;
+  // Read at render, and `rerender` on every edit, so the box tells the truth about the save.
+  const withdraws = domain && form.current ? resetsAck(diff(new FormData(form.current), domain)) : false;
+  const was = domain?.send_unverified_acknowledged_at != null;
+
   const save = useMutation({
     mutationFn: async () => {
-      if (!form.current) return;
+      // Reached late (a request held while offline) after the form was closed: not a save.
+      if (!form.current) throw new Error("The form was closed before it was sent.");
       const f = new FormData(form.current);
       const str = (k: string) => String(f.get(k) ?? "").trim();
       const key = String(f.get("dkim_private_key") ?? "");
       if (domain) {
-        // Only what changed: the API resets the DNS verdict for any of these it is sent, even
-        // with the value it already has.
-        const body: UpdateDomain = {};
-        if (str("from_name") !== (domain.from_name ?? "")) body.from_name = str("from_name") || null;
-        if (signing !== domain.signing) body.signing = signing;
-        if (str("dkim_selector") !== domain.dkim_selector) body.dkim_selector = str("dkim_selector");
-        if (str("return_path_domain") !== (domain.return_path_domain ?? "")) {
-          body.return_path_domain = str("return_path_domain") || null;
+        if (signing === "app" && mode === "replace" && key.trim() === "") {
+          throw new Error("Paste the private key, or choose to keep the stored one.");
         }
-        if (signing === "app") {
-          if (mode === "clear") body.dkim_private_key = null;
-          if (mode === "replace") {
-            if (key.trim() === "") throw new Error("Paste the private key, or choose to keep the stored one.");
-            body.dkim_private_key = key;
-          }
-        }
-        // The API withdraws the acknowledgement whenever one of the settings above is sent, and
-        // keeps it only if it is sent in the same request. An old tick is not carried across
-        // such a change: it would acknowledge a configuration nobody looked at.
-        const was = domain.send_unverified_acknowledged_at != null;
-        const wants = f.get("ack") === "on";
-        if (wants !== was) body.send_unverified_acknowledged = wants;
+        const body = diff(f, domain);
+        // A change to how the domain signs resets the checks, so there is nothing an
+        // acknowledgement could have reviewed: it is never sent with one, and the API withdraws
+        // the old one. Otherwise it is sent only when the box changed.
+        if (!resetsAck(body) && ack !== was) body.send_unverified_acknowledged = ack;
         if (Object.keys(body).length === 0) return;
         const { data, error } = await api.PATCH(
           "/api/v1/workspaces/{workspace_id}/sending-domains/{id}",
@@ -375,7 +391,7 @@ function DomainDialog({
     },
     onSuccess: async () => {
       setKeyMode("keep");
-      onClose();
+        onClose();
       await qc.invalidateQueries({ queryKey: ["sending-domains", ws] });
     },
   });
@@ -390,6 +406,7 @@ function DomainDialog({
   if (editing !== seen) {
     setSeen(editing);
     setSigning(domain?.signing ?? "relay");
+    setAck(domain?.send_unverified_acknowledged_at != null);
   }
 
   return (
@@ -400,9 +417,11 @@ function DomainDialog({
     >
       <form
         ref={form}
+        onChange={() => rerender((n) => n + 1)}
         onSubmit={(e) => {
           e.preventDefault();
-          save.mutate();
+          // `busy` does not disable the button, so a second press must be ignored here.
+          if (!save.isPending) save.mutate();
         }}
       >
         {domain ? null : (
@@ -504,7 +523,12 @@ function DomainDialog({
         {domain ? (
           <div className="mt-6">
             <label className="flex items-start gap-2">
-              <Checkbox name="ack" defaultChecked={domain.send_unverified_acknowledged_at != null} />
+              <Checkbox
+                name="ack"
+                checked={withdraws ? false : ack}
+                disabled={withdraws}
+                onChange={(e) => setAck(e.target.checked)}
+              />
               <span>
                 <span className="font-medium">
                   Allow sending from this domain even if its DNS checks are not all passing
@@ -517,6 +541,13 @@ function DomainDialog({
                   would be an acknowledgement of something else: tick it again after the change.
                   Running a check never withdraws it.
                 </span>
+                {withdraws ? (
+                  <span role="status" className="mt-1 block text-sm font-medium">
+                    {was
+                      ? "This change withdraws the acknowledgement. Save it, run a check, then tick this again."
+                      : "This change resets the DNS checks. Save it first, then tick this."}
+                  </span>
+                ) : null}
               </span>
             </label>
           </div>
