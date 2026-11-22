@@ -812,6 +812,19 @@ is governed by its own outcome.
 - [ ] **Step 3: Implement.** `connect_worker` takes `worker_pool_size`; `db::connect` keeps its 20.
   Both honour the same shutdown signal `app::serve` already installs.
 - [ ] **Step 4: Document** the three modes in `README.md` and the new variables in `.env.example`.
+
+  **And document the trap Task 10 found, because the default configuration hits it.** `mail::build`
+  refuses a non-`https` unsubscribe URL, and `Config::public_url` defaults to
+  `http://localhost:8080`. So `nm all` on defaults **fails every confirmation email** — correctly,
+  since an `http` unsubscribe link in a real inbox is a defect, but the operator sees a worker that
+  refuses everything with no obvious cause.
+
+- [ ] **Step 4b: Make that failure arrive at boot rather than per message.** The worker modes check
+  `public_url`'s scheme at startup: on `http` to a non-local host, refuse to start, naming the
+  variable. On `http` to localhost, warn once that confirmations will fail and why. `app::serve`
+  already has the precedent and the reasoning for exactly this shape — the `trust_proxy_headers`
+  warning, which fires only on an instance someone can reach, with a long comment on why a warning
+  nobody can act on is worse than none. Follow it. A test per branch: refuse, warn, and silent.
 - [ ] **Step 5: Run the tests and the full gate.** Commit.
 
 ---
