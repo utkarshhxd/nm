@@ -255,11 +255,19 @@ impl World {
 
     async fn rows(&self) -> Vec<JobRow> {
         sqlx::query_as::<_, JobRow>(
-            "select failed_at, completed_at, last_error, run_after from jobs order by id",
+            "select failed_at, completed_at, last_error, run_after, attempts
+               from jobs order by id",
         )
         .fetch_all(&self.pool)
         .await
         .expect("the job rows")
+    }
+
+    /// The one row, where a test queued one.
+    async fn only_row(&self) -> JobRow {
+        let mut rows = self.rows().await;
+        assert_eq!(rows.len(), 1, "exactly one job was queued");
+        rows.remove(0)
     }
 
     async fn completed(&self) -> usize {
@@ -286,6 +294,7 @@ struct JobRow {
     completed_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
     run_after: DateTime<Utc>,
+    attempts: i32,
 }
 
 /// One tick takes `BATCH` rows and no more, and the next takes what is left. Deterministic: the
@@ -321,10 +330,10 @@ async fn a_tick_sends_a_batch_and_the_next_takes_the_rest(pool: PgPool) {
 /// messages sent twice.
 ///
 /// A zero budget is the same rule at the other end of the range, and it needs no clock: every
-/// claimed row is one the tick did not start. They must come back **deferred**, because a job
-/// that was never attempted is always safe to retry.
+/// claimed row is one the tick did not start. They must come back **unattempted** — retryable,
+/// and with the attempt the claim counted handed back, because nothing was submitted.
 #[sqlx::test]
-async fn a_tick_that_is_out_of_budget_starts_nothing_and_defers_what_it_claimed(pool: PgPool) {
+async fn a_tick_that_is_out_of_budget_starts_nothing_and_hands_back_what_it_claimed(pool: PgPool) {
     let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
     w.enqueue(2).await;
 
@@ -350,10 +359,9 @@ async fn a_tick_that_is_out_of_budget_starts_nothing_and_defers_what_it_claimed(
             row.failed_at.is_none(),
             "a job that was never attempted must stay retryable, not fail"
         );
-        assert!(
-            row.run_after > Utc::now(),
-            "the row was not deferred: run_after is {}",
-            row.run_after
+        assert_eq!(
+            row.attempts, 0,
+            "a job the tick chose not to start must spend no attempt"
         );
         let reason = row.last_error.expect("a reason an operator can read");
         assert!(
@@ -410,15 +418,81 @@ async fn an_exhausted_bucket_sends_nothing_and_leaves_the_rows_claimable(pool: P
         assert!(row.completed_at.is_none());
         assert!(
             row.failed_at.is_none(),
-            "a throttle destroyed a message: it must be a deferral"
+            "a throttle destroyed a message: it must leave the row claimable"
         );
-        assert!(row.run_after > Utc::now(), "the row was not deferred");
+        assert_eq!(
+            row.attempts, 0,
+            "a throttled claim spent an attempt, so five of them would destroy the message"
+        );
     }
     assert_eq!(
         w.balance(w.relay).await,
         Some(0),
         "a refusal spends nothing"
     );
+    // And claimable is not a figure of speech: the rows come straight back.
+    assert_eq!(
+        worker::claim(&w.pool, "confirmation_email", BATCH, 120)
+            .await
+            .expect("re-claim")
+            .len(),
+        2,
+        "the throttled rows were not offered again"
+    );
+}
+
+/// **`attempts` answers "how many times have we tried to send this", and a job the tick chose not
+/// to start was not tried.**
+///
+/// The claim increments it because claiming is where the lease is taken, and for every other path
+/// that is right: a worker that dies mid-send must burn an attempt, because nothing can know
+/// whether the message went. But a job this tick deliberately did not start, and knows it did not
+/// start, is the one case where that is certain — and counting it turns a scheduling decision
+/// into mail loss, since the fifth such claim fails the row for good.
+///
+/// The two halves run against the same row, so the contrast is exact rather than two fixtures
+/// being compared. Nothing here reads a clock: the second half proves the first half left the row
+/// claimable by claiming it, and a release that left `run_after` a backoff into the future would
+/// find nothing to send.
+#[sqlx::test]
+async fn an_unstarted_job_keeps_its_attempt_and_a_tried_one_spends_it(pool: PgPool) {
+    // 451: the relay asking for it later. A real attempt, with a transient outcome.
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("451 4.3.0 try later"))).await;
+    w.enqueue(1).await;
+
+    // Claimed, and then never started: the tick had no budget left when it reached this job.
+    w.worker(4)
+        .with_budget(Duration::ZERO)
+        .tick()
+        .await
+        .expect("the tick that had no budget");
+
+    let row = w.only_row().await;
+    assert_eq!(
+        row.attempts, 0,
+        "a job that was never submitted spent one of its attempts"
+    );
+    assert_eq!(w.sink.connections(), 0, "nothing was submitted");
+    assert!(row.failed_at.is_none() && row.completed_at.is_none());
+
+    // The same row, tried for real this time.
+    w.worker(4).tick().await.expect("the tick that sends");
+
+    let row = w.only_row().await;
+    assert_eq!(
+        row.attempts, 1,
+        "a job that reached the relay must spend its attempt"
+    );
+    assert_eq!(
+        w.sink.connections(),
+        1,
+        "the relay was dialled exactly once"
+    );
+    assert!(
+        row.run_after > Utc::now(),
+        "a transient outcome is deferred with backoff, which is at least fifteen seconds"
+    );
+    assert!(row.failed_at.is_none() && row.completed_at.is_none());
 }
 
 /// **A relay slower than one batch a minute must still send, and asking for the whole batch is
@@ -455,7 +529,10 @@ async fn a_relay_slower_than_a_batch_sends_what_it_can_rather_than_nothing(pool:
     );
     for row in rows.iter().filter(|r| r.completed_at.is_none()) {
         assert!(row.failed_at.is_none(), "a rate limit destroyed a message");
-        assert!(row.run_after > Utc::now(), "the row was not deferred");
+        assert_eq!(
+            row.attempts, 0,
+            "a job held back by the relay's limit spent an attempt it never used"
+        );
     }
     assert_eq!(w.balance(w.relay).await, Some(0), "both tokens were spent");
 }

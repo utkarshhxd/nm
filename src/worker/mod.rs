@@ -184,6 +184,40 @@ pub async fn defer(db: impl PgExecutor<'_>, j: &Claimed, reason: &str) -> sqlx::
     Ok(())
 }
 
+/// Hands a claimed job back **unattempted**: the lease is given up and the claim's own increment
+/// of `attempts` is taken back, because nothing was submitted.
+///
+/// **This is the one path that may undo that increment, and the reason it may is certainty.**
+/// `attempts` answers "how many times have we tried to send this". [`claim`] increments it
+/// because claiming is where the lease is taken, and for every other path that is right: a worker
+/// that dies mid-send must burn an attempt, since nothing can know whether the message went. The
+/// tick's budget is the one case where the code knows for certain that nothing was submitted —
+/// [`confirmation::handle`] was never called — and counting that as an attempt turns a scheduling
+/// decision of ours into mail loss, because the fifth such claim fails the row for good.
+///
+/// **So its only callers are the two places in [`Worker::tick`] that hold a job back before
+/// `handle`, and that narrowness is the safety property.** A `release` reached from a path that
+/// did submit something would give that message unbounded retries and send it again and again;
+/// `tests/worker_pool.rs` holds both ends, that an unstarted job keeps its attempt and that one
+/// which reached a relay spends it.
+///
+/// `run_after` is `now()`: the row goes back exactly as it was before the claim, and the next
+/// tick — which has a fresh budget and a refilled bucket — may take it immediately. There is no
+/// backoff because nothing failed.
+async fn release(db: impl PgExecutor<'_>, j: &Claimed, reason: &str) -> sqlx::Result<()> {
+    // `greatest` rather than a bare subtraction: `jobs_attempts_non_negative` is on the table,
+    // and a release of a row claimed by something that did not increment must not violate it.
+    sqlx::query(
+        "update jobs set attempts = greatest(0, attempts - 1), run_after = now(), last_error = $2
+          where id = $1",
+    )
+    .bind(j.id)
+    .bind(reason)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// `30 * 2^(attempts - 1)` seconds, capped at an hour, then jittered into the top half of that
 /// range: `[base / 2, base]`.
 ///
@@ -311,10 +345,13 @@ impl Worker {
                     continue;
                 }
             };
-            // What the bucket would not pay for waits for the next tick. **A throttle is not a
-            // failure**: the message is still worth sending in a minute.
+            // What the bucket would not pay for waits for the next tick, and is **released**
+            // rather than deferred: it was claimed and never submitted, so it spends no attempt.
+            // A throttle is not a failure, and five throttled claims must not destroy a message
+            // that was only ever waiting its turn — which is reachable now that `debit` asks for
+            // at most the relay's whole minute and therefore holds rows back routinely.
             let held_back = jobs.split_off(allowed);
-            self.defer_all(&held_back, RATE_LIMITED).await;
+            self.release_all(&held_back, RATE_LIMITED).await;
             self.send(jobs, started).await;
         }
         Ok(total)
@@ -342,8 +379,10 @@ impl Worker {
         }
         let n = i32::try_from(jobs.len()).unwrap_or(i32::MAX);
         match debit(&self.ctx.db, workspace_id, &relays, n).await {
-            Ok(0) => Err(RATE_LIMITED.to_owned()),
+            // Zero is not an error here: it is every job held back, which the caller releases.
             Ok(granted) => Ok(usize::try_from(granted).unwrap_or(0).min(jobs.len())),
+            // A database error, by contrast, is a failure to be recorded with backoff — and one
+            // that must eventually give up, which is what spending an attempt buys.
             Err(e) => Err(format!("the relay bucket could not be debited: {e}")),
         }
     }
@@ -375,7 +414,10 @@ impl Worker {
             let ctx = Arc::clone(&self.ctx);
             running.spawn(async move {
                 if Instant::now() >= deadline {
-                    if let Err(e) = defer(&ctx.db, &job, BUDGET_SPENT).await {
+                    // `release`, not `defer`: this job was claimed and never submitted, so it
+                    // spends no attempt. See `release`'s own note on why that path is the only
+                    // one allowed to undo the claim's increment.
+                    if let Err(e) = release(&ctx.db, &job, BUDGET_SPENT).await {
                         tracing::error!(
                             job = %job.id,
                             error = %e,
@@ -390,12 +432,23 @@ impl Worker {
         while running.join_next().await.is_some() {}
     }
 
-    /// Reschedules every one of `jobs`, with the reason on the row. A `defer` that cannot be
-    /// written is logged and nothing else: the lease expires on its own, and the row comes back.
+    /// Reschedules every one of `jobs` with backoff, spending an attempt, with the reason on the
+    /// row. For something that went wrong: a `defer` that cannot be written is logged and nothing
+    /// else, since the lease expires on its own and the row comes back.
     async fn defer_all(&self, jobs: &[Claimed], reason: &str) {
         for job in jobs {
             if let Err(e) = defer(&self.ctx.db, job, reason).await {
                 tracing::error!(job = %job.id, error = %e, "a job could not be deferred");
+            }
+        }
+    }
+
+    /// Hands every one of `jobs` back unattempted. For jobs this tick **chose** not to start,
+    /// where nothing went wrong and nothing was submitted; see [`release`].
+    async fn release_all(&self, jobs: &[Claimed], reason: &str) {
+        for job in jobs {
+            if let Err(e) = release(&self.ctx.db, job, reason).await {
+                tracing::error!(job = %job.id, error = %e, "a job could not be released");
             }
         }
     }

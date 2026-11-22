@@ -50,14 +50,21 @@ async fn main() -> anyhow::Result<()> {
         Command::All => {
             let cfg = Config::load()?;
             telemetry::init_logging(cfg.log_format);
+            // MIGRATIONS FIRST, BEFORE EITHER HALF STARTS. `serve` runs them too, and finds
+            // them already applied — but it runs them *concurrently with* the worker's first
+            // tick, which would then claim against a schema that does not exist yet and log an
+            // error on a clean first boot. An operator reasonably reads that as "this is
+            // broken". It is the only mode where the two race, because it is the only mode that
+            // starts both halves.
+            if cfg.auto_migrate {
+                let pool = db::connect(&cfg).await?;
+                db::MIGRATOR.run(&pool).await?;
+                pool.close().await;
+            }
             // One process, two pools (`db::connect` and `db::connect_worker`), and one signal
             // each: both halves stop on the same Ctrl-C or SIGTERM. `try_join` so that either
             // half failing — the worker's boot check refusing an `http` public URL, say — takes
             // the process down rather than leaving half of it serving.
-            //
-            // On a database with no schema yet, the worker's first tick can beat `serve`'s
-            // migration and log a claim it could not make. It polls again a second later and
-            // from then on it is correct; that is noise on one boot, not a state to recover from.
             let worker_cfg = cfg.clone();
             tokio::try_join!(
                 nm::app::serve(cfg),
