@@ -7,6 +7,7 @@ import { api, problemText } from "../api/client";
 import type { components } from "../api/schema";
 import { Badge } from "../components/badge";
 import { Button } from "../components/button";
+import { Checkbox } from "../components/checkbox";
 import { ConfirmDialog } from "../components/confirm-dialog";
 import { Dialog } from "../components/dialog";
 import { EmptyState } from "../components/empty-state";
@@ -36,6 +37,7 @@ const CHECKS = [
 ] as const;
 // OpenSSL 1.x writes `BEGIN RSA PRIVATE KEY` and 3.x `BEGIN PRIVATE KEY`; the API takes either.
 const OPENSSL = "openssl genrsa -out dkim-private.pem 2048";
+const allPass = (d: Domain) => CHECKS.every(([key]) => d.checks[key].status === "pass");
 const when = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const PAGE = 100;
 const th = "py-2 pe-3 text-start font-medium";
@@ -193,6 +195,27 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                             <Badge variant="warning" glyph="cross">Key not set</Badge>
                           )}
                         </div>
+                        {d.signing === "app" && d.has_dkim_key ? (
+                          d.dkim_public_txt ? (
+                            <>
+                              <p className="mt-2 text-sm">
+                                Publish this TXT record at{" "}
+                                <code className="wrap-anywhere">
+                                  {d.dkim_selector}._domainkey.{d.domain}
+                                </code>
+                                :
+                              </p>
+                              <pre className="mt-1 max-w-md rounded-sm bg-sunken p-2 text-sm break-all whitespace-pre-wrap">
+                                <code>{d.dkim_public_txt}</code>
+                              </pre>
+                            </>
+                          ) : (
+                            <p className="mt-2 text-sm text-danger-text">
+                              The stored key could not be read, so there is no record to show.
+                              Replace the key.
+                            </p>
+                          )
+                        ) : null}
                       </td>
                       <td className="py-2 pe-3">
                         <ul>
@@ -203,6 +226,17 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
                         <p className="mt-1 text-sm text-fg-muted">
                           {d.checked_at ? `Checked ${when.format(new Date(d.checked_at))}` : "Never checked"}
                         </p>
+                        {d.send_unverified_acknowledged_at ? (
+                          <p className="mt-2 text-sm">
+                            <Badge variant="warning" glyph="dot">Sending unverified allowed</Badge>{" "}
+                            since {when.format(new Date(d.send_unverified_acknowledged_at))}
+                          </p>
+                        ) : allPass(d) ? null : (
+                          <p className="mt-2 text-sm">
+                            <Badge variant="danger" glyph="slash">Not allowed to send</Badge> Not every
+                            check passes and no admin has accepted that. An admin can allow it by editing the domain.
+                          </p>
+                        )}
                       </td>
                       {canEdit ? (
                         <td className="py-2">
@@ -312,6 +346,12 @@ function DomainDialog({
             body.dkim_private_key = key;
           }
         }
+        // The API withdraws the acknowledgement whenever one of the settings above is sent, and
+        // keeps it only if it is sent in the same request. An old tick is not carried across
+        // such a change: it would acknowledge a configuration nobody looked at.
+        const was = domain.send_unverified_acknowledged_at != null;
+        const wants = f.get("ack") === "on";
+        if (wants !== was) body.send_unverified_acknowledged = wants;
         if (Object.keys(body).length === 0) return;
         const { data, error } = await api.PATCH(
           "/api/v1/workspaces/{workspace_id}/sending-domains/{id}",
@@ -460,6 +500,26 @@ function DomainDialog({
               </div>
             ) : null}
           </>
+        ) : null}
+        {domain ? (
+          <div className="mt-6">
+            <label className="flex items-start gap-2">
+              <Checkbox name="ack" defaultChecked={domain.send_unverified_acknowledged_at != null} />
+              <span>
+                <span className="font-medium">
+                  Allow sending from this domain even if its DNS checks are not all passing
+                </span>
+                <span className="mt-1 block text-sm text-fg-muted">
+                  Without SPF, DKIM and DMARC that line up, mail from this domain is likely to land
+                  in recipients&apos; spam folders, or be rejected outright. A campaign will not send
+                  from a domain with a failing check until an admin ticks this. Changing the signing
+                  mode, the selector, the return-path domain or the key withdraws it, because it
+                  would be an acknowledgement of something else: tick it again after the change.
+                  Running a check never withdraws it.
+                </span>
+              </span>
+            </label>
+          </div>
         ) : null}
         {save.error ? <Alert>{save.error.message}</Alert> : null}
         <div className="mt-6 flex flex-wrap justify-end gap-3">
