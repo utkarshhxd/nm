@@ -419,6 +419,7 @@ mod tests {
             return_path_domain: return_path.map(str::to_owned),
             checks: DnsChecks::default(),
             checked_at: None,
+            send_unverified_acknowledged_at: None,
         }
     }
 

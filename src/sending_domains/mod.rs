@@ -80,6 +80,9 @@ pub struct SendingDomain {
     pub return_path_domain: Option<String>,
     pub checks: DnsChecks,
     pub checked_at: Option<DateTime<Utc>>,
+    /// When an admin accepted sending from this domain with its checks not passing; `None` if
+    /// nobody has, or the configuration changed since. What the send-side refusal reads.
+    pub send_unverified_acknowledged_at: Option<DateTime<Utc>>,
 }
 
 /// The workspace's sending domain for `domain`, or `None` if it has none: what a campaign asks
@@ -92,7 +95,7 @@ pub async fn for_domain(
     let row = sqlx::query!(
         r#"select id, workspace_id, domain, from_name, signing as "signing: Signing",
                   dkim_selector, return_path_domain, checks as "checks: Json<DnsChecks>",
-                  checked_at
+                  checked_at, send_unverified_acknowledged_at
            from sending_domains where workspace_id = $1 and domain = $2"#,
         workspace_id,
         domain.to_ascii_lowercase(),
@@ -109,6 +112,7 @@ pub async fn for_domain(
         return_path_domain: r.return_path_domain,
         checks: r.checks.0,
         checked_at: r.checked_at,
+        send_unverified_acknowledged_at: r.send_unverified_acknowledged_at,
     }))
 }
 

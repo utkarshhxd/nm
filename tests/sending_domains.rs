@@ -833,7 +833,34 @@ async fn editing_what_was_checked_resets_the_verdict(pool: PgPool) {
     assert_eq!(r.json::<Value>()["checks"]["spf"]["status"], json!("pass"));
     assert_ne!(r.json::<Value>()["checked_at"], Value::Null);
 
-    // Each of the three things the checker reads empties it, back to "never run".
+    // An acknowledgement is of the configuration it was given for. Given now, it survives an edit
+    // that has nothing to do with DNS, and is set so that the loop below has something to clear.
+    let acknowledge = || async {
+        let r = t
+            .admin
+            .patch(&domain_path(t.id, id))
+            .json(&json!({"send_unverified_acknowledged": true}))
+            .await;
+        r.assert_status_ok();
+        assert_ne!(
+            r.json::<Value>()["send_unverified_acknowledged_at"],
+            Value::Null
+        );
+    };
+    acknowledge().await;
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"from_name": "Acme Again"}))
+        .await;
+    assert_ne!(
+        r.json::<Value>()["send_unverified_acknowledged_at"],
+        Value::Null,
+        "an edit that changes nothing the checker reads withdrew the acknowledgement"
+    );
+
+    // Each of the things the checker reads empties it, back to "never run", and withdraws the
+    // acknowledgement with it.
     for patch in [
         json!({"dkim_selector": "s2"}),
         json!({"return_path_domain": null}),
@@ -842,10 +869,16 @@ async fn editing_what_was_checked_resets_the_verdict(pool: PgPool) {
         json!({"signing": "app"}),
     ] {
         t.admin.post(&check_path(t.id, id)).await.assert_status_ok();
+        acknowledge().await;
         let r = t.admin.patch(&domain_path(t.id, id)).json(&patch).await;
         r.assert_status_ok();
         let shown = r.json::<Value>();
         assert_eq!(shown["checked_at"], Value::Null, "{patch}");
+        assert_eq!(
+            shown["send_unverified_acknowledged_at"],
+            Value::Null,
+            "{patch} left the acknowledgement of the old configuration standing"
+        );
         for check in ["spf", "dkim", "dmarc", "return_path"] {
             assert_eq!(
                 shown["checks"][check]["status"],
@@ -854,6 +887,199 @@ async fn editing_what_was_checked_resets_the_verdict(pool: PgPool) {
             );
         }
     }
+}
+
+#[sqlx::test]
+async fn an_acknowledgement_is_stamped_withdrawn_audited_and_read_by_for_domain(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = add_domain(&t, body("example.com", "relay")).await;
+    let url = domain_path(t.id, id);
+    let shown = t.admin.get(&url).await.json::<Value>();
+    assert_eq!(shown["send_unverified_acknowledged_at"], Value::Null);
+
+    let r = t
+        .admin
+        .patch(&url)
+        .json(&json!({"send_unverified_acknowledged": true}))
+        .await;
+    r.assert_status_ok();
+    let at = r.json::<Value>()["send_unverified_acknowledged_at"].clone();
+    assert!(at.is_string(), "{at}");
+    // A viewer sees it, and the sender's own lookup carries it: Task 10 reads it from there.
+    assert_eq!(
+        t.viewer.get(&url).await.json::<Value>()["send_unverified_acknowledged_at"],
+        at
+    );
+    let found = nm::sending_domains::for_domain(&pool, t.id, "example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(found.send_unverified_acknowledged_at.is_some());
+
+    // Withdrawn on request, and `null` is not a way to say that.
+    t.admin
+        .patch(&url)
+        .json(&json!({"send_unverified_acknowledged": null}))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let r = t
+        .admin
+        .patch(&url)
+        .json(&json!({"send_unverified_acknowledged": false}))
+        .await;
+    assert_eq!(
+        r.json::<Value>()["send_unverified_acknowledged_at"],
+        Value::Null
+    );
+
+    // Sent in the same request as an edit the checks depend on, it is the acknowledgement of the
+    // configuration being saved, so it stands while the checks are reset.
+    let r = t
+        .admin
+        .patch(&url)
+        .json(&json!({"dkim_selector": "s3", "send_unverified_acknowledged": true}))
+        .await;
+    r.assert_status_ok();
+    let shown = r.json::<Value>();
+    assert!(
+        shown["send_unverified_acknowledged_at"].is_string(),
+        "{shown}"
+    );
+    assert_eq!(shown["checked_at"], Value::Null);
+
+    // A viewer may not give it: it is what permits sending from a domain that is not verified.
+    t.viewer
+        .patch(&url)
+        .json(&json!({"send_unverified_acknowledged": true}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+
+    // Audited like the other configuration changes: by key name, and with the value, which is
+    // what the audit question "who accepted this, and when" needs.
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "select metadata from audit_log where action = 'sending_domain.updated' order by id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    // Three: given, withdrawn, and given with a selector change. The refused `null` and the
+    // viewer's attempt wrote nothing.
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0]["send_unverified_acknowledged"], json!(true));
+    assert_eq!(rows[0]["fields"], json!(["send_unverified_acknowledged"]));
+    assert_eq!(rows[1]["send_unverified_acknowledged"], json!(false));
+    assert_eq!(rows[2]["send_unverified_acknowledged"], json!(true));
+    assert_eq!(
+        rows[2]["fields"],
+        json!(["dkim_selector", "send_unverified_acknowledged"])
+    );
+}
+
+#[sqlx::test]
+async fn the_view_publishes_the_public_half_of_the_stored_key_and_only_that(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let record =
+        |pem: &str| nm::mail::dkim::public_key_txt(&nm::mail::dkim::key_from_pem(pem).unwrap());
+    let mut v = body("example.com", "app");
+    v["dkim_private_key"] = json!(KEY_PEM);
+    let created = t.admin.post(&domains_path(t.id)).json(&v).await;
+    created.assert_status(StatusCode::CREATED);
+    let shown = created.json::<Value>();
+    let id: Uuid = shown["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(shown["dkim_public_txt"], json!(record(KEY_PEM)));
+    assert!(record(KEY_PEM).starts_with("v=DKIM1; k=rsa; p="));
+
+    // A PKCS#1 key gives its own record: the stored DER carries no armour, and both forms have to
+    // come back out as the key they are.
+    let mut v = body("pkcs1.example.com", "app");
+    v["dkim_private_key"] = json!(KEY_PEM_PKCS1);
+    let r = t.admin.post(&domains_path(t.id)).json(&v).await;
+    r.assert_status(StatusCode::CREATED);
+    assert_eq!(
+        r.json::<Value>()["dkim_public_txt"],
+        json!(record(KEY_PEM_PKCS1))
+    );
+    assert_ne!(
+        record(KEY_PEM_PKCS1),
+        record(KEY_PEM),
+        "the fixtures are one key"
+    );
+
+    // A keyless domain has nothing to publish.
+    let keyless = add_domain(&t, body("relay.example.com", "relay")).await;
+    assert_eq!(
+        t.admin
+            .get(&domain_path(t.id, keyless))
+            .await
+            .json::<Value>()["dkim_public_txt"],
+        Value::Null
+    );
+
+    // Derived from what is stored now: a replaced key changes it, a cleared one removes it.
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"dkim_private_key": OTHER_PEM}))
+        .await;
+    assert_eq!(
+        r.json::<Value>()["dkim_public_txt"],
+        json!(record(OTHER_PEM))
+    );
+    assert_ne!(
+        record(OTHER_PEM),
+        record(KEY_PEM),
+        "the fixtures are one key"
+    );
+    let r = t
+        .admin
+        .patch(&domain_path(t.id, id))
+        .json(&json!({"signing": "relay", "dkim_private_key": null}))
+        .await;
+    assert_eq!(r.json::<Value>()["dkim_public_txt"], Value::Null);
+
+    // Every route that returns a domain carries it, a viewer included; and none returns the
+    // private key in any form while doing so.
+    let list = t.viewer.get(&domains_path(t.id)).await;
+    let data = list.json::<Value>()["data"].clone();
+    let txts: Vec<_> = data
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["domain"].as_str().unwrap().to_owned(),
+                d["dkim_public_txt"].clone(),
+            )
+        })
+        .collect();
+    assert!(
+        txts.contains(&("pkcs1.example.com".to_owned(), json!(record(KEY_PEM_PKCS1)))),
+        "{txts:?}"
+    );
+    assert!(
+        txts.contains(&("relay.example.com".to_owned(), Value::Null)),
+        "{txts:?}"
+    );
+    for form in key_forms() {
+        assert!(
+            !list.text().contains(&form),
+            "the list leaked the private key"
+        );
+    }
+
+    // Never from the client: it is not a field a request may carry.
+    let mut v = body("sneaky.example.com", "relay");
+    v["dkim_public_txt"] = json!("v=DKIM1; k=rsa; p=AAAA");
+    t.admin
+        .post(&domains_path(t.id))
+        .json(&v)
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    t.admin
+        .patch(&domain_path(t.id, keyless))
+        .json(&json!({"dkim_public_txt": "v=DKIM1; k=rsa; p=AAAA"}))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 // ---------------------------------------------------------------------------------------------

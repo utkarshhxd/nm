@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted is not null as \"has_dkim_key!\",\n                  return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  updated_at\n           from sending_domains where workspace_id = $1 and id = $2",
+  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, return_path_domain, checks as \"checks: Json<DnsChecks>\",\n                  checked_at, send_unverified_acknowledged_at\n           from sending_domains where workspace_id = $1 and domain = $2",
   "describe": {
     "columns": [
       {
@@ -71,12 +71,6 @@
       },
       {
         "ordinal": 6,
-        "name": "has_dkim_key!",
-        "type_info": "Bool",
-        "origin": "Expression"
-      },
-      {
-        "ordinal": 7,
         "name": "return_path_domain",
         "type_info": "Text",
         "origin": {
@@ -87,8 +81,8 @@
         }
       },
       {
-        "ordinal": 8,
-        "name": "checks: SqlJson<DnsChecks>",
+        "ordinal": 7,
+        "name": "checks: Json<DnsChecks>",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
@@ -98,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "checked_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -109,13 +103,13 @@
         }
       },
       {
-        "ordinal": 10,
-        "name": "updated_at",
+        "ordinal": 9,
+        "name": "send_unverified_acknowledged_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
             "table": "sending_domains",
-            "name": "updated_at"
+            "name": "send_unverified_acknowledged_at"
           }
         }
       }
@@ -123,7 +117,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -133,12 +127,11 @@
       true,
       false,
       false,
-      null,
       true,
       false,
       true,
-      false
+      true
     ]
   },
-  "hash": "162adc03ef195e38cb507c5de3da4a41e3dbe045fd852432147d1c812cc7be04"
+  "hash": "60bf4378460ad0667211330b1847c1e6d466694115def4bb8e2bae3162293054"
 }

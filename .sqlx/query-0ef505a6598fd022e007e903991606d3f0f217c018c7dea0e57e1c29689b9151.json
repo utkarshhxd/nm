@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, return_path_domain, checks as \"checks: Json<DnsChecks>\",\n                  checked_at\n           from sending_domains where workspace_id = $1 and domain = $2",
+  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted,\n                  return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  send_unverified_acknowledged_at, updated_at\n           from sending_domains where workspace_id = $1 and id = $2",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "dkim_private_key_encrypted",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "dkim_private_key_encrypted"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "return_path_domain",
         "type_info": "Text",
         "origin": {
@@ -81,8 +92,8 @@
         }
       },
       {
-        "ordinal": 7,
-        "name": "checks: Json<DnsChecks>",
+        "ordinal": 8,
+        "name": "checks: SqlJson<DnsChecks>",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "checked_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -101,12 +112,34 @@
             "name": "checked_at"
           }
         }
+      },
+      {
+        "ordinal": 10,
+        "name": "send_unverified_acknowledged_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "send_unverified_acknowledged_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "updated_at"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -117,9 +150,12 @@
       false,
       false,
       true,
+      true,
       false,
-      true
+      true,
+      true,
+      false
     ]
   },
-  "hash": "4a6a1dccf560944e6e658dbbfa3d72cd0eeafaa941554a01bd7f066f5abf2e04"
+  "hash": "0ef505a6598fd022e007e903991606d3f0f217c018c7dea0e57e1c29689b9151"
 }

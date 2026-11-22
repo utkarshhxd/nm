@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted is not null as \"has_dkim_key!\",\n                  return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  updated_at\n           from sending_domains\n           where workspace_id = $1 and ($2::uuid is null or id < $2)\n           order by id desc limit $3",
+  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted,\n                  return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  send_unverified_acknowledged_at, updated_at\n           from sending_domains\n           where workspace_id = $1 and ($2::uuid is null or id < $2)\n           order by id desc limit $3",
   "describe": {
     "columns": [
       {
@@ -71,9 +71,14 @@
       },
       {
         "ordinal": 6,
-        "name": "has_dkim_key!",
-        "type_info": "Bool",
-        "origin": "Expression"
+        "name": "dkim_private_key_encrypted",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "dkim_private_key_encrypted"
+          }
+        }
       },
       {
         "ordinal": 7,
@@ -110,6 +115,17 @@
       },
       {
         "ordinal": 10,
+        "name": "send_unverified_acknowledged_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "send_unverified_acknowledged_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -134,12 +150,13 @@
       true,
       false,
       false,
-      null,
+      true,
       true,
       false,
+      true,
       true,
       false
     ]
   },
-  "hash": "8ac00d46fd69d41731591ba171bebb49ba0eed20f0369e34ebc8b3bfd1501f97"
+  "hash": "976641f9cc61ae1257bf7f35d4313d187397ea38f7a4141a5b10dd162d3f9556"
 }

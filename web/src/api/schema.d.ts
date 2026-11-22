@@ -2601,6 +2601,13 @@ export interface components {
                 checked_at?: string | null;
                 /** @description The DNS checker's last result; every check is `not_checked` until it has run. */
                 checks: components["schemas"]["DnsChecks"];
+                /**
+                 * @description What to publish as a TXT record at `{dkim_selector}._domainkey.{domain}`: `v=DKIM1; k=rsa;
+                 *     p=...`, the public half of the stored key. Null when no key is stored (or the stored key
+                 *     cannot be read, which is logged). Derived on the server from the stored key and from nothing
+                 *     a client sends; the private key is never returned.
+                 */
+                dkim_public_txt?: string | null;
                 dkim_selector: string;
                 /** @description Lower case. Unique in the workspace, and fixed once created. */
                 domain: string;
@@ -2611,6 +2618,13 @@ export interface components {
                 /** Format: uuid */
                 id: string;
                 return_path_domain?: string | null;
+                /**
+                 * Format: date-time
+                 * @description When an admin acknowledged sending from this domain while its checks are not all passing;
+                 *     null if nobody has. Cleared whenever `checks` is reset. This product records it; the
+                 *     refusal to send without it is made where a send is confirmed.
+                 */
+                send_unverified_acknowledged_at?: string | null;
                 signing: components["schemas"]["Signing"];
                 /** Format: uuid */
                 workspace_id: string;
@@ -2814,8 +2828,8 @@ export interface components {
             snapshot_id: string;
         };
         /**
-         * @description A sending domain as the API shows it. There is no key field, on purpose: `has_dkim_key` is all
-         *     an operator may learn about it.
+         * @description A sending domain as the API shows it. There is no private-key field, on purpose: `has_dkim_key`
+         *     says one is stored, and `dkim_public_txt` is the public half, derived here from the stored key.
          */
         SendingDomainView: {
             /**
@@ -2825,6 +2839,13 @@ export interface components {
             checked_at?: string | null;
             /** @description The DNS checker's last result; every check is `not_checked` until it has run. */
             checks: components["schemas"]["DnsChecks"];
+            /**
+             * @description What to publish as a TXT record at `{dkim_selector}._domainkey.{domain}`: `v=DKIM1; k=rsa;
+             *     p=...`, the public half of the stored key. Null when no key is stored (or the stored key
+             *     cannot be read, which is logged). Derived on the server from the stored key and from nothing
+             *     a client sends; the private key is never returned.
+             */
+            dkim_public_txt?: string | null;
             dkim_selector: string;
             /** @description Lower case. Unique in the workspace, and fixed once created. */
             domain: string;
@@ -2835,6 +2856,13 @@ export interface components {
             /** Format: uuid */
             id: string;
             return_path_domain?: string | null;
+            /**
+             * Format: date-time
+             * @description When an admin acknowledged sending from this domain while its checks are not all passing;
+             *     null if nobody has. Cleared whenever `checks` is reset. This product records it; the
+             *     refusal to send without it is made where a send is confirmed.
+             */
+            send_unverified_acknowledged_at?: string | null;
             signing: components["schemas"]["Signing"];
             /** Format: uuid */
             workspace_id: string;
@@ -3024,8 +3052,8 @@ export interface components {
          *     `null`, which clears them; on any other field `null` is `422`, because there is nothing to
          *     clear it to. The domain itself cannot be changed: delete the domain and add the new one.
          *
-         *     Changing `signing`, `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`,
-         *     which no longer describe what is configured.
+         *     Changing `signing`, `dkim_selector`, `return_path_domain` or `dkim_private_key` resets `checks`
+         *     and the acknowledgement, which no longer describe what is configured.
          */
         UpdateSendingDomain: {
             /** @description Absent keeps the stored key; `null` removes it; a PEM string replaces it. */
@@ -3033,6 +3061,13 @@ export interface components {
             dkim_selector?: string;
             from_name?: string | null;
             return_path_domain?: string | null;
+            /**
+             * @description `true` records that an admin accepts sending from this domain while its checks are not all
+             *     passing, and stamps the time; `false` withdraws it. Editing `signing`, `dkim_selector`,
+             *     `return_path_domain` or `dkim_private_key` withdraws it too, unless this is sent in the same
+             *     request, in which case it is the acknowledgement of the configuration being saved.
+             */
+            send_unverified_acknowledged?: boolean;
             signing?: components["schemas"]["Signing"];
         };
         UpdateTag: {
