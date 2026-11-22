@@ -710,7 +710,16 @@ The sequence, in order:
 5. Build with `mail::build`, sign with `mail::dkim::signed_bytes` when the domain is `app`-signed —
    otherwise take `lettre::Message::formatted()` — and submit with `Transports::send`.
 
-   **The "unsubscribe link is ours" requirement is yours to keep, not `build`'s.** Task 5's review
+   **The unverified-domain gate is a send-side check, and this is the send side.** Task 12 built the
+settings screens and found there was nothing to gate on: the spec requires an explicit
+acknowledgement before sending from a domain whose DNS checks are not passing, and neither the
+column nor the check existed. `0029` adds `send_unverified_acknowledged_at` to `sending_domains`.
+**This handler refuses to send from a domain whose `checks` are not all passing unless that column
+is set**, failing the job with a reason naming the failing check. A tick-box in a browser that
+gates nothing is decoration; the refusal has to live here, where the send happens. Give it a test
+for each half: acknowledged sends, unacknowledged does not.
+
+**The "unsubscribe link is ours" requirement is yours to keep, not `build`'s.** Task 5's review
    established that `build` enforces only that the URL is `https`; *whose* host it points at is
    decided entirely by the caller. So the guarantee in spec §5.5 — that a click can never land on a
    relay's suppression list instead of our `consent_log` — rests on this handler deriving the
