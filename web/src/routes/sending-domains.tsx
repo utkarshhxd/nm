@@ -44,7 +44,14 @@ const OPENSSL = "openssl genrsa -out dkim-private.pem 2048";
 // and always counted, whatever the column says. The send-side gate reads it the same way, in
 // `worker::confirmation::not_passing`.
 const applies = (d: Domain, key: (typeof CHECKS)[number][0]) =>
-  key !== "return_path" || !!d.return_path_domain || d.checks.return_path.status !== "not_checked";
+  // `!= null`, not truthiness: the Rust gate asks `return_path_domain.is_some()`, and `""` is
+  // `Some("")` there but falsy here. Nothing can store `""` today — `dns_name(…, 2)` rejects it on
+  // both write paths — so this is a latent divergence rather than a live one. It is defended
+  // because a mirror that drifts from the gate is exactly the shape of the bug this line exists to
+  // fix: the screen would call a domain fine while the worker destroyed its mail, or the reverse.
+  key !== "return_path" ||
+  d.return_path_domain != null ||
+  d.checks.return_path.status !== "not_checked";
 const allPass = (d: Domain) =>
   CHECKS.every(([key]) => !applies(d, key) || d.checks[key].status === "pass");
 const when = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
