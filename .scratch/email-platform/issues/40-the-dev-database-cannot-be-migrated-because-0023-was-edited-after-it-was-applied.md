@@ -59,3 +59,30 @@ decision should be taken once, deliberately, rather than per-developer.
 - `0026_jobs_references_and_consent_guards.sql` — the table comment that records the rule this
   broke, written after it was broken.
 - M2a's `0028` was applied by hand for the same reason.
+
+## A second instance, same shape, found during M2a
+
+`nm_enum` — the scratch database created to run catalog queries against a schema migrated through
+`0028` — now refuses `nm migrate` too:
+
+```
+migration 28 was previously applied but has been modified
+```
+
+The cause is **not** an edit to the migration's content. `0028` was written with CRLF line endings
+while `.gitattributes` specifies `* text=auto eol=lf`, so the working-tree file disagreed with the
+blob git stored. Normalising it to LF changed the bytes `sqlx::migrate!` hashes at compile time,
+and therefore its checksum, without changing a single character of SQL.
+
+**That is worth knowing on its own**: a migration's checksum covers its bytes, so a line-ending
+normalisation, a trailing-whitespace strip, or an editor rewriting the file invisibly is enough to
+lock out every database that already has it. On Windows this is easy to do by accident — a tool
+that writes CRLF into a repo configured for LF produces exactly this, and `git diff` shows nothing
+because the diff is normalised.
+
+The workaround used during M2a was to apply the one `alter table` by hand so the `sqlx` macros
+could compile. `sqlx::test` databases are built from nothing each run and are unaffected, which is
+why the suite stayed green throughout — the same blind spot this issue already describes.
+
+This strengthens the case for option 2 above: updating the stored checksum is the honest fix for a
+change that did not alter the SQL, and both instances on this branch are exactly that.

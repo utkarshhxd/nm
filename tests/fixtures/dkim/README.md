@@ -11,7 +11,7 @@ signs and verifies with them, and `tests/sending_domains.rs` saves them through 
 | File | What it is | What it is for |
 | --- | --- | --- |
 | `signing-2048-pkcs8.pem` | 2048-bit RSA, `BEGIN PRIVATE KEY` | the key most tests sign with |
-| `signing-2048-pkcs1.pem` | 2048-bit RSA, `BEGIN RSA PRIVATE KEY` | the other armour, which the stored DER no longer records |
+| `signing-2048-pkcs1.pem` | 2048-bit RSA, `BEGIN RSA PRIVATE KEY` | **a different key**, in the other armour. The armour is the point: a stored key is DER with it stripped, so nothing records which form it arrived in and `key_from_pem` must try both. Different rather than the same key on purpose — `a_key_loads_from_either_armour_and_from_the_der_alone` asserts the two public records differ, which is what stops its main assertion being trivially true |
 | `other-2048-pkcs8.pem` | a second 2048-bit RSA key | the key published at a selector that does not match |
 | `too-small-1024-pkcs1.pem` | 1024-bit RSA | refused: under DKIM's and `ring`'s floor |
 | `not-rsa-ec.pem` | P-256 EC | refused: not RSA |
