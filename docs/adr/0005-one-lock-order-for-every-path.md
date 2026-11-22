@@ -131,22 +131,27 @@ holds its row across its whole cascade).
 | `contacts::selection::tag` | the `tags` row (`for key share`), `contact_tags` |
 | `suppressions::routes::create_suppression` / `lift_suppression` | S, C (through `record_workspace_optout`) |
 
-**The rows below are M2a's writers, and most of them do not exist in code yet.** `src/relay/`'s
-CRUD handlers have landed (task 3) and their rows have been checked against the real code; `take`,
-`sending_domains` and `worker` have not — `grep -rn 'mod sending_domains\|mod worker' src/` returns
-nothing. An unchecked row is listed because the ruling in the next section is about it, and **a
-reader must not take a row's presence in this table for evidence that anybody read the code**. Plan
-tasks 4, 8, 9 and 10 own what is left; whoever lands each one re-reads its row rather than assuming
-it, and moves it across the line below.
+**Every row below has been read against the code it names.** `relay::bucket`, `sending_domains`
+and `worker` all shipped on this branch, so the caveat this section carried through M2a — that
+most of these paths did not exist yet — is gone, and with it the licence to treat a row as a
+guess.
 
-| path (M2a; `relay::routes::*` checked, the rest not yet written) | order it takes |
+**What replaces it is a standing obligation, because a snapshot goes stale and this section has
+done so twice.** The table is meant to list *every* path that writes one of the enumerated tables,
+so: **a change that adds a writer adds its row, and a change to what a writer locks changes its
+row — in that same change, not afterwards.** A row with no writer and a writer with no row are
+both defects in this document, and the second is the one that produces a deadlock. If a row and
+the code disagree, the code is what runs: fix the row, and say in the commit which one you read.
+
+| path (M2a) | order it takes |
 |---|---|
 | `relay::routes::create_relay` / `update_relay` | the `relays` row alone. A rename writes `name`, which `relays_workspace_name_key` makes a key column, so it takes `for update` and **not** `for no key update` |
 | `relay::routes::delete_relay` | the `relays` row, then `relay_buckets` (cascade) |
 | `relay::bucket::take` | `relay_buckets`, then `relays` (`for key share`) — **on its insert arm only**. The update arm writes `tokens` and `refilled_at`, so no referential trigger fires and it takes nothing on `relays` |
 | `sending_domains::routes::*` and the DNS checker's write-back | the `sending_domains` row alone; nothing references it |
 | `worker::claim` / `complete` / `fail` / `defer` | `jobs` rows alone, `for update skip locked`. `jobs` is a child of `lists` and `contacts` and is a parent of nothing |
-| `worker::confirmation::handle` | none of these. It reads `suppressions`, `sending_domains` and `relays`, and every write it makes goes through the four rows above |
+| `worker::release` | the `jobs` row alone, by primary key; the update's own row lock and no clause beyond it. It undoes the claim's `attempts` increment and pushes `run_after` for a job the tick chose not to start; it names no parent, and `jobs` is a parent of nothing |
+| `worker::confirmation::handle` | the `jobs` rows above for what it records, and **`relay::bucket::take`'s order** on the failover arm, where it takes a token for a relay the tick did not pay for. It reads `suppressions`, `sending_domains` and `relays` and writes none of them |
 
 ## The rule for new code
 
