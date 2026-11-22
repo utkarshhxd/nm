@@ -218,6 +218,25 @@ async fn a_claimed_row_is_not_re_offered_before_its_lease_expires(pool: PgPool) 
     assert_eq!(third[0].attempts, 2, "and the second claim counts too");
 }
 
+/// The lease the caller asks for is the lease the row gets. Nothing else here pins the *duration*
+/// — every other test would pass on a claim that ignored `lease_secs` and hard-coded one — and the
+/// duration is `JOB_LEASE`, the one value a second constant would be free to drift from.
+///
+/// Ten minutes, asserted as a bound: `run_after` is `now() + 600` at the claim and only shrinks
+/// afterwards, so the upper end is exact and the lower end carries a minute of slack. The 120 s a
+/// hard-coded `JOB_LEASE` would give is nowhere near it.
+#[sqlx::test]
+async fn the_row_is_held_for_the_lease_the_caller_asked_for(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let id = enqueue(&pool, f, KIND, 0, 5).await;
+    assert_eq!(claim(&pool, KIND, 16, 600).await.expect("claim").len(), 1);
+    let left = seconds_until_runnable(&pool, id).await;
+    assert!(
+        (540.0..=600.0).contains(&left),
+        "a ten-minute lease must hold the row for about ten minutes, found {left}"
+    );
+}
+
 /// `completed_at is null` — the third load-bearing clause, and the defect `0025` describes: a
 /// worker written from `0023` alone re-claims every completed row the moment its lease expires,
 /// for ever.

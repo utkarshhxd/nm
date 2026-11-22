@@ -41,8 +41,12 @@ pub use crate::relay::transport::JOB_LEASE;
 /// own rate limits, small enough that a crash re-does little (spec §5.2).
 pub const BATCH: i64 = 16;
 
-/// How often a worker asks for work when the last tick found none. The tick jitters it, so a
-/// fleet restarted together does not poll in lockstep for ever.
+/// How often a worker asks for work when the last tick found none.
+///
+/// **Task 11's tick must jitter this.** That is an obligation, not a description: nothing in this
+/// module applies it. A fleet restarted together — which is what a deploy is — otherwise polls in
+/// lockstep for ever, every worker hitting the same claim at the same instant and all but one of
+/// them doing a round trip for nothing.
 ///
 /// shortcut: polling puts a one-second floor on latency; upgrade to `LISTEN`/`NOTIFY` when a
 /// tick's claim regularly comes back full (spec §5.2).
@@ -222,5 +226,26 @@ mod tests {
         // Zero cannot be claimed (`max_attempts > 0` is on the table and a claim increments before
         // it returns), but the shift must not panic if one ever reaches here.
         assert!((15..=30).contains(&backoff(0)));
+    }
+
+    /// **The jitter has to actually vary, and no bound above says so.** Every range asserted there
+    /// has `base` as its exact upper end and `base / 2` at or below its lower end, so a `backoff`
+    /// that returned a bare `base` — or a `jitter` that returned zero — passes all of them.
+    ///
+    /// What that would cost is not coverage, it is a thundering herd: a relay that refuses one
+    /// message usually refuses the whole batch, and an exact backoff sends every job that failed
+    /// in one tick back at that relay at the same instant. It is the pile-up the token bucket
+    /// exists to prevent, arriving from the other side.
+    ///
+    /// This is a bound on **variance**, not on timing, so it adds no dependence on elapsed time.
+    /// Fifty draws from the 241 values of attempt 5's range: a fixed implementation yields one
+    /// distinct value, and the chance of fifty genuine draws colliding is `241^-49`.
+    #[test]
+    fn backoff_does_not_return_the_same_delay_every_time() {
+        let seen: std::collections::HashSet<i64> = (0..50).map(|_| backoff(5)).collect();
+        assert!(
+            seen.len() > 1,
+            "fifty backoffs over a 240-second range came back identical: {seen:?}"
+        );
     }
 }
