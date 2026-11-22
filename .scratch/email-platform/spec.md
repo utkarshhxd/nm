@@ -522,7 +522,22 @@ A listmonk importer (from its database or API) is also in v1, for adoption by ot
 
 1. ~~License~~: resolved as **AGPL-3.0** (see §5 and the Licensing section in §7).
 2. **UI look and feel:** settle it with mockups before the M0 design system is built.
-3. **OCI bounce and complaint reporting:** research before M3.
-4. **Whether each relay's DKIM signature covers the List-Unsubscribe headers:** verify for OCI first, before M2 is signed off.
+3. ~~**OCI bounce and complaint reporting:** research before M3.~~ **Researched 2026-11-21** —
+   `research/m2-oci-email-delivery.md`. No webhooks and no Events: bounces and complaints arrive
+   only as OCI Logging records (`action=bounce` / `complaint`), the `oci_emaildelivery` metrics,
+   and the suppression-list API. Logging is **opt-in per email domain and not retroactive**. No ARF
+   and no FBL enrolment — Oracle owns those relationships. A send to a suppressed address is
+   **accepted, not rejected** (`254 4.7.1`), so a silent non-delivery looks like success unless the
+   log is read.
+4. **Whether each relay's DKIM signature covers the List-Unsubscribe headers:** verify for OCI
+   first, before M2 is signed off. **Still open, and documentation cannot settle it** — Oracle
+   publishes no `h=` policy and offers no way to configure the signed-header list. Needs a seed
+   send to Gmail and Yahoo and a read of the raw `DKIM-Signature`. M2a therefore builds in-app DKIM
+   signing as a first-class switchable path rather than an optional extra.
+7. **The reference relay is two orders of magnitude below the §9 targets.** OCI's documented paid
+   limits are **50,000/day and 18,000/minute (300/s)** against §9's 5M/day and 1,500/s. Increases
+   are a service request requiring SPF, DKIM and an approved sender. §9's throughput target is a
+   property of the pipeline, provable against a sink relay; it is not reachable through OCI as
+   configured.
 5. **Product name:** the codename NM stays until a name is chosen.
 6. **Team and who builds it:** needed for the implementation plan, not for this design.

@@ -146,6 +146,18 @@ const instanceSuppressionsRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/suppressions"), "InstanceSuppressions"),
 });
 
+const relaysRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "relays",
+  component: lazyRouteComponent(() => import("./routes/relays")),
+});
+
+const sendingDomainsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "sending-domains",
+  component: lazyRouteComponent(() => import("./routes/sending-domains")),
+});
+
 const membersRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "members",
@@ -195,6 +207,8 @@ export const router = createRouter({
       tagsRoute,
       customFieldsRoute,
       suppressionsRoute,
+      relaysRoute,
+      sendingDomainsRoute,
       membersRoute,
       apiKeysRoute,
       auditLogRoute,

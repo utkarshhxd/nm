@@ -34,10 +34,42 @@ async fn main() -> anyhow::Result<()> {
             let pool = db::connect(&cfg).await?;
             admin(cmd, &pool).await?;
         }
+        // THE THREE MODES, and the split is the point of spec M2a section 5.1: `serve` does not
+        // send. An operator who scales the API to four replicas must not thereby quadruple their
+        // send rate, and an API host's connection pool must not be drawn down by sending.
         Command::Serve => {
             let cfg = Config::load()?;
             telemetry::init_logging(cfg.log_format);
             nm::app::serve(cfg).await?;
+        }
+        Command::Worker => {
+            let cfg = Config::load()?;
+            telemetry::init_logging(cfg.log_format);
+            nm::worker::run(cfg, nm::app::shutdown_signal()).await?;
+        }
+        Command::All => {
+            let cfg = Config::load()?;
+            telemetry::init_logging(cfg.log_format);
+            // MIGRATIONS FIRST, BEFORE EITHER HALF STARTS. `serve` runs them too, and finds
+            // them already applied — but it runs them *concurrently with* the worker's first
+            // tick, which would then claim against a schema that does not exist yet and log an
+            // error on a clean first boot. An operator reasonably reads that as "this is
+            // broken". It is the only mode where the two race, because it is the only mode that
+            // starts both halves.
+            if cfg.auto_migrate {
+                let pool = db::connect(&cfg).await?;
+                db::MIGRATOR.run(&pool).await?;
+                pool.close().await;
+            }
+            // One process, two pools (`db::connect` and `db::connect_worker`), and one signal
+            // each: both halves stop on the same Ctrl-C or SIGTERM. `try_join` so that either
+            // half failing — the worker's boot check refusing an `http` public URL, say — takes
+            // the process down rather than leaving half of it serving.
+            let worker_cfg = cfg.clone();
+            tokio::try_join!(
+                nm::app::serve(cfg),
+                nm::worker::run(worker_cfg, nm::app::shutdown_signal()),
+            )?;
         }
     }
     Ok(())

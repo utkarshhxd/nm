@@ -29,13 +29,48 @@ use uuid::Uuid;
 const ONE_CLICK: &str = "List-Unsubscribe=One-Click";
 
 /// **At most two of these run at once, and that is not tidiness.** Each test holds four
-/// connections at its critical moment — the wedge, the probe, and two routes blocked mid-request —
-/// and fourteen of them at once exhausts what the server will give a test binary. A route that
-/// cannot get a connection does not block, it fails, and the test then reports that the
-/// interleaving never formed. Which is the right answer, loudly: before `settle` existed those
+/// connections at its critical moment — the wedge, the probe, and two routes blocked mid-request.
+/// A route that cannot get a connection does not block, it fails, and the test then reports that
+/// the interleaving never formed. Which is the right answer, loudly: before `settle` existed those
 /// runs went green instead.
+///
+/// **Take it as the FIRST line of every test, before anything else happens.** Seven tests took it
+/// after their fixture and three never took it at all, so ten of them did their setup unthrottled
+/// against the two that held it. Where the connections they compete for actually come from is
+/// `own_pool` below, which is the other half of this.
 static GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+/// A pool on this test's own database, **outside the budget `#[sqlx::test]` draws on**. Every test
+/// here takes one and uses it in place of the pool it was handed.
+///
+/// The gate above cannot fit these tests into that budget, and this is the arithmetic that says
+/// so. `#[sqlx::test]` hands each test a pool of 5 whose permits are *stolen* from one
+/// process-wide master pool of **20**, and `DecrementSizeGuard` returns a stolen permit to the
+/// **child's** semaphore, never the master's: the master gets them back only when the child pool
+/// is dropped, at the end of the test. Creating that pool opens one connection eagerly, so on a
+/// sixteen-core box the sixteen tests libtest has in flight have spent sixteen of the twenty
+/// before any of them reaches a wedge — running or parked on the gate, it makes no difference —
+/// and the four left over do not cover two tests needing four apiece.
+///
+/// A route that cannot get a connection waits out sqlx's 30-second `acquire_timeout`, answers
+/// `500`, and so never blocks; `settle` then reports, truthfully, an interleaving that never
+/// formed. That was the whole of this file's intermittent red, and it is why raising Postgres'
+/// `max_connections` and raising `settle`'s budget both changed nothing — neither was the resource
+/// running out. (`--test-threads=2` also makes it pass, for the same reason: fewer live tests,
+/// fewer permits spent. This way the file does not depend on how it is invoked.)
+///
+/// Drawn on its own the ceiling is the server's `max_connections`, which `docker-compose.dev.yml`
+/// already sizes for this file. Six is the four a test holds at its critical moment — wedge,
+/// probe, two routes blocked mid-request — plus slack for the sign-in some of them do between the
+/// two `settle`s.
+async fn own_pool(pool: &PgPool) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(6)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a pool on this test's own database")
+}
 
 /// How many sessions in this test's database are waiting on a lock right now.
 ///
@@ -60,8 +95,19 @@ async fn blocked(probe: &mut sqlx::PgConnection) -> i64 {
 /// because fourteen concurrent `sqlx::test` databases made 400 ms too short. Waiting on the
 /// condition instead is both deterministic and loud: if the interleaving does not form, this
 /// panics saying so.
+/// **The budget is 30 seconds and it has been raised twice; raise it again rather than deleting a
+/// test.** It was 400 ms, which was too short once fourteen concurrent `sqlx::test` databases
+/// existed; then 6 s, which was enough while the machine was CPU-capped to two cores. Uncapped on
+/// sixteen, `cargo test` runs every integration binary at once and the whole box saturates, so the
+/// blocked session takes longer to appear than it ever did on a slower machine — a result that
+/// reads backwards until you see why.
+///
+/// This costs nothing when it works: the loop returns the moment the condition holds, so the
+/// budget is only ever spent on a run that was going to fail anyway. The failure it exists to
+/// prevent is the opposite trade, and far worse — a budget too small fails OPEN in effect, because
+/// the honest panic it produces is indistinguishable from flakiness and gets re-run until green.
 async fn settle(probe: &mut sqlx::PgConnection, n: i64) {
-    for _ in 0..240 {
+    for _ in 0..1200 {
         if blocked(probe).await >= n {
             return;
         }
@@ -176,6 +222,7 @@ impl Fx {
 #[sqlx::test]
 async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -224,6 +271,7 @@ async fn a_one_click_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -279,6 +327,7 @@ async fn erasing_a_contact_and_deleting_a_list_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -345,6 +394,7 @@ async fn a_re_tick_and_a_rename_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -403,6 +453,7 @@ async fn an_operator_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPoo
 #[sqlx::test]
 async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -473,6 +524,7 @@ async fn a_form_submission_and_a_list_deletion_do_not_collide(pool: PgPool) {
 #[sqlx::test]
 async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -528,6 +580,7 @@ async fn a_confirmation_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let fresh = lists[1];
@@ -580,6 +633,7 @@ async fn adding_a_member_and_a_list_deletion_do_not_collide(pool: PgPool) {
 #[sqlx::test]
 async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let fresh = lists[1];
@@ -632,6 +686,7 @@ async fn a_bulk_subscribe_and_a_list_deletion_do_not_collide(pool: PgPool) {
 #[sqlx::test]
 async fn a_bulk_unsubscribe_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -716,6 +771,7 @@ async fn wedge_the_refusal(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Po
 #[sqlx::test]
 async fn a_list_deletion_and_a_rename_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -767,6 +823,7 @@ async fn a_list_deletion_and_a_rename_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn a_list_deletion_and_a_re_tick_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -840,6 +897,7 @@ async fn wedge_the_memberships(
 #[sqlx::test]
 async fn an_operator_unsubscribe_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -878,6 +936,7 @@ async fn an_operator_unsubscribe_and_a_contact_deletion_do_not_deadlock(pool: Pg
 #[sqlx::test]
 async fn a_confirmation_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
@@ -931,6 +990,7 @@ async fn a_confirmation_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
 #[sqlx::test]
 async fn a_one_click_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let _ = lists;
@@ -970,6 +1030,8 @@ async fn a_one_click_and_a_contact_deletion_do_not_deadlock(pool: PgPool) {
 /// answer when the list really has gone. No wedge and no race: the list is simply deleted first.
 #[sqlx::test]
 async fn adding_a_member_to_a_deleted_list_is_not_found(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first"]).await;
     let first = lists[0];
     fx.admin
@@ -1001,6 +1063,8 @@ async fn adding_a_member_to_a_deleted_list_is_not_found(pool: PgPool) {
 /// rather than dressed up by this test.
 #[sqlx::test]
 async fn a_bulk_subscribe_to_a_deleted_list_is_not_found(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
     let (fx, lists) = fixture(&pool, &["first", "fresh"]).await;
     let fresh = lists[1];
     fx.admin
@@ -1031,8 +1095,9 @@ async fn a_bulk_subscribe_to_a_deleted_list_is_not_found(pool: PgPool) {
 /// module's mappings and falls through to `ApiError::Internal`: a `500` on an Editor route.
 #[sqlx::test]
 async fn a_form_update_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
-    let (fx, lists) = fixture(&pool, &["first"]).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let form = Uuid::now_v7();
@@ -1105,8 +1170,9 @@ async fn a_form_update_and_a_list_deletion_do_not_deadlock(pool: PgPool) {
 /// the `404` the guard always meant.
 #[sqlx::test]
 async fn a_bulk_tag_and_a_tag_deletion_do_not_collide(pool: PgPool) {
-    let (fx, _lists) = fixture(&pool, &["first"]).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let tag = Uuid::now_v7();
     sqlx::query("insert into tags (id, workspace_id, name) values ($1, $2, 'vip')")
@@ -1166,8 +1232,9 @@ async fn a_bulk_tag_and_a_tag_deletion_do_not_collide(pool: PgPool) {
 /// guard exists to prevent, through a window two statements wide. Holding the row closes it.
 #[sqlx::test]
 async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
-    let (fx, lists) = fixture(&pool, &["first"]).await;
     let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, lists) = fixture(&pool, &["first"]).await;
     let mut probe = pool.acquire().await.expect("a probe connection");
     let first = lists[0];
     let import = Uuid::now_v7();
@@ -1216,4 +1283,445 @@ async fn starting_an_import_and_a_list_deletion_do_not_collide(pool: PgPool) {
     );
     no_server_error("the list deletion", &deleted);
     no_server_error("the import start", &started);
+}
+
+// ---- M2a: the new foreign-key parents, re-enumerated ------------------------------------------
+//
+// Migration `0028` added `relays`, `sending_domains` and `relay_buckets`, so ADR 0005's
+// enumeration was re-run against `pg_constraint` rather than re-read. It found **one** new parent,
+// `relays`, whose only child is `relay_buckets`; `sending_domains` is referenced by nothing and so
+// is not a parent at all. Both are ruled "not a class", and the five tests below are what that
+// ruling rests on — a ruling with no evidence is the thing that section of the ADR exists to stop.
+//
+// Three of the five are a relay deletion against a bucket debit, because **one arrival order is
+// not an answer**: the two orders produce different outcomes (`23503` and no error at all) by
+// different mechanisms, and a reader given only one of them draws the wrong conclusion about why.
+
+/// The shape Task 8's `bucket::take` will have: one `insert … on conflict do update` that refills
+/// by elapsed time, caps at the relay's per-minute limit and subtracts `n`.
+///
+/// One thing about it is load-bearing here and the whole ruling rests on it. The **insert** arm
+/// writes the foreign-key columns, so it takes `for key share` on the `relays` row at the end of
+/// the statement. The **update** arm writes `tokens` and `refilled_at` only — neither is part of
+/// the foreign key — so the referential trigger does not fire and it takes nothing on the parent.
+/// **This is now a copy of the shipped statement, not a reconstruction of a plan's description of
+/// it**, and the difference mattered. While `take` did not yet exist, this constant was written
+/// from the plan's wording; Task 8 then wrote the real thing and found two departures, one of them
+/// a bug this constant still had:
+///
+/// * the insert arm is a `select … where $3 >= $4` rather than `values`, so a first take larger
+///   than the limit proposes no row and returns `false`, instead of inserting a negative balance
+///   and raising `23514` against `relay_buckets_tokens_non_negative`;
+/// * the refill is wrapped in `greatest(0, …)`. `now()` is **transaction start time**, so a taker
+///   that began later but committed first leaves `refilled_at` *ahead* of this transaction's
+///   `now()`. The elapsed interval is then slightly negative, `floor` turns that into `-1`, and
+///   the update arm **removes** a token instead of adding none. Measured: the concurrency test
+///   granted 45 of 50 before the clamp.
+///
+/// Both arms' lock behaviour is unchanged — the insert arm still writes the foreign-key columns and
+/// so still takes `for key share` on `relays`, the update arm still writes only `tokens` and
+/// `refilled_at` and so still takes nothing on the parent — which is why ADR 0005's ruling survives
+/// the change. **Keep this in step with `src/relay/bucket.rs::TAKE`**: the moment the two drift,
+/// the lock-order evidence is about a statement nothing runs.
+const DEBIT: &str = "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+     select $1, $2, $3::int - $4::int, now() where $3::int >= $4::int
+     on conflict (relay_id) do update
+        set tokens = least($3::int, relay_buckets.tokens
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)))::int
+              - $4::int,
+            refilled_at = now()
+      where least($3::int, relay_buckets.tokens
+              + greatest(0, floor(extract(epoch from now() - relay_buckets.refilled_at) * $3::int / 60)))::int
+              >= $4::int
+     returning tokens";
+
+/// The lock-order evidence is about `DEBIT`; what runs is `bucket::take`. If they drift, the
+/// evidence is about a statement nothing executes, and nobody would notice until a production
+/// deadlock. This is the whole enforcement of "keep this in step".
+#[test]
+fn debit_is_the_statement_take_runs() {
+    assert_eq!(DEBIT, nm::relay::bucket::TAKE);
+}
+
+fn sqlstate(err: &sqlx::Error) -> String {
+    err.as_database_error()
+        .and_then(|e| e.code().map(|c| c.into_owned()))
+        .unwrap_or_else(|| format!("not a database error: {err}"))
+}
+
+/// A workspace and one relay. `bucket` seeds the `relay_buckets` row, which is what tells the two
+/// arms of `DEBIT` apart: absent is a relay's first tick, present is every tick after it.
+async fn relay_fixture(pool: &PgPool, bucket: bool) -> (Uuid, Uuid) {
+    let ws = Uuid::now_v7();
+    sqlx::query("insert into workspaces (id, slug, name) values ($1, 'acme', 'acme')")
+        .bind(ws)
+        .execute(pool)
+        .await
+        .expect("workspace");
+    let relay = Uuid::now_v7();
+    sqlx::query(
+        "insert into relays (id, workspace_id, name, host, port, security, rate_limit_per_minute)
+         values ($1, $2, 'primary', 'smtp.example.com', 587, 'starttls', 60)",
+    )
+    .bind(relay)
+    .bind(ws)
+    .execute(pool)
+    .await
+    .expect("relay");
+    if bucket {
+        // Ten, and the reason is a bug this seeding has already had. `DEBIT`'s update arm answers
+        // `least(60, seeded + elapsed_seconds) - 10`, because the relay's limit of 60 a minute is
+        // exactly one token a second. Seeded at 40 it answers 30 only while the test is
+        // instantaneous, drifts up by one a second, and **reaches the insert arm's 50 after twenty
+        // seconds** — at which point the assertion that tells the two arms apart silently stops
+        // telling them apart. It passed only because the machine was CPU-capped at the time.
+        //
+        // Seeded at 10 the update arm answers `elapsed` — nought to a handful — against the insert
+        // arm's unchanging 50, so the two are forty apart and stay that way for the best part of a
+        // minute. The assertions below are written as bounds rather than equalities for the same
+        // reason: the quantity genuinely is time-dependent, and a test that pretends otherwise is
+        // a test that passes on a fast machine and fails on a slow one.
+        sqlx::query(
+            "insert into relay_buckets (relay_id, workspace_id, tokens) values ($1, $2, 10)",
+        )
+        .bind(relay)
+        .bind(ws)
+        .execute(pool)
+        .await
+        .expect("bucket");
+    }
+    (ws, relay)
+}
+
+/// **The enumeration is closed, and this is what closes it.** `issues/38` records the method ADR
+/// 0005's own history argues for — a new parent, **or a new cascade**, means re-running the
+/// enumeration rather than merely obeying the order — and nothing enforced it, which is how
+/// `form_lists` got through once already.
+///
+/// It pins the whole edge, `(parent, child, on delete action)`, and not the set of parents. The
+/// set of parents alone would be enforcement of one half of the method and silence on the other:
+/// a second child on `relays`, or a `cascade` quietly becoming a `set null`, moves nothing in the
+/// set of parents and moves everything in the ruling. ADR 0005's rulings are written per child and
+/// per action, so this is the granularity they are written at.
+///
+/// It is deliberately an equality and not a superset: an edge that *disappears* also invalidates
+/// the ruling written about it. Duplicate edges collapse — `suppressions` points at `users` twice,
+/// created-by and lifted-by — because a constraint's name is not something a ruling turns on.
+#[sqlx::test]
+async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let edges: Vec<String> = sqlx::query_scalar(
+        "select distinct confrelid::regclass::text || ' -> ' || conrelid::regclass::text \
+                || ' (' || confdeltype::text || ')' \
+         from pg_constraint \
+         where contype = 'f' and connamespace = 'public'::regnamespace order by 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read pg_constraint");
+
+    assert_eq!(
+        edges,
+        [
+            "api_keys -> selection_snapshots (n)",
+            "contacts -> consent_log (c)",
+            "contacts -> contact_tags (c)",
+            "contacts -> jobs (c)",
+            "contacts -> list_memberships (c)",
+            "forms -> form_lists (c)",
+            "imports -> import_errors (c)",
+            "lists -> consent_log (n)",
+            "lists -> form_lists (c)",
+            "lists -> imports (n)",
+            "lists -> jobs (c)",
+            "lists -> list_memberships (c)",
+            "lists -> suppressions (n)",
+            "relays -> relay_buckets (c)",
+            "selection_snapshots -> selection_snapshot_members (c)",
+            "tags -> contact_tags (c)",
+            "users -> api_keys (n)",
+            "users -> auth_challenges (c)",
+            "users -> imports (n)",
+            "users -> invites (n)",
+            "users -> memberships (c)",
+            "users -> passkeys (c)",
+            "users -> recovery_codes (c)",
+            "users -> segments (n)",
+            "users -> selection_snapshots (n)",
+            "users -> sessions (c)",
+            "users -> suppressions (n)",
+            "workspaces -> api_keys (c)",
+            "workspaces -> contacts (c)",
+            "workspaces -> custom_fields (c)",
+            "workspaces -> forms (c)",
+            "workspaces -> imports (c)",
+            "workspaces -> invites (c)",
+            "workspaces -> jobs (c)",
+            "workspaces -> lists (c)",
+            "workspaces -> memberships (c)",
+            "workspaces -> relays (c)",
+            "workspaces -> segments (c)",
+            "workspaces -> selection_snapshots (c)",
+            "workspaces -> sending_domains (c)",
+            "workspaces -> suppressions (c)",
+            "workspaces -> tags (c)",
+        ],
+        "the foreign key graph has moved. ADR 0005's enumeration is over exactly these edges, so \
+         it is now out of date: re-run the query in its \"The method\" section and rule on what \
+         changed, rather than editing this list to match"
+    );
+}
+
+/// **Order A: the deletion's statement lands first, and the first debit raises `23503`.** The
+/// debit writes a `relay_buckets` row and then asks for the `relays` row through
+/// `relay_buckets_relay_fk` — child first, parent last, which is the inversion shape every class
+/// in the ADR has. The deletion is holding that parent row, so the debit queues behind it; when it
+/// commits, the referential check finds the parent gone.
+///
+/// **Say what this does and does not show, because the obvious reading of it is wrong.** It is
+/// tempting to explain the `23503` by "the row the debit holds is uncommitted and so invisible to
+/// the cascade". That is not what rules out a cycle — a cycle needs two waiting transactions, and
+/// the debit is a terminal node that asks for nothing after its one statement — and the mechanism
+/// is *not* in this
+/// test's causal chain either: `delete from relays` locks the parent and runs its cascade scan inside one
+/// statement, and that statement completed before the debit inserted anything. The cascade found
+/// nothing because nothing was there yet, not because it could not see it. The invisibility
+/// argument only ever matters for the interleaving neither test can stage — and that is exactly
+/// why it belongs in the ADR's prose and not in a comment claiming this test measured it.
+///
+/// `a_first_debit_then_a_relay_deletion_both_commit` is the other arrival order, and it produces
+/// no error at all. Neither order is the whole answer; the pair is.
+///
+/// The `settle` is what stops this passing vacuously — without it the deletion could commit before
+/// the debit ever looked, and the `23503` would be a plain sequence rather than an interleaving.
+#[sqlx::test]
+async fn a_relay_deletion_and_a_first_debit_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, false).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let mut deleting = pool.begin().await.unwrap();
+    sqlx::query("delete from relays where id = $1")
+        .bind(relay)
+        .execute(&mut *deleting)
+        .await
+        .expect("delete the relay");
+
+    let debiting = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>(DEBIT)
+                .bind(relay)
+                .bind(ws)
+                .bind(60i32)
+                .bind(10i32)
+                .fetch_optional(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    deleting.commit().await.expect("commit the deletion");
+    let err = debiting
+        .await
+        .expect("the debit")
+        .expect_err("the relay is gone, so its bucket row cannot be written");
+    assert_eq!(
+        sqlstate(&err),
+        "23503",
+        "the cascade ran before this row existed, so the debit's own check finds the parent \
+         gone: a foreign key violation, never a deadlock: {err}"
+    );
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.constraint()),
+        Some("relay_buckets_relay_fk"),
+        "the violation names the relay reference, not some other constraint: {err}"
+    );
+}
+
+/// **Order B: the debit's statement lands first, and nothing fails.** The debit holds its new
+/// bucket row *and* the `for key share` its insert arm took on the relay, so the deletion blocks
+/// on the **parent** row — not on the child, which is the distinction the whole ruling turns on.
+/// When the debit commits, the deletion takes the relay and its cascade, now looking at a
+/// committed child row, takes the bucket with it. Two transactions, both commit, no error of any
+/// kind: neither the `40P01` of a cycle nor the `23503` of Order A.
+///
+/// **This is the order the sibling test does not reach, and it is the one that shows the insert
+/// arm cannot be half of a cycle.** A cycle needs each side to hold something the other wants. The
+/// debit holds the parent lock and, having finished its only statement, wants nothing further — a
+/// terminal node in the wait-for graph. The deletion waits, and that is all it can do.
+///
+/// The deletion's wait is as long as the debit's transaction stays open, which here is however
+/// long the test holds it, so no duration is asserted. What is asserted is that it waits at all:
+/// `settle` panics if it never blocks, which is what it would do if the insert arm stopped taking
+/// the parent lock, and the final count is what fails if the cascade stops seeing the child.
+#[sqlx::test]
+async fn a_first_debit_then_a_relay_deletion_both_commit(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, false).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let mut debiting = pool.begin().await.unwrap();
+    let left: i32 = sqlx::query_scalar(DEBIT)
+        .bind(relay)
+        .bind(ws)
+        .bind(60i32)
+        .bind(10i32)
+        .fetch_one(&mut *debiting)
+        .await
+        .expect("the debit");
+    assert_eq!(
+        left, 50,
+        "the premise: the INSERT arm ran, so this transaction holds the relay `for key share`"
+    );
+
+    let deleting = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query("delete from relays where id = $1")
+                .bind(relay)
+                .execute(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    debiting.commit().await.expect("commit the debit");
+    let deleted = deleting
+        .await
+        .expect("the deletion")
+        .expect("neither 40P01 nor anything else: this order produces no error");
+    assert_eq!(deleted.rows_affected(), 1, "the relay really did go");
+
+    let buckets: i64 = sqlx::query_scalar("select count(*) from relay_buckets")
+        .fetch_one(&pool)
+        .await
+        .expect("count the buckets");
+    assert_eq!(
+        buckets, 0,
+        "the cascade re-scanned after the wait and took the now-committed bucket row"
+    );
+}
+
+/// **Every debit after the first takes no lock on its relay at all.** This is the measured fact
+/// behind the ruling, and the one the ADR would be wrong without: the update arm writes `tokens`
+/// and `refilled_at`, so Postgres fires no referential trigger and an exclusive holder of the
+/// `relays` row does not stand in its way.
+///
+/// The control is the half that keeps this honest. A wedge that silently failed to take the row
+/// would let the debit through for the wrong reason and the test would still go green, so the same
+/// `for key share` the **insert** arm takes is raced against the same wedge first and must block.
+/// Break the ruling — make the update arm write `workspace_id` or `relay_id` — and the debit
+/// blocks behind the wedge until the timeout names it.
+#[sqlx::test]
+async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, true).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    // Stands for every exclusive taker of a relay row: the delete, and a rename, whose `name` is
+    // part of `relays_workspace_name_key` and so takes `for update`, not `for no key update`.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from relays where id = $1 for update")
+        .bind(relay)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the relay");
+
+    let control = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query("select 1 from relays where id = $1 for key share")
+                .bind(relay)
+                .fetch_all(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    let left = tokio::time::timeout(
+        Duration::from_secs(10),
+        sqlx::query_scalar::<_, i32>(DEBIT)
+            .bind(relay)
+            .bind(ws)
+            .bind(60i32)
+            .bind(10i32)
+            .fetch_one(&pool),
+    )
+    .await
+    .expect(
+        "the debit blocked behind an exclusive lock on its relay row: the update arm DOES take \
+         the parent, so `relays` IS a lock class and ADR 0005's ruling on it is wrong",
+    )
+    .expect("the debit");
+    assert!(
+        left < 40,
+        "the ten the bucket held, plus a second's refill per second elapsed, less the ten this \
+         tick took — so a small number. 50 would mean the INSERT arm ran: a different statement \
+         taking a different lock, and not the one under test here. Got {left}"
+    );
+
+    held.commit().await.expect("release the wedge");
+    control
+        .await
+        .expect("the control")
+        .expect("the lock the insert arm would have taken");
+}
+
+/// **A relay deletion waits for a debit in flight; it does not deadlock with one.** This is the
+/// `40P01` half of the ADR's split, and it is unreachable here: the debit holds a bucket row the
+/// cascade *can* see, which is exactly the condition that closes the cycle everywhere else, and
+/// still nothing cycles — because the holder is asking for nothing back.
+///
+/// What this pins beyond the ruling: that the cascade really does wait on a committed child row.
+/// Weaken `relay_buckets_relay_fk` to `no action`, or drop it, and the deletion stops blocking and
+/// `settle` says so, rather than the test passing on a race it never ran.
+#[sqlx::test]
+async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, true).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let mut debiting = pool.begin().await.unwrap();
+    let left: i32 = sqlx::query_scalar(DEBIT)
+        .bind(relay)
+        .bind(ws)
+        .bind(60i32)
+        .bind(10i32)
+        .fetch_one(&mut *debiting)
+        .await
+        .expect("the debit");
+    assert!(
+        left < 40,
+        "the premise: the UPDATE arm ran and took its tokens. 50 would be the insert arm. \
+         Got {left}"
+    );
+
+    let deleting = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query("delete from relays where id = $1")
+                .bind(relay)
+                .execute(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    debiting.commit().await.expect("commit the debit");
+    deleting
+        .await
+        .expect("the deletion")
+        .expect("a cycle here would abort one side with 40P01");
+
+    let buckets: i64 = sqlx::query_scalar("select count(*) from relay_buckets")
+        .fetch_one(&pool)
+        .await
+        .expect("count the buckets");
+    assert_eq!(buckets, 0, "the bucket went with its relay");
 }

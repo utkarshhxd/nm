@@ -1,0 +1,156 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, workspace_id, name, host, port, security as \"security: Security\", username,\n                  password_encrypted is not null as \"has_password!\", max_connections,\n                  rate_limit_per_minute, enabled, failover_order\n           from relays where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "host"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "port",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "port"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "security: Security",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "security"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "has_password!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "max_connections",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "max_connections"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "rate_limit_per_minute",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "rate_limit_per_minute"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "failover_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "failover_order"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f2a9300476f4892bc86ee835610531bd37e8dad3c334ae0b6baca04525fc7fd3"
+}

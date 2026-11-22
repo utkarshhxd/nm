@@ -18,11 +18,12 @@ use crate::{
     http,
     http::csrf,
     http::rate_limit::{
-        EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE, PUBLIC_PER_MINUTE, RateLimiter,
-        SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
+        DNS_CHECK_PER_MINUTE, EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE,
+        PUBLIC_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
     },
     http::security_headers::security_headers,
     public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
+    sending_domains::dns,
     telemetry,
 };
 
@@ -67,6 +68,12 @@ pub struct AppState {
     /// twenty of them take `/readyz` and the authenticated API down with them. It refuses nobody —
     /// a request without a slot waits for one. See `public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS`.
     pub one_click_slots: Arc<Semaphore>,
+    /// Per-workspace cap on `POST /sending-domains/{id}/check`, which makes outbound DNS lookups
+    /// on an authenticated request. See `http::rate_limit::DNS_CHECK_PER_MINUTE`.
+    pub check_limit: Arc<RateLimiter>,
+    /// The DNS checker's resolver, built once: it owns the sockets and the nameserver state, and a
+    /// request that built its own would throw both away. See `sending_domains::dns`.
+    pub resolver: Arc<dns::Resolver>,
 }
 
 impl AppState {
@@ -86,6 +93,8 @@ impl AppState {
             public_limit: Arc::new(RateLimiter::per_minute(PUBLIC_PER_MINUTE)),
             submit_limit: Arc::new(RateLimiter::per_minute(SUBMIT_PER_MINUTE)),
             one_click_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ONE_CLICKS)),
+            check_limit: Arc::new(RateLimiter::per_minute(DNS_CHECK_PER_MINUTE)),
+            resolver: Arc::new(dns::system_resolver()?),
         })
     }
 
@@ -198,11 +207,12 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
 }
 
 /// Whether `public_url` names this machine — a developer's instance rather than one subscribers
-/// reach. `.localhost` is included because RFC 6761 reserves the whole suffix for loopback, which
+/// reach. `worker::run`'s boot check asks the same question of the same URL, for the same reason:
+/// a refusal or a warning is worth printing only where somebody can act on it. `.localhost` is included because RFC 6761 reserves the whole suffix for loopback, which
 /// is how a local reverse-proxy setup is usually named. A URL with no host at all reads as local:
 /// the consequence of being wrong here is only whether a warning is printed, and a warning nobody
 /// can act on is the thing being avoided.
-fn is_local_url(url: &url::Url) -> bool {
+pub(crate) fn is_local_url(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -211,8 +221,9 @@ fn is_local_url(url: &url::Url) -> bool {
     }
 }
 
-/// Resolves on Ctrl-C or, on Unix, SIGTERM (what container runtimes send).
-async fn shutdown_signal() {
+/// Resolves on Ctrl-C or, on Unix, SIGTERM (what container runtimes send). `pub` because
+/// `nm worker` and `nm all` hand the same signal to `worker::run`: one process, one way to stop.
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await

@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update relays set name = coalesce($3, name), host = coalesce($4, host), port = coalesce($5, port), security = coalesce($6, security), max_connections = coalesce($7, max_connections), rate_limit_per_minute = coalesce($8, rate_limit_per_minute), enabled = coalesce($9, enabled), failover_order = coalesce($10, failover_order), username = case when $11 then $12 else username end, password_encrypted = case when $13 then $14 else password_encrypted end, updated_at = now() where workspace_id = $1 and id = $2 returning name, host",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "host"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int4",
+        "Text",
+        "Int4",
+        "Int4",
+        "Bool",
+        "Int4",
+        "Bool",
+        "Text",
+        "Bool",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "6f6f95920614a54eb18e0522e1360e87a05e27a08fb88fd43c498fa7792c399c"
+}

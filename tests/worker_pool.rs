@@ -1,0 +1,887 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! The worker's own connection pool, and the tick that drains the queue.
+//!
+//! **Invariant 7 is the first test here and the reason the file is named after a pool.**
+//! `db::connect` sizes the API's at 20 and `/readyz` reads an exhausted pool as not ready, so a
+//! worker drawing from that pool makes *sending* able to take the product down: sixteen messages
+//! in flight is sixteen connections the API no longer has. The worker gets its own, sized by
+//! `worker_pool_size`, and the test below saturates it and then asks the API for a connection.
+//!
+//! **Nothing here asserts an elapsed time as an equality.** The tick's budget is tested by
+//! injecting a zero budget rather than by watching a clock, and the one test that waits —
+//! `the_loop_drains_the_queue_and_returns_when_shutdown_resolves` — waits for a *condition* with
+//! a generous ceiling, which is a liveness bound and not a timing assertion.
+
+mod common;
+
+use std::{sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
+use common::smtp_sink::{AfterData, Script, Sink};
+use nm::{
+    config::Config,
+    crypto::secrets::Secrets,
+    db,
+    public::token::{self, Purpose, Token},
+    relay::{
+        self,
+        transport::{SESSION_TIMEOUT, Transports},
+    },
+    worker::{self, BATCH, JOB_LEASE, Worker, confirmation::Ctx},
+};
+use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// `https`, because `mail::build` refuses anything else as an unsubscribe URL. The boot check
+/// this task adds is what makes an instance that cannot satisfy that say so before it claims a
+/// row; these tests are about what happens after it does.
+const PUBLIC_URL: &str = "https://mail.example.test";
+const SENDING_DOMAIN: &str = "brand.test";
+const ADDRESS: &str = "reader@dest.test";
+
+/// Enough that a batch of sixteen is granted on the first take and the three that follow it on
+/// the second. The exhausted-bucket test uses a relay of its own with a limit of one.
+const RATE_LIMIT: i32 = 600;
+
+// ---------------------------------------------------------------------------------------------
+// Invariant 7: sending cannot take the API down.
+
+/// The test database's URL, which is what `db::connect` and `db::connect_worker` take. A
+/// `#[sqlx::test]` pool carries no URL of its own, so it is rebuilt from the one the dev
+/// container sets and the temporary database's name.
+fn database_url(pool: &PgPool) -> String {
+    let name = pool
+        .connect_options()
+        .get_database()
+        .expect("the test database's name")
+        .to_owned();
+    let mut url: url::Url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL, which the dev container sets")
+        .parse()
+        .expect("DATABASE_URL is a url");
+    url.set_path(&name);
+    url.to_string()
+}
+
+/// **The worker's pool is its own, and an exhausted one does not reach the API.** Saturating it
+/// takes `worker_pool_size` connections and no more; the API's twenty are untouched, so
+/// `/readyz` — which reads an exhausted pool as not ready — still answers `200`.
+///
+/// Give the worker `db::connect` instead and the first assertion goes: five held connections do
+/// not saturate a pool of twenty, and nothing here would be able to tell the two pools apart.
+#[sqlx::test]
+async fn the_worker_pool_is_separate_from_the_api_pool(pool: PgPool) {
+    let mut cfg = common::test_config(&database_url(&pool));
+    cfg.worker_pool_size = 3;
+
+    let api = db::connect(&cfg).await.expect("the API pool");
+    let sending = db::connect_worker(&cfg).await.expect("the worker pool");
+
+    // Held for the rest of the test: dropping one returns it to the pool.
+    let mut held = Vec::new();
+    for i in 0..cfg.worker_pool_size {
+        held.push(
+            sending.acquire().await.unwrap_or_else(|e| {
+                panic!("worker connection {i} of {}: {e}", cfg.worker_pool_size)
+            }),
+        );
+    }
+    assert!(
+        sending.try_acquire().is_none(),
+        "the worker pool is not bounded by worker_pool_size: {} held connections left room for \
+         another, so it is not a pool of its own",
+        held.len()
+    );
+
+    assert!(
+        api.try_acquire().is_some(),
+        "the API pool had no connection left while the worker's was saturated"
+    );
+    // A smoke check, and deliberately labelled as one: the API pool is alive and serving while
+    // the worker's is at its ceiling. **It cannot fail under a shared pool**, because two
+    // `PgPool` values never share connections however they are sized — what would actually share
+    // them is `worker::run` reusing `app::serve`'s pool, and the thing that stops *that* is `run`
+    // calling `db::connect_worker`. The assertion above is the one with teeth: it is what goes
+    // red if the worker's pool is not bounded by `worker_pool_size`.
+    common::TestApp::with_config(api.clone(), |_| {})
+        .await
+        .server
+        .get("/readyz")
+        .await
+        .assert_status_ok();
+
+    // These pools are this test's own, not `#[sqlx::test]`'s, so nothing else closes them and the
+    // temporary database cannot be dropped while they hold connections open.
+    drop(held);
+    sending.close().await;
+    api.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The tick.
+
+/// A workspace that can send: one list, one contact, one relay pointing at the sink, and one
+/// sending domain whose DNS checks all pass and whose signing is the relay's.
+struct World {
+    pool: PgPool,
+    sink: Sink,
+    ws: Uuid,
+    list: Uuid,
+    contact: Uuid,
+    relay: Uuid,
+    secrets: Arc<Secrets>,
+    config: Arc<Config>,
+}
+
+impl World {
+    async fn new(pool: PgPool, script: Script) -> World {
+        let sink = Sink::start(script).await;
+        let (ws, list, contact, relay) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        // Slugged by id: `one_workspace_at_its_limit_does_not_stop_another` builds two of these
+        // on one database, and `workspaces_slug_key` would refuse a second 'acme'.
+        sqlx::query("insert into workspaces (id, slug, name) values ($1, $2, 'Acme')")
+            .bind(ws)
+            .bind(format!("ws-{ws}"))
+            .execute(&pool)
+            .await
+            .expect("workspace");
+        sqlx::query("insert into lists (id, workspace_id, name) values ($1, $2, 'News')")
+            .bind(list)
+            .bind(ws)
+            .execute(&pool)
+            .await
+            .expect("list");
+        sqlx::query("insert into contacts (id, workspace_id, email) values ($1, $2, $3)")
+            .bind(contact)
+            .bind(ws)
+            .bind(ADDRESS)
+            .execute(&pool)
+            .await
+            .expect("contact");
+        sqlx::query(
+            "insert into sending_domains (id, workspace_id, domain, signing, dkim_selector, checks)
+             values ($1, $2, $3, 'relay', 'nm', $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(ws)
+        .bind(SENDING_DOMAIN)
+        .bind(json!({
+            "spf": {"status": "pass"},
+            "dkim": {"status": "pass"},
+            "dmarc": {"status": "pass"},
+            "return_path": {"status": "pass"},
+        }))
+        .execute(&pool)
+        .await
+        .expect("sending domain");
+
+        let mut config = common::test_config("postgres://unused");
+        config.public_url = PUBLIC_URL.parse().expect("the public URL");
+        let secrets = Arc::new(Secrets::new(&config.secret_key));
+        let world = World {
+            pool,
+            sink,
+            ws,
+            list,
+            contact,
+            relay,
+            secrets,
+            config: Arc::new(config),
+        };
+        world
+            .add_relay(relay, "primary", 0, world.sink.addr.port(), RATE_LIMIT)
+            .await;
+        world
+    }
+
+    /// Another relay for this workspace. `port` is the sink's for a relay that can deliver and
+    /// anything else for one that cannot; no test here needs a second one to answer.
+    async fn add_relay(&self, id: Uuid, name: &str, order: i32, port: u16, limit: i32) {
+        sqlx::query(
+            "insert into relays (id, workspace_id, name, host, port, security,
+                                 rate_limit_per_minute, failover_order)
+             values ($1, $2, $3, $4, $5, 'starttls', $6, $7)",
+        )
+        .bind(id)
+        .bind(self.ws)
+        .bind(name)
+        .bind(self.sink.addr.ip().to_string())
+        .bind(i32::from(port))
+        .bind(limit)
+        .bind(order)
+        .execute(&self.pool)
+        .await
+        .expect("relay");
+    }
+
+    /// A worker on this world, talking to the sink in the clear.
+    fn worker(&self, concurrency: usize) -> Worker {
+        self.worker_with_session(concurrency, SESSION_TIMEOUT)
+    }
+
+    /// A worker whose sessions are bounded at something other than the shipped minute, for the
+    /// one test that has to watch a send hold the tick up.
+    fn worker_with_session(&self, concurrency: usize, session: Duration) -> Worker {
+        Worker::new(
+            Ctx {
+                db: self.pool.clone(),
+                secrets: Arc::clone(&self.secrets),
+                config: Arc::clone(&self.config),
+                transports: Arc::new(
+                    Transports::plaintext_for_tests().with_session_timeout(session),
+                ),
+            },
+            concurrency,
+        )
+    }
+
+    /// `n` fresh, well-formed `confirmation_email` rows, as a signup form would queue them.
+    async fn enqueue(&self, n: usize) {
+        for _ in 0..n {
+            let confirm = token::issue(
+                &self.secrets,
+                &Token {
+                    workspace_id: self.ws,
+                    contact_id: self.contact,
+                    purpose: Purpose::Confirm,
+                    list_id: Some(self.list),
+                    issued_at: Utc::now().timestamp(),
+                    nonce: Uuid::now_v7().to_string(),
+                    kid: None,
+                    ref_id: None,
+                },
+            );
+            sqlx::query(
+                "insert into jobs (id, workspace_id, kind, contact_id, list_id, payload)
+                 values ($1, $2, 'confirmation_email', $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(self.ws)
+            .bind(self.contact)
+            .bind(self.list)
+            .bind(json!({ "email": ADDRESS, "token": confirm }))
+            .execute(&self.pool)
+            .await
+            .expect("job");
+        }
+    }
+
+    async fn rows(&self) -> Vec<JobRow> {
+        sqlx::query_as::<_, JobRow>(
+            "select failed_at, completed_at, last_error, run_after, attempts
+               from jobs where workspace_id = $1 order by id",
+        )
+        .bind(self.ws)
+        .fetch_all(&self.pool)
+        .await
+        .expect("the job rows")
+    }
+
+    /// The one row, where a test queued one.
+    async fn only_row(&self) -> JobRow {
+        let mut rows = self.rows().await;
+        assert_eq!(rows.len(), 1, "exactly one job was queued");
+        rows.remove(0)
+    }
+
+    async fn completed(&self) -> usize {
+        self.rows()
+            .await
+            .iter()
+            .filter(|r| r.completed_at.is_some())
+            .count()
+    }
+
+    /// The bucket balance of `relay`, or `None` where no bucket row exists.
+    async fn balance(&self, relay: Uuid) -> Option<i32> {
+        sqlx::query_scalar("select tokens from relay_buckets where relay_id = $1")
+            .bind(relay)
+            .fetch_optional(&self.pool)
+            .await
+            .expect("read the balance")
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct JobRow {
+    failed_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    run_after: DateTime<Utc>,
+    attempts: i32,
+}
+
+/// One tick takes `BATCH` rows and no more, and the next takes what is left. Deterministic: the
+/// two ticks are driven directly, so nothing here depends on how long either one took.
+#[sqlx::test]
+async fn a_tick_sends_a_batch_and_the_next_takes_the_rest(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let queued = BATCH as usize + 3;
+    w.enqueue(queued).await;
+
+    assert_eq!(
+        w.worker(4).tick().await.expect("the first tick"),
+        BATCH as usize
+    );
+    assert_eq!(
+        w.completed().await,
+        BATCH as usize,
+        "the first tick must complete exactly the batch it claimed"
+    );
+
+    assert_eq!(w.worker(4).tick().await.expect("the second tick"), 3);
+    assert_eq!(w.completed().await, queued, "the queue must be drained");
+    assert_eq!(
+        w.sink.messages().len(),
+        queued,
+        "every completed row must be a message the relay actually read"
+    );
+}
+
+/// **The budget is half the lease, and it is what stops a tick outliving its own claim.** Four
+/// waves of a sixteen-row batch against a relay burning the full 60-second session timeout is 240
+/// seconds, twice `JOB_LEASE`; a tick that runs that long has its rows re-claimed and its
+/// messages sent twice.
+///
+/// A zero budget is the same rule at the other end of the range, and it needs no clock: every
+/// claimed row is one the tick did not start. They must come back **unattempted** — retryable,
+/// and with the attempt the claim counted handed back, because nothing was submitted.
+#[sqlx::test]
+async fn a_tick_that_is_out_of_budget_starts_nothing_and_hands_back_what_it_claimed(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.enqueue(2).await;
+
+    let claimed = w
+        .worker(4)
+        .with_budget(Duration::ZERO)
+        .tick()
+        .await
+        .expect("the tick");
+
+    assert_eq!(
+        claimed, 2,
+        "the rows were claimed before the budget was read"
+    );
+    assert_eq!(
+        w.sink.connections(),
+        0,
+        "a tick with no budget left dialled the relay"
+    );
+    for row in w.rows().await {
+        assert!(row.completed_at.is_none(), "nothing was sent");
+        assert!(
+            row.failed_at.is_none(),
+            "a job that was never attempted must stay retryable, not fail"
+        );
+        assert_eq!(
+            row.attempts, 0,
+            "a job the tick chose not to start must spend no attempt"
+        );
+        let reason = row.last_error.expect("a reason an operator can read");
+        assert!(
+            reason.contains("budget"),
+            "the reason does not name the budget: {reason}"
+        );
+    }
+}
+
+/// The other end of `with_budget`: what the product builds for itself is half the lease.
+#[sqlx::test]
+async fn a_worker_budgets_its_tick_at_half_the_lease(pool: PgPool) {
+    let w = World::new(pool, Script::Silence).await;
+    assert_eq!(
+        w.worker(4).budget(),
+        JOB_LEASE / 2,
+        "a tick may not be allowed to outlive the lease it claimed under"
+    );
+}
+
+/// **A throttle is not a failure.** An exhausted bucket means this relay may not be driven any
+/// harder *this minute*, so the rows come back with a future `run_after` and no `failed_at`, and
+/// nothing is dialled: the sink counts a connection the moment it accepts one, so a tick that
+/// connected and then thought better of it is still caught.
+#[sqlx::test]
+async fn an_exhausted_bucket_sends_nothing_and_leaves_the_rows_claimable(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    // One token a minute, and none in the bucket: the refill is `floor(elapsed * 1 / 60)`, which
+    // is zero for the next sixty seconds however slow this machine is.
+    sqlx::query("update relays set rate_limit_per_minute = 1 where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("the limit");
+    sqlx::query(
+        "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+         values ($1, $2, 0, now())",
+    )
+    .bind(w.relay)
+    .bind(w.ws)
+    .execute(&w.pool)
+    .await
+    .expect("an empty bucket");
+    w.enqueue(2).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(
+        w.sink.connections(),
+        0,
+        "a throttled tick dialled the relay anyway"
+    );
+    for row in w.rows().await {
+        assert!(row.completed_at.is_none());
+        assert!(
+            row.failed_at.is_none(),
+            "a throttle destroyed a message: it must leave the row claimable"
+        );
+        assert_eq!(
+            row.attempts, 0,
+            "a throttled claim spent an attempt, so five of them would destroy the message"
+        );
+        let reason = row.last_error.expect("a reason an operator can read");
+        assert!(
+            reason.contains("rate limit"),
+            "the reason does not say the relay was throttled: {reason}"
+        );
+        // A bound with a reason rather than a reading of the clock: `backoff`'s floor is fifteen
+        // seconds, so anything under that cannot be the failure path and must be the short
+        // attempt-free wait a held-back row gets.
+        assert!(
+            row.run_after < Utc::now() + chrono::Duration::seconds(15),
+            "a throttled row waits a backoff, not the short wait: run_after is {}",
+            row.run_after
+        );
+    }
+    assert_eq!(
+        w.balance(w.relay).await,
+        Some(0),
+        "a refusal spends nothing"
+    );
+}
+
+/// **`attempts` answers "how many times have we tried to send this", and a job the tick chose not
+/// to start was not tried.**
+///
+/// The claim increments it because claiming is where the lease is taken, and for every other path
+/// that is right: a worker that dies mid-send must burn an attempt, because nothing can know
+/// whether the message went. But a job this tick deliberately did not start, and knows it did not
+/// start, is the one case where that is certain — and counting it turns a scheduling decision
+/// into mail loss, since the fifth such claim fails the row for good.
+///
+/// The two halves run against the same row, so the contrast is exact rather than two fixtures
+/// being compared. Nothing here reads a clock: the second half proves the first half left the row
+/// claimable by claiming it, and a release that left `run_after` a backoff into the future would
+/// find nothing to send.
+#[sqlx::test]
+async fn an_unstarted_job_keeps_its_attempt_and_a_tried_one_spends_it(pool: PgPool) {
+    // 451: the relay asking for it later. A real attempt, with a transient outcome.
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("451 4.3.0 try later"))).await;
+    w.enqueue(1).await;
+
+    // Claimed, and then never started: the tick had no budget left when it reached this job.
+    w.worker(4)
+        .with_budget(Duration::ZERO)
+        .tick()
+        .await
+        .expect("the tick that had no budget");
+
+    let row = w.only_row().await;
+    assert_eq!(
+        row.attempts, 0,
+        "a job that was never submitted spent one of its attempts"
+    );
+    assert_eq!(w.sink.connections(), 0, "nothing was submitted");
+    assert!(row.failed_at.is_none() && row.completed_at.is_none());
+
+    // The same row, tried for real this time.
+    w.worker(4).tick().await.expect("the tick that sends");
+
+    let row = w.only_row().await;
+    assert_eq!(
+        row.attempts, 1,
+        "a job that reached the relay must spend its attempt"
+    );
+    assert_eq!(
+        w.sink.connections(),
+        1,
+        "the relay was dialled exactly once"
+    );
+    assert!(
+        row.run_after > Utc::now(),
+        "a transient outcome is deferred with backoff, which is at least fifteen seconds"
+    );
+    assert!(row.failed_at.is_none() && row.completed_at.is_none());
+}
+
+/// **A relay slower than one batch a minute must still send, and asking for the whole batch is
+/// how it would never send at all.** `take` is all or nothing: a batch of sixteen asked of a
+/// relay that allows ten a minute is refused by the insert arm's `limit >= wanted`, every tick,
+/// for ever — the rows are deferred until `max_attempts` runs out and the workspace's mail is
+/// simply destroyed, slowly, with every part of the system reporting that it is behaving.
+///
+/// A relay rated at 100 an hour is an ordinary cheap plan, so this is not a corner. The tick asks
+/// for what the relay could grant at most, sends that many, and defers the rest.
+#[sqlx::test]
+async fn a_relay_slower_than_a_batch_sends_what_it_can_rather_than_nothing(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("update relays set rate_limit_per_minute = 2 where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("a relay that allows two a minute");
+    w.enqueue(5).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(
+        w.sink.messages().len(),
+        2,
+        "a relay allowing two a minute sent {} of a batch of five",
+        w.sink.messages().len()
+    );
+    let rows = w.rows().await;
+    assert_eq!(
+        rows.iter().filter(|r| r.completed_at.is_some()).count(),
+        2,
+        "the two the bucket granted must be the two that completed"
+    );
+    for row in rows.iter().filter(|r| r.completed_at.is_none()) {
+        assert!(row.failed_at.is_none(), "a rate limit destroyed a message");
+        assert_eq!(
+            row.attempts, 0,
+            "a job held back by the relay's limit spent an attempt it never used"
+        );
+    }
+    assert_eq!(w.balance(w.relay).await, Some(0), "both tokens were spent");
+}
+
+/// **An operator deleting a relay mid-tick is a real path, and it is not this batch's fault.**
+/// The relays are read, the operator deletes one, and the debit then raises `23503` against a
+/// parent row that is gone. The tick reads that as *this relay is gone*, falls to the next in
+/// failover order, and the claimed jobs are not failed over it.
+///
+/// Take the `23503` arm out and `debit` surfaces a database error, which the tick can only read
+/// as "the bucket could not be debited" — the whole batch deferred over a relay the workspace
+/// was no longer using.
+#[sqlx::test]
+async fn a_relay_deleted_mid_tick_falls_through_to_the_next(pool: PgPool) {
+    let w = World::new(pool, Script::Silence).await;
+    let standby = Uuid::now_v7();
+    w.add_relay(standby, "standby", 1, w.sink.addr.port(), RATE_LIMIT)
+        .await;
+    let relays = relay::enabled_relays(&w.pool, w.ws).await.expect("relays");
+    assert_eq!(
+        relays.len(),
+        2,
+        "failover order: the primary, then the standby"
+    );
+
+    // Between the read and the debit, which is the window this is about.
+    sqlx::query("delete from relays where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("the operator's delete");
+
+    let granted = worker::debit(&w.pool, w.ws, &relays, 4)
+        .await
+        .expect("a deleted relay is not an error the batch pays for");
+
+    assert_eq!(
+        granted,
+        Some((standby, 4)),
+        "the batch must be paid for by the standby relay, and know that it was"
+    );
+    assert_eq!(
+        w.balance(standby).await,
+        Some(RATE_LIMIT - 4),
+        "the standby's bucket was not debited"
+    );
+    assert_eq!(
+        w.balance(w.relay).await,
+        None,
+        "a bucket was written for a relay that does not exist"
+    );
+}
+
+/// The loop: it keeps ticking until the shutdown future resolves, and then it **returns** rather
+/// than being cancelled mid-send.
+///
+/// The wait is for a condition — every row completed — with a ceiling far above any plausible
+/// runtime, so it is a liveness bound and not a timing assertion. The ceiling failing is a loop
+/// that stopped polling, which is the defect this is for.
+#[sqlx::test]
+async fn the_loop_drains_the_queue_and_returns_when_shutdown_resolves(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let queued = BATCH as usize + 3;
+    w.enqueue(queued).await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+
+    let worker = w.worker(4);
+    let running = worker.run_until(async {
+        let _ = stopped.await;
+    });
+    let driving = async {
+        loop {
+            if w.completed().await == queued {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stop.send(()).expect("the loop is still running");
+    };
+    // A hang is the failure this bounds: without it a loop that never returns hangs the suite.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(running, driving)
+    })
+    .await
+    .expect("the loop drained the queue and returned within a minute");
+
+    assert_eq!(w.completed().await, queued);
+    assert_eq!(w.sink.messages().len(), queued);
+}
+
+/// **The relay that was debited must be the relay that sends.** `debit` spends on the first relay
+/// that *grants*, and `submit` sends through the first relay that is *reachable* — so with relay
+/// 1 exhausted and relay 2 funded, those are two different relays, and a send through relay 1
+/// against a token taken from relay 2 drives relay 1 past its limit without bound. The bucket
+/// stops meaning anything in exactly the configuration it exists for.
+///
+/// Relay 1 here is perfectly reachable and simply out of tokens. It must not be used, however
+/// willing it is, and the message must leave through the relay that was paid for.
+#[sqlx::test]
+async fn a_send_goes_through_the_relay_the_tick_paid_for(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let funded_sink = Sink::start(Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.add_relay(
+        Uuid::now_v7(),
+        "standby",
+        1,
+        funded_sink.addr.port(),
+        RATE_LIMIT,
+    )
+    .await;
+    // One a minute, and none left: `floor(elapsed * 1 / 60)` is zero for the next sixty seconds.
+    sqlx::query("update relays set rate_limit_per_minute = 1 where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("the primary's limit");
+    sqlx::query(
+        "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+         values ($1, $2, 0, now())",
+    )
+    .bind(w.relay)
+    .bind(w.ws)
+    .execute(&w.pool)
+    .await
+    .expect("an empty bucket on the primary");
+    w.enqueue(1).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(
+        w.sink.connections(),
+        0,
+        "the message went through a relay that had no token for it"
+    );
+    assert_eq!(
+        funded_sink.messages().len(),
+        1,
+        "the message did not go through the relay the tick paid for"
+    );
+    assert!(w.only_row().await.completed_at.is_some());
+}
+
+/// **A workspace with no relay at all is handed to the handler, not quietly held back.**
+///
+/// `allowance`'s relay-less arm is the one that cannot be tested by its effect on the bucket,
+/// because there is no bucket. Turn it into "nothing may be sent" and the jobs are released for
+/// ever: never sent, never failed, no `failed_at` for anyone asking why the confirmation never
+/// arrived. So this asserts the opposite of a release — the attempt **is** spent, and the reason
+/// on the row is the handler's own, not the throttle's.
+#[sqlx::test]
+async fn a_workspace_with_no_relay_reaches_the_handler_and_is_told_so(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("delete from relays where workspace_id = $1")
+        .bind(w.ws)
+        .execute(&w.pool)
+        .await
+        .expect("remove every relay");
+    w.enqueue(1).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    let row = w.only_row().await;
+    assert_eq!(
+        row.attempts, 1,
+        "the job was held back rather than attempted, so nothing will ever record why it failed"
+    );
+    assert!(row.completed_at.is_none() && row.failed_at.is_none());
+    let reason = row.last_error.expect("a reason an operator can read");
+    assert!(
+        reason.contains("no enabled relay"),
+        "the reason is not the handler's: {reason}"
+    );
+}
+
+/// **The debit is per workspace, and one workspace's limit is not another's.** A batch may span
+/// workspaces — the claim orders by `run_after`, not by tenant — and a bucket belongs to a relay
+/// of exactly one of them. Debit once for the whole batch and the first workspace's rate limit
+/// silently becomes everybody's.
+#[sqlx::test]
+async fn one_workspace_at_its_limit_does_not_stop_another(pool: PgPool) {
+    let throttled = World::new(pool.clone(), Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let funded = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query("update relays set rate_limit_per_minute = 1 where id = $1")
+        .bind(throttled.relay)
+        .execute(&throttled.pool)
+        .await
+        .expect("the limit");
+    sqlx::query(
+        "insert into relay_buckets (relay_id, workspace_id, tokens, refilled_at)
+         values ($1, $2, 0, now())",
+    )
+    .bind(throttled.relay)
+    .bind(throttled.ws)
+    .execute(&throttled.pool)
+    .await
+    .expect("an empty bucket");
+    throttled.enqueue(2).await;
+    funded.enqueue(2).await;
+
+    // One tick, both workspaces: the claim takes all four rows together.
+    throttled.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(
+        throttled.sink.connections(),
+        0,
+        "the throttled workspace was dialled"
+    );
+    assert_eq!(
+        funded.sink.messages().len(),
+        2,
+        "a workspace with tokens was held back by another workspace's rate limit"
+    );
+    assert_eq!(funded.completed().await, 2);
+    for row in throttled.rows().await {
+        assert!(row.completed_at.is_none() && row.failed_at.is_none());
+        assert_eq!(row.attempts, 0, "a throttled claim spent an attempt");
+    }
+}
+
+/// **Zero is not a smaller pool and not a smaller fan-out.** `max_connections(0)` is a pool
+/// nothing can be taken from, so every acquire waits out sqlx's thirty-second timeout and the
+/// worker refuses everything with no cause an operator can see — which is the failure
+/// `worker::run`'s boot check exists to make visible, arriving by a different door. A
+/// concurrency of zero would mean sending nothing at all.
+#[sqlx::test]
+async fn zero_is_read_as_one_for_both_the_pool_and_the_fan_out(pool: PgPool) {
+    let mut cfg = common::test_config(&database_url(&pool));
+    cfg.worker_pool_size = 0;
+    let sending = db::connect_worker(&cfg).await.expect("a worker pool");
+    sending
+        .acquire()
+        .await
+        .expect("a pool of zero is a worker that can do nothing and says nothing");
+    sending.close().await;
+
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    w.enqueue(1).await;
+
+    w.worker(0).tick().await.expect("the tick");
+
+    assert_eq!(
+        w.completed().await,
+        1,
+        "a concurrency of zero sent nothing at all"
+    );
+}
+
+/// **And the relay the tick paid for is not charged twice.** `submit` takes a token for every
+/// relay but that one; forget which one was paid and every message is billed twice to the relay
+/// it actually goes through, so the product sends at half the rate the operator configured with
+/// nothing to show why.
+#[sqlx::test]
+async fn the_relay_the_tick_paid_for_is_not_charged_twice(pool: PgPool) {
+    let w = World::new(pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    // Ten a minute: the refill is `floor(elapsed * 10 / 60)`, which stays at zero for six
+    // seconds, so the balance below is exact without reading a clock. This test takes
+    // milliseconds.
+    sqlx::query("update relays set rate_limit_per_minute = 10 where id = $1")
+        .bind(w.relay)
+        .execute(&w.pool)
+        .await
+        .expect("the limit");
+    w.enqueue(1).await;
+
+    w.worker(4).tick().await.expect("the tick");
+
+    assert_eq!(w.completed().await, 1, "the message did not go");
+    assert_eq!(
+        w.balance(w.relay).await,
+        Some(9),
+        "one message through one relay must cost one token"
+    );
+}
+
+/// **The budget is read by each send as it starts, not once for the tick.**
+///
+/// `send` documents that, and nothing held it: a mutation that hoists the `Instant::now()` out of
+/// the spawned task and reads it once before the loop passes every other test here, because they
+/// use either a zero budget (everything released under both shapes) or a whole one (everything
+/// sent under both). What that mutation actually costs is the budget itself — read once at a tick
+/// that has just started, it is never spent, so nothing ever stops the tick starting sends and a
+/// slow relay carries it straight past its own lease.
+///
+/// So: one send that holds the session open for longer than the whole budget, and a second job
+/// behind it. The second must be released untouched.
+///
+/// **Two bounds, each with an order of magnitude of slack, and neither an equality.** The first
+/// send must start *inside* the budget — it is three small queries after the tick begins, against
+/// a budget of a second. The second must start *outside* it — it cannot begin until the first
+/// session times out two seconds in, which is past a one-second budget whatever the machine. A
+/// slower machine widens the second bound and only the first is at risk, with a hundredfold
+/// margin.
+#[sqlx::test]
+async fn the_budget_is_read_by_each_send_as_it_starts(pool: PgPool) {
+    // Reads the message and then owes an answer for ever; the transport gives up at the session
+    // timeout below.
+    let w = World::new(pool, Script::Smtp(AfterData::Hang)).await;
+    w.enqueue(2).await;
+
+    w.worker_with_session(1, Duration::from_secs(2))
+        .with_budget(Duration::from_secs(1))
+        .tick()
+        .await
+        .expect("the tick");
+
+    assert_eq!(
+        w.sink.connections(),
+        1,
+        "the second send started although the tick's budget was gone by the time it could"
+    );
+    let rows = w.rows().await;
+    let started: Vec<_> = rows.iter().filter(|r| r.failed_at.is_some()).collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "exactly one job was tried; a hung session is an Unknown and gives up"
+    );
+    let held_back = rows
+        .iter()
+        .find(|r| r.failed_at.is_none())
+        .expect("one job was never started");
+    assert!(held_back.completed_at.is_none());
+    assert_eq!(
+        held_back.attempts, 0,
+        "a job the tick never started must keep its attempt"
+    );
+}

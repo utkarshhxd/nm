@@ -1,0 +1,137 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, return_path_domain, checks as \"checks: Json<DnsChecks>\",\n                  checked_at, send_unverified_acknowledged_at\n           from sending_domains where workspace_id = $1 and domain = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "domain"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "from_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "from_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "signing: Signing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "signing"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "dkim_selector",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "dkim_selector"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "return_path_domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "return_path_domain"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "checks: Json<DnsChecks>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "checks"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "checked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "checked_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "send_unverified_acknowledged_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "send_unverified_acknowledged_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "60bf4378460ad0667211330b1847c1e6d466694115def4bb8e2bae3162293054"
+}

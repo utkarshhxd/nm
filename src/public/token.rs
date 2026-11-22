@@ -42,7 +42,13 @@ impl Purpose {
     /// `None` for `Unsubscribe`: RFC 8058 one-click links sit in an inbox for years, and refusing
     /// to honour one is a compliance failure, not a safety measure. The preference center is
     /// reached by the same token, so it does not expire either.
-    fn ttl_secs(self) -> Option<i64> {
+    ///
+    /// **Public so that nothing else has to say "fourteen days".** `comment on table jobs` makes a
+    /// `confirmation_email` row older than this TTL a row to fail rather than mail, and
+    /// `worker::confirmation` enforces that. A second constant meaning the same window is how the
+    /// two drift, and the drift would be silent: the sender would keep mailing links the confirm
+    /// page refuses, or stop mailing links it would still accept.
+    pub fn ttl_secs(self) -> Option<i64> {
         match self {
             Purpose::Confirm => Some(14 * DAY),
             Purpose::Unsubscribe => None,

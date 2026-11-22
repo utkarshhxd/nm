@@ -9,11 +9,26 @@ yanked = "deny"
 #    (the `COSEKeyPublic::RsaS256` arm) and crypto-glue `x509/chain.rs:376` and `:388`.
 #    (The line numbers here were each several lines short of the call they name; they are the
 #    `verifier.verify(...)` lines in `crypto-glue 0.2.2` and `webauthn-rs-core 0.6.2`.)
-#  - NM holds no RSA private key and performs no RSA private-key operation, which is exactly what the
-#    attack targets.
+#  - NM performs no RSA private-key operation THROUGH `rsa`, which is the crate the advisory is
+#    against. The advisory is not about RSA in general; it is a timing side channel in that
+#    implementation.
+#
+#    THIS CLAUSE USED TO SAY "NM holds no RSA private key and performs no RSA private-key
+#    operation", and as of M2a that is FALSE. The product now holds a DKIM private key per
+#    app-signed sending domain, encrypted at rest, and signs every outgoing message with it
+#    (`src/mail/dkim.rs`). The ignore is still correct and the conclusion never moved, but the
+#    stated reason had stopped being true — in the one file written to be trusted literally. It was
+#    caught by a reviewer, not by the gate, which is the argument for why this paragraph is long.
+#
+#    DKIM signs over `ring`'s `RsaKeyPair`, specifically to keep the `rsa` crate free of
+#    private-key callers. `ring`'s RSA signing is constant-time and is not what RUSTSEC-2023-0071
+#    is about. `cargo tree -d -i ring` prints nothing: one version, already in the tree via rustls.
 # RE-VERIFY ON EVERY `webauthn-rs` OR `crypto-glue` BUMP: crypto-glue already ships private-key
 # operations (`new_key`, `oaep_sha256_decrypt`) that a future version could start using, and this
 # ignore would silently cover that. If either is reached by a new caller, drop the ignore.
+# AND RE-VERIFY ON ANY NEW DKIM OR CRYPTO WORK: the test is no longer "does NM sign with RSA" —
+# it does — but "does any RSA private-key operation reach the `rsa` crate". Check with
+# `cargo tree -i rsa` and read the callers, not the crate list.
 # RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0555 (`chrono-tz`), both `unmaintained`: no
 # vulnerability, no exploit, and no patched version can exist, because the finding IS the
 # maintenance status. They arrived from an advisory-database refresh, not from anything this
@@ -39,6 +54,13 @@ private = { ignore = true } # exempts our own unpublished crate
 unused-allowed-license = "allow"
 allow = [
   "MIT",
+  # 0BSD arrives with `quoted_printable`, through `lettre`, which M2a needs for SMTP and MIME.
+  # It is the BSD Zero Clause License: OSI approved, FSF approved, and strictly MORE permissive
+  # than MIT, which is already on this list — it drops even the attribution and notice
+  # requirements, so anything MIT allows this allows. Added deliberately rather than by widening
+  # the list to "anything permissive": the next unfamiliar licence should fail this gate too and
+  # get its own line and its own sentence.
+  "0BSD",
   "Apache-2.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
@@ -54,6 +76,16 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
+
+# `lettre`'s `tracing` feature logs every line written to the relay at DEBUG, and one of those
+# lines is `AUTH PLAIN <base64>`. That is the relay's password, trivially decodable, in a log file
+# — spec §8 invariant 7 defeated by a feature nobody chose. Feature unification can turn it on
+# from any future dependency with nobody touching our `lettre` line, so this is a gate failure
+# rather than a comment asking people not to. If it ever has to be enabled, the password has to
+# stop reaching lettre as a credential first.
+[[bans.features]]
+crate = "lettre"
+deny = ["tracing"]
 
 [sources]
 unknown-registry = "deny"

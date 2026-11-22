@@ -1,0 +1,169 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, workspace_id, domain, from_name, signing as \"signing: Signing\",\n                  dkim_selector, dkim_private_key_encrypted is not null as \"has_dkim_key!\",\n                  dkim_public_txt, return_path_domain, checks as \"checks: SqlJson<DnsChecks>\", checked_at,\n                  send_unverified_acknowledged_at, updated_at\n           from sending_domains\n           where workspace_id = $1 and ($2::uuid is null or id < $2)\n           order by id desc limit $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "domain"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "from_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "from_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "signing: Signing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "signing"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "dkim_selector",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "dkim_selector"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "has_dkim_key!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "dkim_public_txt",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "dkim_public_txt"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "return_path_domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "return_path_domain"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "checks: SqlJson<DnsChecks>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "checks"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "checked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "checked_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "send_unverified_acknowledged_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "send_unverified_acknowledged_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sending_domains",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      null,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "26b14add26bcce2f5dcca55b93d5f4e26c10268cf33de4ce36349abd29f72cfd"
+}

@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from relays where workspace_id = $1 and id = $2 returning name, host",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relays",
+            "name": "host"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5d32f85467e897851dd65280aa77286e8793e3a82a2d1657afaf48cbfd4e3eb7"
+}
