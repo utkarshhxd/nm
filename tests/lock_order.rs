@@ -1452,6 +1452,7 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
             "users -> sessions (c)",
             "users -> suppressions (n)",
             "workspaces -> api_keys (c)",
+            "workspaces -> brand_kits (c)",
             "workspaces -> contacts (c)",
             "workspaces -> custom_fields (c)",
             "workspaces -> forms (c)",
@@ -1466,6 +1467,7 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
             "workspaces -> sending_domains (c)",
             "workspaces -> suppressions (c)",
             "workspaces -> tags (c)",
+            "workspaces -> templates (c)",
         ],
         "the foreign key graph has moved. ADR 0005's enumeration is over exactly these edges, so \
          it is now out of date: re-run the query in its \"The method\" section and rule on what \
@@ -1724,4 +1726,185 @@ async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool
         .await
         .expect("count the buckets");
     assert_eq!(buckets, 0, "the bucket went with its relay");
+}
+
+// ---- M2b: `templates` and `brand_kits`, re-enumerated -----------------------------------------
+//
+// Migration `0032` added two tables and, against `pg_constraint`, **two edges and no new parent**:
+// `workspaces -> templates (c)` and `workspaces -> brand_kits (c)`. Neither table is referenced by
+// anything, so neither is a parent and the inversion the enumeration is over has nowhere to form;
+// ADR 0005 rules both "not a parent at all", as it does `sending_domains`.
+//
+// That ruling rests on one measurable thing, which is what the test below holds: **a write to
+// either table takes `for key share` on its one `workspaces` row, on its insert arm only, and
+// nothing anywhere else.** `workspaces` is the parent of seventeen tables and nothing takes it
+// exclusively, so a key share on it can wait for nobody.
+//
+// No writer of either table exists in `src/` yet — the CRUD handlers are a later task — so this is
+// held on the SQL shape those handlers will have, exactly as the relay tests above were before
+// `take` was written. The handler task adds its rows to ADR 0005's table and should point its own
+// statements at this test; a handler that grows a second statement taking another lock is what
+// this test cannot see.
+
+/// **A template or brand-kit write waits on its workspace only when it inserts.** Two wedges on the
+/// same `workspaces` row, and the difference between them is the whole test:
+///
+/// * `for no key update` is what an `UPDATE` of any non-key column of `workspaces` takes — the only
+///   exclusive-ish lock the code takes on that row, since `src/` contains no `delete from
+///   workspaces`. A template insert and a brand-kit insert must pass straight through it, because
+///   `for key share` is compatible with it.
+/// * `for update` is what a delete of the workspace, or an update of a key column, would take. It
+///   is the **control**: the same insert is raced against it first and must block, otherwise a
+///   wedge that silently failed to take the row would let every assertion below go green for the
+///   wrong reason. Under that same wedge an `UPDATE` of a template, a `DELETE` of a template and
+///   the update arm of a brand-kit upsert must all complete, because none of them writes a foreign
+///   key column and so Postgres fires no referential trigger on `workspaces`.
+///
+/// If `workspaces` ever gains an exclusive taker, or a handler starts rewriting `workspace_id`, the
+/// first half or the second half of this goes red respectively, naming which.
+#[sqlx::test]
+async fn a_template_or_brand_kit_write_takes_at_most_a_key_share_on_its_workspace(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let ws = Uuid::now_v7();
+    sqlx::query("insert into workspaces (id, slug, name) values ($1, 'acme', 'acme')")
+        .bind(ws)
+        .execute(&pool)
+        .await
+        .expect("workspace");
+    let (kept, doomed) = (Uuid::now_v7(), Uuid::now_v7());
+    for id in [kept, doomed] {
+        sqlx::query(
+            "insert into templates (id, workspace_id, name, kind, source) \
+             values ($1, $2, 't', 'html', 'x')",
+        )
+        .bind(id)
+        .bind(ws)
+        .execute(&pool)
+        .await
+        .expect("template");
+    }
+
+    const INSERT_TEMPLATE: &str = "insert into templates (id, workspace_id, name, kind, source) \
+                                   values ($1, $2, 'new', 'html', 'x')";
+    const UPSERT_KIT: &str = "insert into brand_kits (workspace_id, logo_url) values ($1, $2) \
+                              on conflict (workspace_id) do update \
+                              set logo_url = excluded.logo_url, updated_at = now()";
+    async fn finishes<T>(what: &str, fut: impl std::future::Future<Output = sqlx::Result<T>>) {
+        tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .unwrap_or_else(|_| panic!("{what} blocked behind a lock on its workspace row"))
+            .unwrap_or_else(|e| panic!("{what} failed: {e}"));
+    }
+
+    // What every non-key `UPDATE workspaces` takes.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from workspaces where id = $1 for no key update")
+        .bind(ws)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the workspace, non-exclusively");
+    finishes(
+        "a template insert, whose foreign key takes `for key share`, which `for no key update` \
+         permits: it",
+        sqlx::query(INSERT_TEMPLATE)
+            .bind(Uuid::now_v7())
+            .bind(ws)
+            .execute(&pool),
+    )
+    .await;
+    finishes(
+        "the INSERT arm of a brand-kit upsert: it",
+        sqlx::query(UPSERT_KIT)
+            .bind(ws)
+            .bind("https://example.com/a.png")
+            .execute(&pool),
+    )
+    .await;
+    held.commit().await.expect("release the first wedge");
+
+    // The control, and then the claim: exclusive on the parent.
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from workspaces where id = $1 for update")
+        .bind(ws)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the workspace, exclusively");
+    let control = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            sqlx::query(INSERT_TEMPLATE)
+                .bind(Uuid::now_v7())
+                .bind(ws)
+                .execute(&pool)
+                .await
+        }
+    });
+    settle(&mut probe, 1).await;
+
+    finishes(
+        "a template UPDATE, which writes no foreign key column: it",
+        sqlx::query("update templates set name = 'renamed', updated_at = now() where id = $1")
+            .bind(kept)
+            .execute(&pool),
+    )
+    .await;
+    finishes(
+        "a template DELETE, which is the child side of the foreign key: it",
+        sqlx::query("delete from templates where id = $1")
+            .bind(doomed)
+            .execute(&pool),
+    )
+    .await;
+    finishes(
+        "the UPDATE arm of a brand-kit upsert: it",
+        sqlx::query(UPSERT_KIT)
+            .bind(ws)
+            .bind("https://example.com/b.png")
+            .execute(&pool),
+    )
+    .await;
+
+    held.commit().await.expect("release the second wedge");
+    control
+        .await
+        .expect("the control")
+        .expect("the insert the exclusive wedge was holding back");
+}
+
+// ---- Migration bytes: the issues/40 guard ------------------------------------------------------
+
+/// **No file under `migrations/` may contain a CR byte.** `sqlx` records a migration's checksum
+/// over its bytes, so a copy applied from a CRLF working tree records a checksum that the LF blob
+/// git stores can never match again — without a single character of SQL differing. That broke the
+/// dev database once (`issues/40`) and recurred inside M2b when a scripted edit of `0032` left CRLF
+/// behind. `.gitattributes` (`* text=auto eol=lf`) normalises on commit, which is exactly why
+/// nothing noticed: the committed blob was right and the working tree was not.
+///
+/// Plain read of the directory, no database. It lives in this file because ADR 0005's migrations
+/// are what a careless byte breaks, and because this binary already runs in CI.
+#[test]
+fn no_migration_contains_a_cr_byte() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut crlf = vec![];
+    for entry in std::fs::read_dir(&dir).expect("read the migrations directory") {
+        let path = entry.expect("a directory entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read a migration");
+        if let Some(at) = bytes.iter().position(|&b| b == b'\r') {
+            let line = bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1;
+            crlf.push(format!("{} (first CR on line {line})", path.display()));
+        }
+    }
+    assert!(
+        crlf.is_empty(),
+        "CR byte in a migration — its checksum would differ from the LF form git stores, and a \
+         database migrated from this file could never be migrated again (issues/40). Strip it \
+         with `sed -i 's/\\r$//' <file>` BEFORE running `sqlx migrate run`; if it was already \
+         applied, the database must be recreated, never `_sqlx_migrations` edited: {}",
+        crlf.join(", ")
+    );
 }

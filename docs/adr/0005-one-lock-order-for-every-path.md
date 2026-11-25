@@ -153,6 +153,11 @@ the code disagree, the code is what runs: fix the row, and say in the commit whi
 | `worker::release` | the `jobs` row alone, by primary key; the update's own row lock and no clause beyond it. It undoes the claim's `attempts` increment and pushes `run_after` for a job the tick chose not to start; it names no parent, and `jobs` is a parent of nothing |
 | `worker::confirmation::handle` | the `jobs` rows above for what it records, and **`relay::bucket::take`'s order** on the failover arm, where it takes a token for a relay the tick did not pay for. It reads `suppressions`, `sending_domains` and `relays` and writes none of them |
 
+**M2b has no rows here, and that is a finding rather than an omission.** `templates` and
+`brand_kits` have no writer in `src/` as of `0032`; "M2b: why `templates` and `brand_kits` are not
+a lock class", below, carries the ruling and the shape the first handler must keep. **The task that
+adds one adds its row to this table in the same change.**
+
 ## The rule for new code
 
 If you write `list_memberships` or `consent_log`, call `lists::lock_lists` with the list ids you
@@ -205,7 +210,7 @@ docker compose -f docker-compose.dev.yml -p nm exec -T postgres psql -U nm -d nm
 ```
 
 `psql` is in the `postgres` service, not in the dev container, which is why the second line does
-not go through `scripts/dev.sh`. As of `0028` it answers:
+not go through `scripts/dev.sh`. As of `0032` it answers:
 
 ```
       parent         | fks | children
@@ -222,15 +227,17 @@ not go through `scripts/dev.sh`. As of `0028` it answers:
  users               |  12 | api_keys (n), auth_challenges (c), imports (n), invites (n),
                      |     | memberships (c), passkeys (c), recovery_codes (c), segments (n),
                      |     | selection_snapshots (n), sessions (c), suppressions (n)
- workspaces          |  15 | api_keys (c), contacts (c), custom_fields (c), forms (c),
-                     |     | imports (c), invites (c), jobs (c), lists (c), memberships (c),
-                     |     | relays (c), segments (c), selection_snapshots (c),
-                     |     | sending_domains (c), suppressions (c), tags (c)
+ workspaces          |  17 | api_keys (c), brand_kits (c), contacts (c), custom_fields (c),
+                     |     | forms (c), imports (c), invites (c), jobs (c), lists (c),
+                     |     | memberships (c), relays (c), segments (c), selection_snapshots (c),
+                     |     | sending_domains (c), suppressions (c), tags (c), templates (c)
 ```
 
-**Ten parents, and every one is ruled on.** `0028` added exactly one, `relays`. `sending_domains`
-is listed below the ten although it is not a parent, because it was the other table asked about
-and the answer is load-bearing. `tests/lock_order.rs` asserts that every **edge** of this graph —
+**Ten parents, and every one is ruled on.** `0028` added exactly one, `relays`; `0032` added
+**none** — it added two edges, both out of `workspaces`, and two tables nothing references.
+`sending_domains`, `templates` and `brand_kits` are listed below the ten although they are not
+parents, because each was a table asked about and the answer is load-bearing.
+`tests/lock_order.rs` asserts that every **edge** of this graph —
 each `(parent, child, on delete action)` triple, not merely the set of parents — is unchanged, so
 a migration that adds an eleventh parent, a second child to an existing one, or that turns a
 `cascade` into a `set null`, fails there rather than being noticed by somebody.
@@ -244,10 +251,12 @@ a migration that adds an eleventh parent, a second child to an existing one, or 
 | `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
 | `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
-| `workspaces` | not a class | fifteen children since `0028` — it was thirteen — and no exclusive taker (below) |
+| `workspaces` | not a class | seventeen children since `0032` — it was fifteen, and thirteen before `0028` — and no exclusive taker (below) |
 | `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
 | `relays` | **not a class** — the evidence is four tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
 | `sending_domains` | not a parent at all | nothing references it, so no cascade reaches rows through it and the inversion this enumeration is over has nowhere to form. It is a child of `workspaces` and nothing else |
+| `templates` | not a parent at all — **today**, see the tripwire in the M2b section | `pg_constraint` shows one foreign key on it, `templates_workspace_id_fkey` to `workspaces` (`c`), and none pointing at it. It carries `templates_workspace_id_id_key` precisely so that a later table can, which is the day this row is re-ruled |
+| `brand_kits` | not a parent at all, and cannot become one cheaply | one foreign key, to `workspaces` (`c`), and its primary key *is* `workspace_id`, so the only thing that could reference it is a table that already references `workspaces` for the same row |
 
 **Two measured properties this rests on, worth re-checking rather than re-deriving.** The "no
 cycle" result for `selection::tag` depends on Postgres granting a compatible `FOR KEY SHARE` past
@@ -403,6 +412,81 @@ The day anything references it — a campaign naming the domain it sends as is t
 — it becomes a parent, the enumeration is ten plus one, and it is ruled on then. `0028` already
 carries the `unique (workspace_id, id)` such a reference would point at, so the intent is on the
 record even though the reference is not.
+
+### M2b: why `templates` and `brand_kits` are not a lock class
+
+**Read this section for what it says about code, which is almost nothing, because there is almost
+no code.** Tasks R1-R7 added `0032`, the block tree, the MJML emitter and the renderers, and **not
+one statement that writes `templates` or `brand_kits`**: `src/` contains no `insert into`,
+`update` or `delete from` for either (searched, not remembered), and the only writers are the raw
+SQL in `tests/templates.rs`. The CRUD handlers are a later task. So there is no path to enumerate
+and no row to add to the path table, and the ruling below is on the **schema** and on the
+**statement shape every such handler will have**, held by a test on that shape rather than on a
+handler. That is the same footing `relays` was ruled on before `take` existed, and the same
+warning applies: the ruling is written, not yet exercised by real code.
+
+**The enumeration, against a database migrated from nothing to `0032`** (`pg_constraint`, not the
+migration text — the migration is what was *written*, the catalog is what *runs*):
+
+- `workspaces` gained two children, `brand_kits (c)` and `templates (c)`. Its fan-out is now
+  seventeen. **No new parent**: the ten above are still the ten.
+- Every constraint that mentions `templates` or `brand_kits`, in either column: both tables'
+  primary keys, `templates_workspace_id_fkey`, `brand_kits_workspace_id_fkey`,
+  `templates_workspace_id_id_key` (a unique key, not a reference), and four `check`s. **Nothing
+  references either table.** There are no user triggers on either, so no statement on them runs
+  a second statement behind the first.
+- `audit_log` still has only `audit_log_pkey`. A handler's audit write therefore takes nothing
+  beyond a `RowExclusiveLock` on `audit_log` itself, which is the reasoning `delete_relay` was
+  cleared by and is not repeated here.
+
+**The ruling.** Neither is a lock class, for the reason the method's own definition gives: a class
+exists where one path writes a child directly *and another reaches the same rows through a
+parent's `on delete` action*, and the only parent either table has is `workspaces`, which **nothing
+deletes** (`src/` has no `delete from workspaces`, re-run for this ruling) and whose rows are only
+ever updated in non-key columns. A cascade that never fires cannot be the second path.
+
+**What a write to either table locks**, which is the half the test holds:
+
+| statement | takes on `workspaces` | why |
+|---|---|---|
+| insert a template | `for key share`, at the end of the statement | `templates_workspace_id_fkey`, checked by the referential trigger |
+| insert a brand kit, or the insert arm of an upsert | `for key share`, likewise | `brand_kits_workspace_id_fkey` |
+| update a template (name, tree, source, compiled) | **nothing** | writes no foreign key column, so no referential trigger fires |
+| the update arm of a `brand_kits` upsert on `workspace_id` | **nothing** | `set` names `logo_url`, `palette`, `font_stack`, `footer`, `updated_at` — never `workspace_id`, so the same short-circuit as `relay_buckets`' update arm |
+| delete a template or a brand kit | **nothing** | the child side of a foreign key has no delete-time check |
+
+A `for key share` is compatible with `for no key update`, which is what every `UPDATE` of a
+non-key `workspaces` column takes, so none of these waits on an ordinary workspace edit; and
+because nothing takes a `workspaces` row exclusively, none waits on anything at all. Every one is
+**one statement on one row by primary key**, which makes each a terminal node in the wait-for
+graph: it holds what it holds and asks for nothing further. A cycle needs every node to be both a
+holder and a waiter, so there is none to form.
+`a_template_or_brand_kit_write_takes_at_most_a_key_share_on_its_workspace` measures exactly this
+table, with the control the relay tests use: the same insert is raced first against an exclusive
+hold on the workspace row and must block, so the wedge is shown to be real, and only then are the
+updates, the delete and the upsert's update arm shown to pass it.
+
+**The tripwires, written as things to check.** Each is a one-line check and the first is enforced:
+
+- **Anything starts referencing `templates`.** The obvious candidate is a campaign naming its
+  body, and `templates_workspace_id_id_key` was added so that such a reference can be composite.
+  `the_foreign_key_graph_is_the_one_the_adr_rules_on` fails on the migration that adds it, and
+  `templates` is then an eleventh parent to rule on **before** the migration merges. Rule it with
+  `relays` as the model: a delete that takes the template row and then checks (or cascades into)
+  the children, against a child writer that takes the child first and the template last. If the
+  reference is `on delete restrict` or `no action`, nothing cascades but the referential check
+  still looks at the child; if it is `cascade`, it is the `lists` shape.
+- **Any handler holds a `templates` or `brand_kits` row across a second statement that locks
+  something else** — a template save that also takes a `lists`, `contacts` or `suppressions` row,
+  say. The ruling is about one statement; the audit write that follows a handler's statement is
+  not such a second lock, for the `audit_log` reason above. A handler that grows a second one adds its row to the path table
+  in that same change and is placed in the order above.
+- **A handler writes `workspace_id`.** There is no reason to, since a template never changes
+  workspace, and it is exactly the statement that would turn the "takes nothing" rows above into
+  "takes `for key share`" ones.
+- **A `delete from workspaces` appears anywhere.** That is the one change that makes `workspaces` a
+  class for **seventeen** tables at once instead of fifteen, and it is not enforced by anything
+  (see "Known and open" below, where it is already carried).
 
 ### The tripwire on `tags`, and what to check rather than predict
 
