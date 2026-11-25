@@ -73,15 +73,19 @@ pub struct TextTemplate {
     pub text: String,
 }
 
-/// Operator text into the template source. Plain text has no entities, so the only things changed
-/// are the ones that would be read as structure: a brace (see [`BRACE`]), and the characters this
-/// module and `render.rs` use as delimiters.
+/// Operator text into the template source. Plain text has no entities, so the only change is the one
+/// that keeps a typed `{` from being read as a tag (see [`BRACE`]).
+///
+/// The characters this module uses as its own stand-in and delimiters (`BRACE`, and the three link
+/// delimiters) are RESERVED: operator text may not contain them. `lit` cannot fail, so it writes the
+/// one thing `compile_text` already refuses, the marker text, and the refusal is the same
+/// `ForgedMarker` as for a typed marker. Dropping or rewriting them instead would be silent data
+/// loss.
 fn lit(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
             '{' => out.push(BRACE),
-            BRACE => out.push('\u{FFFD}'),
-            TEXT_LINK_OPEN | TEXT_LINK_SEP | TEXT_LINK_CLOSE => {}
+            BRACE | TEXT_LINK_OPEN | TEXT_LINK_SEP | TEXT_LINK_CLOSE => out.push_str(MARK_START),
             c => out.push(c),
         }
     }
@@ -222,10 +226,12 @@ pub fn compile_text(
     if has_literal_marker(&nodes) {
         return Err(CompileError::ForgedMarker);
     }
-    let (marked, tags) = render::marked(&nodes);
-    let text = marked.replace(BRACE, "{");
-    render::classify_text(&text, tags).map_err(CompileError::Render)?;
+    // The braces are put back in the AST, and ONLY there: the stored text is then written from the
+    // restored AST by `marked`, so the two cannot disagree about it and neither can be skipped
+    // without the other showing.
     restore_braces(&mut nodes);
+    let (text, tags) = render::marked(&nodes);
+    render::classify_text(&text, tags).map_err(CompileError::Render)?;
     Ok(TextTemplate { nodes, text })
 }
 
@@ -1013,9 +1019,9 @@ mod tests {
 
     #[test]
     fn operator_text_next_to_a_tag_in_a_tag_run_is_still_a_literal() {
-        // Text in a `Run::Tag` that is not the tag is escaped like any other text.
-        let out = render(&[para(vec![tag("a\u{2}{b} {{ first_name }}\u{E000}")])]);
-        assert_eq!(out, "a{b} Ada\u{FFFD}");
+        // Text in a `Run::Tag` that is not the tag is a literal like any other text, braces included.
+        let out = render(&[para(vec![tag("a{b} {{ first_name }}{c}")])]);
+        assert_eq!(out, "a{b} Ada{c}");
     }
 
     #[test]
@@ -1027,11 +1033,151 @@ mod tests {
     }
 
     #[test]
-    fn operator_text_cannot_forge_the_templates_own_characters() {
-        // The link delimiters are dropped, and the stand-in for a brace is not turned into one.
-        let out = render(&[para(vec![text("a\u{1}b\u{2}c\u{3}d\u{E000}e")])]);
-        assert_eq!(out, "abcd\u{FFFD}e");
-        assert!(!out.contains('{'));
+    fn operator_text_may_not_contain_the_templates_own_characters() {
+        // A typed marker, the stand-in for a brace and the three link delimiters are one reserved
+        // class, refused one way, wherever operator text can land. Deleting or rewriting them
+        // would be silent data loss.
+        for reserved in [MARK_START, "\u{E000}", "\u{1}", "\u{2}", "\u{3}", "a\u{2}b"] {
+            let brand_with = |t: &str| BrandKit {
+                footer_text: Some(t.into()),
+                ..BrandKit::default()
+            };
+            let cases: Vec<(&str, Vec<Block>, BrandKit)> = vec![
+                (
+                    "text",
+                    vec![para(vec![text(reserved)])],
+                    BrandKit::default(),
+                ),
+                (
+                    "heading",
+                    vec![Block::Heading {
+                        level: 2,
+                        runs: vec![text(reserved)],
+                    }],
+                    BrandKit::default(),
+                ),
+                (
+                    "link text",
+                    vec![para(vec![Run::Link {
+                        href: "https://a.example/".into(),
+                        text: reserved.into(),
+                        marks: vec![],
+                    }])],
+                    BrandKit::default(),
+                ),
+                (
+                    "link href",
+                    vec![para(vec![Run::Link {
+                        href: format!("https://a.example/{reserved}"),
+                        text: "x".into(),
+                        marks: vec![],
+                    }])],
+                    BrandKit::default(),
+                ),
+                (
+                    "text next to a tag",
+                    vec![para(vec![tag(&format!("{reserved}{{{{ first_name }}}}"))])],
+                    BrandKit::default(),
+                ),
+                (
+                    "button label",
+                    vec![button(reserved, "https://a.example/")],
+                    BrandKit::default(),
+                ),
+                (
+                    "button href",
+                    vec![button("Go", &format!("https://a.example/{reserved}"))],
+                    BrandKit::default(),
+                ),
+                (
+                    "image alt",
+                    vec![Block::Image {
+                        src: "https://a.example/i.png".into(),
+                        alt: reserved.into(),
+                    }],
+                    BrandKit::default(),
+                ),
+                ("footer", vec![], brand_with(reserved)),
+            ];
+            for (place, blocks, brand) in cases {
+                assert_eq!(
+                    compile_text(&blocks, &brand, &registry()),
+                    Err(CompileError::ForgedMarker),
+                    "{place}: {reserved:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_marker_in_a_links_lead_or_tail_is_refused_not_copied_out() {
+        use crate::template::render::{MARK_END, classify_text, substitute_text};
+        let (o, s, c) = (TEXT_LINK_OPEN, TEXT_LINK_SEP, TEXT_LINK_CLOSE);
+        let m = |id: usize, suffix: &str| format!("{MARK_START}{id}{suffix}{MARK_END}");
+        // `lead` and `tail` are the only bytes copied out without being walked: a field marker there
+        // would reach the recipient as `~nmmt~0~tmmn~`, and a conditional pair there passes the
+        // marker count and is never walked, so its branch is NOT suppressed.
+        let in_lead = format!("{o}{}{s}https://a.example/{s}{c}", m(0, ""));
+        let in_tail = format!("{o}{s}https://a.example/{s}{}{c}", m(0, ""));
+        let pair_in_lead_and_tail =
+            format!("{o}{}{s}https://a.example/{s}{}{c}", m(0, "o"), m(0, "c"));
+        let nodes = tag::compile("{{# first_name }}{{/ first_name }}", &registry()).unwrap();
+        let field = tag::compile("{{ first_name }}", &registry()).unwrap();
+        for (bad, nodes) in [
+            (&in_lead, &field),
+            (&in_tail, &field),
+            (&pair_in_lead_and_tail, &nodes),
+        ] {
+            assert!(
+                matches!(
+                    classify_text(bad, 1),
+                    Err(RenderError::DangerousContext { .. })
+                ),
+                "classify: {bad:?}"
+            );
+            let attrs = json!({});
+            assert!(
+                matches!(
+                    substitute_text(bad, nodes, &contact("", &attrs)),
+                    Err(RenderError::DangerousContext { .. })
+                ),
+                "substitute: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stored_ast_holds_the_operators_braces_not_the_stand_in() {
+        // `TextTemplate.nodes` is stored. The stand-in for a brace must not be in it, at the top
+        // level or inside a conditional's body.
+        fn has_stand_in(nodes: &[Node]) -> bool {
+            nodes.iter().any(|n| match n {
+                Node::Text(t) => t.contains('\u{E000}'),
+                Node::Field { .. } => false,
+                Node::Present { body, .. }
+                | Node::Absent { body, .. }
+                | Node::Equals { body, .. } => has_stand_in(body),
+            })
+        }
+        let t = text_template(
+            &[para(vec![
+                text("{{ typed }} {"),
+                tag("{{# country }}in {braces} {{ country }}{{/ country }}"),
+            ])],
+            &BrandKit::default(),
+        );
+        assert!(!has_stand_in(&t.nodes), "{:?}", t.nodes);
+        assert!(!t.text.contains('\u{E000}'), "{:?}", t.text);
+        assert!(
+            t.nodes
+                .iter()
+                .any(|n| matches!(n, Node::Text(s) if s.contains("{{ typed }} {")))
+        );
+        // And the text it renders has them.
+        assert_eq!(
+            render_text(&t, &contact("Ada", &json!({"country": "UK"}))).unwrap(),
+            "{{ typed }} {in {braces} UK"
+        );
     }
 
     #[test]
