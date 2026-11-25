@@ -22,6 +22,7 @@ export function TextBlock({ block, label, s }: { block: Extract<Block, { runs: u
       onSelect={s.select}
       onFocus={s.focus}
       onMark={s.mark}
+      onEnter={s.enter}
     />
   );
 }

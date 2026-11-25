@@ -17,6 +17,7 @@ export type Sel = { from: number; to: number };
  */
 
 function paint(root: HTMLElement, runs: Run[]) {
+  const last = runs.at(-1);
   root.replaceChildren(
     ...runs.map((r): Node => {
       if (r.type === "Tag") return tagToken(r.source);
@@ -35,6 +36,9 @@ function paint(root: HTMLElement, runs: Run[]) {
       link.append(node);
       return link;
     }),
+    // A line break at the very end of pre-wrapped text shows no new line until something follows
+    // it, so the caret would sit on the old line. `parse` ignores the <br>.
+    ...(last && last.type !== "Tag" && last.text.endsWith("\n") ? [document.createElement("br")] : []),
   );
 }
 
@@ -127,6 +131,8 @@ type Props = {
   onRuns: (runs: Run[], restore?: Sel) => void;
   onSelect: (sel: Sel) => void;
   onFocus: () => void;
+  /** Enter: split the block at the selection. Shift+Enter is a line break and is handled here. */
+  onEnter: (runs: Run[], sel: Sel) => void;
   onMark: (mark: Mark) => void;
 };
 
@@ -202,8 +208,14 @@ export function RichText(props: Props) {
         props.onRuns(runs);
       }}
       onKeyDown={(e) => {
-        // A block is one paragraph; a new one is added from the toolbar.
-        if (e.key === "Enter") e.preventDefault();
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const runs = parse(e.currentTarget);
+          const sel = selection(e.currentTarget) ?? { from: length(runs), to: length(runs) };
+          // A line break is a "\n" in the text, shown as a break because the block is pre-wrapped.
+          if (e.shiftKey) props.onRuns(edit(runs, sel.from, sel.to, [{ type: "Text", text: "\n", marks: [] }]), { from: sel.from + 1, to: sel.from + 1 });
+          else props.onEnter(runs, sel);
+        }
         const mark = e.key === "b" ? "bold" : e.key === "i" ? "italic" : null;
         if (mark && (e.ctrlKey || e.metaKey)) {
           e.preventDefault();

@@ -53,7 +53,7 @@ export type Op =
   | { type: "update"; at: Loc; block: Block }
   /** Reorder inside one list: `to` is the index the block ends up at. Between lists is delete then insert. */
   | { type: "move"; from: Loc; to: Loc }
-  /** Cut a Text block in two. `offset` counts characters in the run, or is 0 or 1 (before, after) for a Tag. */
+  /** Cut a Text or Heading block in two (a heading keeps its level). `offset` counts code points in the run, or is 0 or 1 (before, after) for a Tag. */
   | { type: "split"; at: Loc; run: number; offset: number };
 
 /** An operation that cannot be applied whole. The document is untouched when this is thrown. */
@@ -253,13 +253,13 @@ export function apply(doc: Doc, op: Op): Doc {
       return {
         blocks: within(doc.blocks, at, (list, i) => {
           const b = list[i];
-          if (b?.type !== "Text") return reject("only a Text block can be split");
+          if (b?.type !== "Text" && b?.type !== "Heading") return reject("only a Text or Heading block can be split");
           const run = b.runs[op.run];
           if (!run) return reject("split names a run that does not exist");
           const [head, tail] = cut(run, op.offset);
           // `normalize` drops empty runs and leaves an empty block as one empty run, the shape `blank` makes.
-          const first: Block = { type: "Text", runs: normalize([...b.runs.slice(0, op.run), ...head]) };
-          const second: Block = { type: "Text", runs: normalize([...tail, ...b.runs.slice(op.run + 1)]) };
+          const first: Block = { ...b, runs: normalize([...b.runs.slice(0, op.run), ...head]) };
+          const second: Block = { ...b, runs: normalize([...tail, ...b.runs.slice(op.run + 1)]) };
           return splice(list, i, 1, first, second);
         }),
       };

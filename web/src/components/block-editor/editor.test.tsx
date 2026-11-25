@@ -323,3 +323,114 @@ test("the_editor_with_a_text_block_selected_has_no_accessibility_violations", as
   await caretIn(page, "Text block 2");
   await expectNoViolations(new AxeBuilder({ page }), "block editor with a text block selected");
 });
+
+const kinds = async (page: Page) => (await doc(page)).blocks.map((b) => b.type);
+const tagsIn = (b: Block) => (b.type === "Text" ? b.runs.filter((r) => r.type === "Tag") : []);
+const TAG = { type: "Tag", source: '{{ first_name | "there" }}' };
+
+test("enter_in_the_middle_of_a_text_block_splits_it_at_the_caret_and_the_caret_moves_on", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 2; i++) await page.keyboard.press("ArrowRight"); // "Hi|"
+  await page.keyboard.press("Enter");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Text", "Columns"]);
+  expect([words(await block(page, 1)), words(await block(page, 2))]).toEqual(["Hi", " {tag}!"]);
+  // The caret is at the start of the second half, so what is typed goes there.
+  await expect(box(page, "Text block 3")).toBeFocused();
+  await page.keyboard.type("X");
+  expect(words(await block(page, 2))).toBe("X {tag}!");
+  // The split is one undo step of its own, and the typing after it is another.
+  await page.getByRole("button", { name: "Undo" }).click();
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Text", "Columns"]);
+  await page.getByRole("button", { name: "Undo" }).click();
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
+  expect(words(await block(page, 1))).toBe("Hi {tag}!");
+});
+
+test("enter_at_the_end_of_a_block_adds_an_empty_text_block_below_with_the_caret_in_it", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("End");
+  await page.keyboard.press("Enter");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Text", "Columns"]);
+  expect(await block(page, 2)).toEqual({ type: "Text", runs: [{ type: "Text", text: "", marks: [] }] });
+  expect(words(await block(page, 1))).toBe("Hi {tag}!");
+  await expect(box(page, "Text block 3")).toBeFocused();
+  await page.keyboard.type("new");
+  expect(words(await block(page, 2))).toBe("new");
+});
+
+test("enter_beside_or_on_a_merge_tag_never_tears_it", async ({ page, app }) => {
+  const runsOf = async (i: number) => ((await block(page, i)) as Extract<Block, { type: "Text" }>).runs;
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight"); // just before the tag
+  await page.keyboard.press("Enter");
+  expect(await runsOf(1)).toEqual([{ type: "Text", text: "Hi ", marks: [] }]);
+  expect(await runsOf(2)).toEqual([TAG, { type: "Text", text: "!", marks: ["bold"] }]);
+
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("End");
+  await page.keyboard.press("ArrowLeft"); // just after the tag
+  await page.keyboard.press("Enter");
+  expect(await runsOf(1)).toEqual([{ type: "Text", text: "Hi ", marks: [] }, TAG]);
+  expect(await runsOf(2)).toEqual([{ type: "Text", text: "!", marks: ["bold"] }]);
+
+  // A click on the tag itself puts the caret in its text; the split still lands on one side of it.
+  await open(page, app);
+  await page.locator("[data-tag]").click();
+  await page.keyboard.press("Enter");
+  const [a, b] = [await block(page, 1), await block(page, 2)];
+  expect(a.type === "Text" && b.type === "Text").toBe(true);
+  expect([...tagsIn(a), ...tagsIn(b)]).toEqual([TAG]);
+  const halves = JSON.stringify([words(a), words(b)]);
+  expect([JSON.stringify(["Hi ", "{tag}!"]), JSON.stringify(["Hi {tag}", "!"])]).toContain(halves);
+});
+
+test("shift_enter_is_a_line_break_inside_the_block_not_a_split", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 2; i++) await page.keyboard.press("ArrowRight"); // "Hi|"
+  await page.keyboard.press("Shift+Enter");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
+  await page.keyboard.type("X");
+  expect(words(await block(page, 1))).toBe("Hi\nX {tag}!");
+  // At the very end, too: the break is real, not swallowed, and the caret is after it.
+  await page.keyboard.press("End");
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("Y");
+  expect(words(await block(page, 1))).toBe("Hi\nX {tag}!\nY");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
+});
+
+test("enter_in_a_heading_splits_it_into_two_headings_and_at_its_end_adds_a_text_block", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Heading block 1");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowRight"); // "Wel|come"
+  await page.keyboard.press("Enter");
+  expect(await kinds(page)).toEqual(["Heading", "Heading", "Text", "Columns"]);
+  expect(await block(page, 0)).toMatchObject({ level: 1, runs: [{ text: "Wel" }] });
+  expect(await block(page, 1)).toMatchObject({ level: 1, runs: [{ text: "come" }] });
+  await page.keyboard.press("End");
+  await page.keyboard.press("Enter");
+  expect(await kinds(page)).toEqual(["Heading", "Heading", "Text", "Text", "Columns"]);
+});
+
+test("enter_over_a_selection_replaces_it_with_the_split_as_one_undo_step", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("Home");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Shift+ArrowRight");
+  await page.keyboard.press("Shift+ArrowRight"); // "i "
+  await page.keyboard.press("Enter");
+  expect([words(await block(page, 1)), words(await block(page, 2))]).toEqual(["H", "{tag}!"]);
+  await page.getByRole("button", { name: "Undo" }).click();
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
+  expect(words(await block(page, 1))).toBe("Hi {tag}!");
+});

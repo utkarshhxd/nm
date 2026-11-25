@@ -12,6 +12,7 @@ import {
   type Loc,
   type Mark,
   type Op,
+  type Run,
   OpRejected,
   amend,
   blank,
@@ -22,7 +23,7 @@ import {
 } from "./model";
 import { Properties } from "./properties";
 import type { Sel } from "./rich-text";
-import { edit, hrefAllowed, length, setLink, toggleMark } from "./runs";
+import { edit, hrefAllowed, length, locate, setLink, toggleMark } from "./runs";
 
 const PALETTE: Block["type"][] = ["Text", "Heading", "Image", "Button", "Divider", "Spacer", "Columns"];
 
@@ -68,10 +69,13 @@ export function BlockEditor({ initial, onChange }: { initial: Doc; onChange?: (d
     onChange?.(next.present);
   }
 
-  function run(op: Op, select: Loc | null, how: { burst?: string; restore?: Sel } = {}) {
+  /** One or more ops as one undo step: the first is committed, the rest amend it. */
+  function run(op: Op | Op[], select: Loc | null, how: { burst?: string; restore?: Sel } = {}) {
     const key = how.burst === undefined ? undefined : `${select?.join()}:${how.burst}`;
     try {
-      const next = (key !== undefined && key === burst.current ? amend : commit)(history, op);
+      const [first, ...rest] = Array.isArray(op) ? op : [op];
+      let next = (key !== undefined && key === burst.current ? amend : commit)(history, first as Op);
+      for (const o of rest) next = amend(next, o);
       endBurst();
       if (key !== undefined) {
         burst.current = key;
@@ -129,6 +133,24 @@ export function BlockEditor({ initial, onChange }: { initial: Doc; onChange?: (d
     );
   }
 
+  /** Enter: delete the selection, then split at the caret, or add a text block below at the end. One undo step. */
+  function enter(loc: Loc, block: TextBlock, runs: Run[], sel: Sel) {
+    const below = [...loc.slice(0, -1), (loc.at(-1) as number) + 1];
+    const ops: Op[] = [];
+    let now = runs;
+    if (sel.from !== sel.to) {
+      now = edit(runs, sel.from, sel.to);
+      ops.push({ type: "update", at: loc, block: { ...block, runs: now } });
+    }
+    // Split names a run and an offset in it, so a merge tag has only two edges and is never cut.
+    ops.push(
+      sel.from >= length(now)
+        ? { type: "insert", at: below, block: blank("Text") }
+        : { type: "split", at: loc, ...locate(now, sel.from) },
+    );
+    run(ops, below, { restore: { from: 0, to: 0 } });
+  }
+
   function row(block: Block, loc: Loc, count: number) {
     const key = loc.join();
     const isSelected = same(selected, loc);
@@ -148,6 +170,7 @@ export function BlockEditor({ initial, onChange }: { initial: Doc; onChange?: (d
       focus: () => !isSelected && setSelected(loc),
       select: (s) => setSel((p) => (p && p.key === key && p.from === s.from && p.to === s.to ? p : { key, ...s })),
       mark: (m) => isText(block) && mark(loc, block, m),
+      enter: (runs, s) => isText(block) && enter(loc, block, runs, s),
       restore: restore && restore.key === key ? restore : null,
     };
     const columns =

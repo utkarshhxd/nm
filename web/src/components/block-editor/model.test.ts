@@ -107,6 +107,14 @@ test("split_at_a_run_edge_leaves_no_empty_run_and_an_empty_half_is_one_empty_run
   expect(apply(doc(plain("ab")), { type: "split", at: [0], run: 0, offset: 0 }).blocks[0]).toEqual(blank("Text"));
 });
 
+test("split_cuts_a_heading_into_two_headings_of_the_same_level", () => {
+  const h: Block = { type: "Heading", level: 3, runs: [t("Hello")] };
+  expect(apply(doc(h), { type: "split", at: [0], run: 0, offset: 2 }).blocks).toEqual([
+    { type: "Heading", level: 3, runs: [t("He")] },
+    { type: "Heading", level: 3, runs: [t("llo")] },
+  ]);
+});
+
 test("split_never_cuts_a_tag", () => {
   const tag = { type: "Tag", source: '{{ first_name | "there" }}' } as const;
   const d = doc(text(t("Hi "), tag, t("!")));

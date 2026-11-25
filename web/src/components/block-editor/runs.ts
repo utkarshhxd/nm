@@ -65,6 +65,22 @@ export function splitAt(runs: Run[], at: number): [Run[], Run[]] {
   return [runs, []];
 }
 
+/** Where flat offset `at` falls, as the `split` op names it: a run, and a code-point offset in it (0 or 1 for a tag). */
+export function locate(runs: Run[], at: number): { run: number; offset: number } {
+  let pos = 0;
+  for (let i = 0; i < runs.length; i++) {
+    const r = runs[i] as Run;
+    const n = size(r);
+    if (at <= pos + n) {
+      if (r.type === "Tag") return { run: i, offset: at - pos };
+      const head = splitAt([r], at - pos)[0][0] as Inline;
+      return { run: i, offset: [...head.text].length };
+    }
+    pos += n;
+  }
+  return { run: Math.max(runs.length - 1, 0), offset: 0 };
+}
+
 /** The runs between two offsets, as pieces (empty ones removed). */
 function slice(runs: Run[], from: number, to: number): Run[] {
   const [, rest] = splitAt(runs, from);

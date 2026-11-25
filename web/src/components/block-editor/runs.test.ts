@@ -5,7 +5,7 @@
 import { expect, test } from "@playwright/test";
 
 import type { Mark, Run } from "./model";
-import { edit, hasTag, hrefAllowed, hrefAt, marked, normalize, splitAt, tagSource, toggleMark, setLink } from "./runs";
+import { edit, hasTag, locate, hrefAllowed, hrefAt, marked, normalize, splitAt, tagSource, toggleMark, setLink } from "./runs";
 
 const t = (text: string, ...marks: Mark[]): Run => ({ type: "Text", text, marks });
 const tag: Run = { type: "Tag", source: '{{ first_name | "there" }}' };
@@ -88,4 +88,13 @@ test("a_merge_tag_field_accepts_the_name_with_or_without_braces", () => {
 test("only_http_https_mailto_and_tel_are_links", () => {
   for (const ok of ["https://a.test/x", "http://a.test", "mailto:a@b.test", "tel:+15550100"]) expect(hrefAllowed(ok)).toBe(true);
   for (const no of ["javascript:alert(1)", "data:text/html,x", "ftp://a.test", "//a.test", "a.test", ""]) expect(hrefAllowed(no)).toBe(false);
+});
+
+test("locate_names_a_run_and_a_code_point_offset_and_a_tag_has_two_edges", () => {
+  const runs = [t("Hi "), tag, t("a\u{1F600}b")];
+  expect(locate(runs, 2)).toEqual({ run: 0, offset: 2 });
+  expect(locate(runs, 3)).toEqual({ run: 0, offset: 3 });
+  expect(locate(runs, 4)).toEqual({ run: 1, offset: 1 });
+  expect(locate(runs, 7)).toEqual({ run: 2, offset: 2 }); // after the emoji: 2 code points, 3 code units
+  expect(locate([t("")], 0)).toEqual({ run: 0, offset: 0 });
 });
