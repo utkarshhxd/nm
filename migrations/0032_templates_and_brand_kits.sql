@@ -27,6 +27,9 @@ create table templates (
   -- Not redundant with the primary key: Postgres requires a unique constraint on exactly these
   -- columns for a child table's composite foreign key to point at.
   constraint templates_workspace_id_id_key unique (workspace_id, id),
+  -- A tree of `null`, `7` or `[]` would deserialize to an error at the moment the editor opens it.
+  -- Null stays legal: a raw template has no tree at all (`templates_tree_xor_source` decides when).
+  constraint templates_tree_is_object check (tree is null or jsonb_typeof(tree) = 'object'),
   -- Exactly one of `tree` and `source`, decided by `kind`. Here and not in the handler, because
   -- the handler is where M1's equivalent drifted.
   constraint templates_tree_xor_source check (
@@ -59,7 +62,10 @@ create table brand_kits (
   font_stack text,
   footer jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  -- `not null` does not stop the JSON value `null`, `7` or `[]`; the renderer reads these as maps.
+  constraint brand_kits_palette_is_object check (jsonb_typeof(palette) = 'object'),
+  constraint brand_kits_footer_is_object check (jsonb_typeof(footer) = 'object')
 );
 
 comment on table brand_kits is
