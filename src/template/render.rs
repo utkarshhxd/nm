@@ -69,6 +69,10 @@ use super::tag::{Filter, Node};
 pub const MARK_START: &str = "~nmmt~";
 /// Closes a [`MARK_START`]; the digits between the two are the tag's index.
 pub const MARK_END: &str = "~tmmn~";
+/// Follows the index when the marker is a conditional's boundary rather than a field. It is in
+/// the marker rather than in a parameter so that [`classify`] can tell the two apart from the
+/// stored HTML alone, with nothing extra to keep in step.
+const MARK_BLOCK: &str = "b";
 
 /// Where a merge tag lands in the finished HTML.
 ///
@@ -92,6 +96,15 @@ pub enum RenderError {
     /// the attribute or the element that held it. Saving this template would publish a message
     /// with the tag silently missing, so it is refused instead.
     TagLost { index: usize },
+    /// `mrml` copied one of a conditional's two boundary markers, so the renderer cannot tell
+    /// which copy delimits the branch.
+    ///
+    /// A duplicated FIELD marker is fine — every copy is given the same value, and `mrml`
+    /// legitimately emits an `mj-button` href twice. A duplicated BOUNDARY is not: suppressing a
+    /// branch means rewinding the output between a matching pair, and with three of them the
+    /// wrong range of a sent message gets dropped, silently, which is the one failure in this
+    /// module that would not announce itself.
+    BlockDuplicated { index: usize, count: usize },
 }
 
 /// The attributes whose value is a URL the browser will fetch or navigate to. Anything here gets
@@ -228,8 +241,14 @@ fn walk<'a>(nodes: &'a [Node], out: &mut String, slots: &mut Vec<Slot<'a>>) {
 }
 
 fn mark<'a>(out: &mut String, slots: &mut Vec<Slot<'a>>, slot: Slot<'a>) {
-    let _ = write!(out, "{MARK_START}{}{MARK_END}", slots.len());
+    let block = !matches!(slot, Slot::Field(_));
+    out.push_str(&marker(slots.len(), block));
     slots.push(slot);
+}
+
+fn marker(id: usize, block: bool) -> String {
+    let suffix = if block { MARK_BLOCK } else { "" };
+    format!("{MARK_START}{id}{suffix}{MARK_END}")
 }
 
 /// This contact's answer for every marker, in the same index order [`marked`] used.
@@ -260,7 +279,10 @@ fn fills(nodes: &[Node], c: &Contact<'_>) -> Vec<Fill> {
 /// `html` is the output of `mrml`, with [`marked`]'s markers still in it, and `tags` is the count
 /// [`marked`] returned. Every index below `tags` must appear in `html` **at least once** — `mrml`
 /// legitimately duplicates a marker (an `mj-button` href is emitted twice, once inside the Outlook
-/// conditional comment), so the invariant is presence, never equality.
+/// conditional comment), so the invariant is presence, never equality — **except** for a
+/// conditional's two boundary markers, which must appear exactly once each, because suppressing a
+/// dropped branch means rewinding between a matching pair and a third copy makes that the wrong
+/// range of the message.
 ///
 /// The returned vector is not a reliable index-to-site map when `mrml` duplicated a marker into
 /// two different contexts: the first site recorded wins, and a `Dangerous` anywhere wins outright.
@@ -365,7 +387,7 @@ fn segments(s: &str) -> Vec<Seg<'_>> {
     while let Some(i) = rest[done..].find(MARK_START).map(|i| done + i) {
         let after = &rest[i + MARK_START.len()..];
         match id_in(after) {
-            Some((id, len)) => {
+            Some((id, _, len)) => {
                 if i > 0 {
                     out.push(Seg::Lit(&rest[..i]));
                 }
@@ -383,18 +405,24 @@ fn segments(s: &str) -> Vec<Seg<'_>> {
     out
 }
 
-/// The digits of a marker that has just had its `MARK_START` consumed, and their byte length.
-fn id_in(after: &str) -> Option<(usize, usize)> {
+/// The inside of a marker that has just had its `MARK_START` consumed: the index, whether it is a
+/// conditional's boundary, and the byte length of both.
+fn id_in(after: &str) -> Option<(usize, bool, usize)> {
     let len = after.find(MARK_END)?;
-    let digits = &after[..len];
+    let body = &after[..len];
+    let (digits, block) = match body.strip_suffix(MARK_BLOCK) {
+        Some(d) => (d, true),
+        None => (body, false),
+    };
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
         .then(|| digits.parse().ok())
         .flatten()
-        .map(|id| (id, len))
+        .map(|id| (id, block, len))
 }
 
 fn position_of(html: &str, id: usize) -> usize {
-    html.find(&format!("{MARK_START}{id}{MARK_END}"))
+    html.find(&marker(id, false))
+        .or_else(|| html.find(&marker(id, true)))
         .unwrap_or(0)
 }
 
@@ -945,9 +973,11 @@ fn scan(
         return Err(RenderError::DangerousContext { position: 0 });
     }
     let mut sites: Vec<Option<Site>> = vec![None; tags];
+    let mut counts: Vec<usize> = vec![0; tags];
+    let mut boundary: Vec<bool> = vec![false; tags];
     let bytes = html.as_bytes();
     for (i, _) in html.match_indices(MARK_START) {
-        let Some((id, _)) = id_in(&html[i + MARK_START.len()..]) else {
+        let Some((id, block, _)) = id_in(&html[i + MARK_START.len()..]) else {
             continue;
         };
         // Bounded BEFORE the resize below: a raw `~nmmt~4294967295~tmmn~` would otherwise ask for
@@ -957,12 +987,32 @@ fn scan(
         }
         if sites.len() <= id {
             sites.resize(id + 1, None);
+            counts.resize(id + 1, 0);
+            boundary.resize(id + 1, false);
         }
+        counts[id] += 1;
+        boundary[id] = block;
         // `<{{ tag }}>`: the tokenizer reads this as TEXT, because a marker is not an ASCII letter
         // and so does not open a tag — but the `<` is already in the template, and a value dropped
         // straight after it is a tag name whatever the tokenizer calls the position.
         if i > 0 && bytes[i - 1] == b'<' {
             sites[id] = Some(Site::Dangerous);
+        }
+    }
+
+    // A conditional's boundary must survive exactly once. `mrml` copies markers — measured, on an
+    // `mj-button` href — and a copied FIELD marker is harmless because every copy is given the
+    // same value. A copied BOUNDARY is not: suppressing a dropped branch means rewinding the
+    // output between a matching pair, and a third marker makes that the wrong range. Everything
+    // else in this module fails closed; this is the one place where not checking would mean a
+    // recipient quietly getting the other branch's content. A boundary with a count of zero is
+    // left to the `TagLost` check below, which says the more useful thing.
+    for (id, &is_boundary) in boundary.iter().enumerate() {
+        if is_boundary && counts[id] != 1 {
+            return Err(RenderError::BlockDuplicated {
+                index: id,
+                count: counts[id],
+            });
         }
     }
 
@@ -994,9 +1044,7 @@ fn scan(
     let mut sites: Vec<Site> = Vec::with_capacity(st.sites.len());
     for (id, site) in st.sites.iter().enumerate() {
         match site {
-            Some(Site::Dangerous) | None
-                if !html.contains(&format!("{MARK_START}{id}{MARK_END}")) =>
-            {
+            Some(Site::Dangerous) | None if counts.get(id).copied().unwrap_or(0) == 0 => {
                 return Err(RenderError::TagLost { index: id });
             }
             Some(Site::Dangerous) | None => {
@@ -1587,6 +1635,43 @@ mod tests {
             let src = format!("<a href=\"{raw}\">x</a>");
             assert_eq!(plain(&src), src, "{raw:?}");
         }
+    }
+
+    /// Everything else in this module fails closed. An unevenly duplicated conditional boundary
+    /// would not: it would suppress the wrong range of a sent message and say nothing, so a
+    /// recipient sees the other branch's content. `mrml 6.0.1` only duplicates attribute values
+    /// today, which is an observation about one version and not a guarantee.
+    #[test]
+    fn a_duplicated_conditional_boundary_is_refused() {
+        let (html, tags) = marked(&nodes("{{# link }}hi{{/ link }}"));
+        assert_eq!(tags, 2);
+        assert_eq!(classify(&html, tags).unwrap(), vec![Site::Text, Site::Text]);
+        for id in [0, 1] {
+            let m = marker(id, true);
+            let doubled = html.replacen(&m, &format!("{m}{m}"), 1);
+            assert_eq!(
+                classify(&doubled, tags),
+                Err(RenderError::BlockDuplicated {
+                    index: id,
+                    count: 2
+                })
+            );
+        }
+        // A duplicated FIELD marker stays legal: every copy is given the same value, which is
+        // what `mrml` does to an `mj-button` href and what a real document relies on.
+        let (html, tags) = marked(&nodes("<p>{{ first_name }}</p>"));
+        let m = marker(0, false);
+        let doubled = html.replacen(&m, &format!("{m}{m}"), 1);
+        assert_eq!(classify(&doubled, tags).unwrap(), vec![Site::Text]);
+        assert_eq!(
+            substitute(
+                &doubled,
+                &nodes("<p>{{ first_name }}</p>"),
+                &contact("Ada", &json!({}))
+            )
+            .unwrap(),
+            "<p>AdaAda</p>"
+        );
     }
 
     #[test]
