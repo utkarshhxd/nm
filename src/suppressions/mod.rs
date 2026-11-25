@@ -92,8 +92,13 @@ pub enum BlockLevel {
 
 /// The standing block that stops one address being mailed, and nothing else about it: not the
 /// row's id, note or who made it, and never another address.
+///
+/// Named for what it blocks rather than `Block`, because `components.schemas` is ONE flat map
+/// keyed by the type's name and `template::block::Block` is a different thing entirely. Two types
+/// sharing a key do not collide loudly: the second insert replaces the first and every `$ref`
+/// still resolves, so one of them ships with the other's shape (`schema_names_are_unique`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
-pub struct Block {
+pub struct SuppressionBlock {
     pub reason: Reason,
     pub level: BlockLevel,
     /// Whether it blocks this one address or every address on its domain.
@@ -120,7 +125,7 @@ pub async fn blocking_suppression(
     secrets: &Secrets,
     workspace_id: Uuid,
     email: &str,
-) -> ApiResult<Option<Block>> {
+) -> ApiResult<Option<SuppressionBlock>> {
     let Ok(email) = normalize_email(email) else {
         return Err(ApiError::Internal(anyhow::anyhow!(
             "a stored address does not normalise, so its suppression status cannot be checked"
@@ -200,7 +205,7 @@ async fn blocking(
     secrets: &Secrets,
     workspace_id: Uuid,
     email: &str,
-) -> sqlx::Result<Option<Block>> {
+) -> sqlx::Result<Option<SuppressionBlock>> {
     let hmac = suppression_hmac(secrets, email);
     // A normalised address has exactly one `@`.
     let domain = email.split_once('@').map_or("", |(_, d)| d);
@@ -224,7 +229,7 @@ async fn blocking(
     )
     .fetch_optional(db)
     .await?;
-    Ok(row.map(|r| Block {
+    Ok(row.map(|r| SuppressionBlock {
         reason: r.reason,
         level: if r.instance {
             BlockLevel::Instance

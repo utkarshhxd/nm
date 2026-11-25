@@ -31,6 +31,11 @@ figment = { version = "0.10.19", features = ["env", "toml"] }
 futures-util = { version = "0.3.34", default-features = false }
 hickory-resolver = "0.26.3"
 hmac = "0.13.0"
+# The HTML5 tokenizer, with the tree-builder feedback that makes `<script>` and `<style>` raw text.
+# `src/template/render.rs` has to agree with a BROWSER about what is script, what is a comment and
+# what is a tag name, so the classifier uses the same parser a browser would. Already in the tree
+# under `mrml`'s `css-inline`; this makes it a direct dependency and adds no crate.
+html5ever = "0.39.0"
 lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "rustls-native-certs", "pool", "ring"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
