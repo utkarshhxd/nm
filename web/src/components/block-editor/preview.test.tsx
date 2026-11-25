@@ -59,9 +59,14 @@ test("the_dark_preview_says_next_to_itself_what_it_covers_and_what_it_cannot", a
   await expect(label).toBeVisible();
   // Read alone, it names what is shown and what is not.
   await expect(label).toContainText("dark styles you wrote");
+  await expect(label).toContainText("recolour the email themselves");
+  await expect(label).toContainText("ignore dark styles and show the light version");
   await expect(label).toContainText("Gmail");
   await expect(label).toContainText("Outlook");
-  await expect(label).toContainText("cannot show");
+  // Behaviour first, clients as examples: tables of who does what disagree and change.
+  await expect(label).toContainText("for example");
+  await expect(label).toContainText("Sources disagree");
+  expect(((await label.textContent()) ?? "").match(/cannot show/g)?.length).toBe(2);
   // Next to the preview, not elsewhere: directly above it, and the frame is described by it.
   const [l, f] = [await label.boundingBox(), await iframe.boundingBox()];
   expect(l && f && l.y + l.height <= f.y && f.y - (l.y + l.height) < 40).toBe(true);
@@ -92,15 +97,47 @@ test("the_preview_frame_cannot_run_scripts_from_the_email", async ({ page, app }
 test("a_button_says_in_words_that_classic_outlook_on_windows_draws_it_square", async ({ page, app }) => {
   await open(page, app);
   const note = page.getByTestId("outlook-button-note");
-  await expect(note).toHaveCount(0);
-  await page.getByRole("textbox", { name: "Button block 3.2.1 label" }).click();
+  // Beside the button itself, with nothing selected, so no layout can put it out of sight.
+  await expect(note).toHaveCount(1);
   await expect(note).toBeVisible();
   await expect(note).toContainText("classic Outlook on Windows");
   await expect(note).toContainText("square");
   await expect(note).toContainText("preview cannot show");
-  // Only where a Button is being edited.
   await page.getByRole("button", { name: "Select Heading block 1" }).click();
-  await expect(note).toHaveCount(0);
+  await expect(note).toBeVisible();
+  // A narrow window: still on screen, and still right under the button.
+  await page.setViewportSize({ width: 400, height: 800 });
+  const input = await page.getByRole("textbox", { name: "Button block 3.2.1 label" }).boundingBox();
+  await note.scrollIntoViewIfNeeded();
+  const n = await note.boundingBox();
+  expect(n && input && n.y - (input.y + input.height) < 24 && n.x >= 0 && n.x + n.width <= 400).toBe(true);
+});
+
+test("remote_images_are_labelled_as_not_loaded_in_the_preview", async ({ page, app }) => {
+  await open(page, app);
+  for (const m of ["Desktop", "Mobile", "Dark"]) {
+    await mode(page, m);
+    await expect(page.getByTestId("preview-images")).toContainText("Remote images are not loaded");
+  }
+  await mode(page, "Plain text");
+  await expect(page.getByTestId("preview-images")).toHaveCount(0);
+});
+
+test("the_live_region_announces_the_settled_result_and_never_checking", async ({ page, app }) => {
+  await open(page, app);
+  const status = page.getByRole("status");
+  await expect(status).toHaveText("No findings.");
+  await page.evaluate(() => {
+    const log: string[] = [];
+    (window as unknown as { __status: string[] }).__status = log;
+    const el = document.querySelector("[role=status]") as Element;
+    new MutationObserver(() => log.push(el.textContent ?? "")).observe(el, { childList: true, characterData: true, subtree: true });
+  });
+  await page.getByRole("button", { name: "Add image", exact: true }).click();
+  await expect(status).toHaveText("2 findings.");
+  await expect(page.getByTestId("findings-count")).toHaveText("2 findings.");
+  const log = await page.evaluate(() => (window as unknown as { __status: string[] }).__status);
+  expect(log).toEqual(["2 findings."]);
 });
 
 test("findings_appear_as_the_document_changes_and_go_when_fixed_with_no_save", async ({ page, app }) => {

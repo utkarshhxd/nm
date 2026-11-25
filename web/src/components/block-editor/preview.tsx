@@ -55,6 +55,7 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
 
   const { result, failed, busy } = state;
   const findings = result?.findings ?? [];
+  const summary = findings.length === 0 ? "No findings." : `${findings.length} ${findings.length === 1 ? "finding" : "findings"}.`;
   return (
     <section aria-label="Preview and checks" className="space-y-3 border-t border-border pt-4">
       <h2 className="text-lg font-semibold">Preview and checks</h2>
@@ -73,11 +74,29 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
           Preview and checks unavailable. Nothing has been checked, so do not read the empty list as a pass.
         </p>
       )}
-      {result && mode === "dark" && (
-        <p id={dark} data-testid="dark-coverage" className="border-l-4 border-warning bg-warning-subtle p-3 text-fg">
-          This shows the dark styles you wrote, as Apple Mail applies them. Gmail and Outlook apps can change your colours on their own,
-          and this preview cannot show that. Send a test to those apps before you rely on dark mode.
+      {result && mode !== "text" && (
+        <p data-testid="preview-images" className="text-sm text-fg-muted">
+          Remote images are not loaded in this preview. Each one shows as its description.
         </p>
+      )}
+      {result && mode === "dark" && (
+        <div id={dark} data-testid="dark-coverage" className="space-y-2 border-l-4 border-warning bg-warning-subtle p-3 text-fg">
+          <p>
+            Dark mode does one of three things in real email apps. This preview shows only the first: it applies the dark styles you wrote.
+          </p>
+          <ul className="list-disc space-y-1 pl-5">
+            <li>Some apps apply your dark styles, Apple Mail for example.</li>
+            <li>
+              Some apps recolour the email themselves whatever you wrote, for example several Outlook and Gmail mobile apps. This preview
+              cannot show that.
+            </li>
+            <li>
+              Many apps ignore dark styles and show the light version, for example Gmail in a browser, Yahoo and classic Outlook. Some
+              rewrite the rule so it never applies. This preview cannot show that either.
+            </li>
+          </ul>
+          <p>Sources disagree about which app does which, and it changes. Send a test to the apps your readers use.</p>
+        </div>
       )}
       {result && mode === "text" && (
         <section aria-label="Plain text version" className="rounded-sm border border-border bg-sunken p-3">
@@ -96,9 +115,15 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
         />
       )}
       {!failed && (
-        <p data-testid="findings-count" role="status" className="font-medium">
-          {busy ? "Checking…" : findings.length === 0 ? "No findings." : `${findings.length} ${findings.length === 1 ? "finding" : "findings"}.`}
-        </p>
+        <>
+          {/* Sighted people see the in-flight state; assistive technology gets the settled result only. */}
+          <p data-testid="findings-count" aria-hidden="true" className="font-medium">
+            {busy ? "Checking…" : summary}
+          </p>
+          <p role="status" className="sr-only">
+            {result ? summary : ""}
+          </p>
+        </>
       )}
       {findings.length > 0 && (
         <ul aria-label="Findings" className="space-y-2">
