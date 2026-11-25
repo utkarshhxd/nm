@@ -22,6 +22,8 @@ import {
   undo,
 } from "./model";
 import { Properties } from "./properties";
+import { Preview } from "./preview";
+import { type PreviewSource, previewSource } from "./preview-source";
 import type { Sel } from "./rich-text";
 import { edit, hrefAllowed, length, locate, setLink, toggleMark } from "./runs";
 
@@ -45,7 +47,15 @@ const isText = (b: Block | null): b is TextBlock => b?.type === "Text" || b?.typ
  * Typing is one undo step per burst: the first keystroke commits, the ones after it amend that
  * step, and a blur, a pause, or any other edit ends the burst.
  */
-export function BlockEditor({ initial, onChange }: { initial: Doc; onChange?: (doc: Doc) => void }) {
+export function BlockEditor({
+  initial,
+  onChange,
+  source = previewSource,
+}: {
+  initial: Doc;
+  onChange?: (doc: Doc) => void;
+  source?: PreviewSource;
+}) {
   const [history, setHistory] = useState<History>(() => start(initial));
   const [selected, setSelected] = useState<Loc | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -292,6 +302,7 @@ export function BlockEditor({ initial, onChange }: { initial: Doc; onChange?: (d
           />
         </aside>
       </div>
+      <Preview doc={history.present} source={source} onLocate={(at) => { endBurst(); setSelected(at); }} />
     </section>
   );
 }

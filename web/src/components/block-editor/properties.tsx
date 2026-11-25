@@ -145,6 +145,11 @@ export function Properties({ block, id, change, text, addTo }: Props) {
             error={block.href !== "" && !hrefAllowed(block.href) ? "Use an address that starts with http, https, mailto or tel." : undefined}
             onChange={(e) => change({ ...block, href: e.target.value }, "href")}
           />
+          {/* Said, not shown: no preview we can build draws Outlook's Word engine. */}
+          <p role="note" data-testid="outlook-button-note" className="mt-3 text-sm text-fg-muted">
+            In classic Outlook on Windows this button is drawn with square corners, whatever its corners look like in the preview. The
+            preview cannot show that.
+          </p>
         </>
       )}
       {block.type === "Spacer" && (

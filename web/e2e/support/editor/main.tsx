@@ -30,12 +30,15 @@ const initial: Doc = {
   ],
 };
 
+// ?preview=fail: a source whose render and checks fail, to see the editor not claim a clean bill.
+const failing = new URLSearchParams(location.search).get("preview") === "fail" ? () => Promise.reject(new Error("down")) : undefined;
+
 const container = document.getElementById("root");
 if (!container) throw new Error("editor/index.html is missing #root");
 (window as unknown as { __doc: Doc }).__doc = initial;
 createRoot(container).render(
   <main className="mx-auto max-w-3xl p-6">
     <h1 className="text-xl font-semibold">Editor</h1>
-    <BlockEditor initial={initial} onChange={(doc) => ((window as unknown as { __doc: Doc }).__doc = doc)} />
+    <BlockEditor initial={initial} source={failing} onChange={(doc) => ((window as unknown as { __doc: Doc }).__doc = doc)} />
   </main>,
 );
