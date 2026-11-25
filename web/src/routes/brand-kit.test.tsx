@@ -171,7 +171,9 @@ test("a logo URL is flagged inline but the save is still sent, and the server's 
   await expect(page.locator("#bk-logo-error")).toHaveText(LOGO_MESSAGE);
   await expect(page.getByRole("alert")).toHaveCount(1);
   await page.getByRole("button", { name: "Save brand kit" }).click();
-  await expect(page.getByRole("alert")).toHaveCount(2);
+  // The server's answer is the field's own sentence word for word: two explanations of one rule
+  // teach an operator to ignore both.
+  await expect(page.getByRole("alert")).toHaveText([LOGO_MESSAGE, LOGO_MESSAGE]);
   await expect(page.getByText("Brand kit saved.")).toHaveCount(0);
   // Nothing the operator typed is lost to the failure.
   await expect(page.getByLabel("Logo address")).toHaveValue("javascript:alert(1)");
@@ -268,7 +270,7 @@ test("a pair that is rendered together and fails contrast is warned about, with 
   await page.getByLabel("Background colour", { exact: true }).fill("#ffffff");
   await page.getByLabel("Text colour", { exact: true }).fill("#aaaaaa");
   const warning = page.getByText(/Text and background colours/);
-  await expect(warning).toContainText("2.3:1");
+  await expect(warning).toContainText("contrast 2.32:1");
   await expect(warning).toContainText("4.5:1");
   await scan(page, "brand kit with a contrast warning");
   await page.getByRole("button", { name: "Save brand kit" }).click();
@@ -286,5 +288,18 @@ test("the accent pair is checked, and colours that are never shown together are 
   await page.getByLabel("Text on the accent colour", { exact: true }).fill("#fff");
   await page.getByLabel("Background colour", { exact: true }).fill("#1a56db");
   await page.getByLabel("Text colour", { exact: true }).fill("#1a");
+  await expect(page.getByText(WARN)).toHaveCount(0);
+});
+
+test("a_pair_just_under_the_line_never_reads_as_the_line", async ({ page, app }) => {
+  // #777777 on white is 4.478:1. Rounded to one place that is "4.5:1, below the 4.5:1", a warning
+  // that argues with itself; it is shown rounded down, to two places.
+  await open(page, app);
+  await page.getByLabel("Background colour", { exact: true }).fill("#ffffff");
+  await page.getByLabel("Text colour", { exact: true }).fill("#777777");
+  const warning = page.getByText(/Text and background colours/);
+  await expect(warning).toContainText("contrast 4.47:1, below the 4.5:1");
+  // One step lighter than the line is the line: #767676 is 4.54:1 and passes.
+  await page.getByLabel("Text colour", { exact: true }).fill("#767676");
   await expect(page.getByText(WARN)).toHaveCount(0);
 });

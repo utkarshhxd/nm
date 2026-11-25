@@ -82,6 +82,9 @@ export function contrast(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
+/** Two places, rounded DOWN: a ratio under the line must never be printed as the line. */
+export const ratioText = (r: number) => (Math.floor(r * 100) / 100).toFixed(2);
+
 /** The pairs a template renders together: only these are worth a warning. */
 export const PAIRS = [
   ["Text and background colours", "text", "background"],

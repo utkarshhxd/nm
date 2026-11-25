@@ -19,6 +19,7 @@ import {
   contrast,
   isColour,
   logoAllowed,
+  ratioText,
   resync,
   toDraft,
   toKit,
@@ -157,7 +158,7 @@ function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boo
               // Advice: the kit saves anyway. It is every email, so it is said here, where it is chosen.
               return (
                 <li key={name} className="text-warning-text">
-                  {name}: contrast {ratio.toFixed(1)}:1, below the {MIN_CONTRAST}:1 that keeps text
+                  {name}: contrast {ratioText(ratio)}:1, below the {MIN_CONTRAST}:1 that keeps text
                   readable. Every email in this workspace uses this pair.
                 </li>
               );
