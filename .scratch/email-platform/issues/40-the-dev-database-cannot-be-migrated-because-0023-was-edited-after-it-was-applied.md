@@ -86,3 +86,21 @@ why the suite stayed green throughout — the same blind spot this issue already
 
 This strengthens the case for option 2 above: updating the stored checksum is the honest fix for a
 change that did not alter the SQL, and both instances on this branch are exactly that.
+
+## Diagnosis, M2b Task R1 (the fix itself is NOT yet done)
+
+`sqlx migrate info` against the `nm` database: **only `0023` diverges**; `1-22` and `24-27` are
+`installed` and match, `28-31` are simply `pending`.
+
+- applied checksum: `ca718464559d3dd2cd59edcac6fdbc7b88355262114f702530ff0a504bd586cf504e9d624fe38ca26b6b54fb991b975d`
+- local checksum:   `7f9e4a69786a627b735228cd68ed66dec2a9eb30feaa01fd77950199113bf891d71174161bd8728eaae16352b16e4c11`
+
+Hashing every committed version of `0023` (sha384, as sqlx does) with LF and with CRLF line endings:
+the applied checksum equals the **CRLF form of the current file (`d27656d`)**, and the local checksum
+equals its LF form. So the two differ in line endings only: the SQL is character-for-character
+identical once normalised. The cause recorded above (a comment-only edit in `d27656d`) is **not**
+what happened; the applied bytes already contained that edit. The database was migrated from a
+working tree that had CRLF, which `.gitattributes` (`* text=auto eol=lf`) later normalised, the same
+mechanism as the `0028` instance above.
+
+Remedy (authorised, NOT yet executed: the action was denied by the permission layer in R1): drop and recreate the `nm` database, never edit `_sqlx_migrations`.
