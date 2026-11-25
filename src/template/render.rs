@@ -1458,8 +1458,13 @@ fn scan_text(text: &str, tags: usize, fills: Option<&[Fill]>) -> Result<String, 
         match piece {
             Piece::Text(s) => w.text(s, &mut out)?,
             Piece::Link { lead, url, tail } => {
-                if [lead, tail].iter().any(|p| p.contains(MARK_START)) {
-                    return Err(RenderError::DangerousContext { position: 0 });
+                if let Some(p) = [lead, tail].into_iter().find(|p| p.contains(MARK_START)) {
+                    // `lead` and `tail` are slices of `text`, so the byte offset of the marker
+                    // is the slice's distance from the start plus where it sits in the slice.
+                    let at = p.as_ptr() as usize - text.as_ptr() as usize;
+                    return Err(RenderError::DangerousContext {
+                        position: at + p.find(MARK_START).unwrap_or(0),
+                    });
                 }
                 links += 1;
                 w.place = links;

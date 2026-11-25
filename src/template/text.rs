@@ -42,6 +42,19 @@
 //!
 //! A URL the HTML part would disable (`javascript:`, a bad scheme, an unparsable value from a tag)
 //! is left out here too, together with its `: ` or brackets: the label stays, the link does not.
+//!
+//! # Reserved characters
+//!
+//! Operator TEXT (runs, labels, alt, hrefs, the text beside a tag in a `Run::Tag`, the footer) may not
+//! contain a typed `~nmmt~`, the brace stand-in U+E000 or a link delimiter U+0001 to U+0003: each is
+//! refused as `CompileError::ForgedMarker`, never deleted or rewritten.
+//!
+//! **A tag's own quoted literals are exempt**: a fallback (`{{ x | "..." }}`) or an equality value
+//! (`{{# x = "..." }}`) is passed through unchecked, and may hold those characters. The reason is not
+//! that the check was skipped. The brace stand-in was a bug because the operator typed `{` and we
+//! stored our own character instead, which is storing something they did not write. A quoted literal is
+//! the operator writing that character on purpose, so storing it is correct, and it cannot do
+//! structural harm: a fill is written after `scan_text` and is never scanned again.
 
 use std::cell::RefCell;
 
@@ -1142,6 +1155,14 @@ mod tests {
                     Err(RenderError::DangerousContext { .. })
                 ),
                 "substitute: {bad:?}"
+            );
+            // Legible months later: the refusal says where the marker is, not `0`.
+            let at = bad.find(MARK_START).unwrap();
+            assert!(at > 0);
+            assert_eq!(
+                classify_text(bad, 1),
+                Err(RenderError::DangerousContext { position: at }),
+                "{bad:?}"
             );
         }
     }
