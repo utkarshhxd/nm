@@ -588,6 +588,25 @@ fn safe_url(raw: &str) -> String {
     }
 }
 
+/// What the allowlist decides about one operator-written URL, before anything is rewritten.
+///
+/// [`static_url`] is this plus the rewrite. It is public so that the link checker and R7's
+/// save-time refusal read the SAME parser and the SAME allowlist: a second URL implementation is
+/// the defect, and without a verdict to read, a checker would have had to grow one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlCheck {
+    /// Absolute, and the scheme is allowed. Carries the parsed URL so a caller that needs a
+    /// component — a `mailto:` address, say — does not reach for a second parser.
+    Allowed(url::Url),
+    /// No scheme at all, so there is nothing to refuse: left exactly as written. M2c's
+    /// unsubscribe links are written this way.
+    Relative,
+    /// Parsed, but the scheme is outside the frozen allowlist. The renderer emits a dead link.
+    Scheme(String),
+    /// Neither a URL nor a relative reference. Carries `url`'s own reason.
+    Malformed(String),
+}
+
 /// The same allowlist over a URL the OPERATOR wrote, with no merge tag in it at all.
 ///
 /// RULING (fix round 1): spec §5.5 wants one renderer for the email and for the hosted
@@ -595,20 +614,33 @@ fn safe_url(raw: &str) -> String {
 /// sanitiser in front of it, so a static `javascript:` href an operator put in `mj-raw` is inert
 /// in an inbox and stored XSS on our origin the moment the same HTML is served as a page. The
 /// operator's own markup is therefore checked too, not only the values substituted into it.
+pub fn check_static_url(raw: &str) -> UrlCheck {
+    match url::Url::parse(raw) {
+        Ok(u) if ALLOWED_SCHEMES.contains(&u.scheme()) => UrlCheck::Allowed(u),
+        Ok(u) => UrlCheck::Scheme(u.scheme().to_owned()),
+        Err(url::ParseError::RelativeUrlWithoutBase) => UrlCheck::Relative,
+        Err(e) => UrlCheck::Malformed(e.to_string()),
+    }
+}
+
+/// [`check_static_url`] as the renderer needs it: the URL to write out.
 ///
 /// A relative URL is left exactly as written: it cannot name a scheme, so there is nothing to
 /// refuse, and M2c's unsubscribe links are written that way.
 fn static_url(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(u) if ALLOWED_SCHEMES.contains(&u.scheme()) => u.to_string(),
-        Ok(u) => {
+    match check_static_url(raw) {
+        UrlCheck::Allowed(u) => u.to_string(),
+        // A malformed URL is left as written, exactly as it was before this verdict was split
+        // out: it names no scheme to refuse, so it is a dead link in the recipient's client
+        // rather than a hazard, and `lint` is what tells the operator about it.
+        UrlCheck::Relative | UrlCheck::Malformed(_) => raw.to_owned(),
+        UrlCheck::Scheme(scheme) => {
             tracing::warn!(
-                scheme = u.scheme(),
+                scheme = scheme,
                 "template holds a URL whose scheme is not allowed; link disabled"
             );
             DEAD_LINK.to_owned()
         }
-        Err(_) => raw.to_owned(),
     }
 }
 

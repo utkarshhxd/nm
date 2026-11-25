@@ -3,6 +3,7 @@
 //! Templates: the merge-tag language, compiled at save and rendered at send.
 
 pub mod block;
+pub mod lint;
 pub mod mjml;
 pub mod render;
 pub mod tag;
