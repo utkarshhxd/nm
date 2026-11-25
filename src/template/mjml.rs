@@ -35,7 +35,7 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 use super::block::{Block, Mark, Run};
-use super::render::{self, RenderError};
+use super::render::{self, MARK_START, RenderError};
 use super::tag::{self, Node, Registry, TagError};
 
 const DEFAULT_BACKGROUND: &str = "#ffffff";
@@ -364,7 +364,8 @@ fn to_mjml(blocks: &[Block], brand: &BrandKit) -> String {
     if let Some(url) = brand.logo_url.as_deref().and_then(logo) {
         section(
             |o| {
-                // Already normalised by the URL parser, so no brace reaches the compiler.
+                // The URL parser encodes a brace in a path but NOT in a query or fragment, so
+                // `literal` is what keeps `?{{first_name}}` from compiling to a live tag.
                 o.push_str("<mj-image width=\"150px\" alt=\"\" src=\"");
                 literal(&url, Ctx::Attr, o);
                 o.push_str("\" />");
@@ -427,16 +428,57 @@ pub struct Compiled {
     pub html: String,
 }
 
-/// Why a template could not be saved. Each arm is the stage that refused, with that stage's own
-/// error, so the caller can tell an operator which part of their template is wrong.
+/// Why a template could not be saved. Each arm is the stage that refused it, and `Display` reads
+/// as a sentence an operator can act on (R7 surfaces these).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CompileError {
-    #[error("merge tag: {0:?}")]
+    #[error("the brand kit is invalid: {0}")]
+    Brand(#[from] BrandError),
+    #[error("{}", tag_message(.0))]
     Tag(TagError),
-    #[error("mjml: {0}")]
+    #[error(
+        "the template contains the text {MARK_START}, which is reserved for the renderer's own use; remove it"
+    )]
+    ForgedMarker,
+    #[error("the template could not be rendered as MJML: {0}")]
     Mjml(#[from] MjmlError),
-    #[error("a merge tag sits where no encoding is safe: {0:?}")]
+    #[error("{}", render_message(.0))]
     Render(RenderError),
+}
+
+fn tag_message(e: &TagError) -> String {
+    match e {
+        TagError::UnknownField(k) => {
+            format!("a merge tag names the field \"{k}\", which does not exist")
+        }
+        TagError::ArchivedField(k) => {
+            format!("a merge tag names the field \"{k}\", which has been archived")
+        }
+        TagError::UnknownFilter(f) => format!(
+            "a merge tag uses the filter \"{f}\"; the filters are upper, lower, title and date"
+        ),
+        TagError::FilterAndFallback => {
+            "a merge tag has both a filter and a fallback; use one or the other".into()
+        }
+        TagError::NonLiteralFallback => {
+            "a merge tag's fallback must be a quoted piece of text".into()
+        }
+        TagError::Unbalanced(k) => {
+            format!("the merge-tag block for \"{k}\" is not closed, or is closed out of order")
+        }
+        TagError::TooDeep => "merge-tag blocks are nested too deeply".into(),
+        TagError::Malformed(why) => format!("a merge tag is malformed: {why}"),
+    }
+}
+
+fn render_message(e: &RenderError) -> String {
+    match e {
+        RenderError::DangerousContext { .. } => "a merge tag is in a position where no encoding can make it safe: inside a script or comment, in a tag or attribute name, or in the scheme or host of a link".into(),
+        RenderError::TagLost { .. } => "a merge tag was dropped while the template was rendered, so recipients would not see it; it is probably in an attribute the email renderer ignores".into(),
+        RenderError::BlockDuplicated { .. } => "a conditional merge-tag block appears more than once in the rendered email, so which part to hide is ambiguous".into(),
+        RenderError::BlockStraddlesTag { .. } => "a conditional merge-tag block starts or ends in the middle of an HTML tag; it must wrap whole elements or whole text".into(),
+        RenderError::BlockUnbalanced { .. } => "a conditional merge-tag block is out of order or not properly nested in the rendered email".into(),
+    }
 }
 
 /// Save a `blocks` template: the whole pipeline in one call, so its order is not something a
@@ -448,6 +490,9 @@ pub fn compile_blocks(
     brand: &BrandKit,
     registry: &Registry,
 ) -> Result<Compiled, CompileError> {
+    // An invalid kit is an error, never a different email than the one configured: `to_mjml` would
+    // drop a bad logo and swap a bad font for the default without a word.
+    brand.validate()?;
     compile(&to_mjml(blocks, brand), registry)
 }
 
@@ -457,10 +502,29 @@ pub fn compile_mjml(source: &str, registry: &Registry) -> Result<Compiled, Compi
     compile(source, registry)
 }
 
+fn has_literal_marker(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Text(t) => t.contains(MARK_START),
+        Node::Field { .. } => false,
+        Node::Present { body, .. } | Node::Absent { body, .. } | Node::Equals { body, .. } => {
+            has_literal_marker(body)
+        }
+    })
+}
+
 /// compile the tags -> mark -> `mrml` once -> classify. `source` is template source, not yet
 /// MJML: a tag's fallback literal can hold quotes that an attribute cannot.
 fn compile(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
     let nodes = tag::compile(source, registry).map_err(CompileError::Tag)?;
+    // Contract section 13: there is exactly one way to make a tag. A literal marker in template
+    // text would alias to a real tag of the same index (a send printed a contact's name where the
+    // operator typed text), which is the shortcut `render::MARK_START` documents and leaves to
+    // this compile path. Refused, not escaped: an escape leans on how mrml and the HTML parser
+    // round-trip a character reference, and no real template contains the text. A tag's fallback
+    // is data in the AST, never emitted as MJML, so only `Node::Text` is checked.
+    if has_literal_marker(&nodes) {
+        return Err(CompileError::ForgedMarker);
+    }
     let (marked, count) = render::marked(&nodes);
     let html = render_mjml(&marked)?;
     render::classify(&html, count).map_err(CompileError::Render)?;
@@ -638,6 +702,10 @@ mod tests {
         assert!(matches!(ours, MjmlError::Parse(_)));
     }
 
+    /// Holds for ONE version of `mrml` and `url`: both feed the bytes this compares, and a bump of
+    /// either can change them. `MARKER_FORMAT_VERSION` does not cover a dependency bump, so after
+    /// one a re-save reclassifies different bytes than the stored copy was made from. Whoever
+    /// bumps either crate must treat stored marked HTML as stale (R7's invalidation key).
     #[test]
     fn the_same_input_gives_byte_identical_output() {
         let brand = BrandKit {
@@ -659,6 +727,20 @@ mod tests {
         }
     }
 
+    // ----- the brand kit ----------------------------------------------------------------------
+
+    /// What `compile_blocks` says about a kit, with an otherwise fine template.
+    fn kit_result(brand: &BrandKit) -> Result<Compiled, CompileError> {
+        compile_blocks(&[para("x")], brand, &Registry::from_definitions(&[]))
+    }
+
+    fn with_font(f: &str) -> BrandKit {
+        BrandKit {
+            font_stack: Some(f.into()),
+            ..BrandKit::default()
+        }
+    }
+
     // ----- font_stack: a CSS injection site ---------------------------------------------------
 
     #[test]
@@ -676,19 +758,70 @@ mod tests {
             ",",
             "Arial,,sans-serif",
         ] {
-            let brand = BrandKit {
-                font_stack: Some(hostile.into()),
-                ..BrandKit::default()
-            };
+            let brand = with_font(hostile);
             assert!(brand.validate().is_err(), "{hostile:?} was accepted");
-            // validate() is the API gate; to_mjml must hold the line on its own as well.
+            // compile_blocks refuses: a bad kit is an error, not a different email.
+            assert!(
+                matches!(
+                    kit_result(&brand),
+                    Err(CompileError::Brand(BrandError::FontStack))
+                ),
+                "{hostile:?}"
+            );
+            // And to_mjml holds the line on its own, in case a caller ever skips the gate.
             let out = to_mjml(&[para("x")], &brand);
             for bad in ["evil", "url(", "script", "} body", "color:red"] {
                 assert!(!out.contains(bad), "{hostile:?} leaked {bad:?}:\n{out}");
             }
-            let html = save(&[para("x")], &brand).unwrap().html;
-            assert!(!html.contains("evil") && !html.contains("url("), "{html}");
         }
+    }
+
+    /// Every single character outside the alphabet is refused ON ITS OWN. The hostile values above
+    /// each carry several forbidden characters, so on their own they would still be refused if any
+    /// one of them were quietly allowed. `"` alone is an attribute breakout in the emitted
+    /// `font-family="..."`.
+    #[test]
+    fn the_font_stack_alphabet_is_pinned_one_character_at_a_time() {
+        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | ',');
+        for c in (0u8..128).map(char::from).filter(|c| !allowed(*c)) {
+            for stack in [format!("a{c}b"), format!("Arial, a{c}b, serif")] {
+                assert!(
+                    with_font(&stack).validate().is_err(),
+                    "{c:?} ({stack:?}) was accepted"
+                );
+            }
+        }
+        // A quote is only a wrapper, never a character of a name.
+        for stack in [
+            "'a\"b'",
+            "\"a'b\"",
+            "'a'b'",
+            "'unclosed",
+            "\"mismatched'",
+            "''",
+            "' a'",
+        ] {
+            assert!(with_font(stack).validate().is_err(), "{stack:?}");
+        }
+        // Letters and parentheses only is still not a font.
+        assert!(with_font("expression(x)").validate().is_err());
+        assert!(with_font("expression(alert(1))").validate().is_err());
+        // The allowed set, including what looks like it might not be.
+        for ok in ["a b", "a_b", "a-b", "Arial,Georgia", "a1"] {
+            with_font(ok)
+                .validate()
+                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_font_stack_length_caps_are_pinned() {
+        let long = |n: usize| "a".repeat(n);
+        with_font(&long(200)).validate().unwrap();
+        assert!(with_font(&long(201)).validate().is_err());
+        let families = |n: usize| vec!["a"; n].join(",");
+        with_font(&families(10)).validate().unwrap();
+        assert!(with_font(&families(11)).validate().is_err());
     }
 
     #[test]
@@ -700,12 +833,9 @@ mod tests {
             "Georgia",
             "Noto Sans JP, sans-serif",
         ] {
-            let brand = BrandKit {
-                font_stack: Some(ok.into()),
-                ..BrandKit::default()
-            };
+            let brand = with_font(ok);
             brand.validate().unwrap_or_else(|e| panic!("{ok:?}: {e}"));
-            let html = save(&[para("x")], &brand).unwrap().html;
+            let html = kit_result(&brand).unwrap().html;
             let first = ok
                 .split(',')
                 .next()
@@ -717,15 +847,22 @@ mod tests {
     }
 
     #[test]
-    fn a_colour_must_be_hex_and_an_invalid_one_is_neither_emitted_nor_accepted() {
+    fn a_colour_must_be_rgb_or_rrggbb_and_nothing_wider() {
+        // Contract section 8 freezes the format; the client enforces exactly these two, and a
+        // server that accepts #rgba or #rrggbbaa is how the two lanes drift apart.
         for bad in [
             "red",
             "#12",
+            "#abcd",
             "#12345",
             "#1234567",
+            "#aabbccdd",
             "#ggg",
+            "#",
+            "fff",
             "url(x)",
             "#fff; x",
+            "#fff ",
             "rgb(0,0,0)",
         ] {
             let brand = BrandKit {
@@ -733,10 +870,18 @@ mod tests {
                 ..BrandKit::default()
             };
             assert!(brand.validate().is_err(), "{bad}");
-            let html = save(&[para("x"), button("https://a.example/")], &brand)
-                .unwrap()
-                .html;
-            assert!(!html.contains(bad), "{bad} leaked");
+            assert!(
+                matches!(
+                    kit_result(&brand),
+                    Err(CompileError::Brand(BrandError::Colour { field: "accent" }))
+                ),
+                "{bad}"
+            );
+            let out = to_mjml(&[para("x"), button("https://a.example/")], &brand);
+            // (Skipped for values that are substrings of the default colours.)
+            if !matches!(bad, "#" | "fff") {
+                assert!(!out.contains(bad), "{bad} leaked");
+            }
         }
         for ok in ["#fff", "#FFF", "#a1B2c3"] {
             BrandKit {
@@ -749,7 +894,23 @@ mod tests {
     }
 
     #[test]
-    fn a_logo_must_be_http_or_https() {
+    fn every_colour_field_is_validated_and_named() {
+        for field in ["background", "text", "accent", "accent_text"] {
+            let mut brand = BrandKit::default();
+            let slot = match field {
+                "background" => &mut brand.background,
+                "text" => &mut brand.text,
+                "accent" => &mut brand.accent,
+                _ => &mut brand.accent_text,
+            };
+            *slot = Some("nope".into());
+            let err = brand.validate().unwrap_err();
+            assert!(err.to_string().starts_with(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_logo_must_be_http_or_https_without_userinfo() {
         for bad in [
             "mailto:a@b.example",
             "tel:+1",
@@ -758,12 +919,22 @@ mod tests {
             "//cdn.example/x.png",
             "not a url",
             "https://user:pw@cdn.example/x.png",
+            // The two userinfo checks are separate: either alone is enough to refuse.
+            "https://user@cdn.example/x.png",
+            "https://:pw@cdn.example/x.png",
         ] {
             let brand = BrandKit {
                 logo_url: Some(bad.into()),
                 ..BrandKit::default()
             };
             assert!(brand.validate().is_err(), "{bad}");
+            assert!(
+                matches!(
+                    kit_result(&brand),
+                    Err(CompileError::Brand(BrandError::Logo))
+                ),
+                "{bad}"
+            );
             let out = to_mjml(&[para("x")], &brand);
             assert!(
                 !out.contains("javascript") && !out.contains("mailto") && !out.contains("data:"),
@@ -778,6 +949,67 @@ mod tests {
             .validate()
             .unwrap();
         }
+    }
+
+    #[test]
+    fn a_logo_url_cannot_become_a_tag_through_its_query_or_fragment() {
+        // The `url` crate leaves `{` alone in a query and a fragment (it encodes it in a path), so
+        // the escaping in `literal` is what keeps a logo URL from compiling to a live tag.
+        let brand = BrandKit {
+            logo_url: Some("https://a.example/l.png?{{first_name}}#{{email}}".into()),
+            ..BrandKit::default()
+        };
+        brand.validate().unwrap();
+        let src = to_mjml(&[], &brand);
+        assert!(src.contains("https://a.example/l.png"), "{src}");
+        let nodes = tag::compile(&src, &Registry::from_definitions(&[])).unwrap();
+        assert!(matches!(nodes.as_slice(), [Node::Text(_)]), "{nodes:?}");
+        // And end to end: nothing for a contact to be substituted into.
+        let saved = kit_result(&brand).unwrap();
+        assert!(!send(&saved, "Ann").contains("Ann"));
+    }
+
+    #[test]
+    fn an_invalid_kit_is_an_error_not_a_different_email() {
+        // Previously a bad logo was dropped and a bad font replaced with the default, silently.
+        let brand = BrandKit {
+            logo_url: Some("javascript:alert(1)".into()),
+            ..BrandKit::default()
+        };
+        let err = kit_result(&brand).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the brand kit is invalid: logo must be an http or https URL"
+        );
+    }
+
+    #[test]
+    fn the_footer_is_text_then_address() {
+        let brand = BrandKit {
+            footer_text: Some("FOOTTEXT".into()),
+            footer_address: Some("FOOTADDRESS".into()),
+            ..BrandKit::default()
+        };
+        let html = kit_result(&brand).unwrap().html;
+        let (t, a) = (
+            html.find("FOOTTEXT").unwrap(),
+            html.find("FOOTADDRESS").unwrap(),
+        );
+        assert!(t < a, "{html}");
+        // Either one alone; blank is the same as absent, so no empty footer block.
+        let only = BrandKit {
+            footer_address: Some("ONLYADDR".into()),
+            footer_text: Some("  ".into()),
+            ..BrandKit::default()
+        };
+        let html = kit_result(&only).unwrap().html;
+        assert!(html.contains("ONLYADDR"), "{html}");
+        // mrml may tidy the HTML, so the blank part is pinned in the source it is given.
+        let src = to_mjml(&[], &only);
+        assert!(
+            src.contains("font-size=\"12px\">ONLYADDR</mj-text>"),
+            "{src}"
+        );
     }
 
     #[test]
@@ -1177,6 +1409,100 @@ mod tests {
         assert!(matches!(nodes.as_slice(), [Node::Text(_)]), "{nodes:?}");
     }
 
+    #[test]
+    fn markup_before_a_tag_in_a_tag_runs_source_is_escaped_too() {
+        // The hostile text sits BEFORE the tag. Escaping only what follows a tag would leave this
+        // one open: a script in the stored HTML, served on our own origin by the hosted page.
+        let evil = "</mj-text><mj-raw><script>x()</script></mj-raw><mj-text>{{ first_name }}";
+        let html = html_of(&[Block::Text {
+            runs: vec![tag(evil)],
+        }]);
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;x()"), "{html}");
+        // And between two tags, and in a URL field around a tag.
+        let html = html_of(&[
+            Block::Text {
+                runs: vec![tag("{{ first_name }}<script>y()</script>{{ email }}")],
+            },
+            button("https://a.example/<script>z()</script>{{ first_name }}"),
+        ]);
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    // ----- a literal marker is not a tag (contract section 13) --------------------------------
+
+    #[test]
+    fn a_literal_marker_in_any_field_is_refused_not_aliased_to_a_tag() {
+        // `~nmmt~0~tmmn~` is the renderer's stand-in for tag 0. Typed into a field it used to
+        // alias to the template's real tag 0, so a send printed the contact's name where the
+        // operator typed text. REFUSED rather than escaped: an escape would lean on how mrml and
+        // the HTML parser round-trip a character reference, and no legitimate template contains
+        // this text, so the loud failure costs nothing.
+        let m = format!("x {MARK_START}0{}", render::MARK_END);
+        let reg = Registry::from_definitions(&[]);
+        let brand = BrandKit {
+            footer_text: Some(m.clone()),
+            ..BrandKit::default()
+        };
+        let cases: Vec<(&str, Vec<Block>, BrandKit)> = vec![
+            ("text run", vec![para(&m)], BrandKit::default()),
+            (
+                "image alt",
+                vec![Block::Image {
+                    src: "https://a.example/a.png".into(),
+                    alt: m.clone(),
+                }],
+                BrandKit::default(),
+            ),
+            (
+                "button label",
+                vec![Block::Button {
+                    label: m.clone(),
+                    href: "https://a.example/".into(),
+                }],
+                BrandKit::default(),
+            ),
+            (
+                "button href",
+                vec![button(&format!("https://a.example/{m}"))],
+                BrandKit::default(),
+            ),
+            (
+                "tag run, around the tag",
+                vec![Block::Text {
+                    runs: vec![tag(&format!("{m}{{{{ first_name }}}}"))],
+                }],
+                BrandKit::default(),
+            ),
+            ("footer", vec![para("x")], brand),
+        ];
+        for (name, blocks, brand) in cases {
+            assert_eq!(
+                compile_blocks(&blocks, &brand, &reg),
+                Err(CompileError::ForgedMarker),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            compile_mjml(
+                &format!("<mjml><mj-body><mj-text>{m}</mj-text></mj-body></mjml>"),
+                &reg
+            ),
+            Err(CompileError::ForgedMarker)
+        );
+        // A tilde on its own, and a marker inside a tag's FALLBACK (data in the AST, never
+        // emitted as MJML and never rescanned), are not refused.
+        compile_blocks(&[para("~ /~user ~nmm")], &BrandKit::default(), &reg).unwrap();
+        compile_blocks(
+            &[Block::Text {
+                runs: vec![tag(&format!("{{{{ first_name | \"{m}\" }}}}"))],
+            }],
+            &BrandKit::default(),
+            &reg,
+        )
+        .unwrap();
+    }
+
     // ----- URLs are R3's to judge -------------------------------------------------------------
 
     #[test]
@@ -1220,5 +1546,96 @@ mod tests {
             out.contains("href=\"https://a.example/%22%20onclick=%22alert(2)\""),
             "href did not round-trip: {out}"
         );
+    }
+
+    #[test]
+    fn marks_close_in_the_reverse_order_they_open() {
+        let both = Block::Text {
+            runs: vec![Run::Text {
+                text: "both".into(),
+                marks: vec![Mark::Italic, Mark::Bold],
+            }],
+        };
+        // mrml re-serialises mis-nested tags into well-formed ones, so pin the source as well.
+        let src = to_mjml(std::slice::from_ref(&both), &BrandKit::default());
+        assert!(src.contains("<strong><em>both</em></strong>"), "{src}");
+        let html = html_of(&[both]);
+        // Bold outermost, whatever order the wire lists them in; never `</strong></em>`.
+        assert!(html.contains("<strong><em>both</em></strong>"), "{html}");
+        let link = Block::Text {
+            runs: vec![Run::Link {
+                href: "https://a.example/".into(),
+                text: "l".into(),
+                marks: vec![Mark::Bold, Mark::Italic],
+            }],
+        };
+        assert!(html_of(&[link]).contains("<strong><em>l</em></strong></a>"));
+    }
+
+    #[test]
+    fn control_characters_in_an_attribute_value_become_spaces() {
+        let blocks = [Block::Image {
+            src: "https://a.example/a.png".into(),
+            alt: "a\tb\nc\r\u{7f}d".into(),
+        }];
+        let html = html_of(&blocks);
+        assert!(html.contains("alt=\"a b c  d\""), "{html}");
+    }
+
+    #[test]
+    fn a_tag_mrml_drops_is_refused_at_save_not_shipped_missing() {
+        // mrml silently discards an attribute it does not know; the tag in it would vanish from
+        // every recipient's mail.
+        let src = "<mjml><mj-body><mj-section><mj-column><mj-text bogus=\"{{ first_name }}\">x</mj-text></mj-column></mj-section></mj-body></mjml>";
+        assert!(matches!(
+            compile_mjml(src, &Registry::from_definitions(&[])),
+            Err(CompileError::Render(RenderError::TagLost { .. }))
+        ));
+    }
+
+    #[test]
+    fn compile_errors_read_as_sentences() {
+        let reg = Registry::from_definitions(&[]);
+        let err = |b: &[Block]| compile_blocks(b, &BrandKit::default(), &reg).unwrap_err();
+        let unknown = err(&[Block::Text {
+            runs: vec![tag("{{ nope }}")],
+        }]);
+        assert_eq!(
+            unknown.to_string(),
+            "a merge tag names the field \"nope\", which does not exist"
+        );
+        let host = err(&[button("https://{{ first_name }}.example.com/")]).to_string();
+        assert!(host.contains("scheme or host"), "{host}");
+        let lost = compile_mjml(
+            "<mjml><mj-body><mj-section><mj-column><mj-text bogus=\"{{ first_name }}\">x</mj-text></mj-column></mj-section></mj-body></mjml>",
+            &reg,
+        )
+        .unwrap_err()
+        .to_string();
+        // Each render failure says its own thing; none is the dangerous-position message.
+        assert!(
+            lost.contains("dropped") && !lost.contains("no encoding"),
+            "{lost}"
+        );
+        assert!(!unknown.to_string().contains("UnknownField"));
+        let forged = CompileError::ForgedMarker.to_string();
+        assert!(
+            forged.contains(MARK_START) && forged.contains("remove it"),
+            "{forged}"
+        );
+        for (e, word) in [
+            (
+                RenderError::BlockDuplicated { index: 0, count: 2 },
+                "more than once",
+            ),
+            (
+                RenderError::BlockStraddlesTag { index: 0 },
+                "middle of an HTML tag",
+            ),
+            (RenderError::BlockUnbalanced { index: 0 }, "nested"),
+        ] {
+            let m = CompileError::Render(e).to_string();
+            assert!(m.contains(word) && !m.contains("no encoding"), "{m}");
+        }
     }
 }

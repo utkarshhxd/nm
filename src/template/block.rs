@@ -193,6 +193,15 @@ mod tests {
     }
 
     #[test]
+    fn a_spacer_height_is_a_u16() {
+        parse(json!({"type":"Spacer","height":0})).unwrap();
+        parse(json!({"type":"Spacer","height":65535})).unwrap();
+        for height in [json!(65536), json!(-1), json!(1.5), json!("24")] {
+            refused(json!({"type":"Spacer","height":height}));
+        }
+    }
+
+    #[test]
     fn a_missing_field_is_refused_rather_than_defaulted() {
         refused(json!({"type":"Text","runs":[{"type":"Text","text":"x"}]}));
         refused(json!({"type":"Image","src":"s"}));
