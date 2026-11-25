@@ -4,6 +4,7 @@
 //! is the only thing stored; the operator's source text is never parsed again at send time.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,10 @@ pub enum TagError {
     UnknownField(String),
     ArchivedField(String),
     UnknownFilter(String),
+    /// `{{ x | upper | "a" }}`. The grammar allows a filter or a fallback, never both; saying so
+    /// beats `UnknownFilter("\"a\"")`, which sends the operator hunting for a filter they never
+    /// meant to write.
+    FilterAndFallback,
     NonLiteralFallback,
     Unbalanced(String),
     TooDeep,
@@ -215,7 +220,36 @@ fn open_tag(s: &str) -> Result<(String, Kind), TagError> {
     }
 }
 
+/// A strftime format for `date:`. The format runs to the end of the tag, so unchecked it swallows
+/// whatever follows: `{{ x | date:%Y | "a" }}` would compile to `Date("%Y | \"a\"")` and the
+/// operator's fallback would vanish into a strftime literal. The charset rejection catches that;
+/// the sample format catches `%Q`, which is valid-looking text and would otherwise fail at send,
+/// which is the render-time surprise compiling at save exists to prevent. Internal spaces stay
+/// legal — `date:%d %B %Y` is a real format.
+fn date_format(raw: &str) -> Result<String, TagError> {
+    let fmt = raw.trim();
+    let bad = |m: &str| Err(TagError::Malformed(format!("{m}: {fmt:?}")));
+    if fmt.is_empty() {
+        return bad("empty date format");
+    }
+    if fmt.contains(['|', '"', '{', '}']) {
+        return bad("a date format may not contain | \" { or }");
+    }
+    let sample = chrono::DateTime::from_timestamp(946_782_245, 0).expect("a fixed valid timestamp");
+    let mut out = String::new();
+    if write!(out, "{}", sample.format(fmt)).is_err() {
+        return bad("not a strftime format");
+    }
+    Ok(fmt.to_string())
+}
+
 /// The inside of `{{ … }}`: `key`, `key | "fallback"` or `key | filter`.
+///
+/// After the `|`, a quoted string is a fallback literal and a bare word is a filter position —
+/// always, so an unknown bare word is `UnknownFilter` whatever the workspace's fields are called.
+/// Deciding it by whether the word happens to name a field would make the same template yield
+/// different errors in different workspaces, and turn the error into an oracle for which fields
+/// exist.
 fn field_tag(s: &str, registry: &Registry) -> Result<Node, TagError> {
     let (key, arg) = match s.split_once('|') {
         None => (s, None),
@@ -225,22 +259,22 @@ fn field_tag(s: &str, registry: &Registry) -> Result<Node, TagError> {
     registry.check(&key)?;
     let (mut filter, mut fallback) = (None, None);
     if let Some(arg) = arg {
-        if arg.starts_with('"') {
-            fallback = Some(literal(arg).ok_or(TagError::NonLiteralFallback)?);
-        } else {
-            filter = Some(match arg {
-                "upper" => Filter::Upper,
-                "lower" => Filter::Lower,
-                "title" => Filter::Title,
-                _ => match arg.strip_prefix("date:") {
-                    Some(fmt) if !fmt.is_empty() => Filter::Date(fmt.to_string()),
-                    // Naming another field here is an attempt at an expression, not a typo.
-                    _ if registry.live.contains(arg) || registry.archived.contains(arg) => {
-                        return Err(TagError::NonLiteralFallback);
-                    }
-                    _ => return Err(TagError::UnknownFilter(arg.to_string())),
-                },
-            });
+        match literal(arg) {
+            // A fallback may hold a `|`, so the literal is tried before the second-`|` check.
+            Some(text) => fallback = Some(text),
+            None if arg.contains('|') => return Err(TagError::FilterAndFallback),
+            None if arg.starts_with('"') => return Err(TagError::NonLiteralFallback),
+            None => {
+                filter = Some(match arg {
+                    "upper" => Filter::Upper,
+                    "lower" => Filter::Lower,
+                    "title" => Filter::Title,
+                    _ => match arg.strip_prefix("date:") {
+                        Some(fmt) => Filter::Date(date_format(fmt)?),
+                        None => return Err(TagError::UnknownFilter(arg.to_string())),
+                    },
+                });
+            }
         }
     }
     Ok(Node::Field {
@@ -390,10 +424,12 @@ mod tests {
     #[test]
     fn a_fallback_must_be_a_quoted_literal() {
         let r = registry();
-        // Another field is an expression, not a literal.
+        // After `|`, a bare word is a filter position whatever it is named — including a word that
+        // happens to name a field. Deciding it by the registry would make the error depend on the
+        // workspace and turn it into an oracle for which fields exist.
         assert_eq!(
             compile("{{ first_name | last_name }}", &r),
-            Err(TagError::NonLiteralFallback)
+            Err(TagError::UnknownFilter("last_name".into()))
         );
         // A quote that does not close, or closes early.
         assert_eq!(
@@ -409,6 +445,15 @@ mod tests {
             compile("{{ first_name | 'there' }}", &r),
             Err(TagError::UnknownFilter("'there'".into()))
         );
+        // A `|` inside the quotes belongs to the fallback: the tag splits on the FIRST `|`.
+        assert_eq!(
+            compile("{{ first_name | \"a|b\" }}", &r).unwrap(),
+            vec![Node::Field {
+                key: "first_name".into(),
+                filter: None,
+                fallback: Some("a|b".into())
+            }]
+        );
         // An equality takes a quoted literal too.
         assert!(matches!(
             compile("{{# country = US }}x{{/ country }}", &r),
@@ -417,15 +462,110 @@ mod tests {
     }
 
     #[test]
-    fn an_unfrozen_filter_is_a_compile_error() {
+    fn a_filter_and_a_fallback_cannot_be_combined() {
         let r = registry();
-        for f in ["env", "include", "render", "date:", "UPPER", "upper:x"] {
+        for t in [
+            "{{ first_name | upper | \"a\" }}",
+            "{{ first_name | \"a\" | upper }}",
+            "{{ first_name | date:%Y | \"a\" }}",
+        ] {
+            assert_eq!(compile(t, &r), Err(TagError::FilterAndFallback), "{t}");
+        }
+    }
+
+    /// The frozen list is the reason this language has no `env`, no `include` and no expressions,
+    /// so it is pinned as an allowlist: all four compile to the right variant and anything else is
+    /// refused. A denylist of names cannot say "and nothing else".
+    #[test]
+    fn the_filter_list_is_frozen_at_four() {
+        let r = registry();
+        let filter = |t: &str| match compile(t, &r) {
+            Ok(nodes) => match nodes.as_slice() {
+                [Node::Field { filter, .. }] => filter.clone(),
+                other => panic!("{t}: {other:?}"),
+            },
+            Err(e) => panic!("{t}: {e:?}"),
+        };
+        assert_eq!(filter("{{ first_name | upper }}"), Some(Filter::Upper));
+        assert_eq!(filter("{{ first_name | lower }}"), Some(Filter::Lower));
+        assert_eq!(filter("{{ first_name | title }}"), Some(Filter::Title));
+        assert_eq!(
+            filter("{{ first_name | date:%d %B %Y }}"),
+            Some(Filter::Date("%d %B %Y".into()))
+        );
+        assert_eq!(filter("{{ first_name }}"), None);
+        for f in [
+            "env",
+            "include",
+            "render",
+            "trim",
+            "capitalize",
+            "default",
+            "escape",
+            "raw",
+            "safe",
+            "UPPER",
+            "upper:x",
+        ] {
             assert_eq!(
                 compile(&format!("{{{{ first_name | {f} }}}}"), &r),
                 Err(TagError::UnknownFilter(f.into())),
                 "{f}"
             );
         }
+    }
+
+    /// `date:` runs to the end of the tag, so an unchecked format swallows whatever follows; and a
+    /// format that is only wrong at send defeats the point of compiling at save.
+    #[test]
+    fn a_date_format_is_validated_at_compile() {
+        let r = registry();
+        for t in [
+            "{{ first_name | date: }}",
+            "{{ first_name | date:%\" }}",
+            "{{ first_name | date:% }}",
+            "{{ first_name | date:{{ email }} }}",
+        ] {
+            assert!(
+                matches!(compile(t, &r), Err(TagError::Malformed(_))),
+                "{t}: {:?}",
+                compile(t, &r)
+            );
+        }
+        // The format is trimmed, so `date: %Y` does not keep its leading space.
+        assert_eq!(
+            compile("{{ first_name | date: %Y-%m-%d }}", &r).unwrap(),
+            vec![Node::Field {
+                key: "first_name".into(),
+                filter: Some(Filter::Date("%Y-%m-%d".into())),
+                fallback: None
+            }]
+        );
+    }
+
+    /// The contact columns a tag may name without a custom field definition. Pinned, because
+    /// dropping one breaks every template that uses it and no other test names them.
+    #[test]
+    fn the_system_field_list_is_frozen_at_four() {
+        assert_eq!(
+            SYSTEM_FIELDS,
+            ["email", "first_name", "last_name", "timezone"]
+        );
+        let r = Registry::from_definitions(&[]);
+        for f in SYSTEM_FIELDS {
+            assert!(compile(&format!("{{{{ {f} }}}}"), &r).is_ok(), "{f}");
+        }
+    }
+
+    #[test]
+    fn a_key_must_be_lowercase_snake_case_within_63_characters() {
+        assert!(is_key("a"));
+        assert!(is_key("a_1"));
+        assert!(is_key(&"a".repeat(63)));
+        for bad in ["", "A", "1a", "a-b", "a b", "a.b", "_a", "aB"] {
+            assert!(!is_key(bad), "{bad:?}");
+        }
+        assert!(!is_key(&"a".repeat(64)));
     }
 
     #[test]
@@ -490,6 +630,7 @@ mod tests {
             s.push_str(&"{{/ first_name }}".repeat(n));
             s
         };
+        assert_eq!(MAX_DEPTH, 32);
         assert!(compile(&nest(MAX_DEPTH), &r).is_ok());
         assert_eq!(compile(&nest(MAX_DEPTH + 1), &r), Err(TagError::TooDeep));
         assert_eq!(compile(&nest(10_000), &r), Err(TagError::TooDeep));
