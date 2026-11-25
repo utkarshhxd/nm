@@ -24,6 +24,7 @@ pub mod sending_domains;
 pub mod suppressions;
 pub mod tags;
 pub mod telemetry;
+pub mod template;
 pub mod users;
 pub mod worker;
 pub mod workspaces;
