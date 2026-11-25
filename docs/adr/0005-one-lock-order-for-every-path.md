@@ -546,13 +546,16 @@ anything about the code.
 - **The `delete from` grep is enforced for `workspaces` only.** `nothing_in_src_deletes_a_workspace`
   scans `src/` for a `delete from` or `truncate` of `workspaces`, tolerating case, whitespace and
   newlines, `\n` / `\t` escapes, string continuations, `public.` qualifiers, quoted identifiers
-  (bare or `\"`-escaped) and a `truncate` that names it anywhere in a list. Its matcher is held
-  by `the_workspace_deletion_matcher_sees_what_it_is_for`, whose samples are written in the
-  source form the matcher reads, escapes and all. **Its blind spots:** a table name not spelled
-  out in `src/` (`format!("delete from {t}")`, `concat!`); anything outside `src/`; `drop table`;
-  an SQL comment between tokens (`delete /* c */ from workspaces`); and a spaced qualifier
+  (bare or `\"`-escaped) and a `truncate` that names it anywhere in a list (`only` before a name,
+  `*` after it). Whole-line `//` comments are skipped. Its matcher is held by
+  `the_workspace_deletion_matcher_sees_what_it_is_for`, whose samples are written in the source
+  form the matcher reads, escapes and all. **Its blind spots:** a table name not spelled out in
+  `src/` (`format!("delete from {t}")`, `concat!`); anything outside `src/`; `drop table`; an
+  SQL comment between tokens (`delete /* c */ from workspaces`); and a spaced qualifier
   (`"public" . "workspaces"`). The last two are not chased: nobody writes them, and a matcher
-  that tried would be fragile guesswork.
+  that tried would be fragile guesswork. **And the false-positive side:** a `/* */` block, a
+  comment trailing code and a string that merely mentions the statement still trip it, so the
+  failure prints the file, the line and the text that matched.
   `users` and `api_keys` are still a grep somebody ran once; the same test with another table name
   closes them.
 - **The importer's tag race**, `issues/39`, two sections above. Still open, still reproduced,

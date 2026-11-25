@@ -1922,7 +1922,9 @@ fn no_migration_contains_a_cr_byte() {
 /// **What it tolerates:** case, any run of whitespace including newlines inside the statement,
 /// those escapes, an optional `only` / `table` keyword, an optional `public.` qualifier, quoted
 /// identifiers (bare or `\"`), the statement split across adjacent string literals
-/// (`"delete from " "workspaces"`), and `truncate` naming it anywhere in a list.
+/// (`"delete from " "workspaces"`), and `truncate` naming it anywhere in a list, with `only`
+/// before a name and `*` after it. A whole-line `//`, `///` or `//!` comment is skipped: it
+/// executes nothing, and a sentence about truncation must not fail the build for everyone.
 ///
 /// **What it does not catch, so nobody reads a green run as more than it is:** a table name that
 /// is not spelled out in `src/` (`format!("delete from {table}")`, `concat!(…)`, a name read from
@@ -1931,9 +1933,36 @@ fn no_migration_contains_a_cr_byte() {
 /// parent's `on delete cascade`, which the foreign key graph test above is for), an SQL comment
 /// between tokens (`delete /* c */ from workspaces`, `delete from -- c` over a line break), and a
 /// spaced qualifier (`"public" . "workspaces"`). The last two are left alone on purpose: nobody
-/// writes them, and chasing them would make this fragile guesswork. It errs the other way too: a
-/// comment that merely *says* `delete from workspaces` also trips it.
+/// writes them, and chasing them would make this fragile guesswork. **It errs the other way
+/// too:** a `/* … */` block, a comment trailing code on the same line, and a string or message
+/// that merely *says* `delete from workspaces` all still trip it, because telling them from code
+/// takes a Rust lexer. The failure message prints the line and the text that matched for that
+/// reason.
 fn deletes_workspaces(text: &str) -> bool {
+    workspace_statement_at(&flatten(&without_line_comments(text))).is_some()
+}
+
+/// `text` with every whole-line `//` comment (`//`, `///`, `//!`) blanked. A line comment executes
+/// nothing, so a statement inside one is harmless, and prose about truncation is ordinary English
+/// that must not fail the build. The line count is kept so a line number found later is the
+/// file's own. Only whole lines are cut: a trailing comment after code, and a `/* … */` block,
+/// are still read (see "does not catch" above).
+fn without_line_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Lower-cased, unescaped, de-quoted and whitespace-collapsed, so one statement is one run of
+/// single-spaced words.
+fn flatten(text: &str) -> String {
     // Order matters: a continuation is a backslash before a REAL newline, so it goes first; then
     // the escapes a normal string spells with a backslash and a letter; then `\"`, which is a
     // quote that has to disappear along with the bare ones.
@@ -1946,7 +1975,11 @@ fn deletes_workspaces(text: &str) -> bool {
         .replace("\\t", " ")
         .replace("\\\"", "")
         .replace('"', "");
-    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Where in `flat` (the output of `flatten`) a statement against `workspaces` starts.
+fn workspace_statement_at(flat: &str) -> Option<usize> {
     // One table name, ignoring `only` and a `public.` qualifier; true if it is `workspaces`.
     let is_workspaces = |name: &str| {
         let name = name.trim();
@@ -1957,7 +1990,7 @@ fn deletes_workspaces(text: &str) -> bool {
     };
     for (at, lead) in flat.match_indices("delete from ") {
         if is_workspaces(&flat[at + lead.len()..]) {
-            return true;
+            return Some(at);
         }
     }
     for (at, lead) in flat.match_indices("truncate ") {
@@ -1965,17 +1998,42 @@ fn deletes_workspaces(text: &str) -> bool {
         let rest = rest.strip_prefix("table ").unwrap_or(rest);
         // `truncate a, b, c`: every item is checked, and the list ends at the first item that has
         // anything after its name (`cascade`, `restart identity`, a `;`), because past that point
-        // it is no longer the statement's table list.
+        // it is no longer the statement's table list. `only` before a name and `*` after it are
+        // part of the name, not of what follows it.
         for item in rest.split(',') {
             if is_workspaces(item) {
-                return true;
+                return Some(at);
             }
-            if item.trim().contains(' ') {
+            let bare = item.trim();
+            let bare = bare.strip_prefix("only ").unwrap_or(bare);
+            let bare = bare.strip_suffix('*').unwrap_or(bare).trim_end();
+            if bare.contains(' ') {
                 break;
             }
         }
     }
-    false
+    None
+}
+
+/// The line (1-based) and the flattened text of the first statement against `workspaces` in
+/// `text`, for a failure message that shows the reader what matched rather than only which file.
+fn locate_workspace_statement(text: &str) -> Option<(usize, String)> {
+    let text = without_line_comments(text);
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, first) in lines.iter().enumerate() {
+        if first.trim().is_empty() {
+            continue;
+        }
+        // A statement can run over several lines, so look at a window; it counts for this line
+        // only if the statement STARTS on it, which keeps the answer at the first line of it.
+        let flat = flatten(&lines[i..(i + 8).min(lines.len())].join("\n"));
+        if let Some(at) = workspace_statement_at(&flat)
+            && at < flatten(first).len()
+        {
+            return Some((i + 1, flat[at..].chars().take(70).collect()));
+        }
+    }
+    None
 }
 
 /// **The matcher has to see its own target, in every shape a human will type it.** A grep test that
@@ -1999,6 +2057,9 @@ fn the_workspace_deletion_matcher_sees_what_it_is_for() {
         "truncate table lists, workspaces",
         "truncate table lists , only public.workspaces cascade",
         "truncate table \"lists\", \"workspaces\"",
+        "truncate table only lists, only workspaces cascade",
+        "truncate table lists *, workspaces *",
+        "// a comment above does not hide the statement below\ndelete from workspaces",
     ] {
         assert!(deletes_workspaces(yes), "should have matched: {yes:?}");
     }
@@ -2028,6 +2089,10 @@ fn the_workspace_deletion_matcher_sees_what_it_is_for() {
         "truncate table lists, templates",
         "truncate table lists, workspaces_archive",
         "truncate table lists restart identity; select * from workspaces",
+        // A line comment executes nothing, and prose about truncation is ordinary English.
+        "// We never truncate lists, workspaces or members: the cascade is too wide.",
+        "    /// Truncate workspaces names to 64 chars.",
+        "//! This module must never delete from workspaces.",
         r#""delete from \"templates\"\nwhere workspace_id = $1""#,
     ] {
         assert!(!deletes_workspaces(no), "should not have matched: {no:?}");
@@ -2054,7 +2119,9 @@ fn nothing_in_src_deletes_a_workspace() {
             } else if let Ok(bytes) = std::fs::read(&path)
                 && deletes_workspaces(&String::from_utf8_lossy(&bytes))
             {
-                hits.push(path.display().to_string());
+                let (line, excerpt) = locate_workspace_statement(&String::from_utf8_lossy(&bytes))
+                    .unwrap_or((0, "(could not locate the line)".to_owned()));
+                hits.push(format!("{}:{line}: `{excerpt}`", path.display()));
             }
         }
     }
@@ -2065,9 +2132,13 @@ fn nothing_in_src_deletes_a_workspace() {
     );
     assert!(
         hits.is_empty(),
-        "a statement that deletes or truncates `workspaces` appears in: {}. That makes `workspaces` \
-         an exclusive taker and invalidates the \"no exclusive taker\" ruling in ADR 0005 for all \
-         seventeen of its children: re-open that ruling rather than editing this test",
-        hits.join(", ")
+        "text that reads as a delete or truncate of `workspaces` appears at (file:line: the text \
+         that matched, lower-cased and flattened):\n  {}\n\
+         If that is a comment, a message or a name, reword it: a trailing `//` comment, a `/* */` \
+         block and a string are all still read, and only whole `//` lines are skipped. If it is a \
+         real statement, `workspaces` has an exclusive taker and ADR 0005's \"no exclusive \
+         taker\" ruling is void for all seventeen of its children: re-open that ruling rather \
+         than editing this test",
+        hits.join("\n  ")
     );
 }
