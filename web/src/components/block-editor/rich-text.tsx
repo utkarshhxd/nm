@@ -3,7 +3,7 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 
 import type { Mark, Run } from "./model";
-import { edit, hasTag, length, normalize } from "./runs";
+import { breakAt, edit, hasTag, length, normalize } from "./runs";
 import { isTagToken, tagToken } from "./tag-token";
 
 /** A selection as flat offsets into the block's runs; a merge tag counts 1. `from <= to`. */
@@ -121,6 +121,15 @@ function select(root: HTMLElement, sel: Sel) {
   s?.addRange(range);
 }
 
+/** Enter (a new block) or Shift+Enter (a line break) at the selection, for a key or a soft keyboard. */
+function lineOrSplit(el: HTMLElement, shift: boolean, p: Props) {
+  const runs = parse(el);
+  const sel = selection(el) ?? { from: length(runs), to: length(runs) };
+  // A line break is a newline in the text of the run it is in, shown as a break because the block is pre-wrapped.
+  if (shift) p.onRuns(breakAt(runs, sel.from, sel.to), { from: sel.from + 1, to: sel.from + 1 });
+  else p.onEnter(runs, sel);
+}
+
 type Props = {
   runs: Run[];
   label: string;
@@ -168,6 +177,12 @@ export function RichText(props: Props) {
     el.addEventListener("focusout", report);
     // Deleting next to or across a merge tag is the model's: one step, the whole tag, every browser.
     const beforeInput = (e: InputEvent) => {
+      // A soft keyboard sends these instead of a key; a composition's Enter is the input method's.
+      if ((e.inputType === "insertParagraph" || e.inputType === "insertLineBreak") && !e.isComposing) {
+        e.preventDefault();
+        lineOrSplit(el, e.inputType === "insertLineBreak", latest.current);
+        return;
+      }
       if (e.inputType !== "deleteContentBackward" && e.inputType !== "deleteContentForward") return;
       const s = selection(el);
       if (!s) return;
@@ -208,13 +223,10 @@ export function RichText(props: Props) {
         props.onRuns(runs);
       }}
       onKeyDown={(e) => {
-        if (e.key === "Enter") {
+        // Enter is also how an input method confirms a candidate: not ours while one is open.
+        if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
           e.preventDefault();
-          const runs = parse(e.currentTarget);
-          const sel = selection(e.currentTarget) ?? { from: length(runs), to: length(runs) };
-          // A line break is a "\n" in the text, shown as a break because the block is pre-wrapped.
-          if (e.shiftKey) props.onRuns(edit(runs, sel.from, sel.to, [{ type: "Text", text: "\n", marks: [] }]), { from: sel.from + 1, to: sel.from + 1 });
-          else props.onEnter(runs, sel);
+          lineOrSplit(e.currentTarget, e.shiftKey, props);
         }
         const mark = e.key === "b" ? "bold" : e.key === "i" ? "italic" : null;
         if (mark && (e.ctrlKey || e.metaKey)) {

@@ -434,3 +434,103 @@ test("enter_over_a_selection_replaces_it_with_the_split_as_one_undo_step", async
   expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
   expect(words(await block(page, 1))).toBe("Hi {tag}!");
 });
+
+// A document the editor did not make: stored on a server or written by an API client, so it need
+// not be normalised. The fixture is the point of these tests; a normalised one cannot fail them.
+const given = (page: Page, app: string, blocks: Block[]) =>
+  page.goto(app + EDITOR + "?doc=" + encodeURIComponent(JSON.stringify({ blocks })));
+const T = (text: string, ...marks: ("bold" | "italic")[]) => ({ type: "Text" as const, text, marks });
+
+test("enter_splits_at_the_caret_in_a_document_that_is_not_normalised", async ({ page, app }) => {
+  // Adjacent runs of one kind: the caret at 8 is inside run 0 "Hello " only if runs are merged.
+  await given(page, app, [{ type: "Text", runs: [T("Hello "), T("world")] }]);
+  await caretIn(page, "Text block 1");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 8; i++) await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect([words(await block(page, 0)), words(await block(page, 1))]).toEqual(["Hello wo", "rld"]);
+
+  // An empty run in front shifts every index by one: the split must still land at "abcd|ef".
+  await given(page, app, [{ type: "Text", runs: [T(""), T("abc"), T("def", "bold")] }]);
+  await caretIn(page, "Text block 1");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 4; i++) await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  expect([words(await block(page, 0)), words(await block(page, 1))]).toEqual(["abcd", "ef"]);
+  expect(await block(page, 1)).toEqual({ type: "Text", runs: [T("ef", "bold")] });
+  // One Undo takes the whole Enter back, to the document as it was given.
+  await page.getByRole("button", { name: "Undo" }).click();
+  expect((await doc(page)).blocks).toHaveLength(1);
+});
+
+test("enter_that_confirms_an_ime_candidate_does_not_split_the_block", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("Home");
+  // Enter during composition is how an input method confirms a candidate: the browser flags it so.
+  const prevented = await page.evaluate(() => {
+    const el = document.querySelector('[aria-label="Text block 2"]') as HTMLElement;
+    const e = new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true, cancelable: true });
+    el.dispatchEvent(e);
+    return e.defaultPrevented;
+  });
+  expect(prevented).toBe(false);
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
+  // The same key outside a composition still splits.
+  await page.keyboard.press("Enter");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Text", "Columns"]);
+});
+
+test("shift_enter_leaves_the_newline_inside_the_run_it_was_pressed_in", async ({ page, app }) => {
+  const link = { type: "Link" as const, href: "https://a.test", text: "click here", marks: ["bold" as const] };
+  await given(page, app, [{ type: "Text", runs: [link, T(" now")] }]);
+  await caretIn(page, "Text block 1");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 5; i++) await page.keyboard.press("ArrowRight"); // "click|"
+  await page.keyboard.press("Shift+Enter");
+  expect(((await block(page, 0)) as Extract<Block, { type: "Text" }>).runs).toEqual([
+    { ...link, text: "click\n here" },
+    T(" now"),
+  ]);
+  // The same in a bold run: one bold run holding the break, not bold, plain, bold.
+  await given(page, app, [{ type: "Text", runs: [T("a bold sentence", "bold")] }]);
+  await caretIn(page, "Text block 1");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 6; i++) await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Shift+Enter");
+  expect(((await block(page, 0)) as Extract<Block, { type: "Text" }>).runs).toEqual([T("a bold\n sentence", "bold")]);
+});
+
+test("a_line_break_at_the_end_of_a_block_is_visible", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("End");
+  const height = async () => ((await box(page, "Text block 2").boundingBox()) as { height: number }).height;
+  const one = await height();
+  await page.keyboard.press("Shift+Enter");
+  // The caret now sits on a second line, so the block is taller by a line, before anything is typed after it.
+  const two = await height();
+  expect(two).toBeGreaterThanOrEqual(one + 15); // a line is about 20px; the block's own minimum is 24
+  await page.keyboard.press("Shift+Enter");
+  expect(await height()).toBeGreaterThanOrEqual(two + 15);
+});
+
+test("a_soft_keyboards_paragraph_and_line_break_are_handled_like_enter_and_shift_enter", async ({ page, app }) => {
+  const send = (inputType: string) =>
+    page.evaluate((type) => {
+      const el = document.querySelector('[aria-label="Text block 2"]') as HTMLElement;
+      el.dispatchEvent(new InputEvent("beforeinput", { inputType: type, bubbles: true, cancelable: true }));
+    }, inputType);
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  await page.keyboard.press("Home");
+  for (let i = 0; i < 2; i++) await page.keyboard.press("ArrowRight"); // "Hi|"
+  await send("insertLineBreak");
+  expect(words(await block(page, 1))).toBe("Hi\n {tag}!");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
+  await send("insertParagraph");
+  expect(await kinds(page)).toEqual(["Heading", "Text", "Text", "Columns"]);
+  expect([words(await block(page, 1)), words(await block(page, 2))]).toEqual(["Hi\n", " {tag}!"]);
+});

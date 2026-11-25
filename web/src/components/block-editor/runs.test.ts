@@ -5,7 +5,7 @@
 import { expect, test } from "@playwright/test";
 
 import type { Mark, Run } from "./model";
-import { edit, hasTag, locate, hrefAllowed, hrefAt, marked, normalize, splitAt, tagSource, toggleMark, setLink } from "./runs";
+import { breakAt, edit, hasTag, locate, hrefAllowed, hrefAt, marked, normalize, splitAt, tagSource, toggleMark, setLink } from "./runs";
 
 const t = (text: string, ...marks: Mark[]): Run => ({ type: "Text", text, marks });
 const tag: Run = { type: "Tag", source: '{{ first_name | "there" }}' };
@@ -97,4 +97,16 @@ test("locate_names_a_run_and_a_code_point_offset_and_a_tag_has_two_edges", () =>
   expect(locate(runs, 4)).toEqual({ run: 1, offset: 1 });
   expect(locate(runs, 7)).toEqual({ run: 2, offset: 2 }); // after the emoji: 2 code points, 3 code units
   expect(locate([t("")], 0)).toEqual({ run: 0, offset: 0 });
+});
+
+test("a_line_break_goes_inside_the_run_it_is_in_and_replaces_the_selection", () => {
+  expect(breakAt([t("ab", "bold"), t("cd")], 1, 1)).toEqual([t("a\nb", "bold"), t("cd")]);
+  // At a join the earlier run takes it, as typing there would; at the very start the first one does.
+  expect(breakAt([t("ab", "bold"), t("cd")], 2, 2)).toEqual([t("ab\n", "bold"), t("cd")]);
+  expect(breakAt([t("ab", "bold")], 0, 0)).toEqual([t("\nab", "bold")]);
+  expect(breakAt([t("abcd")], 1, 3)).toEqual([t("a\nd")]);
+  // After a tag there is no text to put it in, so it makes its own run; before text it joins that.
+  expect(breakAt([tag], 1, 1)).toEqual([tag, t("\n")]);
+  expect(breakAt([tag, t("x", "italic")], 1, 1)).toEqual([tag, t("\nx", "italic")]);
+  expect(breakAt([t("")], 0, 0)).toEqual([t("\n")]);
 });

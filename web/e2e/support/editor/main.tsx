@@ -9,7 +9,7 @@ import { BlockEditor } from "../../../src/components/block-editor/editor";
 import type { Doc } from "../../../src/components/block-editor/model";
 import "../../../src/styles.css";
 
-const initial: Doc = {
+const fixture: Doc = {
   blocks: [
     { type: "Heading", level: 1, runs: [{ type: "Text", text: "Welcome", marks: [] }] },
     {
@@ -29,6 +29,10 @@ const initial: Doc = {
     },
   ],
 };
+
+// ?doc=<json>: a document the editor did not make, e.g. one a server stored, which need not be normalised.
+const given = new URLSearchParams(location.search).get("doc");
+const initial: Doc = given ? (JSON.parse(given) as Doc) : fixture;
 
 // ?preview=fail: a source whose render and checks fail, to see the editor not claim a clean bill.
 const failing = new URLSearchParams(location.search).get("preview") === "fail" ? () => Promise.reject(new Error("down")) : undefined;

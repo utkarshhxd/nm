@@ -143,21 +143,22 @@ export function BlockEditor({
     );
   }
 
-  /** Enter: delete the selection, then split at the caret, or add a text block below at the end. One undo step. */
+  /**
+   * Enter: split at the caret, or add a text block below at the end. One undo step. The caret was
+   * located in `runs`, which is normalised, so the first op writes those runs into the block: a
+   * stored document need not be normalised, and a run index from one list is wrong in the other.
+   * With a selection, `runs` is first cut down to what is left of it.
+   */
   function enter(loc: Loc, block: TextBlock, runs: Run[], sel: Sel) {
     const below = [...loc.slice(0, -1), (loc.at(-1) as number) + 1];
-    const ops: Op[] = [];
-    let now = runs;
-    if (sel.from !== sel.to) {
-      now = edit(runs, sel.from, sel.to);
-      ops.push({ type: "update", at: loc, block: { ...block, runs: now } });
-    }
+    const now = sel.from === sel.to ? runs : edit(runs, sel.from, sel.to);
     // Split names a run and an offset in it, so a merge tag has only two edges and is never cut.
-    ops.push(
+    const ops: Op[] = [
+      { type: "update", at: loc, block: { ...block, runs: now } },
       sel.from >= length(now)
         ? { type: "insert", at: below, block: blank("Text") }
         : { type: "split", at: loc, ...locate(now, sel.from) },
-    );
+    ];
     run(ops, below, { restore: { from: 0, to: 0 } });
   }
 

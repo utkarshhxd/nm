@@ -146,3 +146,24 @@ export function hrefAllowed(href: string): boolean {
     return false;
   }
 }
+
+/**
+ * A line break at `from`, replacing the selection: a newline inside the text of the run it is in,
+ * so a bold or linked sentence stays one run (contract section 7). At a join the earlier run takes it,
+ * as typing there would. Where no run has text to hold it (after a tag at the end) it is a run of its own.
+ */
+export function breakAt(runs: Run[], from: number, to: number): Run[] {
+  const cut = edit(runs, from, to);
+  let pos = 0;
+  for (let i = 0; i < cut.length; i++) {
+    const r = cut[i] as Run;
+    const n = size(r);
+    if (r.type !== "Tag" && from >= pos && from <= pos + n) {
+      const k = splitAt([r], from - pos)[0][0] as Inline;
+      const at = k.text.length;
+      return normalize([...cut.slice(0, i), { ...r, text: r.text.slice(0, at) + "\n" + r.text.slice(at) }, ...cut.slice(i + 1)]);
+    }
+    pos += n;
+  }
+  return edit(cut, from, from, [{ type: "Text", text: "\n", marks: [] }]);
+}
