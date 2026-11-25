@@ -11,19 +11,19 @@ import "../../../src/styles.css";
 
 const initial: Doc = {
   blocks: [
-    { type: "Heading", level: 1, runs: [{ type: "Plain", text: "Welcome" }] },
+    { type: "Heading", level: 1, runs: [{ type: "Text", text: "Welcome", marks: [] }] },
     {
       type: "Text",
       runs: [
-        { type: "Plain", text: "Hi " },
-        { type: "Tag", source: 'first_name | "there"' },
-        { type: "Bold", text: "!" },
+        { type: "Text", text: "Hi ", marks: [] },
+        { type: "Tag", source: '{{ first_name | "there" }}' },
+        { type: "Text", text: "!", marks: ["bold"] },
       ],
     },
     {
       type: "Columns",
       children: [
-        [{ type: "Text", runs: [{ type: "Plain", text: "left" }] }],
+        [{ type: "Text", runs: [{ type: "Text", text: "left", marks: [] }] }],
         [{ type: "Button", label: "Read more", href: "https://example.com" }],
       ],
     },

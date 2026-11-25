@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { normalize } from "./runs";
+
 /**
  * The document model. The document is plain data in React state and is the only source of truth:
- * the DOM is never read back as a document, and undo is a stack of these, not the browser's.
+ * the DOM is a paint of it (rich-text.tsx reads one block's runs back after typing, nothing more),
+ * and undo is a stack of these, not the browser's.
  *
- * `Block` and `Run` mirror the Rust enums in `src/template/block.rs` variant for variant. They are
+ * `Block` and `Run` mirror the Rust enums in `src/template/block.rs` variant for variant, in the
+ * shape `.superpowers/sdd/m2b/contract-block-tree.md` fixes. They are
  * the contract between the lanes: what the editor serialises is what the server parses. Every
  * variant name below is a Rust variant name.
  *
@@ -12,13 +16,18 @@
  * so no operation takes a range, and one that is handed several is rejected, never half-applied.
  */
 
-/** Inline content. A run is flat, never nested: bold-italic is a later decision, not an accident. */
+export type Mark = "bold" | "italic";
+
+/**
+ * Inline content, as the cross-lane contract fixes it (`.superpowers/sdd/m2b/contract-block-tree.md`).
+ * `marks` is always present, `[]` when empty, and is a set: bold and italic can sit on one run.
+ * A mark list is replaced, never mutated, because a split leaves two runs holding the same array
+ * and history holds both.
+ */
 export type Run =
-  | { type: "Plain"; text: string }
-  | { type: "Bold"; text: string }
-  | { type: "Italic"; text: string }
-  | { type: "Link"; href: string; text: string }
-  /** A merge tag. Atomic: never split, deleted whole. `source` is what sits between `{{` and `}}`. */
+  | { type: "Text"; text: string; marks: Mark[] }
+  | { type: "Link"; href: string; text: string; marks: Mark[] }
+  /** A merge tag. Atomic: never split, deleted whole. `source` is the whole tag, braces included. */
   | { type: "Tag"; source: string };
 
 export type Block =
@@ -60,9 +69,9 @@ const reject = (why: string): never => {
 export function blank(type: Block["type"]): Block {
   switch (type) {
     case "Text":
-      return { type, runs: [{ type: "Plain", text: "" }] };
+      return { type, runs: [{ type: "Text", text: "", marks: [] }] };
     case "Heading":
-      return { type, level: 2, runs: [{ type: "Plain", text: "" }] };
+      return { type, level: 2, runs: [{ type: "Text", text: "", marks: [] }] };
     case "Image":
       return { type, src: "", alt: "" };
     case "Button":
@@ -98,10 +107,65 @@ function within(blocks: Block[], loc: Loc, f: (list: Block[], index: number) => 
   return splice(blocks, i, 1, { ...host, children });
 }
 
-const oneBlock = (b: unknown): Block =>
-  typeof b === "object" && b !== null && !Array.isArray(b) && typeof (b as Block).type === "string"
-    ? (b as Block)
-    : reject("an operation carries exactly one block");
+const isObject = (x: unknown): x is Record<string, unknown> =>
+  typeof x === "object" && x !== null && !Array.isArray(x);
+const isText = (x: unknown) => typeof x === "string";
+const areMarks = (m: unknown) => Array.isArray(m) && m.every((x) => x === "bold" || x === "italic");
+
+function validRun(r: unknown): boolean {
+  if (!isObject(r)) return false;
+  switch (r["type"]) {
+    case "Text":
+      return isText(r["text"]) && areMarks(r["marks"]);
+    case "Link":
+      return isText(r["href"]) && isText(r["text"]) && areMarks(r["marks"]);
+    case "Tag":
+      return isText(r["source"]);
+    default:
+      return false;
+  }
+}
+
+/** One well-formed block. `nested` is true inside a column, where a Columns block cannot go. */
+function oneBlock(b: unknown, nested: boolean): Block {
+  if (!isObject(b)) return reject("an operation carries exactly one block");
+  switch (b["type"]) {
+    case "Text":
+    case "Heading": {
+      const { runs, level } = b;
+      if (!Array.isArray(runs) || !runs.every(validRun)) return reject(`a ${b["type"]} block needs valid runs`);
+      if (b["type"] === "Heading" && !(Number.isInteger(level) && (level as number) >= 1 && (level as number) <= 6)) {
+        return reject("a Heading level is 1 to 6");
+      }
+      break;
+    }
+    case "Image":
+      if (!isText(b["src"]) || !isText(b["alt"])) return reject("an Image block needs src and alt");
+      break;
+    case "Button":
+      if (!isText(b["label"]) || !isText(b["href"])) return reject("a Button block needs label and href");
+      break;
+    case "Divider":
+      break;
+    case "Spacer": {
+      const h = b["height"];
+      if (!Number.isInteger(h) || (h as number) < 0 || (h as number) > 65535) return reject("a Spacer height is 0 to 65535");
+      break;
+    }
+    case "Columns": {
+      if (nested) return reject("Columns do not nest");
+      const { children } = b;
+      if (!Array.isArray(children) || !children.every((c) => Array.isArray(c))) {
+        return reject("Columns children are a list of lists");
+      }
+      for (const column of children as unknown[][]) for (const child of column) oneBlock(child, true);
+      break;
+    }
+    default:
+      return reject("unknown block type");
+  }
+  return b as unknown as Block;
+}
 
 // Array#toSpliced is ES2023 and this project targets ES2022.
 const splice = <T,>(list: T[], at: number, remove: number, ...add: T[]): T[] => [
@@ -112,27 +176,42 @@ const splice = <T,>(list: T[], at: number, remove: number, ...add: T[]): T[] => 
 
 const sameList = (a: Loc, b: Loc) => a.length === b.length && a.slice(0, -1).every((n, k) => n === b[k]);
 
-/** Splits one run at `offset`; a Tag has only two edges, so it is never cut. */
+/** Splits one run at `offset`, counted in code points so an emoji is never torn; a Tag has only two edges. */
 function cut(run: Run, offset: number): [Run[], Run[]] {
   if (run.type === "Tag") {
     return offset === 0 ? [[], [run]] : offset === 1 ? [[run], []] : reject("a merge tag is never split");
   }
-  if (!Number.isInteger(offset) || offset < 0 || offset > run.text.length) {
+  const chars = [...run.text];
+  if (!Number.isInteger(offset) || offset < 0 || offset > chars.length) {
     return reject("split offset is outside the run");
   }
-  const head = { ...run, text: run.text.slice(0, offset) };
-  const tail = { ...run, text: run.text.slice(offset) };
-  return [head.text ? [head] : [], tail.text ? [tail] : []];
+  return [
+    [{ ...run, text: chars.slice(0, offset).join("") }],
+    [{ ...run, text: chars.slice(offset).join("") }],
+  ];
 }
+
+/** The fields each op defines. An op carrying any other is rejected: a stray `to` must not be ignored. */
+const FIELDS: Record<Op["type"], string[]> = {
+  insert: ["at", "block"],
+  delete: ["at"],
+  update: ["at", "block"],
+  move: ["from", "to"],
+  split: ["at", "run", "offset"],
+};
 
 /** Applies one operation. Pure: returns a new Doc, or throws OpRejected and changes nothing. */
 export function apply(doc: Doc, op: Op): Doc {
-  // `op` can come from anywhere, so the discriminant is checked, not trusted.
-  switch (op?.type) {
+  // `op` can come from anywhere, so its shape is checked, not trusted.
+  const fields = isObject(op) && typeof op.type === "string" && Object.hasOwn(FIELDS, op.type) ? FIELDS[op.type] : undefined;
+  if (!fields) return reject("unknown operation");
+  for (const key of Object.keys(op)) {
+    if (key !== "type" && !fields.includes(key)) reject(`${op.type} has no field "${key}"`);
+  }
+  switch (op.type) {
     case "insert": {
       const at = checked(op.at, "insert");
-      const b = oneBlock(op.block);
-      if (at.length > 1 && b.type === "Columns") reject("Columns do not nest");
+      const b = oneBlock(op.block, at.length > 1);
       return {
         blocks: within(doc.blocks, at, (list, i) =>
           i > list.length ? reject(`cannot insert at ${i}: the list has ${list.length}`) : splice(list, i, 0, b),
@@ -149,8 +228,7 @@ export function apply(doc: Doc, op: Op): Doc {
     }
     case "update": {
       const at = checked(op.at, "update");
-      const b = oneBlock(op.block);
-      if (at.length > 1 && b.type === "Columns") reject("Columns do not nest");
+      const b = oneBlock(op.block, at.length > 1);
       return {
         blocks: within(doc.blocks, at, (list, i) =>
           i < list.length ? splice(list, i, 1, b) : reject(`no block at ${i}`),
@@ -171,6 +249,7 @@ export function apply(doc: Doc, op: Op): Doc {
     }
     case "split": {
       const at = checked(op.at, "split");
+      if (!Number.isInteger(op.run) || op.run < 0) return reject("split names a run by its index");
       return {
         blocks: within(doc.blocks, at, (list, i) => {
           const b = list[i];
@@ -178,21 +257,20 @@ export function apply(doc: Doc, op: Op): Doc {
           const run = b.runs[op.run];
           if (!run) return reject("split names a run that does not exist");
           const [head, tail] = cut(run, op.offset);
-          const first: Block = { type: "Text", runs: [...b.runs.slice(0, op.run), ...head] };
-          const second: Block = { type: "Text", runs: [...tail, ...b.runs.slice(op.run + 1)] };
+          // `normalize` drops empty runs and leaves an empty block as one empty run, the shape `blank` makes.
+          const first: Block = { type: "Text", runs: normalize([...b.runs.slice(0, op.run), ...head]) };
+          const second: Block = { type: "Text", runs: normalize([...tail, ...b.runs.slice(op.run + 1)]) };
           return splice(list, i, 1, first, second);
         }),
       };
     }
-    default:
-      return reject("unknown operation");
   }
 }
 
 /** Undo is a stack of Docs: `past` oldest first, `future` next redo first. */
 export type History = { past: Doc[]; present: Doc; future: Doc[] };
 
-const DEPTH = 200;
+export const DEPTH = 200;
 
 export const start = (doc: Doc): History => ({ past: [], present: doc, future: [] });
 
@@ -200,6 +278,12 @@ export const start = (doc: Doc): History => ({ past: [], present: doc, future: [
 export function commit(h: History, op: Op): History {
   return { past: [...h.past, h.present].slice(-DEPTH), present: apply(h.present, op), future: [] };
 }
+
+/**
+ * Applies `op` to the present without a new undo step: a burst of typing is one step, the one its
+ * first keystroke committed. A rejected op throws, as in `commit`.
+ */
+export const amend = (h: History, op: Op): History => ({ ...h, present: apply(h.present, op), future: [] });
 
 export const undo = (h: History): History => {
   const previous = h.past.at(-1);
