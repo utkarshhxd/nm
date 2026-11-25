@@ -551,9 +551,11 @@ anything about the code.
   `the_workspace_deletion_matcher_sees_what_it_is_for`, whose samples are written in the source
   form the matcher reads, escapes and all. **Its blind spots:** a table name not spelled out in
   `src/` (`format!("delete from {t}")`, `concat!`); anything outside `src/`; `drop table`; an
-  SQL comment between tokens (`delete /* c */ from workspaces`); and a spaced qualifier
-  (`"public" . "workspaces"`). The last two are not chased: nobody writes them, and a matcher
-  that tried would be fragile guesswork. **And the false-positive side:** a `/* */` block, a
+  SQL comment between tokens (`delete /* c */ from workspaces`); a spaced qualifier
+  (`"public" . "workspaces"`); and a line *inside* a multi-line or raw string whose first
+  non-whitespace is `//`, which the comment skip blanks along with real comments. The last three
+  are not chased: nobody writes them — `//` is not SQL — and a matcher that tried would be
+  fragile guesswork. **And the false-positive side:** a `/* */` block, a
   comment trailing code and a string that merely mentions the statement still trip it, so the
   failure prints the file, the line and the text that matched.
   `users` and `api_keys` are still a grep somebody ran once; the same test with another table name
