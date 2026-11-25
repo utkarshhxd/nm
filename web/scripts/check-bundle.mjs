@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Guards two budgets. The shell (the entry chunk and the chunks it imports statically) stays under
-// 150 KB compressed. Every other JS chunk — a lazily imported route, or a helper only routes
-// share — stays under 50 KB compressed on its own, so the contacts route cannot quietly grow
-// without bound just because the shell is not the one measuring it. CSS is a separate file.
+// 150 KB compressed. Every other JS chunk is measured as a closure: itself plus every chunk it
+// imports statically, minus the shell, stays under 50 KB compressed. Measuring chunks one by one
+// would let a route (or a framework) through in two pieces with the gate green. CSS is a separate
+// file.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -20,13 +21,13 @@ if (!manifest[ENTRY]) {
   process.exit(1);
 }
 
-const chunks = new Set();
-function collect(key) {
-  if (chunks.has(key)) return;
-  chunks.add(key);
-  for (const imported of manifest[key].imports ?? []) collect(imported);
+function collect(key, into = new Set()) {
+  if (into.has(key)) return into;
+  into.add(key);
+  for (const imported of manifest[key].imports ?? []) collect(imported, into);
+  return into;
 }
-collect(ENTRY);
+const chunks = collect(ENTRY);
 
 const gzipped = (file) => gzipSync(readFileSync(join(DIST, file)), { level: 9 }).length;
 
@@ -47,10 +48,11 @@ if (total > LIMIT) {
 
 for (const [key, { file }] of Object.entries(manifest)) {
   if (chunks.has(key) || !file.endsWith(".js")) continue;
-  const size = gzipped(file);
-  console.log(`${String(size).padStart(8)}  ${file} (lazy, limit ${CHUNK_LIMIT})`);
+  const closure = [...collect(key)].filter((k) => !chunks.has(k));
+  const size = closure.reduce((sum, k) => sum + gzipped(manifest[k].file), 0);
+  console.log(`${String(size).padStart(8)}  ${file} (route closure of ${closure.length}, limit ${CHUNK_LIMIT})`);
   if (size > CHUNK_LIMIT) {
-    console.error(`${file} is over the per-chunk budget by ${size - CHUNK_LIMIT} bytes`);
+    console.error(`${file} is over the per-route budget by ${size - CHUNK_LIMIT} bytes`);
     failed = true;
   }
 }

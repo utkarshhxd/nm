@@ -23,7 +23,12 @@ function run(files) {
     };
     write(cwd, "assets/index.js", files.shell);
     for (const [name, size] of Object.entries(files.lazy)) {
-      manifest[name] = { file: `assets/${name}.js`, isDynamicEntry: true, imports: ["index.html"] };
+      manifest[name] = { file: `assets/${name}.js`, isDynamicEntry: true, imports: ["index.html", ...(files.uses?.[name] ?? [])] };
+      write(cwd, `assets/${name}.js`, size);
+    }
+    // Chunks only routes import (a manualChunks split): in the manifest, but not entries.
+    for (const [name, size] of Object.entries(files.split ?? {})) {
+      manifest[name] = { file: `assets/${name}.js` };
       write(cwd, `assets/${name}.js`, size);
     }
     write(cwd, ".vite/manifest.json", JSON.stringify(manifest), true);
@@ -63,4 +68,25 @@ test("reports_which_chunk_broke_the_budget", () => {
   const over = r.out.split("\n").filter((line) => /over|exceeds/i.test(line));
   assert.ok(over.some((line) => line.includes("contacts.js")), r.out);
   assert.ok(!over.some((line) => line.includes("tags.js")), r.out);
+});
+
+test("fails_when_a_route_split_into_two_chunks_exceeds_50kb_between_them", () => {
+  const r = run({
+    shell: 100 * KB,
+    lazy: { editor: 30 * KB },
+    split: { "editor-core": 30 * KB },
+    uses: { editor: ["editor-core"] },
+  });
+  assert.notEqual(r.status, 0, r.out);
+  assert.match(r.out, /editor\.js is over the per-route budget/);
+});
+
+test("passes_when_two_routes_share_a_chunk_and_each_closure_fits", () => {
+  const r = run({
+    shell: 100 * KB,
+    lazy: { contacts: 20 * KB, tags: 20 * KB },
+    split: { shared: 25 * KB },
+    uses: { contacts: ["shared"], tags: ["shared"] },
+  });
+  assert.equal(r.status, 0, r.out);
 });
