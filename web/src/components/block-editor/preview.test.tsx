@@ -12,8 +12,8 @@ import { expectNoViolations } from "../../../e2e/support/axe";
 const FRAME = "Email preview";
 const mode = (page: Page, name: string) => page.getByRole("button", { name, exact: true }).click();
 const frame = (page: Page) => page.frameLocator(`iframe[title="${FRAME}"]`);
-const open = async (page: Page, app: string) => {
-  await page.goto(app + EDITOR);
+const open = async (page: Page, app: string, query = "") => {
+  await page.goto(app + EDITOR + query);
   await expect(page.getByRole("textbox", { name: "Text block 2", exact: true })).toBeVisible();
   await expect(page.locator(`iframe[title="${FRAME}"]`)).toBeVisible();
 };
@@ -61,6 +61,8 @@ test("the_dark_preview_says_next_to_itself_what_it_covers_and_what_it_cannot", a
   await expect(label).toContainText("dark styles you wrote");
   await expect(label).toContainText("recolour the email themselves");
   await expect(label).toContainText("ignore dark styles and show the light version");
+  await expect(label).toContainText("Thunderbird");
+  await expect(label).not.toContainText("Apple Mail"); // vendors disagree on that client
   await expect(label).toContainText("Gmail");
   await expect(label).toContainText("Outlook");
   // Behaviour first, clients as examples: tables of who does what disagree and change.
@@ -89,9 +91,8 @@ test("every_mode_says_the_preview_is_the_browser_not_an_email_client", async ({ 
 
 test("the_preview_frame_cannot_run_scripts_from_the_email", async ({ page, app }) => {
   await open(page, app);
-  const sandbox = (await page.locator(`iframe[title="${FRAME}"]`).getAttribute("sandbox")) ?? "missing";
-  expect(sandbox).not.toBe("missing");
-  expect(sandbox).not.toContain("allow-scripts");
+  // Exactly empty: every token loosens it, and allow-same-origin is the one that matters for operator content on the admin origin.
+  expect(await page.locator(`iframe[title="${FRAME}"]`).getAttribute("sandbox")).toBe("");
 });
 
 test("a_button_says_in_words_that_classic_outlook_on_windows_draws_it_square", async ({ page, app }) => {
@@ -118,6 +119,7 @@ test("remote_images_are_labelled_as_not_loaded_in_the_preview", async ({ page, a
   for (const m of ["Desktop", "Mobile", "Dark"]) {
     await mode(page, m);
     await expect(page.getByTestId("preview-images")).toContainText("Remote images are not loaded");
+    await expect(page.getByTestId("preview-images")).toContainText("without one shows blank");
   }
   await mode(page, "Plain text");
   await expect(page.getByTestId("preview-images")).toHaveCount(0);

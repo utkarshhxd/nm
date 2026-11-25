@@ -5,6 +5,7 @@ import { useEffect, useId, useState } from "react";
 import { Button } from "../button";
 import type { Doc, Loc } from "./model";
 import type { PreviewResult, PreviewSource } from "./preview-source";
+import { themed } from "./preview-theme";
 
 type Mode = "desktop" | "mobile" | "dark" | "text";
 const MODES: [Mode, string][] = [
@@ -16,16 +17,6 @@ const MODES: [Mode, string][] = [
 
 /** A pause in editing this long (ms) before the server is asked again. */
 const DEBOUNCE = 250;
-
-/**
- * What a dark preview can honestly reproduce: the author's own `prefers-color-scheme: dark` CSS.
- * The query is rewritten to always (or never) match, so the frame shows the same thing whatever
- * the operator's own system theme is. A client that recolours the email itself cannot be shown
- * by a browser, and there is no colour inversion here on purpose: a guess would be a lie.
- * shortcut: a regex over the server's HTML, fine for the one spelling MJML emits; use a parse if that changes.
- */
-const themed = (html: string, dark: boolean) =>
-  html.replace(/@media\s*\(\s*prefers-color-scheme\s*:\s*dark\s*\)/gi, dark ? "@media all" : "@media not all");
 
 type State = { result: PreviewResult | null; failed: boolean; busy: boolean };
 
@@ -55,9 +46,10 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
 
   const { result, failed, busy } = state;
   const findings = result?.findings ?? [];
+  const view = result && mode !== "text" ? themed(result.html, mode === "dark") : null;
   const summary = findings.length === 0 ? "No findings." : `${findings.length} ${findings.length === 1 ? "finding" : "findings"}.`;
   return (
-    <section aria-label="Preview and checks" className="space-y-3 border-t border-border pt-4">
+    <section aria-label="Preview and checks" aria-busy={busy} className="space-y-3 border-t border-border pt-4">
       <h2 className="text-lg font-semibold">Preview and checks</h2>
       <div role="group" aria-label="Preview mode" className="flex flex-wrap gap-2">
         {MODES.map(([m, name]) => (
@@ -76,7 +68,18 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
       )}
       {result && mode !== "text" && (
         <p data-testid="preview-images" className="text-sm text-fg-muted">
-          Remote images are not loaded in this preview. Each one shows as its description.
+          Remote images are not loaded in this preview. An image with a description shows that description in its place; one without one shows blank.
+        </p>
+      )}
+      {view?.partial && (
+        <p role="note" data-testid="preview-partial" className="border-l-4 border-warning bg-warning-subtle p-3 text-fg">
+          Some dark styles in this email could not be previewed, so this preview may not match what they do.
+        </p>
+      )}
+      {mode === "dark" && view && view.dark === 0 && !view.partial && (
+        <p role="note" data-testid="dark-none" className="border-l-4 border-warning bg-warning-subtle p-3 text-fg">
+          This email has no dark styles, so the Dark preview looks the same as Light. That does not mean dark mode is handled: apps that
+          ignore dark styles show exactly this, and apps that recolour the email will still change it.
         </p>
       )}
       {result && mode === "dark" && (
@@ -85,7 +88,7 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
             Dark mode does one of three things in real email apps. This preview shows only the first: it applies the dark styles you wrote.
           </p>
           <ul className="list-disc space-y-1 pl-5">
-            <li>Some apps apply your dark styles, Apple Mail for example.</li>
+            <li>Some apps apply your dark styles, Thunderbird for example.</li>
             <li>
               Some apps recolour the email themselves whatever you wrote, for example several Outlook and Gmail mobile apps. This preview
               cannot show that.
@@ -108,23 +111,22 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
           title="Email preview"
           // Nothing in an email runs in the editor: no scripts, no same-origin access, no navigation.
           sandbox=""
-          srcDoc={themed(result.html, mode === "dark")}
+          srcDoc={view?.html}
           aria-describedby={mode === "dark" ? dark : undefined}
           style={{ width: mode === "mobile" ? 375 : 640 }}
           className="block h-[32rem] max-w-full rounded-sm border border-border-strong bg-white"
         />
       )}
+      {/* Sighted people see the in-flight state; assistive technology gets the settled result only. */}
       {!failed && (
-        <>
-          {/* Sighted people see the in-flight state; assistive technology gets the settled result only. */}
-          <p data-testid="findings-count" aria-hidden="true" className="font-medium">
-            {busy ? "Checking…" : summary}
-          </p>
-          <p role="status" className="sr-only">
-            {result ? summary : ""}
-          </p>
-        </>
+        <p data-testid="findings-count" aria-hidden="true" className="font-medium">
+          {busy ? "Checking…" : summary}
+        </p>
       )}
+      {/* Always mounted: a live region that appears with its text already in it is not announced, so recovery would be silent. */}
+      <p role="status" className="sr-only">
+        {result ? summary : ""}
+      </p>
       {findings.length > 0 && (
         <ul aria-label="Findings" className="space-y-2">
           {findings.map((f, i) => (
