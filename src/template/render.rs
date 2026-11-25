@@ -64,15 +64,23 @@ use super::tag::{Filter, Node};
 /// trusting that markers are inert.
 ///
 /// shortcut: a template whose own literal text contains this sequence would have it read as a
-/// marker. Only the operator can write that, and the damage is to their own template; give the
-/// compile path a rejection for it if it ever happens in practice.
+/// marker. Only the operator can write one — `mrml` copies the suffix verbatim, and a contact
+/// value is never re-scanned — but the damage is NOT confined to the forger's own template: a
+/// forged marker aliasing a conditional's index would, unchecked, turn the pair back into "just a
+/// field" and a branch meant to be hidden would render to every recipient. `scan` refuses an index
+/// used in both forms for that reason. Give the compile path a rejection for a literal marker in
+/// template text if it ever happens in practice.
 pub const MARK_START: &str = "~nmmt~";
 /// Closes a [`MARK_START`]; the digits between the two are the tag's index.
 pub const MARK_END: &str = "~tmmn~";
-/// Follows the index when the marker is a conditional's boundary rather than a field. It is in
-/// the marker rather than in a parameter so that [`classify`] can tell the two apart from the
-/// stored HTML alone, with nothing extra to keep in step.
-const MARK_BLOCK: &str = "b";
+/// Follow the index when the marker opens or closes a conditional rather than standing for a
+/// field. They are in the marker rather than in a parameter so that [`classify`] can tell the
+/// three apart from the stored HTML alone, with nothing extra to keep in step.
+///
+/// A conditional's two markers share ONE index, so the pair is explicit: a close marker names the
+/// open it belongs to, and [`scan`] can check ordering and nesting without being handed a map.
+const MARK_OPEN: &str = "o";
+const MARK_CLOSE: &str = "c";
 
 /// Where a merge tag lands in the finished HTML.
 ///
@@ -96,8 +104,9 @@ pub enum RenderError {
     /// the attribute or the element that held it. Saving this template would publish a message
     /// with the tag silently missing, so it is refused instead.
     TagLost { index: usize },
-    /// `mrml` copied one of a conditional's two boundary markers, so the renderer cannot tell
-    /// which copy delimits the branch.
+    /// A conditional's boundary markers did not survive exactly once each, so the renderer cannot
+    /// tell which copy delimits the branch. Also covers an index used in both boundary and field
+    /// form, which would otherwise hide the pair from this check entirely.
     ///
     /// A duplicated FIELD marker is fine — every copy is given the same value, and `mrml`
     /// legitimately emits an `mj-button` href twice. A duplicated BOUNDARY is not: suppressing a
@@ -105,6 +114,21 @@ pub enum RenderError {
     /// wrong range of a sent message gets dropped, silently, which is the one failure in this
     /// module that would not announce itself.
     BlockDuplicated { index: usize, count: usize },
+    /// A conditional's two markers do not bracket a whole region of the document: one is inside an
+    /// attribute value and the other is not, or they are in different attributes.
+    ///
+    /// Dropping a branch means rewinding the output between the pair. When they straddle a tag the
+    /// rewind lands between `<` and `>`, the serialiser keeps writing, and everything after it is
+    /// parsed as attributes of an unterminated tag — so a value encoded for the context it was
+    /// classified in ends up in a different one. That is the whole defect this module exists to
+    /// prevent, arriving by way of the conditional.
+    BlockStraddlesTag { index: usize },
+    /// A conditional's markers are out of order, unmatched, or not properly nested.
+    ///
+    /// `mrml 6.0.1` does not reorder markers. That is an observation about one version, and this
+    /// module has been bitten three times by exactly that kind of observation, so the pairing is
+    /// required rather than assumed.
+    BlockUnbalanced { index: usize },
 }
 
 /// The attributes whose value is a URL the browser will fetch or navigate to. Anything here gets
@@ -197,16 +221,24 @@ fn scalar(v: &Value) -> Option<String> {
 /// that builds this list, so the indices cannot drift apart.
 enum Slot<'a> {
     Field(&'a Node),
-    /// A conditional opens here, and its `Close` is the matching marker.
-    Open(&'a Node),
-    Close,
+    /// A conditional. It writes TWO markers — an open and a close sharing this one index — so the
+    /// pair is self-describing in the HTML.
+    Block(&'a Node),
 }
 
 /// What a marker is replaced by at send time, by index.
 enum Fill {
     Value(Option<String>),
-    /// `true` when this contact takes the branch; `false` suppresses everything up to the `Close`.
-    Open(bool),
+    /// `true` when this contact takes the branch; `false` suppresses everything between the two
+    /// markers.
+    Block(bool),
+}
+
+/// Which of the three forms a marker is in. Read back out of the marker itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Field,
+    Open,
     Close,
 }
 
@@ -230,24 +262,28 @@ fn walk<'a>(nodes: &'a [Node], out: &mut String, slots: &mut Vec<Slot<'a>>) {
     for n in nodes {
         match n {
             Node::Text(t) => out.push_str(t),
-            Node::Field { .. } => mark(out, slots, Slot::Field(n)),
+            Node::Field { .. } => {
+                let id = slots.len();
+                slots.push(Slot::Field(n));
+                out.push_str(&marker(id, Kind::Field));
+            }
             Node::Present { body, .. } | Node::Absent { body, .. } | Node::Equals { body, .. } => {
-                mark(out, slots, Slot::Open(n));
+                let id = slots.len();
+                slots.push(Slot::Block(n));
+                out.push_str(&marker(id, Kind::Open));
                 walk(body, out, slots);
-                mark(out, slots, Slot::Close);
+                out.push_str(&marker(id, Kind::Close));
             }
         }
     }
 }
 
-fn mark<'a>(out: &mut String, slots: &mut Vec<Slot<'a>>, slot: Slot<'a>) {
-    let block = !matches!(slot, Slot::Field(_));
-    out.push_str(&marker(slots.len(), block));
-    slots.push(slot);
-}
-
-fn marker(id: usize, block: bool) -> String {
-    let suffix = if block { MARK_BLOCK } else { "" };
+fn marker(id: usize, kind: Kind) -> String {
+    let suffix = match kind {
+        Kind::Field => "",
+        Kind::Open => MARK_OPEN,
+        Kind::Close => MARK_CLOSE,
+    };
     format!("{MARK_START}{id}{suffix}{MARK_END}")
 }
 
@@ -259,13 +295,12 @@ fn fills(nodes: &[Node], c: &Contact<'_>) -> Vec<Fill> {
         .iter()
         .map(|slot| match slot {
             Slot::Field(n) => Fill::Value(field_value(n, c)),
-            Slot::Open(n) => Fill::Open(match n {
+            Slot::Block(n) => Fill::Block(match n {
                 Node::Present { key, .. } => c.value(key).is_some(),
                 Node::Absent { key, .. } => c.value(key).is_none(),
                 Node::Equals { key, value, .. } => c.value(key).as_deref() == Some(value.as_str()),
                 Node::Text(_) | Node::Field { .. } => false,
             }),
-            Slot::Close => Fill::Close,
         })
         .collect()
 }
@@ -295,7 +330,10 @@ pub fn classify(html: &str, tags: usize) -> Result<Vec<Site>, RenderError> {
 /// One contact's copy of the already-classified document.
 ///
 /// `html` is the stored output of `mrml` — the same string [`classify`] passed — and `nodes` is the
-/// AST it was marked from. A value is substituted and then written out; it is never read back, so
+/// AST it was marked from. Nothing in the types ties those two together, and this function
+/// re-scans, so a caller that hands it a DIFFERENT document gets that document's classification
+/// rather than none: it will encode correctly for whatever it is given, and silently for the wrong
+/// document if it is given the wrong one. Store the HTML `classify` accepted and pass that. A value is substituted and then written out; it is never read back, so
 /// a contact whose `first_name` is the text `{{ email }}` gets that text and not somebody's
 /// address.
 pub fn substitute(
@@ -309,10 +347,14 @@ pub fn substitute(
 
 /// [`substitute`] for a template that is already the document being sent, with no MJML step.
 ///
-/// This is the plain-HTML case and the one the tests use. The MJML pipeline must NOT go through
-/// here: it marks the MJML source and would classify a document `mrml` has not rewritten yet. See
-/// the pipeline diagram at the top of this module.
-pub fn render_html(nodes: &[Node], contact: &Contact<'_>) -> Result<String, RenderError> {
+/// **Test-only, deliberately.** Handed an MJML AST this marks the MJML source and classifies a
+/// document `mrml` has not rewritten yet, which is exactly the defect the pipeline above exists to
+/// prevent — and it would return `Ok`, because it is self-consistent about the wrong document. A
+/// doc comment is not enough to stop the next caller reaching for the function named "render", so
+/// it is not compiled outside tests. The product's path is `marked` + `classify` at save and
+/// [`substitute`] at send.
+#[cfg(test)]
+fn render_html(nodes: &[Node], contact: &Contact<'_>) -> Result<String, RenderError> {
     let (html, _) = marked(nodes);
     substitute(&html, nodes, contact)
 }
@@ -374,7 +416,7 @@ fn format_date(v: &str, fmt: &str) -> Option<String> {
 
 enum Seg<'a> {
     Lit(&'a str),
-    Mark(usize),
+    Mark(usize, Kind),
 }
 
 /// Splits a run of text into literal and marker pieces. A `MARK_START` with no digits-then-
@@ -387,11 +429,11 @@ fn segments(s: &str) -> Vec<Seg<'_>> {
     while let Some(i) = rest[done..].find(MARK_START).map(|i| done + i) {
         let after = &rest[i + MARK_START.len()..];
         match id_in(after) {
-            Some((id, _, len)) => {
+            Some((id, kind, len)) => {
                 if i > 0 {
                     out.push(Seg::Lit(&rest[..i]));
                 }
-                out.push(Seg::Mark(id));
+                out.push(Seg::Mark(id, kind));
                 rest = &after[len + MARK_END.len()..];
                 done = 0;
             }
@@ -405,24 +447,28 @@ fn segments(s: &str) -> Vec<Seg<'_>> {
     out
 }
 
-/// The inside of a marker that has just had its `MARK_START` consumed: the index, whether it is a
-/// conditional's boundary, and the byte length of both.
-fn id_in(after: &str) -> Option<(usize, bool, usize)> {
+/// The inside of a marker that has just had its `MARK_START` consumed: the index, which of the
+/// three forms it is in, and the byte length of both.
+fn id_in(after: &str) -> Option<(usize, Kind, usize)> {
     let len = after.find(MARK_END)?;
     let body = &after[..len];
-    let (digits, block) = match body.strip_suffix(MARK_BLOCK) {
-        Some(d) => (d, true),
-        None => (body, false),
+    let (digits, kind) = if let Some(d) = body.strip_suffix(MARK_OPEN) {
+        (d, Kind::Open)
+    } else if let Some(d) = body.strip_suffix(MARK_CLOSE) {
+        (d, Kind::Close)
+    } else {
+        (body, Kind::Field)
     };
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
         .then(|| digits.parse().ok())
         .flatten()
-        .map(|id| (id, block, len))
+        .map(|id| (id, kind, len))
 }
 
 fn position_of(html: &str, id: usize) -> usize {
-    html.find(&marker(id, false))
-        .or_else(|| html.find(&marker(id, true)))
+    [Kind::Field, Kind::Open, Kind::Close]
+        .into_iter()
+        .find_map(|k| html.find(&marker(id, k)))
         .unwrap_or(0)
 }
 
@@ -581,11 +627,14 @@ fn url_parts(segs: &[Seg<'_>]) -> (Vec<(usize, Part)>, Option<String>) {
     let mut first = true;
     for seg in segs {
         let l = match seg {
-            Seg::Mark(id) => {
+            // A conditional's markers write nothing, so they take no component: only field
+            // markers are positions a value lands in.
+            Seg::Mark(id, Kind::Field) => {
                 parts.push((*id, state));
                 first = false;
                 continue;
             }
+            Seg::Mark(..) => continue,
             Seg::Lit(l) => *l,
         };
         let b = l.as_bytes();
@@ -674,6 +723,18 @@ struct Sink<'v> {
     st: RefCell<St<'v>>,
 }
 
+/// Where in the document's STRUCTURE a marker sits. A conditional is dropped by rewinding the
+/// output between its two markers, so both ends must be in the same place: the rewind has to
+/// delete a whole region, not the back half of a start tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Outside any tag.
+    Text,
+    /// The nth attribute VALUE the serialiser has reached. Two markers share a place only when
+    /// they are in the same attribute of the same tag.
+    Attr(usize),
+}
+
 struct St<'v> {
     sites: Vec<Option<Site>>,
     /// `None` when classifying: there is no contact, so nothing is substituted, no branch is
@@ -688,6 +749,14 @@ struct St<'v> {
     /// at together with the output length to rewind to.
     depth: usize,
     suppress: Option<(usize, usize)>,
+    /// Where the serialiser is, and the open conditionals with where each one started. Together
+    /// they are what makes "the rewind deletes a whole region" checkable.
+    place: Place,
+    attr_seq: usize,
+    blocks: Vec<(usize, Place)>,
+    /// The first conditional that did not bracket a whole region, or was out of order. Held
+    /// rather than returned because the sink cannot return.
+    block_err: Option<RenderError>,
     /// Character tokens arrive in chunks split at `&`, `<` and NUL; a run is buffered so a marker
     /// can never be half in one chunk and half in the next.
     text: String,
@@ -714,7 +783,7 @@ impl<'v> St<'v> {
 
     fn mark_all(&mut self, s: &str, site: Site) {
         for seg in segments(s) {
-            if let Seg::Mark(id) = seg {
+            if let Seg::Mark(id, _) = seg {
                 self.record(id, site);
             }
         }
@@ -722,11 +791,20 @@ impl<'v> St<'v> {
 
     /// Writes one marker's replacement. The encoder is chosen by `site`, which came from the
     /// position — never from the value and never from what was recorded earlier.
-    fn emit(&mut self, id: usize, site: Site) {
-        match self.fill(id) {
-            // Classifying: nothing is substituted.
-            None => {}
-            Some(Fill::Value(v)) => {
+    fn fail_block(&mut self, e: RenderError) {
+        if self.block_err.is_none() {
+            self.block_err = Some(e);
+        }
+    }
+
+    fn emit(&mut self, id: usize, kind: Kind, site: Site) {
+        match kind {
+            Kind::Field => {
+                let Some(Fill::Value(v)) = self.fill(id) else {
+                    // Classifying, or an index used in both forms — which `scan`'s count check
+                    // refuses, so this arm writes nothing rather than guessing.
+                    return;
+                };
                 let Some(v) = v.as_deref() else { return };
                 match site {
                     Site::Text => escape_text(v, &mut self.out),
@@ -742,13 +820,24 @@ impl<'v> St<'v> {
                     }
                 }
             }
-            Some(Fill::Open(taken)) => {
+            Kind::Open => {
+                // Recorded whether or not there is a contact: the structural check is part of
+                // classification, not of rendering.
+                self.blocks.push((id, self.place));
                 self.depth += 1;
-                if !taken && self.suppress.is_none() {
+                if matches!(self.fill(id), Some(Fill::Block(false))) && self.suppress.is_none() {
                     self.suppress = Some((self.depth, self.out.len()));
                 }
             }
-            Some(Fill::Close) => {
+            Kind::Close => {
+                match self.blocks.pop() {
+                    Some((open, place)) if open == id => {
+                        if place != self.place {
+                            self.fail_block(RenderError::BlockStraddlesTag { index: id });
+                        }
+                    }
+                    Some(_) | None => self.fail_block(RenderError::BlockUnbalanced { index: id }),
+                }
                 if let Some((at, len)) = self.suppress
                     && at == self.depth
                 {
@@ -779,9 +868,9 @@ impl<'v> St<'v> {
                     Raw::Data | Raw::Rcdata => escape_text(s, &mut self.out),
                     Raw::Style | Raw::Script | Raw::Other => self.out.push_str(s),
                 },
-                Seg::Mark(id) => {
+                Seg::Mark(id, kind) => {
                     self.record(id, site);
-                    self.emit(id, site);
+                    self.emit(id, kind, site);
                 }
             }
         }
@@ -790,7 +879,7 @@ impl<'v> St<'v> {
     fn attr_value(&mut self, value: &str, site: Site) {
         let segs = segments(value);
         if site == Site::Url {
-            if segs.iter().any(|s| matches!(s, Seg::Mark(_))) {
+            if segs.iter().any(|s| matches!(s, Seg::Mark(..))) {
                 self.url_attr(&segs);
             } else {
                 escape_attr(&static_url(value), &mut self.out);
@@ -800,9 +889,9 @@ impl<'v> St<'v> {
         for seg in &segs {
             match seg {
                 Seg::Lit(l) => escape_attr(l, &mut self.out),
-                Seg::Mark(id) => {
+                Seg::Mark(id, kind) => {
                     self.record(*id, site);
-                    self.emit(*id, site);
+                    self.emit(*id, *kind, site);
                 }
             }
         }
@@ -816,7 +905,7 @@ impl<'v> St<'v> {
     /// for the component they land in. A value that is only "a valid URL character" is not safe
     /// here; `&`, `=` and `#` are legal in a URL and are exactly how a value injects a parameter.
     fn url_attr(&mut self, segs: &[Seg<'_>]) {
-        if let [Seg::Mark(id)] = segs {
+        if let [Seg::Mark(id, Kind::Field)] = segs {
             self.record(*id, Site::Url);
             if let Some(Fill::Value(v)) = self.fill(*id) {
                 escape_attr(&safe_url(v.as_deref().unwrap_or_default()), &mut self.out);
@@ -835,23 +924,39 @@ impl<'v> St<'v> {
                 Site::Url
             }
         };
+        if bad_scheme {
+            // Every marker, not only the field ones. A conditional has no URL component of its
+            // own, so without this a `{{# x }}javascript:{{/ x }}alert(1)` href would hold no
+            // field marker for the scheme check to land on and would slip past the static sweep
+            // too, because that only runs on an attribute with no markers in it at all.
+            for seg in segs {
+                if let Seg::Mark(id, _) = seg {
+                    self.record(*id, Site::Dangerous);
+                }
+            }
+        }
         let mut next = parts.iter();
         for seg in segs {
             match seg {
                 Seg::Lit(l) => escape_attr(l, &mut self.out),
-                Seg::Mark(id) => {
+                Seg::Mark(id, Kind::Field) => {
                     let part = next.next().map(|(_, p)| *p).unwrap_or(Part::Scheme);
                     self.record(*id, site_of(part));
                     match self.fill(*id) {
-                        Some(Fill::Value(v)) if !site_of(part).eq(&Site::Dangerous) => {
+                        Some(Fill::Value(v)) if site_of(part) != Site::Dangerous => {
                             let mut enc = String::new();
                             percent_encode(v.as_deref().unwrap_or_default(), part.keep(), &mut enc);
                             escape_attr(&enc, &mut self.out);
                         }
                         // Refused, so nothing is written; the document is discarded anyway.
-                        Some(Fill::Value(_)) | None => {}
-                        Some(Fill::Open(_)) | Some(Fill::Close) => self.emit(*id, Site::Text),
+                        _ => {}
                     }
+                }
+                // A conditional kept wholly inside one URL attribute is legitimate; it writes
+                // nothing itself, and `url_parts` does not give it a component.
+                Seg::Mark(id, kind) => {
+                    self.record(*id, Site::Url);
+                    self.emit(*id, *kind, Site::Url);
                 }
             }
         }
@@ -886,7 +991,10 @@ impl<'v> St<'v> {
             // Every attribute is re-serialised with double quotes, whatever the source wrote, so
             // the encoder never has to guess which character ends this value.
             self.out.push_str("=\"");
+            self.attr_seq += 1;
+            self.place = Place::Attr(self.attr_seq);
             self.attr_value(&a.value, attr_site(name, n, http_equiv));
+            self.place = Place::Text;
             self.out.push('"');
         }
         if tag.self_closing {
@@ -973,11 +1081,13 @@ fn scan(
         return Err(RenderError::DangerousContext { position: 0 });
     }
     let mut sites: Vec<Option<Site>> = vec![None; tags];
-    let mut counts: Vec<usize> = vec![0; tags];
-    let mut boundary: Vec<bool> = vec![false; tags];
+    // Counted per FORM, not per index: last-occurrence-wins would let a forged field-form alias
+    // placed after a conditional's marker reset the flag and skip the check below entirely, and a
+    // branch meant to be hidden would then render to every recipient.
+    let mut counts: Vec<[usize; 3]> = vec![[0; 3]; tags];
     let bytes = html.as_bytes();
     for (i, _) in html.match_indices(MARK_START) {
-        let Some((id, block, _)) = id_in(&html[i + MARK_START.len()..]) else {
+        let Some((id, kind, _)) = id_in(&html[i + MARK_START.len()..]) else {
             continue;
         };
         // Bounded BEFORE the resize below: a raw `~nmmt~4294967295~tmmn~` would otherwise ask for
@@ -987,11 +1097,9 @@ fn scan(
         }
         if sites.len() <= id {
             sites.resize(id + 1, None);
-            counts.resize(id + 1, 0);
-            boundary.resize(id + 1, false);
+            counts.resize(id + 1, [0; 3]);
         }
-        counts[id] += 1;
-        boundary[id] = block;
+        counts[id][kind as usize] += 1;
         // `<{{ tag }}>`: the tokenizer reads this as TEXT, because a marker is not an ASCII letter
         // and so does not open a tag — but the `<` is already in the template, and a value dropped
         // straight after it is a tag name whatever the tokenizer calls the position.
@@ -1000,18 +1108,20 @@ fn scan(
         }
     }
 
-    // A conditional's boundary must survive exactly once. `mrml` copies markers — measured, on an
-    // `mj-button` href — and a copied FIELD marker is harmless because every copy is given the
-    // same value. A copied BOUNDARY is not: suppressing a dropped branch means rewinding the
-    // output between a matching pair, and a third marker makes that the wrong range. Everything
-    // else in this module fails closed; this is the one place where not checking would mean a
-    // recipient quietly getting the other branch's content. A boundary with a count of zero is
-    // left to the `TagLost` check below, which says the more useful thing.
-    for (id, &is_boundary) in boundary.iter().enumerate() {
-        if is_boundary && counts[id] != 1 {
+    // A conditional's two markers must each survive exactly once, and the index must not also
+    // appear in field form. `mrml` copies markers — measured, on an `mj-button` href — and a
+    // copied FIELD marker is harmless because every copy is given the same value. A copied
+    // BOUNDARY is not: dropping a branch means rewinding the output between the pair, and a third
+    // marker makes that the wrong range. Everything else in this module fails closed; this is one
+    // of the two places where not checking would mean a recipient quietly getting the other
+    // branch's content. A conditional absent altogether is left to the `TagLost` check below,
+    // which says the more useful thing.
+    for (id, c) in counts.iter().enumerate() {
+        let [field, open, close] = *c;
+        if (open > 0 || close > 0) && (open != 1 || close != 1 || field != 0) {
             return Err(RenderError::BlockDuplicated {
                 index: id,
-                count: counts[id],
+                count: field + open + close,
             });
         }
     }
@@ -1026,6 +1136,10 @@ fn scan(
                 forged: false,
                 depth: 0,
                 suppress: None,
+                place: Place::Text,
+                attr_seq: 0,
+                blocks: Vec::new(),
+                block_err: None,
                 text: String::new(),
             }),
         },
@@ -1038,13 +1152,27 @@ fn scan(
 
     let mut st = tok.sink.st.borrow_mut();
     st.flush_text();
+    // Dropping a branch rewinds the output between a conditional's two markers, so the pair has
+    // to bracket a whole region of the document. When it does not — one marker inside an
+    // attribute value and the other outside the tag — the rewind lands between `<` and `>`, the
+    // serialiser keeps writing, and the rest of the document is parsed as attributes of an
+    // unterminated tag. A value encoded for the context it was classified in then arrives in a
+    // different one, which is the defect this module exists to prevent.
+    if let Some(e) = st.block_err.clone() {
+        return Err(e);
+    }
+    if let Some(&(index, _)) = st.blocks.first() {
+        return Err(RenderError::BlockUnbalanced { index });
+    }
     // Fail closed, twice over. A marker the tokenizer never handed back is a position nobody
     // classified; a marker that is not in the document at all is a merge tag `mrml` threw away,
     // and saving that publishes a message with the tag silently missing.
     let mut sites: Vec<Site> = Vec::with_capacity(st.sites.len());
     for (id, site) in st.sites.iter().enumerate() {
         match site {
-            Some(Site::Dangerous) | None if counts.get(id).copied().unwrap_or(0) == 0 => {
+            Some(Site::Dangerous) | None
+                if counts.get(id).is_none_or(|c| c.iter().sum::<usize>() == 0) =>
+            {
                 return Err(RenderError::TagLost { index: id });
             }
             Some(Site::Dangerous) | None => {
@@ -1601,6 +1729,12 @@ mod tests {
             classify(&raw, 1),
             Err(RenderError::DangerousContext { .. })
         ));
+        // The count itself is caller-supplied and sizes a vector before the prescan runs, so it
+        // is bounded too.
+        assert!(matches!(
+            classify("", MAX_TAGS + 1),
+            Err(RenderError::DangerousContext { .. })
+        ));
         // `~` written as `&#126;`: the raw prescan sees character references, the tokenizer sees a
         // marker with an index that would size a vector.
         let encoded =
@@ -1643,24 +1777,24 @@ mod tests {
     /// today, which is an observation about one version and not a guarantee.
     #[test]
     fn a_duplicated_conditional_boundary_is_refused() {
+        // A conditional is one slot writing two markers that share its index, so the pair names
+        // itself and `classify` can check it without being handed a map.
         let (html, tags) = marked(&nodes("{{# link }}hi{{/ link }}"));
-        assert_eq!(tags, 2);
-        assert_eq!(classify(&html, tags).unwrap(), vec![Site::Text, Site::Text]);
-        for id in [0, 1] {
-            let m = marker(id, true);
+        assert_eq!(tags, 1);
+        assert_eq!(classify(&html, tags).unwrap(), vec![Site::Text]);
+        for kind in [Kind::Open, Kind::Close] {
+            let m = marker(0, kind);
             let doubled = html.replacen(&m, &format!("{m}{m}"), 1);
             assert_eq!(
                 classify(&doubled, tags),
-                Err(RenderError::BlockDuplicated {
-                    index: id,
-                    count: 2
-                })
+                Err(RenderError::BlockDuplicated { index: 0, count: 3 }),
+                "{kind:?}"
             );
         }
         // A duplicated FIELD marker stays legal: every copy is given the same value, which is
         // what `mrml` does to an `mj-button` href and what a real document relies on.
         let (html, tags) = marked(&nodes("<p>{{ first_name }}</p>"));
-        let m = marker(0, false);
+        let m = marker(0, Kind::Field);
         let doubled = html.replacen(&m, &format!("{m}{m}"), 1);
         assert_eq!(classify(&doubled, tags).unwrap(), vec![Site::Text]);
         assert_eq!(
@@ -1671,6 +1805,109 @@ mod tests {
             )
             .unwrap(),
             "<p>AdaAda</p>"
+        );
+    }
+
+    /// Dropping a branch rewinds the output between a conditional's two markers. If they do not
+    /// bracket a whole region the rewind lands between `<` and `>`, the serialiser keeps writing,
+    /// and the rest of the document is parsed as attributes of an unterminated tag — so a value
+    /// encoded as TEXT, where `escape_text` leaves `"` alone, arrives in attribute position. That
+    /// is this module's own defect reached through the conditional, and it survives real `mrml`.
+    #[test]
+    fn a_conditional_that_straddles_a_tag_is_refused() {
+        for src in [
+            "<a href=\"https://x.example/{{# link }}\">hi{{/ link }}</a><p>{{ first_name }}</p>",
+            "<a title=\"t{{# link }}\">x</a><img alt=\"a{{/ link }}\">",
+            "<p title=\"t{{# link }}\">body{{/ link }}</p>",
+        ] {
+            assert!(
+                matches!(sites(src), Err(RenderError::BlockStraddlesTag { index: 0 })),
+                "{src}: {:?}",
+                sites(src)
+            );
+        }
+        // Nor can a conditional smuggle a disallowed scheme past the static sweep by wrapping
+        // it: the sweep only runs on an attribute with no markers at all, and a conditional has
+        // no URL component for the scheme check to land on.
+        assert!(matches!(
+            sites("<a href=\"{{# link }}javascript:{{/ link }}alert(1)\">x</a>"),
+            Err(RenderError::DangerousContext { .. })
+        ));
+        // Kept wholly inside ONE attribute value it is legitimate and must keep working.
+        let src = "<a href=\"https://app.example.com/go{{# link }}?u=1{{/ link }}\">x</a>";
+        assert_eq!(sites(src).unwrap(), vec![Site::Url]);
+        assert_eq!(
+            ok(src, "Ada", json!({ "link": "y" })),
+            "<a href=\"https://app.example.com/go?u=1\">x</a>"
+        );
+        assert_eq!(
+            ok(src, "Ada", json!({})),
+            "<a href=\"https://app.example.com/go\">x</a>"
+        );
+    }
+
+    /// The check that a conditional's markers survive exactly once is keyed on the index, so an
+    /// index that ALSO appears in field form would hide the pair from it. Placed after the real
+    /// markers that used to reset a last-occurrence-wins flag, and the hidden branch then rendered
+    /// to every recipient.
+    #[test]
+    fn a_forged_field_alias_cannot_hide_a_conditional() {
+        let ast = nodes("{{# link }}SECRET{{/ link }}TAIL");
+        let (html, tags) = marked(&ast);
+        for forged in [
+            format!("{html}{}", marker(0, Kind::Field)),
+            format!("{}{html}", marker(0, Kind::Field)),
+        ] {
+            assert!(
+                matches!(
+                    classify(&forged, tags),
+                    Err(RenderError::BlockDuplicated { index: 0, .. })
+                ),
+                "{:?}",
+                classify(&forged, tags)
+            );
+            assert!(substitute(&forged, &ast, &contact("Ada", &json!({}))).is_err());
+        }
+    }
+
+    /// RULING (fix round 3). `mrml 6.0.1` does not reorder markers — an observation about one
+    /// version, and this module has been bitten three times by exactly that kind of observation.
+    /// Counting without pairing lets a reordered pair through with counts of one and one.
+    #[test]
+    fn a_reordered_or_crossed_conditional_pair_is_refused() {
+        let (_, tags) = marked(&nodes("{{# link }}body{{/ link }}"));
+        let swapped = format!("{}body{}", marker(0, Kind::Close), marker(0, Kind::Open));
+        assert_eq!(
+            classify(&swapped, tags),
+            Err(RenderError::BlockUnbalanced { index: 0 })
+        );
+        // Crossed rather than nested: every count is one and every marker is present.
+        let (_, tags) = marked(&nodes("{{# link }}a{{/ link }}{{# bio }}b{{/ bio }}"));
+        assert_eq!(tags, 2);
+        let crossed = format!(
+            "{}{}{}{}",
+            marker(0, Kind::Open),
+            marker(1, Kind::Open),
+            marker(0, Kind::Close),
+            marker(1, Kind::Close)
+        );
+        assert_eq!(
+            classify(&crossed, tags),
+            Err(RenderError::BlockUnbalanced { index: 0 })
+        );
+        // An open whose close is somewhere no token reports it — here a comment. The document is
+        // refused either way, because the close is a dangerous position too; the leftover check
+        // is what makes the refusal say "your conditional is unbalanced" instead of pointing at
+        // the comment.
+        let (_, tags) = marked(&nodes("{{# link }}body{{/ link }}"));
+        let orphan = format!(
+            "{}body<!--{}-->",
+            marker(0, Kind::Open),
+            marker(0, Kind::Close)
+        );
+        assert_eq!(
+            classify(&orphan, tags),
+            Err(RenderError::BlockUnbalanced { index: 0 })
         );
     }
 
