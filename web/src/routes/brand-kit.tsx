@@ -5,13 +5,24 @@ import { useState } from "react";
 
 import { problemText } from "../api/client";
 import { Button } from "../components/button";
-import { hrefAllowed } from "../components/block-editor/runs";
 import { ErrorState } from "../components/error-state";
 import { Alert, Field } from "../components/field";
 import { CONTROL } from "../components/input";
 import { Skeleton } from "../components/skeleton";
 import { atLeast } from "../lib/roles";
-import { type Draft, PALETTE, isColour, toDraft, toKit } from "./brand-kit-model";
+import {
+  type Draft,
+  LOGO_MESSAGE,
+  MIN_CONTRAST,
+  PAIRS,
+  PALETTE,
+  contrast,
+  isColour,
+  logoAllowed,
+  resync,
+  toDraft,
+  toKit,
+} from "./brand-kit-model";
 import { type BrandKit, brandKitSource } from "./brand-kit-source";
 import { useWorkspace } from "./workspace-layout";
 
@@ -23,7 +34,7 @@ export default function BrandKitScreen() {
   const { workspace } = useWorkspace();
   // The layout renders no `Outlet` until the workspace resolves, so this is only a type guard.
   if (!workspace) return null;
-  return <Page ws={workspace.id} canEdit={atLeast(workspace.role, "editor")} />;
+  return <Page ws={workspace.id} canEdit={atLeast(workspace.role, "admin")} />;
 }
 
 function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
@@ -56,13 +67,19 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
   );
 }
 
-const URL_FLAG = "Use an address that starts with http, https, mailto or tel.";
 const COLOUR_FLAG = "Use a colour written as #rgb or #rrggbb, such as #1a56db.";
 
 function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boolean }) {
   const qc = useQueryClient();
-  const [base, setBase] = useState(kit);
   const [draft, setDraft] = useState<Draft>(() => toDraft(kit));
+  // A newer copy of the kit (a refetch, a save) replaces the form unless the operator has typed in
+  // it. `kit` is also what a save merges onto, so what a newer version wrote is never overwritten
+  // from a stale copy; two operators saving at once is last-write-wins, with no etag.
+  const [seen, setSeen] = useState(kit);
+  if (kit !== seen) {
+    setDraft(resync(draft, seen, kit));
+    setSeen(kit);
+  }
   const set = (key: keyof Draft) => (e: { target: { value: string } }) => {
     setDraft((d) => ({ ...d, [key]: e.target.value }));
     save.reset();
@@ -72,12 +89,11 @@ function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boo
     mutationFn: async () => {
       // Typed text is sent as typed. A flag is advice; the server is the gate, and its refusal is
       // what the operator is shown.
-      const { data, error } = await brandKitSource.put(ws, toKit(base, draft));
+      const { data, error } = await brandKitSource.put(ws, toKit(kit, draft));
       if (!data) throw new Error(problemText(error, KNOWN, "The brand kit could not be saved."));
       return data;
     },
     onSuccess: (saved) => {
-      setBase(saved);
       qc.setQueryData(["brand-kit", ws], saved);
     },
   });
@@ -101,7 +117,7 @@ function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boo
           autoComplete="off"
           value={draft.logo}
           onChange={set("logo")}
-          error={draft.logo.trim() !== "" && !hrefAllowed(draft.logo.trim()) ? URL_FLAG : undefined}
+          error={draft.logo.trim() !== "" && !logoAllowed(draft.logo.trim()) ? LOGO_MESSAGE : undefined}
           hint="The full address of your logo image. Leave it empty for no logo."
         />
 
@@ -132,6 +148,21 @@ function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boo
               }
             />
           ))}
+          <ul className="mt-4 space-y-1">
+            {PAIRS.map(([name, fg, bg]) => {
+              const [a, b] = [draft[fg].trim(), draft[bg].trim()];
+              if (!isColour(a) || !isColour(b)) return null;
+              const ratio = contrast(a, b);
+              if (ratio >= MIN_CONTRAST) return null;
+              // Advice: the kit saves anyway. It is every email, so it is said here, where it is chosen.
+              return (
+                <li key={name} className="text-warning-text">
+                  {name}: contrast {ratio.toFixed(1)}:1, below the {MIN_CONTRAST}:1 that keeps text
+                  readable. Every email in this workspace uses this pair.
+                </li>
+              );
+            })}
+          </ul>
         </div>
 
         <Field

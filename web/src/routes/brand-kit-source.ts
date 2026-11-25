@@ -16,13 +16,14 @@
  * "no kit yet" from "an empty one": W6 maps the server's answer for that case here.
  */
 
-import { hrefAllowed } from "../components/block-editor/runs";
+import { LOGO_MESSAGE, logoAllowed } from "./brand-kit-model";
 
 export type BrandKit = {
   logo_url: string | null;
-  palette: Record<string, string>;
+  // `unknown` values: a newer server may enrich a key this screen knows, or add its own.
+  palette: Record<string, unknown>;
   font_stack: string | null;
-  footer: Record<string, string>;
+  footer: Record<string, unknown>;
 };
 
 /** The `{ data, error }` an `openapi-fetch` call resolves to, so the swap changes no call site. */
@@ -53,8 +54,8 @@ const mock: BrandKitSource = {
   get: async (workspace) => ({ data: structuredClone(kits.get(workspace) ?? EMPTY) }),
   put: async (workspace, kit) => {
     // The server is the gate for the scheme allowlist; the mock stands in for that gate.
-    if (kit.logo_url !== null && !hrefAllowed(kit.logo_url)) {
-      return refuse("The logo address must start with http or https.", "logo_url");
+    if (kit.logo_url !== null && !logoAllowed(kit.logo_url)) {
+      return refuse(LOGO_MESSAGE, "logo_url");
     }
     kits.set(workspace, structuredClone(kit));
     return { data: structuredClone(kit) };

@@ -139,9 +139,12 @@ export function tagSource(raw: string): string | null {
 }
 
 /** The URL scheme allowlist, frozen: a link is http, https, mailto or tel and nothing else. */
-export function hrefAllowed(href: string): boolean {
+export function hrefAllowed(
+  href: string,
+  schemes: readonly string[] = ["http:", "https:", "mailto:", "tel:"],
+): boolean {
   try {
-    return ["http:", "https:", "mailto:", "tel:"].includes(new URL(href).protocol);
+    return schemes.includes(new URL(href).protocol);
   } catch {
     return false;
   }

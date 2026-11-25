@@ -10,14 +10,13 @@ import { type Page, expect } from "@playwright/test";
 import type { components } from "../api/schema";
 import { test } from "../../e2e/support/app";
 import { expectNoViolations } from "../../e2e/support/axe";
-import { isColour, toKit } from "./brand-kit-model";
-import type { BrandKit } from "./brand-kit-source";
+import { LOGO_MESSAGE, contrast, isColour, resync, toDraft, toKit } from "./brand-kit-model";
+import { type BrandKit, brandKitSource } from "./brand-kit-source";
 
 type Me = components["schemas"]["MeResponse"];
 
 const WS = "11111111-1111-4111-8111-111111111111";
 const FLAG = "Use a colour written as #rgb or #rrggbb, such as #1a56db.";
-const URL_FLAG = "Use an address that starts with http, https, mailto or tel.";
 
 async function open(page: Page, app: string, role: "viewer" | "editor" | "admin" = "admin") {
   const me: Me = {
@@ -72,6 +71,62 @@ test("toKit_omits_empty_values_keeps_keys_it_does_not_edit_and_is_always_objects
   });
 });
 
+test("toDraft_reads_every_field_from_its_own_key", () => {
+  const kit: BrandKit = {
+    logo_url: "https://a.example/l.png",
+    palette: { background: "#111111", text: "#222222", accent: "#333333", accent_text: "#444444" },
+    font_stack: "Georgia",
+    footer: { text: "T", address: "A" },
+  };
+  // Eight different values, so a field read from the wrong key shows up as a swap.
+  expect(toDraft(kit)).toEqual({
+    logo: "https://a.example/l.png",
+    font: "Georgia",
+    footerText: "T",
+    footerAddress: "A",
+    background: "#111111",
+    text: "#222222",
+    accent: "#333333",
+    accent_text: "#444444",
+  });
+  expect(toDraft({ logo_url: null, palette: {}, font_stack: null, footer: {} })).toEqual(
+    Object.fromEntries(Object.keys(toDraft(kit)).map((k) => [k, ""])),
+  );
+});
+
+test("a_known_key_holding_a_non_string_is_shown_blank_and_left_alone_by_a_save", () => {
+  // What a newer server might write under a key this screen knows: it must neither crash the
+  // screen nor be dropped by a save that did not touch it.
+  const richer = { light: "#fff", dark: "#000" };
+  const kit: BrandKit = {
+    logo_url: null,
+    palette: { accent: richer, background: 5, text: null, accent_text: ["#fff"], other: [1] },
+    font_stack: null,
+    footer: { text: { html: "<b>x</b>" }, address: 7 },
+  };
+  const draft = toDraft(kit);
+  expect(Object.values(draft).every((v) => v === "")).toBe(true);
+  expect(toKit(kit, draft)).toEqual(kit);
+  // The operator typing over one replaces it; the others stay.
+  const edited = toKit(kit, { ...draft, accent: "#123456" });
+  expect(edited.palette).toEqual({ ...kit.palette, accent: "#123456" });
+  expect(edited.footer).toEqual(kit.footer);
+});
+
+test("a_newer_kit_replaces_an_untouched_form_and_never_one_the_operator_has_typed_in", () => {
+  const was: BrandKit = { logo_url: null, palette: { text: "#111" }, font_stack: null, footer: {} };
+  const now: BrandKit = { logo_url: "https://a.example/l.png", palette: { text: "#222" }, font_stack: "Georgia", footer: {} };
+  expect(resync(toDraft(was), was, now)).toEqual(toDraft(now));
+  const typed = { ...toDraft(was), font: "Arial" };
+  expect(resync(typed, was, now)).toBe(typed);
+});
+
+test("a_whitespace_only_field_clears_a_string_value_like_an_empty_one", () => {
+  const kit: BrandKit = { logo_url: "https://a.example/l.png", palette: { text: "#111" }, font_stack: "Georgia", footer: { text: "x" } };
+  const out = toKit(kit, { ...toDraft(kit), text: "   ", logo: " 	", font: "  ", footerText: " " });
+  expect(out).toEqual({ logo_url: null, palette: {}, font_stack: null, footer: {} });
+});
+
 test("the form renders every field with a label and passes axe", async ({ page, app }) => {
   await open(page, app);
   for (const name of [
@@ -111,11 +166,12 @@ test("a logo URL is flagged inline but the save is still sent, and the server's 
   await open(page, app);
   await page.getByLabel("Logo address").fill("javascript:alert(1)");
   await page.getByLabel("Text colour", { exact: true }).fill("#222222");
-  await expect(page.getByText(URL_FLAG)).toBeVisible();
+  // One sentence for one rule: the flag and the server's refusal say the same thing, so the
+  // refusal is told apart by where it is: the field's own error, then a second alert for the save.
+  await expect(page.locator("#bk-logo-error")).toHaveText(LOGO_MESSAGE);
+  await expect(page.getByRole("alert")).toHaveCount(1);
   await page.getByRole("button", { name: "Save brand kit" }).click();
-  // The flag did not stop the request: the answer below is the mock server's, not this screen's.
-  const alert = page.getByRole("alert").filter({ hasText: "The logo address must start with http or https." });
-  await expect(alert).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(2);
   await expect(page.getByText("Brand kit saved.")).toHaveCount(0);
   // Nothing the operator typed is lost to the failure.
   await expect(page.getByLabel("Logo address")).toHaveValue("javascript:alert(1)");
@@ -123,22 +179,112 @@ test("a logo URL is flagged inline but the save is still sent, and the server's 
   await scan(page, "brand kit with a failed save");
 });
 
-test("a good save says so, and clears an earlier failure", async ({ page, app }) => {
+test("a logo is http or https only: mailto and tel are flagged, a relative path is flagged, https is not", async ({ page, app }) => {
   await open(page, app);
+  const logo = page.getByLabel("Logo address");
+  for (const bad of ["mailto:a@b.example", "tel:+15555550100", "/logo.png", "logo.png"]) {
+    await logo.fill(bad);
+    await expect(page.locator("#bk-logo-error"), bad).toHaveText(LOGO_MESSAGE);
+  }
+  for (const good of ["https://a.example/l.png", "http://a.example/l.png"]) {
+    await logo.fill(good);
+    await expect(page.locator("#bk-logo-error"), good).toHaveCount(0);
+  }
+});
+
+test("a good save says so, a failure goes as soon as the operator edits, and what was saved is what comes back", async ({ page, app }) => {
+  await open(page, app);
+  // The nav link needs a page to leave for and return from.
+  await page.route(/\/api\/v1\/workspaces\/[^/]+\/sending-domains(\?.*)?$/, (route) => route.fulfill({ json: { data: [] } }));
   const logo = page.getByLabel("Logo address");
   await logo.fill("ftp://x.example/l.png");
   await page.getByRole("button", { name: "Save brand kit" }).click();
-  await expect(page.getByRole("alert").filter({ hasText: "must start with http" })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(2);
+  // Editing clears the stale save error at once, before anything is sent again.
   await logo.fill("https://x.example/l.png");
-  await expect(page.getByText(URL_FLAG)).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await page.getByLabel("Text colour", { exact: true }).fill("#222222");
+  await page.getByLabel("Font stack").fill("Georgia, serif");
+  await page.getByLabel("Footer text").fill("You are on our list.");
+  await page.getByLabel("Postal address").fill("1 Main St");
   await page.getByRole("button", { name: "Save brand kit" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Brand kit saved." })).toBeVisible();
-  await expect(page.getByRole("alert").filter({ hasText: "must start with http" })).toHaveCount(0);
+  // ...and the confirmation does not outlive the next edit.
+  await page.getByLabel("Font stack").fill("Georgia, serif;");
+  await expect(page.getByText("Brand kit saved.")).toHaveCount(0);
+  await page.getByLabel("Font stack").fill("Georgia, serif");
+  // Leave the screen and come back: the form is filled from what the source holds.
+  await page.getByRole("link", { name: "Sending domains" }).click();
+  await expect(page.getByRole("heading", { name: "Sending domains", level: 2, exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Brand kit" }).click();
+  await expect(page.getByLabel("Logo address")).toHaveValue("https://x.example/l.png");
+  await expect(page.getByLabel("Text colour", { exact: true })).toHaveValue("#222222");
+  await expect(page.getByLabel("Font stack")).toHaveValue("Georgia, serif");
+  await expect(page.getByLabel("Footer text")).toHaveValue("You are on our list.");
+  await expect(page.getByLabel("Postal address")).toHaveValue("1 Main St");
 });
 
-test("a viewer sees the kit read-only and no save button", async ({ page, app }) => {
-  await open(page, app, "viewer");
-  await expect(page.getByLabel("Logo address")).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Save brand kit" })).toHaveCount(0);
-  await scan(page, "brand kit, read-only");
+// The postal address is what every email must legally say: changing it is an admin's job. This
+// disables controls only; the server is the gate.
+for (const role of ["viewer", "editor"] as const) {
+  test(`${role}: sees the kit read-only and no save button`, async ({ page, app }) => {
+    await open(page, app, role);
+    await expect(page.getByLabel("Logo address")).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Save brand kit" })).toHaveCount(0);
+    await scan(page, `brand kit, read-only for a ${role}`);
+  });
+}
+
+test("contrast_is_the_wcag_ratio_and_reads_three_digit_and_either_case", () => {
+  expect(contrast("#000", "#FFFFFF")).toBeCloseTo(21, 5);
+  expect(contrast("#fff", "#fff")).toBeCloseTo(1, 5);
+  // The standard boundary: #767676 on white is 4.54, one step lighter is 4.48.
+  expect(contrast("#767676", "#fff")).toBeGreaterThanOrEqual(4.5);
+  expect(contrast("#777777", "#fff")).toBeLessThan(4.5);
+  expect(contrast("#fff", "#767676")).toBe(contrast("#767676", "#fff"));
+});
+
+test("a_workspace_with_no_kit_gets_an_empty_one_not_an_error", async () => {
+  // R7 is likely to answer 404 for a workspace that has never saved a kit, which is every
+  // workspace on day one. Whatever the source is, the screen must be reachable: `get` resolves to
+  // data, and it is the empty kit, with `palette` and `footer` as objects.
+  const { data, error } = await brandKitSource.get("99999999-9999-4999-8999-999999999999");
+  expect(error).toBeUndefined();
+  expect(data).toEqual({ logo_url: null, palette: {}, font_stack: null, footer: {} });
+});
+
+test("a workspace with no kit opens an empty, editable form", async ({ page, app }) => {
+  await open(page, app);
+  for (const name of ["Logo address", "Background colour", "Text colour", "Font stack", "Footer text", "Postal address"]) {
+    await expect(page.getByLabel(name, { exact: true })).toHaveValue("");
+  }
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+const WARN = /contrast/i;
+
+test("a pair that is rendered together and fails contrast is warned about, with the ratio, and still saves", async ({ page, app }) => {
+  await open(page, app);
+  await page.getByLabel("Background colour", { exact: true }).fill("#ffffff");
+  await page.getByLabel("Text colour", { exact: true }).fill("#aaaaaa");
+  const warning = page.getByText(/Text and background colours/);
+  await expect(warning).toContainText("2.3:1");
+  await expect(warning).toContainText("4.5:1");
+  await scan(page, "brand kit with a contrast warning");
+  await page.getByRole("button", { name: "Save brand kit" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Brand kit saved." })).toBeVisible();
+  await page.getByLabel("Text colour", { exact: true }).fill("#222222");
+  await expect(page.getByText(WARN)).toHaveCount(0);
+});
+
+test("the accent pair is checked, and colours that are never shown together are not", async ({ page, app }) => {
+  await open(page, app);
+  await page.getByLabel("Accent colour", { exact: true }).fill("#1a56db");
+  await page.getByLabel("Text on the accent colour", { exact: true }).fill("#1a5fdb");
+  await expect(page.getByText(/Accent and accent text colours/)).toBeVisible();
+  // Background and accent are not a rendered pair; one half missing or invalid is not a pair.
+  await page.getByLabel("Text on the accent colour", { exact: true }).fill("#fff");
+  await page.getByLabel("Background colour", { exact: true }).fill("#1a56db");
+  await page.getByLabel("Text colour", { exact: true }).fill("#1a");
+  await expect(page.getByText(WARN)).toHaveCount(0);
 });
