@@ -27,8 +27,14 @@ export const isColour = (s: string) => /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(s)
 
 /** A logo is an image source: `http` and `https` only (contract section 11). `mailto:` and `tel:` are links, not images. */
 export const logoAllowed = (url: string) => hrefAllowed(url, ["http:", "https:"]);
-/** The one sentence for this rule, said by the inline flag and by the server's refusal alike. */
-export const LOGO_MESSAGE = "The logo address must start with http or https.";
+/**
+ * The one sentence for this rule, said by the inline flag and by the server's refusal alike
+ * (contract section 11: two different explanations of one rule is how an operator learns to
+ * ignore both). W5 chose its own wording while the server was a mock; this is now `BrandError::Logo`
+ * in `src/template/mjml.rs`, word for word, because that is the sentence the operator gets back
+ * from a save and only one of the two can move. `e2e/brand-kit.spec.ts` pins that they agree.
+ */
+export const LOGO_MESSAGE = "logo must be an http or https URL";
 
 /** The server may put anything under a key this screen knows (a newer version's richer value): only a string is editable here. */
 const str = (v: unknown) => (typeof v === "string" ? v : "");

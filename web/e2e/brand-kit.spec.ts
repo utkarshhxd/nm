@@ -166,15 +166,13 @@ test("the_servers_refusal_of_a_logo_scheme_is_what_the_operator_is_shown", async
   await openKit();
   await page.getByLabel("Logo address", { exact: true }).fill("ftp://example.com/logo.png");
   await page.getByRole("button", { name: "Save brand kit", exact: true }).click();
-  // The server's own sentence, word for word. The screen flags the URL itself as it is typed and
-  // sends it anyway, because the gate is the server's; what comes back is what is shown.
-  //
-  // NOTE for the integration review: the two sentences differ. The field's flag says "The logo
-  // address must start with http or https." and `BrandError::Logo` says "logo must be an http or
-  // https URL". W5 wanted one sentence per rule and its mock made that true by returning the
-  // screen's own; the real server does not. Neither side is wrong, but one of them should move.
-  await expect(
-    page.getByRole("alert").filter({ hasText: "logo must be an http or https URL" }),
-  ).toBeVisible();
+  // Contract section 11: the inline flag and the server's refusal say the SAME sentence, because
+  // two explanations of one rule teach an operator to ignore both. The screen flags the URL as it
+  // is typed and sends it anyway — the gate is the server's — so both alerts are on screen here,
+  // and the literal below is `BrandError::Logo`'s own text, not a constant this lane could drift.
+  await expect(page.getByRole("alert")).toHaveText([
+    "logo must be an http or https URL",
+    "logo must be an http or https URL",
+  ]);
   await expect(page.getByText("Brand kit saved.")).toBeHidden();
 });

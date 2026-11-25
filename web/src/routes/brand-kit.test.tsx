@@ -29,8 +29,15 @@ const EMPTY: BrandKit = { logo_url: null, palette: {}, font_stack: null, footer:
  *
  * The logo gate is the server's, and is the reason this stub exists at all: the screen sends a
  * URL it has already flagged, and what the operator is shown is the refusal that comes back.
+ *
+ * The returned handle is the other operator: `set` is what a save made in another window leaves
+ * behind, and `read` is what the row holds afterwards. A route stub can hold a key this screen
+ * does not know, which the W5 in-memory mock could not — that the real row holds one too is
+ * pinned in `e2e/brand-kit.spec.ts`.
  */
-async function stubKit(page: Page): Promise<void> {
+type Kits = { set: (k: BrandKit) => void; read: () => BrandKit };
+
+async function stubKit(page: Page): Promise<Kits> {
   let kit: BrandKit = structuredClone(EMPTY);
   await page.route(/\/api\/v1\/workspaces\/[^/]+\/brand-kit$/, async (route) => {
     if (route.request().method() === "PUT") {
@@ -54,9 +61,14 @@ async function stubKit(page: Page): Promise<void> {
     }
     return route.fulfill({ json: kit });
   });
+  return { set: (k) => (kit = structuredClone(k)), read: () => kit };
 }
 
-async function open(page: Page, app: string, role: "viewer" | "editor" | "admin" = "admin") {
+async function open(
+  page: Page,
+  app: string,
+  role: "viewer" | "editor" | "admin" = "admin",
+): Promise<Kits> {
   const me: Me = {
     csrf_token: "t",
     display_name: "Ada",
@@ -68,11 +80,18 @@ async function open(page: Page, app: string, role: "viewer" | "editor" | "admin"
     workspaces: [{ id: WS, name: "Acme", role, slug: "acme" }],
   };
   await page.route("**/api/v1/me", (route) => route.fulfill({ json: me }));
-  await stubKit(page);
+  const kits = await stubKit(page);
   await page.goto(`${app}/w/acme/brand-kit`);
   await expect(page.getByRole("heading", { name: "Brand kit", level: 2 })).toBeVisible();
   await expect(page.getByLabel("Logo address")).toBeVisible();
+  return kits;
 }
+
+/** What react-query listens to for "the tab came back": a stale query then asks again. */
+const refocus = (page: Page) =>
+  page.evaluate(() => {
+    window.dispatchEvent(new Event("visibilitychange"));
+  });
 
 const scan = (page: Page, label: string) =>
   expectNoViolations(new AxeBuilder({ page }), label, { requireRules: ["color-contrast"] });
@@ -336,4 +355,48 @@ test("a_pair_just_under_the_line_never_reads_as_the_line", async ({ page, app })
   // One step lighter than the line is the line: #767676 is 4.54:1 and passes.
   await page.getByLabel("Text colour", { exact: true }).fill("#767676");
   await expect(page.getByText(WARN)).toHaveCount(0);
+});
+
+test("a_newer_kit_arriving_under_the_open_form_replaces_it_when_nothing_was_typed", async ({
+  page,
+  app,
+}) => {
+  // Only `resync` itself was pinned before this: nothing said the FORM is replaced when a newer
+  // kit lands under it, so deleting the call left every test green.
+  const kits = await open(page, app);
+  await expect(page.getByLabel("Font stack", { exact: true })).toHaveValue("");
+  kits.set({
+    logo_url: "https://a.example/l.png",
+    palette: { accent: "#1a56db" },
+    font_stack: "Georgia, serif",
+    footer: {},
+  });
+  await refocus(page);
+  await expect(page.getByLabel("Font stack", { exact: true })).toHaveValue("Georgia, serif");
+  await expect(page.getByLabel("Accent colour", { exact: true })).toHaveValue("#1a56db");
+});
+
+test("a_save_merges_onto_the_latest_kit_so_a_key_added_under_the_form_survives", async ({
+  page,
+  app,
+}) => {
+  // The kit gains a key this screen cannot show AFTER the form was mounted. A save that merged
+  // onto the kit as it was at mount would drop it, and nothing on screen would say so.
+  const kits = await open(page, app);
+  kits.set({
+    logo_url: null,
+    palette: { accent: "#1a56db", sparkle: "aurora" },
+    font_stack: null,
+    footer: { seasonal_note: "winter" },
+  });
+  await refocus(page);
+  await expect(page.getByLabel("Accent colour", { exact: true })).toHaveValue("#1a56db");
+
+  await page.getByLabel("Text colour", { exact: true }).fill("#111111");
+  await page.getByRole("button", { name: "Save brand kit" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Brand kit saved." })).toBeVisible();
+
+  const saved = kits.read();
+  expect(saved.palette).toEqual({ accent: "#1a56db", sparkle: "aurora", text: "#111111" });
+  expect(saved.footer).toEqual({ seasonal_note: "winter" });
 });
