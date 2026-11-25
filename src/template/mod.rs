@@ -6,3 +6,4 @@ pub mod block;
 pub mod mjml;
 pub mod render;
 pub mod tag;
+pub mod text;
