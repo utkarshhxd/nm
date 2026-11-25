@@ -1914,34 +1914,64 @@ fn no_migration_contains_a_cr_byte() {
 /// Whether `text` contains a statement that deletes `workspaces` rows — or truncates the table,
 /// which cascades the same way.
 ///
-/// **What it tolerates:** case, any run of whitespace including newlines inside the statement, a
-/// Rust string continuation (`\` at the end of a line), an optional `only` / `table` keyword, an
-/// optional `public.` qualifier, quoted identifiers, and the statement being split across adjacent
-/// string literals (`"delete from " "workspaces"`), because quotes are dropped before matching.
+/// **What it reads is source text, not string values**, which is the thing the first two versions
+/// of this got wrong: a Rust string literal arrives with its escapes still in it (`\"`, `\n`,
+/// `\t`, `\r`, a `\` before a line break), a raw string or a `.sql` file arrives without them, and
+/// both must match.
+///
+/// **What it tolerates:** case, any run of whitespace including newlines inside the statement,
+/// those escapes, an optional `only` / `table` keyword, an optional `public.` qualifier, quoted
+/// identifiers (bare or `\"`), the statement split across adjacent string literals
+/// (`"delete from " "workspaces"`), and `truncate` naming it anywhere in a list.
 ///
 /// **What it does not catch, so nobody reads a green run as more than it is:** a table name that
 /// is not spelled out in `src/` (`format!("delete from {table}")`, `concat!(…)`, a name read from
-/// a config), a statement in a file outside `src/` that the binary loads at run time, and a
-/// delete that reaches `workspaces` only through another route (`drop table`, a foreign key from a
-/// new parent's `on delete cascade`, which the foreign key graph test above is for). It errs the
-/// other way on purpose: a comment that merely *says* `delete from workspaces` also trips it.
+/// a config), a statement in a file outside `src/` that the binary loads at run time, a delete
+/// that reaches `workspaces` only through another route (`drop table`, a foreign key from a new
+/// parent's `on delete cascade`, which the foreign key graph test above is for), an SQL comment
+/// between tokens (`delete /* c */ from workspaces`, `delete from -- c` over a line break), and a
+/// spaced qualifier (`"public" . "workspaces"`). The last two are left alone on purpose: nobody
+/// writes them, and chasing them would make this fragile guesswork. It errs the other way too: a
+/// comment that merely *says* `delete from workspaces` also trips it.
 fn deletes_workspaces(text: &str) -> bool {
+    // Order matters: a continuation is a backslash before a REAL newline, so it goes first; then
+    // the escapes a normal string spells with a backslash and a letter; then `\"`, which is a
+    // quote that has to disappear along with the bare ones.
     let flat = text
         .to_lowercase()
-        .replace("\\\n", " ")
         .replace("\\\r\n", " ")
+        .replace("\\\n", " ")
+        .replace("\\n", " ")
+        .replace("\\r", " ")
+        .replace("\\t", " ")
+        .replace("\\\"", "")
         .replace('"', "");
     let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
-    for lead in ["delete from ", "truncate "] {
-        for (at, _) in flat.match_indices(lead) {
-            let mut rest = &flat[at + lead.len()..];
-            for skip in ["table ", "only ", "public."] {
-                rest = rest.strip_prefix(skip).unwrap_or(rest);
-            }
-            if let Some(after) = rest.strip_prefix("workspaces")
-                && !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')
-            {
+    // One table name, ignoring `only` and a `public.` qualifier; true if it is `workspaces`.
+    let is_workspaces = |name: &str| {
+        let name = name.trim();
+        let name = name.strip_prefix("only ").unwrap_or(name).trim_start();
+        let name = name.strip_prefix("public.").unwrap_or(name);
+        name.strip_prefix("workspaces")
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    };
+    for (at, lead) in flat.match_indices("delete from ") {
+        if is_workspaces(&flat[at + lead.len()..]) {
+            return true;
+        }
+    }
+    for (at, lead) in flat.match_indices("truncate ") {
+        let rest = &flat[at + lead.len()..];
+        let rest = rest.strip_prefix("table ").unwrap_or(rest);
+        // `truncate a, b, c`: every item is checked, and the list ends at the first item that has
+        // anything after its name (`cascade`, `restart identity`, a `;`), because past that point
+        // it is no longer the statement's table list.
+        for item in rest.split(',') {
+            if is_workspaces(item) {
                 return true;
+            }
+            if item.trim().contains(' ') {
+                break;
             }
         }
     }
@@ -1966,8 +1996,26 @@ fn the_workspace_deletion_matcher_sees_what_it_is_for() {
         "with gone as (delete from workspaces returning id) select * from gone",
         "truncate table workspaces cascade",
         "TRUNCATE workspaces",
+        "truncate table lists, workspaces",
+        "truncate table lists , only public.workspaces cascade",
+        "truncate table \"lists\", \"workspaces\"",
     ] {
         assert!(deletes_workspaces(yes), "should have matched: {yes:?}");
+    }
+    // **Source form.** The matcher reads `.rs` files, so what it sees is the text of a Rust string
+    // literal — backslash escapes still unprocessed — and a sample written as the already-unescaped
+    // value is a sample of something it never meets. These are raw strings so that every
+    // backslash below is exactly the byte that appears in a source file. The block above is
+    // SQL text, as in a `.sql` file or a raw string; this one is what a normal string looks like.
+    for yes in [
+        r#"sqlx::query("delete from \"public\".\"workspaces\" where id = $1")"#,
+        r#"sqlx::query("delete from \"workspaces\"")"#,
+        r#""delete\nfrom\tworkspaces where id = $1""#,
+        r#""delete from\r\n  workspaces""#,
+        r#""truncate table lists, workspaces""#,
+        r#""truncate table \"lists\", \"workspaces\" cascade""#,
+    ] {
+        assert!(deletes_workspaces(yes), "should have matched: {yes}");
     }
     for no in [
         "delete from workspaces_archive",
@@ -1977,6 +2025,10 @@ fn the_workspace_deletion_matcher_sees_what_it_is_for() {
         "update workspaces set name = $2",
         "insert into workspaces (id) values ($1)",
         "truncate table lists",
+        "truncate table lists, templates",
+        "truncate table lists, workspaces_archive",
+        "truncate table lists restart identity; select * from workspaces",
+        r#""delete from \"templates\"\nwhere workspace_id = $1""#,
     ] {
         assert!(!deletes_workspaces(no), "should not have matched: {no:?}");
     }

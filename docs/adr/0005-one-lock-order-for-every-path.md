@@ -432,9 +432,9 @@ migration text — the migration is what was *written*, the catalog is what *run
   seventeen. **No new parent**: the ten above are still the ten.
 - Every constraint that mentions `templates` or `brand_kits`, in either column: both tables'
   primary keys, `templates_workspace_id_fkey`, `brand_kits_workspace_id_fkey`,
-  `templates_workspace_id_id_key` (a unique key, not a reference), and four `check`s. **Nothing
-  references either table.** There are no user triggers on either, so no statement on them runs
-  a second statement behind the first.
+  `templates_workspace_id_id_key` (a unique key, not a reference), and five `check`s (three on
+  `templates`, two on `brand_kits`). **Nothing references either table.** There are no user
+  triggers on either, so no statement on them runs a second statement behind the first.
 - `audit_log` still has only `audit_log_pkey`. A handler's audit write therefore takes nothing
   beyond a `RowExclusiveLock` on `audit_log` itself, which is the reasoning `delete_relay` was
   cleared by and is not repeated here.
@@ -466,7 +466,8 @@ table, with the control the relay tests use: the same insert is raced first agai
 hold on the workspace row and must block, so the wedge is shown to be real, and only then are the
 updates, the delete and the upsert's update arm shown to pass it.
 
-**The tripwires, written as things to check.** Each is a one-line check and the first is enforced:
+**The tripwires, written as things to check.** Each is a one-line check; the first and the last
+are enforced:
 
 - **Anything starts referencing `templates`.** The obvious candidate is a campaign naming its
   body, and `templates_workspace_id_id_key` was added so that such a reference can be composite.
@@ -479,8 +480,8 @@ updates, the delete and the upsert's update arm shown to pass it.
 - **Any handler holds a `templates` or `brand_kits` row across a second statement that locks
   something else** — a template save that also takes a `lists`, `contacts` or `suppressions` row,
   say. The ruling is about one statement; the audit write that follows a handler's statement is
-  not such a second lock, for the `audit_log` reason above. A handler that grows a second one adds its row to the path table
-  in that same change and is placed in the order above.
+  not such a second lock, for the `audit_log` reason above. A handler that grows a second one
+  adds its row to the path table in that same change and is placed in the order above.
 - **A handler writes `workspace_id`.** There is no reason to, since a template never changes
   workspace, and it is exactly the statement that would turn the "takes nothing" rows above into
   "takes `for key share`" ones.
@@ -533,8 +534,9 @@ anything about the code.
 
 - **Enforced.** A new parent, a new child, a removed edge, a changed cascade action.
 - **Not enforced, and this is the bigger half.** Two of the ten rulings — `api_keys` and `users`
-  (`workspaces` is now held by `nothing_in_src_deletes_a_workspace`) — rest on "`src/` contains no `delete from` for this table", which is a
-  grep somebody ran once. Nothing fails if a delete is added. They become classes the day one is,
+  (`workspaces` is now held by `nothing_in_src_deletes_a_workspace`) — rest on "`src/` contains
+  no `delete from` for this table", which is a grep somebody ran once. Nothing fails if a delete
+  is added. They become classes the day one is,
   and the only thing standing between here and there is a reviewer noticing. The same is true of
   every statement-shape claim in the `relays` section above: no test sees a `take` that grows a
   second statement.
@@ -543,9 +545,14 @@ anything about the code.
 
 - **The `delete from` grep is enforced for `workspaces` only.** `nothing_in_src_deletes_a_workspace`
   scans `src/` for a `delete from` or `truncate` of `workspaces`, tolerating case, whitespace and
-  newlines, string continuations, `public.` qualifiers and quoted identifiers; its matcher is
-  held by `the_workspace_deletion_matcher_sees_what_it_is_for`. It is blind to a table name that
-  is not spelled out in `src/` (`format!("delete from {t}")`) and to anything outside `src/`.
+  newlines, `\n` / `\t` escapes, string continuations, `public.` qualifiers, quoted identifiers
+  (bare or `\"`-escaped) and a `truncate` that names it anywhere in a list. Its matcher is held
+  by `the_workspace_deletion_matcher_sees_what_it_is_for`, whose samples are written in the
+  source form the matcher reads, escapes and all. **Its blind spots:** a table name not spelled
+  out in `src/` (`format!("delete from {t}")`, `concat!`); anything outside `src/`; `drop table`;
+  an SQL comment between tokens (`delete /* c */ from workspaces`); and a spaced qualifier
+  (`"public" . "workspaces"`). The last two are not chased: nobody writes them, and a matcher
+  that tried would be fragile guesswork.
   `users` and `api_keys` are still a grep somebody ran once; the same test with another table name
   closes them.
 - **The importer's tag race**, `issues/39`, two sections above. Still open, still reproduced,
