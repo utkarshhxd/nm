@@ -1,4 +1,4 @@
-Status: needs-triage
+Status: resolved 2026-11-25
 
 # The dev database cannot be migrated, because 0023 was edited after it was applied
 
@@ -104,3 +104,22 @@ working tree that had CRLF, which `.gitattributes` (`* text=auto eol=lf`) later 
 mechanism as the `0028` instance above.
 
 Remedy (authorised, NOT yet executed: the action was denied by the permission layer in R1): drop and recreate the `nm` database, never edit `_sqlx_migrations`.
+
+## Resolved — 2026-11-25
+
+Diagnosis confirmed twice, independently. The applied checksum is the sha384 of `0023` in its
+**CRLF** form; the local checksum is the sha384 of the same file in its **LF** form. Full match on
+both sides, at commit `d27656d`. The SQL never differed by a character — only the line endings did,
+and migration checksums cover bytes.
+
+Remedy executed: `drop database nm with (force)` / `create database nm owner nm`, then
+`cargo sqlx migrate run`. All 32 migrations applied cleanly, `migrate info` reports nothing
+pending. No test data was lost: `#[sqlx::test]` builds its own database per test, which is also
+why the broken dev database never showed up as a failing suite.
+
+**The mechanism recurred during M2b**, which is the part worth keeping. A Python edit to `0032`
+left CRLF in the working tree; `.gitattributes` (`* text=auto eol=lf`) normalises on commit, so the
+committed blob was correct and nothing noticed the working tree was not. It was caught by eye.
+A migration applied locally from CRLF bytes records a checksum that can never match again — so the
+guard against it is a test, not vigilance. Task R8 adds one: any CR byte under `migrations/` fails
+the suite.
