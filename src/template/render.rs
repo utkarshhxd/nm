@@ -73,6 +73,31 @@ use super::tag::{Filter, Node};
 pub const MARK_START: &str = "~nmmt~";
 /// Closes a [`MARK_START`]; the digits between the two are the tag's index.
 pub const MARK_END: &str = "~tmmn~";
+/// The spelling and index scheme of the markers in a stored document.
+///
+/// **Bump this whenever either changes**, and that means the marker text itself, the suffixes, or
+/// what an index counts. The marked HTML is stored at save and substituted into at send, possibly
+/// months later and certainly after deploys, so a document carries a format its code may no longer
+/// speak. The caller that stores the HTML stores this number beside it and refuses to substitute
+/// into a version it does not recognise, rather than guessing — guessing means markers read as
+/// literal text in a sent message, or worse, a conditional whose boundaries are not understood.
+///
+/// The version belongs to the stored blob, not inside the markers: putting it in the markers would
+/// make it part of the thing being versioned.
+///
+/// Two changes have already happened, neither of which reached storage, which is the only reason
+/// this is a constant and not a migration:
+///
+/// 1. `U+E000`/`U+E001` private-use delimiters. `mrml` runs attribute values through
+///    `char::escape_debug`, so they survived in text and came out of an `href` as the literal
+///    `\u{e000}` — a merge tag that silently vanished from every link.
+/// 2. `~nmmt~<index>~tmmn~`, with a `b` suffix marking a conditional's boundary. A conditional's
+///    two markers carried unrelated indices, so their pairing was not derivable from the HTML and
+///    a reordered or crossed pair could not be refused.
+/// 3. The present scheme: `o` and `c` suffixes, and a conditional is ONE index written twice, so
+///    a close names the open it belongs to.
+pub const MARKER_FORMAT_VERSION: u32 = 3;
+
 /// Follow the index when the marker opens or closes a conditional rather than standing for a
 /// field. They are in the marker rather than in a parameter so that [`classify`] can tell the
 /// three apart from the stored HTML alone, with nothing extra to keep in step.
@@ -751,6 +776,10 @@ struct St<'v> {
     suppress: Option<(usize, usize)>,
     /// Where the serialiser is, and the open conditionals with where each one started. Together
     /// they are what makes "the rewind deletes a whole region" checkable.
+    ///
+    /// `attr_seq` only ever increases, and only `attr_value` touches either field — which is what
+    /// stops two different attribute values being given the same `Place` and a conditional
+    /// straddling them passing for one kept inside a single attribute.
     place: Place,
     attr_seq: usize,
     blocks: Vec<(usize, Place)>,
@@ -853,6 +882,10 @@ impl<'v> St<'v> {
         if self.text.is_empty() {
             return;
         }
+        debug_assert!(
+            self.place == Place::Text,
+            "character data was flushed while the serialiser was inside an attribute"
+        );
         let text = std::mem::take(&mut self.text);
         let raw = self.raw;
         let site = match raw {
@@ -877,6 +910,22 @@ impl<'v> St<'v> {
     }
 
     fn attr_value(&mut self, value: &str, site: Site) {
+        // The place is taken here rather than by the caller on purpose: an attribute value that
+        // was serialised without a fresh sequence number would share a `Place` with the previous
+        // one, and a conditional straddling the two would pass for one kept inside a single
+        // attribute — the exact hole this records a place to close. Doing it here means there is
+        // no caller that can forget.
+        debug_assert!(
+            self.place == Place::Text,
+            "attribute values do not nest; a Place was left behind"
+        );
+        self.attr_seq += 1;
+        self.place = Place::Attr(self.attr_seq);
+        self.attr_value_inner(value, site);
+        self.place = Place::Text;
+    }
+
+    fn attr_value_inner(&mut self, value: &str, site: Site) {
         let segs = segments(value);
         if site == Site::Url {
             if segs.iter().any(|s| matches!(s, Seg::Mark(..))) {
@@ -991,10 +1040,7 @@ impl<'v> St<'v> {
             // Every attribute is re-serialised with double quotes, whatever the source wrote, so
             // the encoder never has to guess which character ends this value.
             self.out.push_str("=\"");
-            self.attr_seq += 1;
-            self.place = Place::Attr(self.attr_seq);
             self.attr_value(&a.value, attr_site(name, n, http_equiv));
-            self.place = Place::Text;
             self.out.push('"');
         }
         if tag.self_closing {
