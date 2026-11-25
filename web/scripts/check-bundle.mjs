@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Guards two budgets. The shell (the entry chunk and the chunks it imports statically) stays under
-// 150 KB compressed. Every other JS chunk is measured as a closure: itself plus every chunk it
-// imports statically, minus the shell, stays under 50 KB compressed. Measuring chunks one by one
-// would let a route (or a framework) through in two pieces with the gate green. CSS is a separate
-// file.
+// 150 KB compressed. Every other JS chunk is measured together with what it loads: the chunk, every
+// chunk it imports statically, and every chunk it (or those) import dynamically, each counted once
+// and minus the shell. That total stays under 50 KB compressed. Measuring chunks one by one would
+// let a route, or a framework, through in two pieces with the gate green.
+// It over-counts on purpose: a dynamically imported chunk that a user may never load still counts,
+// and a helper shared by several routes counts in full against each. It does not model load order,
+// and it measures JS only; CSS is a separate file.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -21,10 +24,15 @@ if (!manifest[ENTRY]) {
   process.exit(1);
 }
 
-function collect(key, into = new Set()) {
-  if (into.has(key)) return into;
+// Everything `key` pulls in, following static imports and, with `dynamic`, dynamic ones too.
+// The shell's own dynamic imports (every route) are never followed.
+function collect(key, { dynamic = false, skip = new Set() } = {}, into = new Set()) {
+  if (into.has(key) || skip.has(key)) return into;
   into.add(key);
-  for (const imported of manifest[key].imports ?? []) collect(imported, into);
+  const { imports = [], dynamicImports = [] } = manifest[key];
+  for (const next of dynamic ? [...imports, ...dynamicImports] : imports) {
+    collect(next, { dynamic, skip }, into);
+  }
   return into;
 }
 const chunks = collect(ENTRY);
@@ -48,11 +56,11 @@ if (total > LIMIT) {
 
 for (const [key, { file }] of Object.entries(manifest)) {
   if (chunks.has(key) || !file.endsWith(".js")) continue;
-  const closure = [...collect(key)].filter((k) => !chunks.has(k));
-  const size = closure.reduce((sum, k) => sum + gzipped(manifest[k].file), 0);
-  console.log(`${String(size).padStart(8)}  ${file} (route closure of ${closure.length}, limit ${CHUNK_LIMIT})`);
+  const loaded = [...collect(key, { dynamic: true, skip: chunks })];
+  const size = loaded.reduce((sum, k) => sum + gzipped(manifest[k].file), 0);
+  console.log(`${String(size).padStart(8)}  ${file} (lazy, ${loaded.length} chunks, limit ${CHUNK_LIMIT})`);
   if (size > CHUNK_LIMIT) {
-    console.error(`${file} is over the per-route budget by ${size - CHUNK_LIMIT} bytes`);
+    console.error(`${file} and what it loads is over the lazy-chunk budget by ${size - CHUNK_LIMIT} bytes`);
     failed = true;
   }
 }
