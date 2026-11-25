@@ -153,10 +153,23 @@ the code disagree, the code is what runs: fix the row, and say in the commit whi
 | `worker::release` | the `jobs` row alone, by primary key; the update's own row lock and no clause beyond it. It undoes the claim's `attempts` increment and pushes `run_after` for a job the tick chose not to start; it names no parent, and `jobs` is a parent of nothing |
 | `worker::confirmation::handle` | the `jobs` rows above for what it records, and **`relay::bucket::take`'s order** on the failover arm, where it takes a token for a relay the tick did not pay for. It reads `suppressions`, `sending_domains` and `relays` and writes none of them |
 
-**M2b has no rows here, and that is a finding rather than an omission.** `templates` and
-`brand_kits` have no writer in `src/` as of `0032`; "M2b: why `templates` and `brand_kits` are not
-a lock class", below, carries the ruling and the shape the first handler must keep. **The task that
-adds one adds its row to this table in the same change.**
+**M2b's writers landed with R7**, which is the task that turned the ruling below from a claim
+about statement shapes into a claim about code. Each row is one locking statement; the reads
+beside them (`custom_fields`, `brand_kits`, the row being patched) are plain selects with no `for`
+clause and lock nothing.
+
+| path (M2b) | order it takes |
+|---|---|
+| `template::routes::create_template` | the new `templates` row, then `workspaces` (`for key share`) through `templates_workspace_id_fkey`'s referential trigger, at the end of that one statement. Reads `custom_fields` and `brand_kits` first, both unlocked |
+| `template::routes::update_template` | the `templates` row alone. The `set` names `name`, `tree`, `source`, `compiled` and `updated_at` and never `workspace_id`, so no referential trigger fires and it takes nothing on `workspaces`. It reads the row first with a plain `select` — **no `for update`** — because it only needs the kind and whatever the patch leaves alone |
+| `template::routes::delete_template` | the `templates` row alone. The child side of a foreign key has no delete-time check, and nothing references `templates` |
+| `template::routes::preview_template` | **nothing.** It writes no row: an unsaved document is compiled in memory, and a stored rendition that is no longer usable is refused (`409 template-stale`) rather than silently recompiled and written back |
+| `brand::routes::save_brand_kit` | the `brand_kits` row, and `workspaces` (`for key share`) **on the upsert's insert arm only**. The update arm's `set` names `logo_url`, `palette`, `font_stack`, `footer` and `updated_at` — never `workspace_id` — so it is the same short-circuit as `relay_buckets`' update arm |
+
+Each is `one statement on one row by primary key` plus the audit write, which takes nothing beyond
+a `RowExclusiveLock` on `audit_log` (the `delete_relay` reasoning). So each stays a terminal node
+in the wait-for graph, which is what the ruling below rests on. `templates` and `brand_kits` are
+still not lock classes and still not parents.
 
 ## The rule for new code
 
@@ -417,13 +430,12 @@ record even though the reference is not.
 
 **Read this section for what it says about code, which is almost nothing, because there is almost
 no code.** Tasks R1-R7 added `0032`, the block tree, the MJML emitter and the renderers, and **not
-one statement that writes `templates` or `brand_kits`**: `src/` contains no `insert into`,
-`update` or `delete from` for either (searched, not remembered), and the only writers are the raw
-SQL in `tests/templates.rs`. The CRUD handlers are a later task. So there is no path to enumerate
-and no row to add to the path table, and the ruling below is on the **schema** and on the
-**statement shape every such handler will have**, held by a test on that shape rather than on a
-handler. That is the same footing `relays` was ruled on before `take` existed, and the same
-warning applies: the ruling is written, not yet exercised by real code.
+one statement that writes `templates` or `brand_kits`**: when this was first written `src/`
+contained no `insert into`, `update` or `delete from` for either, and the only writers were the
+raw SQL in `tests/templates.rs`. **R7 has since added the handlers**, and their rows are in the
+path table above; each was read against the statement it names. The ruling below is on the
+**schema** and on the **statement shape every such handler has**, held by a test on that shape as
+well as by the rows.
 
 **The enumeration, against a database migrated from nothing to `0032`** (`pg_constraint`, not the
 migration text — the migration is what was *written*, the catalog is what *runs*):

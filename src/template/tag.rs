@@ -113,6 +113,38 @@ enum Kind {
     Equals(String),
 }
 
+/// The depth of an AST that was READ rather than parsed.
+///
+/// [`compile`] enforces [`MAX_DEPTH`] from the length of its own stack, so a tree it returns is
+/// within the cap by construction. `serde`'s `Deserialize` on [`Node`] re-validates **nothing**:
+/// a tree that came back out of `templates.compiled` was not parsed here and may have been
+/// written by an older build, a future one, or anything that is not `compile`. Every renderer
+/// recurses over the tree and assumes the cap, so anything that LOADS an AST calls this first.
+///
+/// Iterative rather than recursive, because the tree it is handed is exactly the one that must
+/// not be walked by a recursion: a deep one has to be refused, not discovered by overflowing the
+/// stack on the way to finding out.
+pub fn check_depth(nodes: &[Node]) -> Result<(), TagError> {
+    let mut pending: Vec<(&[Node], usize)> = vec![(nodes, 0)];
+    while let Some((level, depth)) = pending.pop() {
+        for node in level {
+            let body = match node {
+                Node::Text(_) | Node::Field { .. } => continue,
+                Node::Present { body, .. }
+                | Node::Absent { body, .. }
+                | Node::Equals { body, .. } => body,
+            };
+            // `compile` refuses to open a block while `stack.len() >= MAX_DEPTH`, so a block at
+            // nesting level `MAX_DEPTH` is the deepest it will produce. Same comparison here.
+            if depth + 1 > MAX_DEPTH {
+                return Err(TagError::TooDeep);
+            }
+            pending.push((body, depth + 1));
+        }
+    }
+    Ok(())
+}
+
 /// One pass over `source`. Text between tags is copied verbatim and tags become nodes; nothing
 /// the AST later produces is ever fed back in here.
 pub fn compile(source: &str, registry: &Registry) -> Result<Vec<Node>, TagError> {

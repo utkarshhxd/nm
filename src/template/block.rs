@@ -33,7 +33,12 @@ pub enum Block {
         height: u16,
     },
     Columns {
+        /// `no_recursion` because `Block` contains itself here. Without it `utoipa` inlines the
+        /// nested schema for ever and the document build overflows its stack; with it the field
+        /// is a `$ref` to this same component, which is what the generated TypeScript needs to
+        /// describe a column holding blocks.
         #[serde(deserialize_with = "no_nested_columns")]
+        #[schema(no_recursion)]
         children: Vec<Vec<Block>>,
     },
 }

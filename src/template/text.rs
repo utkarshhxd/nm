@@ -80,7 +80,11 @@ const BRACE: char = '\u{E000}';
 /// A template that has been through the whole save pipeline. `text` is the marked plain text, already
 /// classified; `nodes` is the AST it was marked from. Store both with `render::MARKER_FORMAT_VERSION`
 /// and pass them to [`render_text`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because R7 stores it in `templates.compiled` beside the marked HTML:
+/// both renditions are written in one transaction and filled from one AST, which is what stops the
+/// two halves of a message disagreeing about the recipient.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextTemplate {
     pub nodes: Vec<Node>,
     pub text: String,

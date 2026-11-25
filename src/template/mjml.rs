@@ -442,8 +442,53 @@ pub enum CompileError {
     ForgedMarker,
     #[error("the template could not be rendered as MJML: {0}")]
     Mjml(#[from] MjmlError),
+    /// [`RenderError::DangerousContext`] with its position translated back into the operator's own
+    /// text. The raw position is a byte offset into **`mrml`'s output**, a document the operator
+    /// has never seen, so a refusal carrying only that number is correct and unactionable — which
+    /// for the operator is the same as a bug. This is the only place the classified document and
+    /// the template source are both in hand, so the mapping is made here.
+    #[error(
+        "the merge tag {tag} is in a position where no encoding can make it safe: inside a script \
+         or comment, in a tag or attribute name, or in the scheme or host of a link"
+    )]
+    DangerousTag { tag: String },
     #[error("{}", render_message(.0))]
     Render(RenderError),
+}
+
+/// The `index`-th merge tag in `source`, exactly as the operator wrote it.
+///
+/// [`render::marked`] numbers slots in the order [`tag::compile`] produced them, which is the
+/// order the tags appear in the source. A block's CLOSING `{{/ key }}` takes no slot of its own,
+/// so it is skipped here too. The tag scanning rule is `tag::compile`'s, byte for byte: a `{{`,
+/// then the first `}}` after it.
+fn nth_tag(source: &str, index: usize) -> Option<&str> {
+    let (mut seen, mut at) = (0usize, 0usize);
+    while let Some(offset) = source[at..].find("{{") {
+        let start = at + offset;
+        let len = source[start + 2..].find("}}")?;
+        let end = start + 2 + len + 2;
+        at = end;
+        if source[start + 2..end].trim_start().starts_with('/') {
+            continue;
+        }
+        if seen == index {
+            return Some(&source[start..end]);
+        }
+        seen += 1;
+    }
+    None
+}
+
+/// The slot index of the marker that starts at `position` in the classified document.
+fn marker_index(html: &str, position: usize) -> Option<usize> {
+    let body = html.get(position..)?.strip_prefix(render::MARK_START)?;
+    let digits = &body[..body.find(render::MARK_END)?];
+    // A conditional's boundary marker carries an `o` or `c` after its index.
+    digits
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .parse()
+        .ok()
 }
 
 fn tag_message(e: &TagError) -> String {
@@ -471,7 +516,7 @@ fn tag_message(e: &TagError) -> String {
     }
 }
 
-fn render_message(e: &RenderError) -> String {
+pub(crate) fn render_message(e: &RenderError) -> String {
     match e {
         RenderError::DangerousContext { .. } => "a merge tag is in a position where no encoding can make it safe: inside a script or comment, in a tag or attribute name, or in the scheme or host of a link".into(),
         RenderError::TagLost { .. } => "a merge tag was dropped while the template was rendered, so recipients would not see it; it is probably in an attribute the email renderer ignores".into(),
@@ -493,13 +538,23 @@ pub fn compile_blocks(
     // An invalid kit is an error, never a different email than the one configured: `to_mjml` would
     // drop a bad logo and swap a bad font for the default without a word.
     brand.validate()?;
-    compile(&to_mjml(blocks, brand), registry)
+    compile(&to_mjml(blocks, brand), registry, true)
 }
 
 /// Save a raw `mjml` template. Unlike a block template the operator writes the source directly and
 /// there is no `Run::Tag`, so the WHOLE source is scanned for merge tags.
 pub fn compile_mjml(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
-    compile(source, registry)
+    compile(source, registry, true)
+}
+
+/// Save a raw `html` template: the same pipeline with the `mrml` step removed, because there is no
+/// MJML to render and running one over hand-written HTML would rewrite the operator's document.
+///
+/// The SHAPE is deliberately identical to the other two — mark the tags, classify once, store the
+/// marked document, substitute per contact — so a raw HTML template is not a second rendering
+/// model with its own escaping rules. `Compiled::html` here is the marked source itself.
+pub fn compile_html(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
+    compile(source, registry, false)
 }
 
 fn has_literal_marker(nodes: &[Node]) -> bool {
@@ -512,9 +567,9 @@ fn has_literal_marker(nodes: &[Node]) -> bool {
     })
 }
 
-/// compile the tags -> mark -> `mrml` once -> classify. `source` is template source, not yet
-/// MJML: a tag's fallback literal can hold quotes that an attribute cannot.
-fn compile(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
+/// compile the tags -> mark -> `mrml` once (when `mjml`) -> classify. `source` is template source,
+/// not yet MJML: a tag's fallback literal can hold quotes that an attribute cannot.
+fn compile(source: &str, registry: &Registry, mjml: bool) -> Result<Compiled, CompileError> {
     let nodes = tag::compile(source, registry).map_err(CompileError::Tag)?;
     // Contract section 13: there is exactly one way to make a tag. A literal marker in template
     // text would alias to a real tag of the same index (a send printed a contact's name where the
@@ -526,8 +581,19 @@ fn compile(source: &str, registry: &Registry) -> Result<Compiled, CompileError> 
         return Err(CompileError::ForgedMarker);
     }
     let (marked, count) = render::marked(&nodes);
-    let html = render_mjml(&marked)?;
-    render::classify(&html, count).map_err(CompileError::Render)?;
+    let html = if mjml { render_mjml(&marked)? } else { marked };
+    if let Err(e) = render::classify(&html, count) {
+        // The one refusal whose position means nothing to the operator. Falls back to the plain
+        // message when the offset is not a marker start, rather than guessing at a tag.
+        if let RenderError::DangerousContext { position } = &e
+            && let Some(tag) = marker_index(&html, *position).and_then(|i| nth_tag(source, i))
+        {
+            return Err(CompileError::DangerousTag {
+                tag: tag.to_owned(),
+            });
+        }
+        return Err(CompileError::Render(e));
+    }
     Ok(Compiled { nodes, html })
 }
 
@@ -1219,10 +1285,11 @@ mod tests {
                 label: "b".into(),
                 href: href.into(),
             }];
+            // The refusal names the operator's own tag, not a byte offset into `mrml` output.
             assert!(
                 matches!(
                     compile_blocks(&b, &BrandKit::default(), &reg),
-                    Err(CompileError::Render(RenderError::DangerousContext { .. }))
+                    Err(CompileError::DangerousTag { ref tag }) if tag == "{{ first_name }}"
                 ),
                 "{href}"
             );
@@ -1321,7 +1388,7 @@ mod tests {
                 "<mjml><mj-body><mj-raw><script>var a = \"{{ first_name }}\";</script></mj-raw></mj-body></mjml>",
                 &reg
             ),
-            Err(CompileError::Render(RenderError::DangerousContext { .. }))
+            Err(CompileError::DangerousTag { .. })
         ));
     }
 

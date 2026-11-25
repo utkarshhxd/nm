@@ -77,6 +77,14 @@ pub mod actions {
     pub const SENDING_DOMAIN_CREATED: &str = "sending_domain.created";
     pub const SENDING_DOMAIN_UPDATED: &str = "sending_domain.updated";
     pub const SENDING_DOMAIN_DELETED: &str = "sending_domain.deleted";
+    // Metadata names the template and its kind, never the document: it is kept in the row, it is
+    // large, and the audit log is kept for ever.
+    pub const TEMPLATE_CREATED: &str = "template.created";
+    pub const TEMPLATE_UPDATED: &str = "template.updated";
+    pub const TEMPLATE_DELETED: &str = "template.deleted";
+    // Metadata names which palette and footer keys were set, never their values: `footer.address`
+    // is a postal address.
+    pub const BRAND_KIT_UPDATED: &str = "brand_kit.updated";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

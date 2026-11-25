@@ -158,3 +158,793 @@ async fn json_columns_must_be_objects(pool: PgPool) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The API (task R7). Everything above this line is the schema's own guarantees, in raw SQL.
+
+mod common;
+
+use axum::http::StatusCode;
+use common::{PW, TestApp, add_member, create_user, create_workspace};
+use nm::workspaces::roles::Role;
+
+struct Tenant {
+    id: Uuid,
+    admin: TestApp,
+    editor: TestApp,
+    viewer: TestApp,
+}
+
+async fn tenant(pool: &PgPool, slug: &str) -> Tenant {
+    let owner = create_user(pool, &format!("owner-{slug}@example.com"), PW, false).await;
+    let id = create_workspace(pool, owner, slug).await;
+    let member = |role: Role| {
+        let email = format!("{role:?}-{slug}@example.com").to_lowercase();
+        async move {
+            let user = create_user(pool, &email, PW, false).await;
+            add_member(pool, id, user, role).await;
+            let mut app = TestApp::new(pool.clone()).await;
+            app.login(&email, PW).await;
+            app
+        }
+    };
+    Tenant {
+        id,
+        admin: member(Role::Admin).await,
+        editor: member(Role::Editor).await,
+        viewer: member(Role::Viewer).await,
+    }
+}
+
+fn templates_path(ws: Uuid) -> String {
+    format!("/api/v1/workspaces/{ws}/templates")
+}
+
+fn template_path(ws: Uuid, id: Uuid) -> String {
+    format!("{}/{id}", templates_path(ws))
+}
+
+fn preview_path(ws: Uuid, id: Uuid) -> String {
+    format!("{}/preview", template_path(ws, id))
+}
+
+fn kit_path(ws: Uuid) -> String {
+    format!("/api/v1/workspaces/{ws}/brand-kit")
+}
+
+fn error_fields(r: &axum_test::TestResponse) -> Vec<String> {
+    r.json::<serde_json::Value>()["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no errors array: {}", r.text()))
+        .iter()
+        .map(|e| e["field"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A one-block document whose only run is `tag`.
+fn doc(tag: &str) -> serde_json::Value {
+    json!({"blocks": [{"type": "Text", "runs": [{"type": "Tag", "source": tag}]}]})
+}
+
+async fn custom_field(pool: &PgPool, ws: Uuid, key: &str, label: &str, kind: &str) {
+    sqlx::query(
+        "insert into custom_fields (id, workspace_id, key, label, kind) values ($1,$2,$3,$4,$5)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind(key)
+    .bind(label)
+    .bind(kind)
+    .execute(pool)
+    .await
+    .expect("custom field");
+}
+
+async fn archive_fields(pool: &PgPool, ws: Uuid) {
+    sqlx::query("update custom_fields set archived_at = now() where workspace_id = $1")
+        .bind(ws)
+        .execute(pool)
+        .await
+        .expect("archive");
+}
+
+/// Creates a blocks template and returns its id.
+async fn create(t: &Tenant, name: &str, tree: serde_json::Value) -> Uuid {
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": name, "kind": "blocks", "tree": tree}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    Uuid::parse_str(r.json::<serde_json::Value>()["id"].as_str().unwrap()).unwrap()
+}
+
+/// Previews what is STORED: no document in the body.
+async fn preview_stored(t: &Tenant, id: Uuid) -> axum_test::TestResponse {
+    t.viewer
+        .post(&preview_path(t.id, id))
+        .json(&json!({}))
+        .await
+}
+
+#[sqlx::test]
+async fn another_workspaces_template_is_404(pool: PgPool) {
+    let mine = tenant(&pool, "acme").await;
+    let theirs = tenant(&pool, "other").await;
+    let id = create(&mine, "mine", doc("{{ first_name }}")).await;
+
+    // Asked for through the other workspace's path: 404, never 403 and never the document.
+    for r in [
+        theirs.viewer.get(&template_path(theirs.id, id)).await,
+        theirs
+            .editor
+            .patch(&template_path(theirs.id, id))
+            .json(&json!({"name": "stolen"}))
+            .await,
+        theirs.editor.delete(&template_path(theirs.id, id)).await,
+        theirs
+            .viewer
+            .post(&preview_path(theirs.id, id))
+            .json(&json!({}))
+            .await,
+    ] {
+        r.assert_status(StatusCode::NOT_FOUND);
+        assert!(!r.text().contains("mine"), "leaked the name: {}", r.text());
+    }
+
+    // And asked for through MY path by a member of the other workspace: still 404, because the
+    // membership lookup fails before the row is read.
+    theirs
+        .viewer
+        .get(&template_path(mine.id, id))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn every_mutating_verb_is_role_gated(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+
+    // POST, PATCH and DELETE — all three, not one of three.
+    t.viewer
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "v", "kind": "blocks", "tree": doc("{{ email }}")}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    t.viewer
+        .patch(&template_path(t.id, id))
+        .json(&json!({"name": "renamed"}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    t.viewer
+        .delete(&template_path(t.id, id))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+
+    // A viewer may still read and preview.
+    t.viewer
+        .get(&template_path(t.id, id))
+        .await
+        .assert_status_ok();
+    preview_stored(&t, id).await.assert_status_ok();
+
+    // The editor may do all three.
+    t.editor
+        .patch(&template_path(t.id, id))
+        .json(&json!({"name": "renamed"}))
+        .await
+        .assert_status_ok();
+    t.editor
+        .delete(&template_path(t.id, id))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+}
+
+#[sqlx::test]
+async fn the_brand_kit_is_admin_gated(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let kit = json!({"logo_url": null, "palette": {}, "font_stack": null, "footer": {}});
+    // An editor composes emails; an admin configures what every email is legally obliged to say.
+    t.editor
+        .put(&kit_path(t.id))
+        .json(&kit)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    t.viewer
+        .put(&kit_path(t.id))
+        .json(&kit)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&kit)
+        .await
+        .assert_status_ok();
+}
+
+#[sqlx::test]
+async fn saving_a_tag_naming_an_unknown_field_is_422_with_the_field_name(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "blocks", "tree": doc("{{ nope }}")}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["tree"]);
+    assert!(
+        r.text().contains("nope"),
+        "the refusal must name the field: {}",
+        r.text()
+    );
+}
+
+#[sqlx::test]
+async fn saving_a_tag_naming_an_archived_field_is_422(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    custom_field(&pool, t.id, "colour", "Teal", "text").await;
+    archive_fields(&pool, t.id).await;
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "blocks", "tree": doc("{{ colour }}")}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["tree"]);
+    assert!(
+        r.text().contains("archived"),
+        "a new tag on an archived field is told why: {}",
+        r.text()
+    );
+}
+
+#[sqlx::test]
+async fn a_template_compiled_before_archiving_still_renders(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    custom_field(&pool, t.id, "colour", "Teal", "text").await;
+    let id = create(&t, "t", doc("{{ colour }}")).await;
+    archive_fields(&pool, t.id).await;
+
+    // The other half of R2's rule: a NEW tag on an archived field is refused, an already
+    // compiled one still renders. The contact keeps its value until the field is purged.
+    let r = preview_stored(&t, id).await;
+    r.assert_status_ok();
+    assert!(
+        r.json::<serde_json::Value>()["html"]
+            .as_str()
+            .unwrap()
+            .contains("Teal")
+    );
+}
+
+#[sqlx::test]
+async fn both_parts_are_filled_from_one_stored_ast_after_a_field_is_archived(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    custom_field(&pool, t.id, "colour", "Teal", "text").await;
+    let id = create(&t, "t", doc("{{ colour }}")).await;
+    archive_fields(&pool, t.id).await;
+
+    // THE divergence R5 was restructured to make impossible: compiled separately, the archive
+    // lands between the two calls and the tag fails in one part while the other still renders
+    // it — one message disagreeing with itself about the recipient.
+    let r = preview_stored(&t, id).await;
+    r.assert_status_ok();
+    let body = r.json::<serde_json::Value>();
+    let (html, text) = (
+        body["html"].as_str().unwrap(),
+        body["text"].as_str().unwrap(),
+    );
+    assert!(html.contains("Teal"), "html: {html}");
+    assert!(text.contains("Teal"), "text: {text}");
+    assert!(!text.contains("~nmmt~"), "text carries markers: {text}");
+}
+
+#[sqlx::test]
+async fn a_field_kind_change_after_compile_is_detected_not_mis_rendered(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    custom_field(&pool, t.id, "colour", "Teal", "text").await;
+    let id = create(&t, "t", doc("{{ colour }}")).await;
+    // The API refuses a kind change, so this is the row written by another path — which is the
+    // case the stored AST cannot be trusted about.
+    sqlx::query("update custom_fields set kind = 'select', options = $2 where workspace_id = $1")
+        .bind(t.id)
+        .bind(json!(["a"]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = preview_stored(&t, id).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert!(r.text().contains("template-stale"), "{}", r.text());
+    assert!(r.text().contains("colour"), "names the field: {}", r.text());
+}
+
+#[sqlx::test]
+async fn a_bogus_marker_format_version_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+    preview_stored(&t, id).await.assert_status_ok();
+
+    sqlx::query(
+        "update templates set compiled = jsonb_set(compiled, '{marker_format_version}', '99') \
+         where id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Not guessed at: a boundary marker read as a field marker drops the wrong range of a
+    // message, silently.
+    let r = preview_stored(&t, id).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert!(r.text().contains("marker format 99"), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn an_over_deep_stored_ast_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+
+    // Written straight to the column, never through `compile`: `serde`'s `Deserialize` on
+    // `tag::Node` re-validates nothing, so the depth cap every renderer's recursion assumes is
+    // not a property of a row.
+    let mut deep = json!([]);
+    for _ in 0..=nm::template::tag::MAX_DEPTH {
+        deep = json!([{"Present": {"key": "first_name", "body": deep}}]);
+    }
+    sqlx::query("update templates set compiled = jsonb_set(compiled, '{nodes}', $2) where id = $1")
+        .bind(id)
+        .bind(&deep)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let r = preview_stored(&t, id).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert!(r.text().contains("deeper than"), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn changing_the_brand_kit_alone_invalidates_the_stored_renditions(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+    preview_stored(&t, id).await.assert_status_ok();
+
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&json!({
+            "logo_url": null,
+            "palette": {"accent": "#ff0000"},
+            "font_stack": null,
+            "footer": {}
+        }))
+        .await
+        .assert_status_ok();
+
+    // The kit is emitted into the MJML the classifier ran over, so the stored classification now
+    // describes a document this template no longer produces. A stale classification is a
+    // security bug, not a cache miss.
+    let r = preview_stored(&t, id).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert!(r.text().contains("template-stale"), "{}", r.text());
+
+    // Saving the template again compiles it against the kit as it is now.
+    t.editor
+        .patch(&template_path(t.id, id))
+        .json(&json!({"name": "t"}))
+        .await
+        .assert_status_ok();
+    preview_stored(&t, id).await.assert_status_ok();
+}
+
+#[sqlx::test]
+async fn preview_returns_html_text_and_findings(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let tree = json!({"blocks": [
+        {"type": "Heading", "level": 1, "runs": [{"type": "Text", "text": "Hi", "marks": []}]},
+        {"type": "Button", "label": "Go", "href": ""}
+    ]});
+    let id = create(&t, "t", tree).await;
+
+    let r = preview_stored(&t, id).await;
+    r.assert_status_ok();
+    let body = r.json::<serde_json::Value>();
+    let html = body["html"].as_str().expect("html");
+    assert!(html.contains("<html"), "a whole document: {html}");
+    assert!(body["text"].as_str().expect("text").contains("Hi"));
+    let findings = body["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "empty_href");
+    assert_eq!(findings[0]["check"], "link");
+    assert_eq!(findings[0]["severity"], "warning");
+    assert_eq!(findings[0]["at"], json!([1]), "a PATH, not an index");
+}
+
+#[sqlx::test]
+async fn preview_takes_the_unsaved_document_when_one_is_sent(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+    let r = t
+        .viewer
+        .post(&preview_path(t.id, id))
+        .json(&json!({"tree": {"blocks": [
+            {"type": "Text", "runs": [{"type": "Text", "text": "unsaved", "marks": []}]}]}}))
+        .await;
+    r.assert_status_ok();
+    assert!(
+        r.json::<serde_json::Value>()["text"]
+            .as_str()
+            .unwrap()
+            .contains("unsaved")
+    );
+    // Nothing was written: what is stored is still the saved document.
+    let stored = preview_stored(&t, id).await;
+    assert!(
+        !stored.json::<serde_json::Value>()["text"]
+            .as_str()
+            .unwrap()
+            .contains("unsaved")
+    );
+}
+
+#[sqlx::test]
+async fn a_dangerous_merge_tag_refusal_names_the_operators_own_text(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // The byte offset `classify` returns is into `mrml`'s OUTPUT, a document the operator has
+    // never seen. The refusal has to point at what they wrote.
+    let tree = json!({"blocks": [
+        {"type": "Button", "label": "Go", "href": "https://{{ first_name }}.example.com/"}]});
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "blocks", "tree": tree}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        r.text().contains("{{ first_name }}"),
+        "must quote the operator's own tag: {}",
+        r.text()
+    );
+
+    // And for a raw template, where the source IS what they typed.
+    let source = "<mjml><mj-body><mj-raw><script>var a = \"{{ email }}\";</script></mj-raw>\
+                  </mj-body></mjml>";
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "raw", "kind": "mjml", "source": source}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.text().contains("{{ email }}"), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn an_empty_raw_source_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // `templates.source is not null` admits the empty string. RULING: the handler refuses it. An
+    // empty raw template compiles to an email with nothing in it, and `lint` cannot check it at
+    // all, so it is a template that could never be previewed.
+    //
+    // The MESSAGE is asserted, not only the field: an empty MJML source also fails in
+    // `mrml::parse`, which reports the same field, so a test reading only the field name passes
+    // with this rule deleted. An empty `html` source has no second refusal behind it at all and
+    // would be saved.
+    for kind in ["mjml", "html"] {
+        for source in ["", "   \n "] {
+            let r = t
+                .editor
+                .post(&templates_path(t.id))
+                .json(&json!({"name": "t", "kind": kind, "source": source}))
+                .await;
+            r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(error_fields(&r), ["source"], "{kind} {source:?}");
+            assert!(
+                r.text().contains("cannot be empty"),
+                "{kind} {source:?}: {}",
+                r.text()
+            );
+        }
+    }
+}
+
+#[sqlx::test]
+async fn a_link_scheme_outside_the_allowlist_is_refused_at_save(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // `static_url` would rewrite it to `#` at render, so the operator's link would be silently
+    // dead rather than refused.
+    let tree = json!({"blocks": [
+        {"type": "Button", "label": "Go", "href": "javascript:alert(1)"}]});
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "blocks", "tree": tree}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["tree.blocks[0].href"]);
+
+    // A relative href is NOT refused: it names no scheme, and M2c's unsubscribe links are
+    // written that way.
+    t.editor
+        .post(&templates_path(t.id))
+        .json(
+            &json!({"name": "rel", "kind": "blocks", "tree": json!({"blocks": [
+            {"type": "Button", "label": "Go", "href": "/u/abc"}]})}),
+        )
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
+#[sqlx::test]
+async fn too_many_blocks_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let flat: Vec<serde_json::Value> = (0..nm::template::routes::MAX_BLOCKS + 1)
+        .map(|_| json!({"type": "Divider"}))
+        .collect();
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "blocks", "tree": {"blocks": flat}}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["tree"]);
+
+    // Width inside a `Columns` counts too: depth is bounded, width is not.
+    let wide: Vec<serde_json::Value> = (0..nm::template::routes::MAX_BLOCKS)
+        .map(|_| json!({"type": "Divider"}))
+        .collect();
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "blocks", "tree": {"blocks": [
+            {"type": "Columns", "children": [wide]}]}}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test]
+async fn the_brand_kit_is_one_row_per_workspace(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let other = tenant(&pool, "other").await;
+
+    // A workspace with no row has an EMPTY kit, never a 404: the screen must be reachable on day
+    // one, when no workspace has saved one.
+    let r = t.viewer.get(&kit_path(t.id)).await;
+    r.assert_status_ok();
+    r.assert_json(&json!({"logo_url": null, "palette": {}, "font_stack": null, "footer": {}}));
+
+    let kit = json!({
+        "logo_url": "https://cdn.example.com/logo.png",
+        "palette": {"background": "#fff", "text": "#111111", "accent": "#2563EB",
+                    "accent_text": "#ffffff"},
+        "font_stack": "Helvetica Neue, Arial, sans-serif",
+        "footer": {"text": "Acme", "address": "1 Way, Town"}
+    });
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&kit)
+        .await
+        .assert_status_ok();
+    // Saved twice: a PUT replaces the one row rather than adding a second.
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&kit)
+        .await
+        .assert_status_ok();
+    let rows: i64 = sqlx::query_scalar("select count(*) from brand_kits where workspace_id = $1")
+        .bind(t.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    t.viewer.get(&kit_path(t.id)).await.assert_json(&kit);
+
+    // And it is the WORKSPACE's: the other one still has none.
+    other
+        .viewer
+        .get(&kit_path(other.id))
+        .await
+        .assert_json(&json!({"logo_url": null, "palette": {}, "font_stack": null, "footer": {}}));
+}
+
+#[sqlx::test]
+async fn unknown_brand_kit_keys_survive_a_save(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let kit = json!({
+        "logo_url": null,
+        "palette": {"accent": "#2563eb", "from_a_newer_version": "#abc"},
+        "font_stack": null,
+        "footer": {"address": "1 Way", "legalese": "..."}
+    });
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&kit)
+        .await
+        .assert_status_ok();
+    // A kit written by a newer version must survive a round trip through an older screen.
+    t.viewer.get(&kit_path(t.id)).await.assert_json(&kit);
+}
+
+#[sqlx::test]
+async fn a_font_stack_that_breaks_out_of_css_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    for font in [
+        "Arial; } body { background: url(https://evil.example/x) ",
+        "Arial}",
+        "url(javascript:alert(1))",
+        "Arial;",
+    ] {
+        let r = t
+            .admin
+            .put(&kit_path(t.id))
+            .json(&json!({"logo_url": null, "palette": {}, "font_stack": font, "footer": {}}))
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_fields(&r), ["font_stack"], "{font}");
+    }
+}
+
+#[sqlx::test]
+async fn a_logo_url_must_be_http_or_https(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // The link allowlist is wider than this field: `mailto:` and `tel:` are meaningless as an
+    // image source (contract section 11).
+    for logo in [
+        "mailto:a@b.example",
+        "tel:+1",
+        "javascript:alert(1)",
+        "not a url",
+    ] {
+        let r = t
+            .admin
+            .put(&kit_path(t.id))
+            .json(&json!({"logo_url": logo, "palette": {}, "font_stack": null, "footer": {}}))
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_fields(&r), ["logo_url"], "{logo}");
+    }
+}
+
+#[sqlx::test]
+async fn a_colour_outside_the_frozen_format_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    for (bad, field) in [
+        (json!({"accent": "red"}), "palette.accent"),
+        (json!({"background": "#12345"}), "palette.background"),
+        (json!({"text": "rgb(0,0,0)"}), "palette.text"),
+        // A non-string would otherwise be stored, returned, and silently ignored by the emitter.
+        (json!({"accent_text": 7}), "palette.accent_text"),
+    ] {
+        let r = t
+            .admin
+            .put(&kit_path(t.id))
+            .json(&json!({"logo_url": null, "palette": bad, "font_stack": null, "footer": {}}))
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_fields(&r), [field], "{bad}");
+    }
+}
+
+#[sqlx::test]
+async fn a_raw_html_template_is_never_rendered_through_mrml(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "h", "kind": "html",
+                      "source": "<p>Hi {{ first_name }}</p>"}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = Uuid::parse_str(r.json::<serde_json::Value>()["id"].as_str().unwrap()).unwrap();
+    let r = preview_stored(&t, id).await;
+    r.assert_status_ok();
+    let body = r.json::<serde_json::Value>();
+    let html = body["html"].as_str().unwrap();
+    assert!(html.starts_with("<p>Hi Sam</p>"), "{html}");
+    assert!(!html.contains("<mjml"), "mrml must not have run: {html}");
+    // The plain-text part of a raw template comes from the SUBSTITUTED html, never the marked one.
+    assert_eq!(body["text"].as_str().unwrap(), "Hi Sam");
+}
+
+#[sqlx::test]
+async fn a_blocks_template_stores_both_renditions_and_a_raw_one_stores_only_the_html(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let blocks = create(&t, "b", doc("{{ first_name }}")).await;
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "h", "kind": "html", "source": "<p>{{ first_name }}</p>"}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let raw = Uuid::parse_str(r.json::<serde_json::Value>()["id"].as_str().unwrap()).unwrap();
+
+    let part = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "select jsonb_typeof(compiled->'text') from templates where id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("compiled")
+        }
+    };
+    // A blocks template stores the marked plain text BESIDE the marked HTML, written in one
+    // transaction from one AST. A raw one has no block tree to build a text skeleton from, so its
+    // text part is derived from the substituted HTML per contact and nothing is stored.
+    assert_eq!(part(blocks).await, "object");
+    assert_eq!(part(raw).await, "null");
+
+    // And both carry the marker format the renderer wrote them with, so a later build can refuse
+    // a document whose shape it does not speak.
+    for id in [blocks, raw] {
+        let version: i32 = sqlx::query_scalar(
+            "select (compiled->>'marker_format_version')::int from templates where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version as u32, nm::template::render::MARKER_FORMAT_VERSION);
+        let key: String =
+            sqlx::query_scalar("select compiled->>'fingerprint' from templates where id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!key.is_empty());
+    }
+}
+
+#[sqlx::test]
+async fn the_dangerous_tag_is_the_nth_one_the_operator_wrote_not_the_nth_brace(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // A conditional's CLOSING tag takes no marker slot of its own, so the tag that marker 1
+    // stands for is `{{ email }}` and not `{{/ first_name }}`.
+    let source = "<mjml><mj-body><mj-text>{{# first_name }}hi{{/ first_name }}</mj-text>\
+                  <mj-raw><script>var a = \"{{ email }}\";</script></mj-raw></mj-body></mjml>";
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "mjml", "source": source}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.text().contains("{{ email }}"), "{}", r.text());
+    assert!(!r.text().contains("{{/ first_name }}"), "{}", r.text());
+
+    // A conditional's BOUNDARY marker carries an `o` or `c` after its index. Read as part of the
+    // index it is not a number at all, and the refusal falls back to naming no tag.
+    let source = "<mjml><mj-body><mj-raw><script>{{# first_name }}x{{/ first_name }}</script>\
+                  </mj-raw></mj-body></mjml>";
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t2", "kind": "mjml", "source": source}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.text().contains("{{# first_name }}"), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn a_patch_that_sends_null_is_refused_rather_than_ignored(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+    for field in ["name", "tree", "source"] {
+        let r = t
+            .editor
+            .patch(&template_path(t.id, id))
+            .json(&json!({ field: serde_json::Value::Null }))
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_fields(&r), [field]);
+    }
+    // And the document column that does not belong to this kind is refused too.
+    let r = t
+        .editor
+        .patch(&template_path(t.id, id))
+        .json(&json!({"source": "<p>x</p>"}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}
