@@ -4,6 +4,7 @@ import { useId, useState } from "react";
 
 import { Button } from "../button";
 import { Field } from "../field";
+import { isOurEnter } from "./keys";
 import { tagSource } from "./runs";
 
 const CLASS = "rounded-sm bg-accent-subtle px-1 font-mono text-sm text-accent-text";
@@ -47,7 +48,7 @@ export function TagInsert({ onInsert }: { onInsert: (source: string) => void }) 
         hint={'For example first_name | "there"'}
         onChange={(e) => setRaw(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (isOurEnter(e)) {
             e.preventDefault();
             insert();
           }

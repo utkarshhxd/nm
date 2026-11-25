@@ -324,6 +324,7 @@ test("the_editor_with_a_text_block_selected_has_no_accessibility_violations", as
   await expectNoViolations(new AxeBuilder({ page }), "block editor with a text block selected");
 });
 
+type KeyInit = { isComposing?: boolean; keyCode?: number };
 const kinds = async (page: Page) => (await doc(page)).blocks.map((b) => b.type);
 const tagsIn = (b: Block) => (b.type === "Text" ? b.runs.filter((r) => r.type === "Tag") : []);
 const TAG = { type: "Tag", source: '{{ first_name | "there" }}' };
@@ -469,14 +470,18 @@ test("enter_that_confirms_an_ime_candidate_does_not_split_the_block", async ({ p
   await open(page, app);
   await caretIn(page, "Text block 2");
   await page.keyboard.press("Home");
-  // Enter during composition is how an input method confirms a candidate: the browser flags it so.
-  const prevented = await page.evaluate(() => {
-    const el = document.querySelector('[aria-label="Text block 2"]') as HTMLElement;
-    const e = new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true, cancelable: true });
-    el.dispatchEvent(e);
-    return e.defaultPrevented;
-  });
-  expect(prevented).toBe(false);
+  // Enter during composition is how an input method confirms a candidate. Chromium flags it with
+  // isComposing; Safari sends the confirming Enter after compositionend, so isComposing is false and
+  // only keyCode 229 says it belongs to the input method.
+  const prevented = (init: KeyInit) =>
+    page.evaluate((i) => {
+      const el = document.querySelector('[aria-label="Text block 2"]') as HTMLElement;
+      const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, ...i });
+      el.dispatchEvent(e);
+      return e.defaultPrevented;
+    }, init);
+  expect(await prevented({ isComposing: true })).toBe(false);
+  expect(await prevented({ isComposing: false, keyCode: 229 })).toBe(false);
   expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
   // The same key outside a composition still splits.
   await page.keyboard.press("Enter");
@@ -512,25 +517,57 @@ test("a_line_break_at_the_end_of_a_block_is_visible", async ({ page, app }) => {
   await page.keyboard.press("Shift+Enter");
   // The caret now sits on a second line, so the block is taller by a line, before anything is typed after it.
   const two = await height();
-  expect(two).toBeGreaterThanOrEqual(one + 15); // a line is about 20px; the block's own minimum is 24
+  expect(two).toBeGreaterThanOrEqual(one + 15); // a line is 24px (text-base); a break adds one
   await page.keyboard.press("Shift+Enter");
   expect(await height()).toBeGreaterThanOrEqual(two + 15);
 });
 
 test("a_soft_keyboards_paragraph_and_line_break_are_handled_like_enter_and_shift_enter", async ({ page, app }) => {
-  const send = (inputType: string) =>
-    page.evaluate((type) => {
-      const el = document.querySelector('[aria-label="Text block 2"]') as HTMLElement;
-      el.dispatchEvent(new InputEvent("beforeinput", { inputType: type, bubbles: true, cancelable: true }));
-    }, inputType);
+  // Untrusted events have no default action, so the handler's preventDefault is read off the event:
+  // without it a real keyboard would insert its own <div> or <br> as well as run the split.
+  const send = (inputType: string, isComposing = false) =>
+    page.evaluate(
+      ([type, composing]) => {
+        const el = document.querySelector('[aria-label="Text block 2"]') as HTMLElement;
+        const e = new InputEvent("beforeinput", { inputType: type as string, isComposing: composing as boolean, bubbles: true, cancelable: true });
+        el.dispatchEvent(e);
+        return e.defaultPrevented;
+      },
+      [inputType, isComposing],
+    );
   await open(page, app);
   await caretIn(page, "Text block 2");
   await page.keyboard.press("Home");
   for (let i = 0; i < 2; i++) await page.keyboard.press("ArrowRight"); // "Hi|"
-  await send("insertLineBreak");
+  // Inside a composition neither is ours: the input method owns the text until it commits.
+  expect(await send("insertParagraph", true)).toBe(false);
+  expect(await send("insertLineBreak", true)).toBe(false);
+  expect(words(await block(page, 1))).toBe("Hi {tag}!");
+  expect(await send("insertLineBreak")).toBe(true);
   expect(words(await block(page, 1))).toBe("Hi\n {tag}!");
   expect(await kinds(page)).toEqual(["Heading", "Text", "Columns"]);
-  await send("insertParagraph");
+  expect(await send("insertParagraph")).toBe(true);
   expect(await kinds(page)).toEqual(["Heading", "Text", "Text", "Columns"]);
   expect([words(await block(page, 1)), words(await block(page, 2))]).toEqual(["Hi\n", " {tag}!"]);
+});
+
+test("enter_that_confirms_an_ime_candidate_in_the_merge_tag_field_does_not_insert_the_tag", async ({ page, app }) => {
+  await open(page, app);
+  await caretIn(page, "Text block 2");
+  const field = page.getByLabel("Merge tag");
+  await field.fill('first_name | "');
+  const prevented = (init: KeyInit) =>
+    field.evaluate((el, i) => {
+      const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, ...i });
+      el.dispatchEvent(e);
+      return e.defaultPrevented;
+    }, init);
+  expect(await prevented({ isComposing: true })).toBe(false);
+  expect(await prevented({ isComposing: false, keyCode: 229 })).toBe(false);
+  expect(await tagCount(page)).toBe(1); // only the one that was there
+  await expect(field).toHaveValue('first_name | "');
+  // Outside a composition the same key inserts it.
+  await field.fill("last_name");
+  await field.press("Enter");
+  expect(await tagCount(page)).toBe(2);
 });

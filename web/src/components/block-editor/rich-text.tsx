@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useRef } from "react";
 
 import type { Mark, Run } from "./model";
 import { breakAt, edit, hasTag, length, normalize } from "./runs";
+import { isOurEnter } from "./keys";
 import { isTagToken, tagToken } from "./tag-token";
 
 /** A selection as flat offsets into the block's runs; a merge tag counts 1. `from <= to`. */
@@ -224,7 +225,7 @@ export function RichText(props: Props) {
       }}
       onKeyDown={(e) => {
         // Enter is also how an input method confirms a candidate: not ours while one is open.
-        if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+        if (isOurEnter(e)) {
           e.preventDefault();
           lineOrSplit(e.currentTarget, e.shiftKey, props);
         }
