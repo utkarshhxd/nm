@@ -81,8 +81,11 @@ impl Registry {
                 live.insert(d.key.clone());
             }
         }
-        // A system name can never be archived away.
-        archived.retain(|k| !live.contains(k));
+        // A custom field may be keyed like a system field (`validate_key` does not reserve the
+        // names — issues/44), so `live` and `archived` can hold the same key. Nothing is pruned
+        // here: `check` asks `live` first, which is what makes the system field win. A
+        // `retain(|k| !live.contains(k))` used to sit here and could not change any answer, so it
+        // read as a guard while being dead; the lookup ORDER is the guard, and the test names it.
         Self { live, archived }
     }
 
@@ -286,8 +289,6 @@ fn field_tag(s: &str, registry: &Registry) -> Result<Node, TagError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::custom_fields::FieldKind;
 
@@ -311,47 +312,6 @@ mod tests {
             key: key.into(),
             filter: None,
             fallback: None,
-        }
-    }
-
-    /// A stand-in for R3's renderer: one walk over the AST, values written out and never read
-    /// again. The property under test is that nothing feeds a value back into `compile`.
-    fn eval(nodes: &[Node], vals: &HashMap<&str, &str>, out: &mut String) {
-        for n in nodes {
-            match n {
-                Node::Text(t) => out.push_str(t),
-                Node::Field {
-                    key,
-                    filter,
-                    fallback,
-                } => {
-                    let v = vals.get(key.as_str()).copied().filter(|v| !v.is_empty());
-                    match (v, fallback) {
-                        (Some(v), _) => match filter {
-                            Some(Filter::Upper) => out.push_str(&v.to_uppercase()),
-                            Some(Filter::Lower) => out.push_str(&v.to_lowercase()),
-                            _ => out.push_str(v),
-                        },
-                        (None, Some(f)) => out.push_str(f),
-                        (None, None) => {}
-                    }
-                }
-                Node::Present { key, body } => {
-                    if vals.get(key.as_str()).is_some_and(|v| !v.is_empty()) {
-                        eval(body, vals, out);
-                    }
-                }
-                Node::Absent { key, body } => {
-                    if vals.get(key.as_str()).is_none_or(|v| v.is_empty()) {
-                        eval(body, vals, out);
-                    }
-                }
-                Node::Equals { key, value, body } => {
-                    if vals.get(key.as_str()) == Some(&value.as_str()) {
-                        eval(body, vals, out);
-                    }
-                }
-            }
         }
     }
 
@@ -406,6 +366,17 @@ mod tests {
             compile("{{# nope }}x{{/ nope }}", &r),
             Err(TagError::UnknownField("nope".into()))
         );
+    }
+
+    /// `custom_fields::validate_key` does not reserve the system names (issues/44), so a
+    /// workspace may define a custom field keyed `email`. Archiving it must not take `{{ email }}`
+    /// away from every template in that workspace. What prevents that is `check` asking `live`
+    /// before `archived`, and this is the test that holds the order there.
+    #[test]
+    fn a_system_field_survives_an_archived_custom_field_of_the_same_name() {
+        let r = Registry::from_definitions(&[def("email", true), def("first_name", true)]);
+        assert!(compile("{{ email }}", &r).is_ok());
+        assert!(compile("{{# first_name }}x{{/ first_name }}", &r).is_ok());
     }
 
     #[test]
@@ -638,30 +609,6 @@ mod tests {
         assert_eq!(
             compile(&"{{^ first_name }}".repeat(10_000), &r),
             Err(TagError::TooDeep)
-        );
-    }
-
-    #[test]
-    fn a_substituted_value_is_never_re_parsed() {
-        let nodes = compile(
-            "Hi {{ first_name }}, we have {{ email }} on file.",
-            &registry(),
-        )
-        .unwrap();
-        let vals = HashMap::from([("first_name", "{{ email }}"), ("email", "a@example.com")]);
-        let mut out = String::new();
-        eval(&nodes, &vals, &mut out);
-        assert_eq!(out, "Hi {{ email }}, we have a@example.com on file.");
-        // A value that is itself a block opener or an invalid tag is equally inert.
-        let vals = HashMap::from([
-            ("first_name", "{{# country }}{{ nope }}"),
-            ("email", "a@example.com"),
-        ]);
-        let mut out = String::new();
-        eval(&nodes, &vals, &mut out);
-        assert_eq!(
-            out,
-            "Hi {{# country }}{{ nope }}, we have a@example.com on file."
         );
     }
 }

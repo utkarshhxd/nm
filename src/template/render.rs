@@ -5,23 +5,42 @@
 //!
 //! The product ships no general template language, so there is nothing to escape *from*. This
 //! module is the other half: making sure a *value* cannot break out of the context it lands in.
-//! Two rules decide the design.
 //!
-//! **Classification runs over the HTML `mrml` produced, never over the MJML source.** `mrml`
-//! rewrites attributes — an `mj-text color="…"` becomes `style="color:…"` on a `<div>` — so a
-//! position classified in the MJML may not exist in the output, and a document that was
-//! classified is then not the document that is sent. The compile step therefore renders
-//! [`marked`] through `mrml` and hands the result to [`classify`].
+//! # The pipeline, which is not negotiable
 //!
-//! **A tag in a dangerous context is refused, never escaped.** Inside `<script>`, inside a
-//! comment, in a tag name, in an attribute name, in an event-handler attribute: encoding does not
-//! make those positions safe, so the answer is [`RenderError::DangerousContext`] and no template.
+//! ```text
+//! save:  AST --marked()--> marked MJML --mrml--> marked HTML --classify()--> refuse or store
+//! send:  stored marked HTML + AST + contact --substitute()--> the message
+//! ```
+//!
+//! `mrml` runs **once, at save**, and the marked HTML it produced is what gets stored. Every send
+//! substitutes into *that* document and never runs `mrml` again. Two reasons, in order:
+//!
+//! 1. **Correctness.** `mrml` rewrites attributes — `mj-text color="…"` becomes `style="color:…"`
+//!    on a `div` — so a position classified in the MJML may not exist in the output, and the
+//!    encoder a value needs is decided by where it lands in the HTML, not in the source. Wiring it
+//!    the other way means the document that was classified is not the document that is sent, and
+//!    the gap is a CSS injection: `color` is an ordinary attribute in the MJML and a CSS context in
+//!    the HTML. `classification_runs_on_mrml_output_not_on_mjml` is the proof those two disagree.
+//! 2. Speed, a distant second: it takes a full MJML render off a path that walks millions of rows.
+//!
+//! # The two rules
+//!
+//! **Classification runs over the HTML `mrml` produced, never over the MJML source**, and every
+//! tag `marked()` emitted must still be there. A merge tag that `mrml` dropped is a tag that is
+//! silently gone from every recipient's mail, so [`classify`] is told how many to expect and
+//! refuses when one is missing.
+//!
+//! **A tag in a dangerous context is refused, never escaped.** Inside `<script>`, inside a comment,
+//! in a tag name, in an attribute name, in an event-handler attribute, in a `meta refresh`, and in
+//! the scheme or host of a URL: encoding does not make those positions safe, so the answer is
+//! [`RenderError::DangerousContext`] and no template.
 //!
 //! The classification is driven by `html5ever`'s HTML5 tokenizer, with the tree-builder feedback
 //! that makes `<script>` and `<style>` contents raw text, because the question being asked is what
 //! a *browser* will do with this document — a hand-rolled scanner answers a different question.
 //! Rendering re-serialises the token stream, which is what forces every attribute into double
-//! quotes and what lets a URL attribute be assembled and checked as one whole URL.
+//! quotes.
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -69,11 +88,19 @@ pub enum RenderError {
     /// A merge tag sits where no encoding helps. `position` is the byte offset of its marker in
     /// the classified HTML.
     DangerousContext { position: usize },
+    /// A merge tag that [`marked`] emitted is not in the classified HTML at all — `mrml` dropped
+    /// the attribute or the element that held it. Saving this template would publish a message
+    /// with the tag silently missing, so it is refused instead.
+    TagLost { index: usize },
 }
 
 /// The attributes whose value is a URL the browser will fetch or navigate to. Anything here gets
-/// the whole-value URL treatment; everything else is an ordinary attribute.
-const URL_ATTRS: [&str; 11] = [
+/// the URL treatment; everything else is an ordinary attribute.
+///
+/// `xlink:href` is in the list because the HTML tokenizer keeps the prefix in the local name, and
+/// `<svg><a xlink:href="…">` is reachable through `mj-raw` — inert in most inboxes, live on the
+/// hosted view-in-browser page.
+const URL_ATTRS: [&str; 12] = [
     "action",
     "background",
     "cite",
@@ -85,6 +112,7 @@ const URL_ATTRS: [&str; 11] = [
     "ping",
     "poster",
     "src",
+    "xlink:href",
 ];
 
 /// Frozen (spec §5.3). Widening this is a spec change, not an implementation choice.
@@ -149,69 +177,122 @@ fn scalar(v: &Value) -> Option<String> {
     }
 }
 
-/// The template's literal text with every field tag replaced by a marker, every conditional branch
-/// included.
-///
-/// This is what the compile step wraps in MJML and hands to `mrml`; [`classify`] then reads the
-/// markers back out of the HTML `mrml` produced. Every branch is present because any of them may
-/// be the one that renders, so all of them have to be classified — and a branch that would place a
-/// tag somewhere dangerous has to be refused at save, not at send.
-pub fn marked(nodes: &[Node]) -> String {
-    let mut out = String::new();
-    mark(nodes, None, &mut out, &mut Vec::new());
-    out
+// ---------------------------------------------------------------------------------------------
+// Marking: one traversal, used by both ends of the pipeline
+
+/// What the marker at a given index stands for. The traversal that writes the markers is the one
+/// that builds this list, so the indices cannot drift apart.
+enum Slot<'a> {
+    Field(&'a Node),
+    /// A conditional opens here, and its `Close` is the matching marker.
+    Open(&'a Node),
+    Close,
 }
 
-fn mark<'a>(
-    nodes: &'a [Node],
-    c: Option<&Contact<'_>>,
-    out: &mut String,
-    fields: &mut Vec<&'a Node>,
-) {
+/// What a marker is replaced by at send time, by index.
+enum Fill {
+    Value(Option<String>),
+    /// `true` when this contact takes the branch; `false` suppresses everything up to the `Close`.
+    Open(bool),
+    Close,
+}
+
+/// The template's literal text with every tag replaced by a marker, and the number of markers.
+///
+/// Every conditional branch is present, because any of them may be the one that renders: all of
+/// them have to be classified, and a branch that would place a tag somewhere dangerous has to be
+/// refused at save rather than at send. Which branch a contact actually takes is decided by
+/// [`substitute`], against this same document.
+///
+/// This is what the compile step wraps in MJML and hands to `mrml`. The count goes to [`classify`]
+/// so a tag `mrml` dropped cannot pass for a template that never had one.
+pub fn marked(nodes: &[Node]) -> (String, usize) {
+    let mut out = String::new();
+    let mut slots = Vec::new();
+    walk(nodes, &mut out, &mut slots);
+    (out, slots.len())
+}
+
+fn walk<'a>(nodes: &'a [Node], out: &mut String, slots: &mut Vec<Slot<'a>>) {
     for n in nodes {
         match n {
             Node::Text(t) => out.push_str(t),
-            Node::Field { .. } => {
-                let _ = write!(out, "{MARK_START}{}{MARK_END}", fields.len());
-                fields.push(n);
-            }
-            Node::Present { key, body } => {
-                if c.is_none_or(|c| c.value(key).is_some()) {
-                    mark(body, c, out, fields);
-                }
-            }
-            Node::Absent { key, body } => {
-                if c.is_none_or(|c| c.value(key).is_none()) {
-                    mark(body, c, out, fields);
-                }
-            }
-            Node::Equals { key, value, body } => {
-                if c.is_none_or(|c| c.value(key).as_deref() == Some(value.as_str())) {
-                    mark(body, c, out, fields);
-                }
+            Node::Field { .. } => mark(out, slots, Slot::Field(n)),
+            Node::Present { body, .. } | Node::Absent { body, .. } | Node::Equals { body, .. } => {
+                mark(out, slots, Slot::Open(n));
+                walk(body, out, slots);
+                mark(out, slots, Slot::Close);
             }
         }
     }
 }
 
-/// Where each merge tag in `html` lands, in document order.
-///
-/// `html` is the output of `mrml`, with [`marked`]'s markers still in it. Used at COMPILE time: an
-/// `Err` here is a template that is never saved.
-pub fn classify(html: &str) -> Result<Vec<Site>, RenderError> {
-    scan(html, None).map(|(sites, _)| sites)
+fn mark<'a>(out: &mut String, slots: &mut Vec<Slot<'a>>, slot: Slot<'a>) {
+    let _ = write!(out, "{MARK_START}{}{MARK_END}", slots.len());
+    slots.push(slot);
 }
 
-/// One contact's copy of the document.
+/// This contact's answer for every marker, in the same index order [`marked`] used.
+fn fills(nodes: &[Node], c: &Contact<'_>) -> Vec<Fill> {
+    let mut slots = Vec::new();
+    walk(nodes, &mut String::new(), &mut slots);
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Slot::Field(n) => Fill::Value(field_value(n, c)),
+            Slot::Open(n) => Fill::Open(match n {
+                Node::Present { key, .. } => c.value(key).is_some(),
+                Node::Absent { key, .. } => c.value(key).is_none(),
+                Node::Equals { key, value, .. } => c.value(key).as_deref() == Some(value.as_str()),
+                Node::Text(_) | Node::Field { .. } => false,
+            }),
+            Slot::Close => Fill::Close,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The two public entry points
+
+/// Where each merge tag in `html` lands, in document order. Used at COMPILE time: an `Err` here is
+/// a template that is never saved.
 ///
-/// A value is substituted and then written out; it is never read back, so a contact whose
-/// `first_name` is the text `{{ email }}` gets that text and not somebody's address.
+/// `html` is the output of `mrml`, with [`marked`]'s markers still in it, and `tags` is the count
+/// [`marked`] returned. Every index below `tags` must appear in `html` **at least once** — `mrml`
+/// legitimately duplicates a marker (an `mj-button` href is emitted twice, once inside the Outlook
+/// conditional comment), so the invariant is presence, never equality.
+///
+/// The returned vector is not a reliable index-to-site map when `mrml` duplicated a marker into
+/// two different contexts: the first site recorded wins, and a `Dangerous` anywhere wins outright.
+/// It is sound for the refusal decision, which is all it is used for. A preview that wants to show
+/// an operator *where* each tag landed needs more than this.
+pub fn classify(html: &str, tags: usize) -> Result<Vec<Site>, RenderError> {
+    scan(html, tags, None).map(|(sites, _)| sites)
+}
+
+/// One contact's copy of the already-classified document.
+///
+/// `html` is the stored output of `mrml` — the same string [`classify`] passed — and `nodes` is the
+/// AST it was marked from. A value is substituted and then written out; it is never read back, so
+/// a contact whose `first_name` is the text `{{ email }}` gets that text and not somebody's
+/// address.
+pub fn substitute(
+    html: &str,
+    nodes: &[Node],
+    contact: &Contact<'_>,
+) -> Result<String, RenderError> {
+    let fills = fills(nodes, contact);
+    scan(html, fills.len(), Some(&fills)).map(|(_, out)| out)
+}
+
+/// [`substitute`] for a template that is already the document being sent, with no MJML step.
+///
+/// This is the plain-HTML case and the one the tests use. The MJML pipeline must NOT go through
+/// here: it marks the MJML source and would classify a document `mrml` has not rewritten yet. See
+/// the pipeline diagram at the top of this module.
 pub fn render_html(nodes: &[Node], contact: &Contact<'_>) -> Result<String, RenderError> {
-    let mut html = String::new();
-    let mut fields = Vec::new();
-    mark(nodes, Some(contact), &mut html, &mut fields);
-    let values: Vec<Option<String>> = fields.iter().map(|n| field_value(n, contact)).collect();
-    scan(&html, Some(&values)).map(|(_, out)| out)
+    let (html, _) = marked(nodes);
+    substitute(&html, nodes, contact)
 }
 
 /// A field tag's value for this contact: the stored value through its filter, or the fallback.
@@ -274,22 +355,26 @@ enum Seg<'a> {
     Mark(usize),
 }
 
-/// Splits a run of text into literal and marker pieces. A `MARK_START` with no digits-then-`MARK_END`
-/// after it is not a marker; it is dropped rather than carried into the output.
+/// Splits a run of text into literal and marker pieces. A `MARK_START` with no digits-then-
+/// `MARK_END` after it is not a marker and stays literal text: dropping it would delete six
+/// characters from the sent mail with nothing said.
 fn segments(s: &str) -> Vec<Seg<'_>> {
     let mut out = Vec::new();
     let mut rest = s;
-    while let Some(i) = rest.find(MARK_START) {
-        if i > 0 {
-            out.push(Seg::Lit(&rest[..i]));
-        }
+    let mut done = 0;
+    while let Some(i) = rest[done..].find(MARK_START).map(|i| done + i) {
         let after = &rest[i + MARK_START.len()..];
         match id_in(after) {
             Some((id, len)) => {
+                if i > 0 {
+                    out.push(Seg::Lit(&rest[..i]));
+                }
                 out.push(Seg::Mark(id));
                 rest = &after[len + MARK_END.len()..];
+                done = 0;
             }
-            None => rest = after,
+            // Not a marker. Keep it in the literal run and look past it.
+            None => done = i + MARK_START.len(),
         }
     }
     if !rest.is_empty() {
@@ -345,7 +430,8 @@ fn escape_attr(s: &str, out: &mut String) {
 
 /// CSS escaping: everything outside a small literal set becomes `\<hex> `, which is inert both in
 /// a `style` attribute (where the browser decodes entities FIRST, so an entity-based escape would
-/// not survive) and in `<style>` raw text (where it never decodes entities at all).
+/// not survive) and in `<style>` raw text (where it never decodes entities at all). `;`, `:`, `(`
+/// and `}` are all outside the set, which is what stops a value adding a declaration of its own.
 ///
 /// shortcut: the literal set covers colours, lengths and font stacks, not `rgb(…)` — a parenthesis
 /// is escaped and the value stops being a function call. Widen the set if a CSS position ever has
@@ -360,15 +446,35 @@ fn escape_css(s: &str, out: &mut String) {
     }
 }
 
-/// Substitute, parse, canonicalise, check the scheme, re-serialise.
+/// Percent-encode a value for one component of a URL: everything outside `keep` and the
+/// alphanumerics, byte by byte so non-ASCII comes out as correct UTF-8 escapes.
+fn percent_encode(s: &str, keep: &str, out: &mut String) {
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || keep.as_bytes().contains(&b) {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+}
+
+/// Substitute, parse, canonicalise, check the scheme, re-serialise. For the case where the tag IS
+/// the whole attribute value.
 ///
 /// Never a blocklist and never a regex for the string `javascript:` — `java\tscript:`,
 /// `&#106;avascript:`, `JaVaScript:`, a leading NUL and a leading newline all defeat string
 /// matching, and a real URL parser reduces every one of them to the same scheme.
+///
+/// Userinfo is refused rather than preserved: `http://login.example.com@evil.example/` has an
+/// allowed scheme and reads as the operator's domain, which is the whole trick.
 fn safe_url(raw: &str) -> String {
+    // The URL itself is contact data, so only the reason is ever logged.
     match url::Url::parse(raw) {
+        Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+            tracing::warn!("merge tag produced a URL carrying userinfo; link disabled");
+            DEAD_LINK.to_owned()
+        }
         Ok(u) if ALLOWED_SCHEMES.contains(&u.scheme()) => u.to_string(),
-        // The URL itself is contact data, so only the reason is logged.
         Ok(u) => {
             tracing::warn!(
                 scheme = u.scheme(),
@@ -383,11 +489,135 @@ fn safe_url(raw: &str) -> String {
     }
 }
 
-/// An attribute's site, by name.
-fn attr_site(name: &str) -> Site {
+/// The same allowlist over a URL the OPERATOR wrote, with no merge tag in it at all.
+///
+/// RULING (fix round 1): spec §5.5 wants one renderer for the email and for the hosted
+/// view-in-browser page. That page is a real browser on our own origin with no email client's
+/// sanitiser in front of it, so a static `javascript:` href an operator put in `mj-raw` is inert
+/// in an inbox and stored XSS on our origin the moment the same HTML is served as a page. The
+/// operator's own markup is therefore checked too, not only the values substituted into it.
+///
+/// A relative URL is left exactly as written: it cannot name a scheme, so there is nothing to
+/// refuse, and M2c's unsubscribe links are written that way.
+fn static_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(u) if ALLOWED_SCHEMES.contains(&u.scheme()) => u.to_string(),
+        Ok(u) => {
+            tracing::warn!(
+                scheme = u.scheme(),
+                "template holds a URL whose scheme is not allowed; link disabled"
+            );
+            DEAD_LINK.to_owned()
+        }
+        Err(_) => raw.to_owned(),
+    }
+}
+
+/// Which part of a URL a tag occupies, decided by the literal characters the operator wrote around
+/// it. The tag itself is opaque: what matters is the structure the literals create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Scheme,
+    Host,
+    Path,
+    Query,
+    Fragment,
+}
+
+impl Part {
+    /// The characters a value may keep in this component. Everything else is percent-encoded,
+    /// which is what stops a value in a query adding `&sig=forged`, or a value in a path climbing
+    /// out with `../`.
+    fn keep(self) -> &'static str {
+        match self {
+            Part::Path => "-._~!$&'()*+,;=:@",
+            Part::Query | Part::Fragment => "-._~!$'()*+,;:@/?",
+            // Refused, never encoded.
+            Part::Scheme | Part::Host => "",
+        }
+    }
+
+    /// A value here decides where the link points, which is the operator handing the destination
+    /// to contact data. No encoding fixes that.
+    fn is_destination(self) -> bool {
+        matches!(self, Part::Scheme | Part::Host)
+    }
+}
+
+/// Walks the operator's URL template and reports which part each marker falls in, plus the scheme
+/// the literal text fixes (`None` for a relative URL).
+fn url_parts(segs: &[Seg<'_>]) -> (Vec<(usize, Part)>, Option<String>) {
+    let mut parts = Vec::new();
+    let mut state = Part::Scheme;
+    let mut scheme = String::new();
+    let mut first = true;
+    for seg in segs {
+        let l = match seg {
+            Seg::Mark(id) => {
+                parts.push((*id, state));
+                first = false;
+                continue;
+            }
+            Seg::Lit(l) => *l,
+        };
+        let b = l.as_bytes();
+        let mut i = 0;
+        // `//host/x` has no scheme and takes an arbitrary host: the host case wearing a hat.
+        if first && state == Part::Scheme && l.starts_with("//") {
+            state = Part::Host;
+            i = 2;
+        }
+        first = false;
+        while i < b.len() {
+            state = match (state, b[i]) {
+                (Part::Scheme, b':') => {
+                    if b[i + 1..].starts_with(b"//") {
+                        i += 2;
+                        Part::Host
+                    } else {
+                        Part::Path
+                    }
+                }
+                (Part::Scheme, b'/') => {
+                    scheme.clear();
+                    Part::Path
+                }
+                (Part::Scheme, b'?') => {
+                    scheme.clear();
+                    Part::Query
+                }
+                (Part::Scheme, b'#') => {
+                    scheme.clear();
+                    Part::Fragment
+                }
+                (Part::Scheme, c) => {
+                    scheme.push(c as char);
+                    Part::Scheme
+                }
+                (Part::Host, b'/') => Part::Path,
+                (Part::Host, b'?') => Part::Query,
+                (Part::Host, b'#') => Part::Fragment,
+                (Part::Path, b'?') => Part::Query,
+                (Part::Path | Part::Query, b'#') => Part::Fragment,
+                (s, _) => s,
+            };
+            i += 1;
+        }
+    }
+    let scheme = (state != Part::Scheme && !scheme.is_empty()).then(|| scheme.to_ascii_lowercase());
+    (parts, scheme)
+}
+
+/// An attribute's site, by element and attribute name.
+fn attr_site(elem: &str, name: &str, http_equiv: bool) -> Site {
     // An event handler's value is JavaScript the browser parses AFTER decoding entities, so
-    // attribute encoding buys exactly nothing there; `srcdoc` is a whole HTML document.
+    // attribute encoding buys exactly nothing there; `srcdoc` is a whole HTML document; and a
+    // `meta refresh` target is a redirect destination written as `0;url=…`, which is a URL with a
+    // prefix glued on rather than a URL attribute.
     if name.len() > 2 && name.starts_with("on") {
+        return Site::Dangerous;
+    }
+    if elem == "meta" && name == "content" && http_equiv {
         return Site::Dangerous;
     }
     match name {
@@ -418,21 +648,26 @@ struct Sink<'v> {
 
 struct St<'v> {
     sites: Vec<Option<Site>>,
-    /// `None` when classifying: there is no contact, so nothing is substituted and `out` is scrap.
-    values: Option<&'v [Option<String>]>,
+    /// `None` when classifying: there is no contact, so nothing is substituted, no branch is
+    /// suppressed — every one of them is classified — and `out` is scrap.
+    fills: Option<&'v [Fill]>,
     out: String,
     raw: Raw,
     /// A marker index past `MAX_TAGS`, which only a forged marker produces. Refused at the end,
     /// like any other position nobody could classify.
     forged: bool,
+    /// How many conditionals are open, and — when a branch is being dropped — the depth it opened
+    /// at together with the output length to rewind to.
+    depth: usize,
+    suppress: Option<(usize, usize)>,
     /// Character tokens arrive in chunks split at `&`, `<` and NUL; a run is buffered so a marker
     /// can never be half in one chunk and half in the next.
     text: String,
 }
 
 impl<'v> St<'v> {
-    fn value(&self, id: usize) -> Option<&'v str> {
-        self.values?.get(id)?.as_deref()
+    fn fill(&self, id: usize) -> Option<&'v Fill> {
+        self.fills?.get(id)
     }
 
     fn record(&mut self, id: usize, site: Site) {
@@ -453,6 +688,46 @@ impl<'v> St<'v> {
         for seg in segments(s) {
             if let Seg::Mark(id) = seg {
                 self.record(id, site);
+            }
+        }
+    }
+
+    /// Writes one marker's replacement. The encoder is chosen by `site`, which came from the
+    /// position — never from the value and never from what was recorded earlier.
+    fn emit(&mut self, id: usize, site: Site) {
+        match self.fill(id) {
+            // Classifying: nothing is substituted.
+            None => {}
+            Some(Fill::Value(v)) => {
+                let Some(v) = v.as_deref() else { return };
+                match site {
+                    Site::Text => escape_text(v, &mut self.out),
+                    Site::Css => escape_css(v, &mut self.out),
+                    Site::Attribute => escape_attr(v, &mut self.out),
+                    // A URL is never emitted through here: `url_attr` owns every one of them,
+                    // because the encoding depends on the component and not only on the site.
+                    Site::Url | Site::Dangerous => {
+                        debug_assert!(
+                            site == Site::Dangerous,
+                            "a Url site must be emitted by url_attr"
+                        );
+                    }
+                }
+            }
+            Some(Fill::Open(taken)) => {
+                self.depth += 1;
+                if !taken && self.suppress.is_none() {
+                    self.suppress = Some((self.depth, self.out.len()));
+                }
+            }
+            Some(Fill::Close) => {
+                if let Some((at, len)) = self.suppress
+                    && at == self.depth
+                {
+                    self.out.truncate(len);
+                    self.suppress = None;
+                }
+                self.depth = self.depth.saturating_sub(1);
             }
         }
     }
@@ -478,14 +753,7 @@ impl<'v> St<'v> {
                 },
                 Seg::Mark(id) => {
                     self.record(id, site);
-                    if let Some(v) = self.value(id) {
-                        match site {
-                            Site::Text => escape_text(v, &mut self.out),
-                            Site::Css => escape_css(v, &mut self.out),
-                            // Dangerous: the document is refused and `out` is discarded.
-                            _ => {}
-                        }
-                    }
+                    self.emit(id, site);
                 }
             }
         }
@@ -493,25 +761,11 @@ impl<'v> St<'v> {
 
     fn attr_value(&mut self, value: &str, site: Site) {
         let segs = segments(value);
-        for seg in &segs {
-            if let Seg::Mark(id) = seg {
-                self.record(*id, site);
-            }
-        }
-        let substituted = segs.iter().any(|s| matches!(s, Seg::Mark(_)));
-        if site == Site::Url && substituted {
-            // The whole attribute is one URL and is checked as one: a value spliced into it decides
-            // the scheme as surely as a value that is the entire attribute, so neither may be
-            // validated on its own.
-            if self.values.is_some() {
-                let mut url = String::new();
-                for seg in &segs {
-                    match seg {
-                        Seg::Lit(l) => url.push_str(l),
-                        Seg::Mark(id) => url.push_str(self.value(*id).unwrap_or_default()),
-                    }
-                }
-                escape_attr(&safe_url(&url), &mut self.out);
+        if site == Site::Url {
+            if segs.iter().any(|s| matches!(s, Seg::Mark(_))) {
+                self.url_attr(&segs);
+            } else {
+                escape_attr(&static_url(value), &mut self.out);
             }
             return;
         }
@@ -519,12 +773,56 @@ impl<'v> St<'v> {
             match seg {
                 Seg::Lit(l) => escape_attr(l, &mut self.out),
                 Seg::Mark(id) => {
-                    if let Some(v) = self.value(*id) {
-                        match site {
-                            Site::Css => escape_css(v, &mut self.out),
-                            Site::Attribute | Site::Url => escape_attr(v, &mut self.out),
-                            Site::Text | Site::Dangerous => {}
+                    self.record(*id, site);
+                    self.emit(*id, site);
+                }
+            }
+        }
+    }
+
+    /// A URL attribute that holds at least one tag.
+    ///
+    /// The whole value being one tag is the ordinary case — a stored link — and gets the scheme
+    /// allowlist. Otherwise the operator built the URL and the tag fills in part of it, so the
+    /// part decides: scheme or host is refused, and path, query and fragment are percent-encoded
+    /// for the component they land in. A value that is only "a valid URL character" is not safe
+    /// here; `&`, `=` and `#` are legal in a URL and are exactly how a value injects a parameter.
+    fn url_attr(&mut self, segs: &[Seg<'_>]) {
+        if let [Seg::Mark(id)] = segs {
+            self.record(*id, Site::Url);
+            if let Some(Fill::Value(v)) = self.fill(*id) {
+                escape_attr(&safe_url(v.as_deref().unwrap_or_default()), &mut self.out);
+            }
+            return;
+        }
+        let (parts, scheme) = url_parts(segs);
+        // A tag cannot make `javascript:{{ x }}` safe by being well-encoded.
+        let bad_scheme = scheme
+            .as_deref()
+            .is_some_and(|s| !ALLOWED_SCHEMES.contains(&s));
+        let site_of = |p: Part| {
+            if bad_scheme || p.is_destination() {
+                Site::Dangerous
+            } else {
+                Site::Url
+            }
+        };
+        let mut next = parts.iter();
+        for seg in segs {
+            match seg {
+                Seg::Lit(l) => escape_attr(l, &mut self.out),
+                Seg::Mark(id) => {
+                    let part = next.next().map(|(_, p)| *p).unwrap_or(Part::Scheme);
+                    self.record(*id, site_of(part));
+                    match self.fill(*id) {
+                        Some(Fill::Value(v)) if !site_of(part).eq(&Site::Dangerous) => {
+                            let mut enc = String::new();
+                            percent_encode(v.as_deref().unwrap_or_default(), part.keep(), &mut enc);
+                            escape_attr(&enc, &mut self.out);
                         }
+                        // Refused, so nothing is written; the document is discarded anyway.
+                        Some(Fill::Value(_)) | None => {}
+                        Some(Fill::Open(_)) | Some(Fill::Close) => self.emit(*id, Site::Text),
                     }
                 }
             }
@@ -541,16 +839,16 @@ impl<'v> St<'v> {
         }
 
         if tag.kind == EndTag {
-            // An end tag's attributes are ignored by the spec, but a marker in one still has to be
-            // accounted for or the fail-closed check would be the only thing catching it.
-            for a in &tag.attrs {
-                self.mark_all(&a.value, Site::Dangerous);
-            }
+            // An end tag's attribute VALUES are not swept here on purpose: the spec drops them, no
+            // token reports them, and the fail-closed check in `scan` refuses the template for
+            // exactly that reason. A sweep here would be a second line doing the same work, and
+            // removing it would leave the suite green — which is how dead safety nets are born.
             self.raw = Raw::Data;
             let _ = write!(self.out, "</{name}>");
             return TokenSinkResult::Continue;
         }
 
+        let http_equiv = tag.attrs.iter().any(|a| &*a.name.local == "http-equiv");
         self.out.push('<');
         self.out.push_str(name);
         for a in &tag.attrs {
@@ -560,7 +858,7 @@ impl<'v> St<'v> {
             // Every attribute is re-serialised with double quotes, whatever the source wrote, so
             // the encoder never has to guess which character ends this value.
             self.out.push_str("=\"");
-            self.attr_value(&a.value, attr_site(n));
+            self.attr_value(&a.value, attr_site(name, n, http_equiv));
             self.out.push('"');
         }
         if tag.self_closing {
@@ -633,15 +931,27 @@ impl TokenSink for Sink<'_> {
     }
 }
 
-/// Classify every marker in `html`, and — when `values` is given — re-serialise the document with
-/// each marker replaced by its encoded value.
-fn scan(html: &str, values: Option<&[Option<String>]>) -> Result<(Vec<Site>, String), RenderError> {
-    let mut sites: Vec<Option<Site>> = Vec::new();
+/// Classify every marker in `html`, and — when `fills` is given — re-serialise the document with
+/// each marker replaced.
+///
+/// `tags` is how many markers the template emitted. Pre-sizing the table with it is what turns
+/// "`mrml` dropped this tag" from a silent `Ok(vec![])` into a refusal.
+fn scan(
+    html: &str,
+    tags: usize,
+    fills: Option<&[Fill]>,
+) -> Result<(Vec<Site>, String), RenderError> {
+    if tags > MAX_TAGS {
+        return Err(RenderError::DangerousContext { position: 0 });
+    }
+    let mut sites: Vec<Option<Site>> = vec![None; tags];
     let bytes = html.as_bytes();
     for (i, _) in html.match_indices(MARK_START) {
         let Some((id, _)) = id_in(&html[i + MARK_START.len()..]) else {
             continue;
         };
+        // Bounded BEFORE the resize below: a raw `~nmmt~4294967295~tmmn~` would otherwise ask for
+        // four billion entries before anything checked it.
         if id >= MAX_TAGS {
             return Err(RenderError::DangerousContext { position: i });
         }
@@ -660,10 +970,12 @@ fn scan(html: &str, values: Option<&[Option<String>]>) -> Result<(Vec<Site>, Str
         Sink {
             st: RefCell::new(St {
                 sites,
-                values,
+                fills,
                 out: String::new(),
                 raw: Raw::Data,
                 forged: false,
+                depth: 0,
+                suppress: None,
                 text: String::new(),
             }),
         },
@@ -676,18 +988,24 @@ fn scan(html: &str, values: Option<&[Option<String>]>) -> Result<(Vec<Site>, Str
 
     let mut st = tok.sink.st.borrow_mut();
     st.flush_text();
-    // Fail closed. A marker the tokenizer never handed back is a position nobody classified, and
-    // an unclassified position is the one case where "it is probably fine" is how this ships a
-    // vulnerability.
-    let sites: Vec<Site> = st
-        .sites
-        .iter()
-        .map(|s| s.unwrap_or(Site::Dangerous))
-        .collect();
-    if let Some(id) = sites.iter().position(|s| *s == Site::Dangerous) {
-        return Err(RenderError::DangerousContext {
-            position: position_of(html, id),
-        });
+    // Fail closed, twice over. A marker the tokenizer never handed back is a position nobody
+    // classified; a marker that is not in the document at all is a merge tag `mrml` threw away,
+    // and saving that publishes a message with the tag silently missing.
+    let mut sites: Vec<Site> = Vec::with_capacity(st.sites.len());
+    for (id, site) in st.sites.iter().enumerate() {
+        match site {
+            Some(Site::Dangerous) | None
+                if !html.contains(&format!("{MARK_START}{id}{MARK_END}")) =>
+            {
+                return Err(RenderError::TagLost { index: id });
+            }
+            Some(Site::Dangerous) | None => {
+                return Err(RenderError::DangerousContext {
+                    position: position_of(html, id),
+                });
+            }
+            Some(s) => sites.push(*s),
+        }
     }
     if st.forged {
         return Err(RenderError::DangerousContext { position: 0 });
@@ -702,6 +1020,19 @@ mod tests {
     use super::*;
     use crate::custom_fields::{Definition, FieldKind};
     use crate::template::tag::{Registry, compile};
+
+    /// `mrml` is run with the default options, which build the CSS inliner with
+    /// `load_remote_stylesheets(false)` — see `deny.toml`. Note for whoever ever turns inlining
+    /// ON: a `<style>` block becomes a `style` attribute, so a tag classified `Css` in the head
+    /// moves into an attribute. Both are `Css` here, so the encoder is the same either way, but
+    /// the classification has to be re-run on the inlined output, not on the pre-inline HTML.
+    fn render_mjml(mjml: &str) -> String {
+        mrml::parse(mjml)
+            .expect("mjml parses")
+            .element
+            .render(&mrml::prelude::render::RenderOptions::default())
+            .expect("mjml renders")
+    }
 
     fn def(key: &str) -> Definition {
         Definition {
@@ -721,22 +1052,32 @@ mod tests {
 
     /// What the compile step does: mark the tags, (optionally render through `mrml`), classify.
     fn sites(src: &str) -> Result<Vec<Site>, RenderError> {
-        classify(&marked(&nodes(src)))
+        let (html, tags) = marked(&nodes(src));
+        classify(&html, tags)
     }
 
-    fn render(src: &str, first_name: &str, attrs: Value) -> Result<String, RenderError> {
-        let c = Contact {
+    fn contact<'a>(first_name: &'a str, attrs: &'a Value) -> Contact<'a> {
+        Contact {
             email: "ada@example.com",
             first_name,
             last_name: "Lovelace",
             timezone: None,
-            attributes: &attrs,
-        };
-        render_html(&nodes(src), &c)
+            attributes: attrs,
+        }
+    }
+
+    fn render(src: &str, first_name: &str, attrs: Value) -> Result<String, RenderError> {
+        render_html(&nodes(src), &contact(first_name, &attrs))
     }
 
     fn ok(src: &str, first_name: &str, attrs: Value) -> String {
         render(src, first_name, attrs).expect("the template must render")
+    }
+
+    /// `href="…"` with the given value, rendered.
+    fn href(template: &str, link: &str) -> String {
+        let src = format!("<a href=\"{template}\">x</a>");
+        ok(&src, "Ada", json!({ "link": link }))
     }
 
     #[test]
@@ -788,13 +1129,8 @@ mod tests {
             sites("<a href=\"{{ link }}\">x</a>").unwrap(),
             vec![Site::Url]
         );
-        let out = ok(
-            "<a href=\"{{ link }}\">x</a>",
-            "Ada",
-            json!({ "link": "https://example.com/a b\"c<d?q=1 2" }),
-        );
         assert_eq!(
-            out,
+            href("{{ link }}", "https://example.com/a b\"c<d?q=1 2"),
             "<a href=\"https://example.com/a%20b%22c%3Cd?q=1%202\">x</a>"
         );
     }
@@ -846,9 +1182,6 @@ mod tests {
             "<a {{ first_name }}=\"x\">y</a>",
             "<a href=\"x\" {{ first_name }}>y</a>",
             "<a href=\"x\" on{{ first_name }}=\"1\">y</a>",
-            // An end tag's attributes are dropped by the spec, so the value would silently vanish
-            // — but nothing may be left unclassified.
-            "<a href=\"x\">y</a {{ first_name }}=\"z\">",
             // An event handler's value is JavaScript, decoded before it is parsed.
             "<a href=\"x\" onclick=\"f('{{ first_name }}')\">y</a>",
         ] {
@@ -858,6 +1191,64 @@ mod tests {
                 sites(src)
             );
         }
+    }
+
+    /// An end tag's attributes are dropped by the spec, so a value there would silently vanish.
+    /// The name case is caught by the shared name path; the VALUE case has its own line.
+    #[test]
+    fn a_tag_in_an_end_tag_attribute_fails_to_compile() {
+        for src in [
+            "<a href=\"x\">y</a {{ first_name }}=\"z\">",
+            "<a href=\"x\">y</a alt=\"{{ first_name }}\">",
+        ] {
+            assert!(
+                matches!(sites(src), Err(RenderError::DangerousContext { .. })),
+                "{src}: {:?}",
+                sites(src)
+            );
+        }
+    }
+
+    #[test]
+    fn a_tag_in_srcdoc_fails_to_compile() {
+        assert!(matches!(
+            sites("<iframe srcdoc=\"<p>{{ first_name }}</p>\"></iframe>"),
+            Err(RenderError::DangerousContext { .. })
+        ));
+        // The same value in an ordinary attribute of the same element is not a refusal.
+        assert_eq!(
+            sites("<iframe title=\"{{ first_name }}\"></iframe>").unwrap(),
+            vec![Site::Attribute]
+        );
+    }
+
+    /// The fail-closed net. A duplicate attribute is dropped by the tokenizer, so the marker in it
+    /// is never handed to any handler — this line is the only thing that catches it.
+    #[test]
+    fn a_marker_no_token_accounted_for_is_refused() {
+        assert!(matches!(
+            sites("<a alt=\"y\" alt=\"{{ first_name }}\">x</a>"),
+            Err(RenderError::DangerousContext { .. })
+        ));
+    }
+
+    /// `mrml` dropping a tag is not the same as a template that never had one. Without the count,
+    /// this saves clean and the merge tag is gone from every recipient's mail, silently, forever.
+    #[test]
+    fn a_tag_mrml_dropped_is_refused_rather_than_read_as_no_tags() {
+        let src = "<mjml><mj-body><mj-section><mj-column>\
+                   <mj-text notanattr=\"{{ colour }}\">hi</mj-text>\
+                   </mj-column></mj-section></mj-body></mjml>";
+        let (mjml, tags) = marked(&nodes(src));
+        assert_eq!(tags, 1);
+        let html = render_mjml(&mjml);
+        assert!(!html.contains(MARK_START), "mrml must have dropped it");
+        assert_eq!(
+            classify(&html, tags),
+            Err(RenderError::TagLost { index: 0 })
+        );
+        // And the count is what does it: told to expect none, the same HTML is clean.
+        assert_eq!(classify(&html, 0).unwrap(), Vec::<Site>::new());
     }
 
     #[test]
@@ -872,13 +1263,10 @@ mod tests {
             "\u{0}\u{9}JaVa\nScRiPt\t:alert(1)",
             "data:text/html;base64,PHNjcmlwdD4=",
             "vbscript:msgbox(1)",
+            // Userinfo: an allowed scheme, and the operator's domain in the part a reader trusts.
+            "https://app.example.com@evil.example/",
         ] {
-            let out = ok(
-                "<a href=\"{{ link }}\">x</a>",
-                "Ada",
-                json!({ "link": raw }),
-            );
-            assert_eq!(out, "<a href=\"#\">x</a>", "{raw:?}");
+            assert_eq!(href("{{ link }}", raw), "<a href=\"#\">x</a>", "{raw:?}");
         }
         // The allowlist is not a wall: the four schemes that are on it still work.
         for raw in [
@@ -887,23 +1275,170 @@ mod tests {
             "mailto:ada@example.com",
             "tel:+15551234567",
         ] {
-            let out = ok(
-                "<a href=\"{{ link }}\">x</a>",
-                "Ada",
-                json!({ "link": raw }),
-            );
-            assert!(out.contains(raw), "{raw}: {out}");
+            assert!(href("{{ link }}", raw).contains(raw), "{raw}");
         }
-        // A value spliced into the MIDDLE of a URL is checked as part of the whole URL too.
-        let out = ok(
-            "<a href=\"https://example.com/{{ link }}\">x</a>",
-            "Ada",
-            json!({ "link": "a\"><script>alert(1)</script>" }),
+    }
+
+    /// RULING (fix round 1, F6). A value that decides where a link points is the operator handing
+    /// the destination to contact data, and no encoding makes that safe.
+    #[test]
+    fn a_tag_in_a_url_scheme_or_host_fails_to_compile() {
+        for src in [
+            "<a href=\"https://{{ link }}.example.com/\">x</a>",
+            "<a href=\"{{ link }}://example.com/\">x</a>",
+            "<a href=\"ht{{ link }}ps://example.com/\">x</a>",
+            // Protocol-relative is the host case wearing a hat: it inherits the scheme and takes
+            // an arbitrary host.
+            "<a href=\"//{{ link }}/x\">x</a>",
+            // And a scheme the operator wrote that is not on the allowlist taints the whole
+            // attribute, however well the value is encoded.
+            "<a href=\"javascript:{{ link }}\">x</a>",
+        ] {
+            assert!(
+                matches!(sites(src), Err(RenderError::DangerousContext { .. })),
+                "{src}: {:?}",
+                sites(src)
+            );
+        }
+    }
+
+    /// RULING (fix round 1, F6). Path, query and fragment are percent-encoded for the component
+    /// the tag lands in, which keeps the per-recipient links M2c and M2d need working.
+    #[test]
+    fn a_tag_in_a_url_path_or_query_is_component_encoded() {
+        // A path tag cannot climb out of its segment.
+        assert_eq!(
+            href("https://app.example.com/u/{{ link }}", "../../admin"),
+            "<a href=\"https://app.example.com/u/..%2F..%2Fadmin\">x</a>"
+        );
+        // A query tag cannot add a parameter of its own.
+        assert_eq!(
+            href(
+                "https://app.example.com/?u={{ link }}&sig=abc",
+                "1&sig=forged"
+            ),
+            "<a href=\"https://app.example.com/?u=1%26sig%3Dforged&amp;sig=abc\">x</a>"
+        );
+        // Nor move the operator's parameters into the fragment, where they are never sent.
+        assert_eq!(
+            href("https://app.example.com/?u={{ link }}&sig=abc", "1#"),
+            "<a href=\"https://app.example.com/?u=1%23&amp;sig=abc\">x</a>"
+        );
+        // A fragment tag stays in the fragment.
+        assert_eq!(
+            href("https://app.example.com/#{{ link }}", "a#b"),
+            "<a href=\"https://app.example.com/#a%23b\">x</a>"
+        );
+        // `mailto:` has no authority, so the tag is in the path.
+        assert_eq!(
+            href("mailto:{{ link }}", "ada@example.com"),
+            "<a href=\"mailto:ada@example.com\">x</a>"
         );
         assert_eq!(
-            out,
-            "<a href=\"https://example.com/a%22%3E%3Cscript%3Ealert(1)%3C/script%3E\">x</a>"
+            sites("<a href=\"https://app.example.com/u/{{ link }}\">x</a>").unwrap(),
+            vec![Site::Url]
         );
+    }
+
+    /// RULING (fix round 1, F8). M2c and M2d write per-recipient unsubscribe and tracking links,
+    /// and they are relative. Before this they rendered a dead `#` with only a log line.
+    #[test]
+    fn a_relative_url_works_and_a_protocol_relative_one_does_not() {
+        assert_eq!(
+            href("/u/{{ link }}", "tok-123"),
+            "<a href=\"/u/tok-123\">x</a>"
+        );
+        assert_eq!(
+            href("?token={{ link }}", "a&b=c"),
+            "<a href=\"?token=a%26b%3Dc\">x</a>"
+        );
+        assert!(matches!(
+            sites("<a href=\"//{{ link }}/x\">x</a>"),
+            Err(RenderError::DangerousContext { .. })
+        ));
+    }
+
+    /// `xlink:href` is live on the hosted view-in-browser page, and a `meta refresh` target is a
+    /// redirect destination with a `0;url=` prefix glued on.
+    #[test]
+    fn xlink_href_is_a_url_and_meta_refresh_is_refused() {
+        assert_eq!(
+            sites("<svg><a xlink:href=\"{{ link }}\">x</a></svg>").unwrap(),
+            vec![Site::Url]
+        );
+        assert_eq!(
+            ok(
+                "<svg><a xlink:href=\"{{ link }}\">x</a></svg>",
+                "Ada",
+                json!({ "link": "javascript:alert(1)" })
+            ),
+            "<svg><a xlink:href=\"#\">x</a></svg>"
+        );
+        assert!(matches!(
+            sites("<meta http-equiv=\"refresh\" content=\"0;url={{ link }}\">"),
+            Err(RenderError::DangerousContext { .. })
+        ));
+        // A `content` attribute with no `http-equiv` beside it is an ordinary attribute.
+        assert_eq!(
+            sites("<meta name=\"description\" content=\"{{ first_name }}\">").unwrap(),
+            vec![Site::Attribute]
+        );
+    }
+
+    /// The encoder standing between a contact value and a CSS context, in both of the places a
+    /// CSS context exists.
+    #[test]
+    fn a_css_position_is_css_escaped() {
+        let injection = "red;background:url(https://evil.example/p.png)";
+        // In a `style` attribute.
+        assert_eq!(
+            ok(
+                "<p style=\"color:{{ colour }}\">x</p>",
+                "Ada",
+                json!({ "colour": injection })
+            ),
+            "<p style=\"color:red\\3b background\\3a url\\28 https\\3a \\2f \\2f evil.example\\2f p.png\\29 \">x</p>"
+        );
+        // And in a `<style>` element, where entities are never decoded and only this escaping is
+        // between the value and the stylesheet.
+        assert_eq!(
+            ok(
+                "<style>.a{color:{{ colour }}}</style>",
+                "Ada",
+                json!({ "colour": injection })
+            ),
+            "<style>.a{color:red\\3b background\\3a url\\28 https\\3a \\2f \\2f evil.example\\2f p.png\\29 }</style>"
+        );
+        // An ordinary colour is left alone, which is the point of the narrow literal set.
+        assert_eq!(
+            ok(
+                "<p style=\"color:{{ colour }}\">x</p>",
+                "Ada",
+                json!({ "colour": "#ff0000" })
+            ),
+            "<p style=\"color:#ff0000\">x</p>"
+        );
+    }
+
+    /// The defect this fix round opened with: `classify` said `Css`, the renderer encoded for the
+    /// MJML source's `Attribute`, and a contact field injected CSS declarations into sent mail.
+    #[test]
+    fn the_renderer_encodes_for_the_document_that_was_classified() {
+        let src = "<mjml><mj-body><mj-section><mj-column>\
+                   <mj-text color=\"{{ colour }}\">hi</mj-text>\
+                   </mj-column></mj-section></mj-body></mjml>";
+        let ast = nodes(src);
+        let (mjml, tags) = marked(&ast);
+        let html = render_mjml(&mjml);
+        assert_eq!(classify(&html, tags).unwrap(), vec![Site::Css]);
+
+        let attrs = json!({ "colour": "red;background:url(https://evil.example/p.png)" });
+        let out = substitute(&html, &ast, &contact("Ada", &attrs)).unwrap();
+        assert!(
+            !out.contains("background:url("),
+            "a contact value injected a CSS declaration: {out}"
+        );
+        assert!(out.contains("color:red\\3b "), "{out}");
     }
 
     #[test]
@@ -915,6 +1450,11 @@ mod tests {
             "<a href=\"#\">&lt;b&gt;</a>"
         );
         assert_eq!(ok(src, "<b>", json!({})), "<p>&lt;b&gt;</p>");
+        // Nested, and the inner branch of a dropped outer one is dropped with it.
+        let nested = "{{# link }}A{{# bio }}B{{/ bio }}C{{/ link }}D";
+        assert_eq!(ok(nested, "x", json!({ "link": "y", "bio": "z" })), "ABCD");
+        assert_eq!(ok(nested, "x", json!({ "link": "y" })), "ACD");
+        assert_eq!(ok(nested, "x", json!({ "bio": "z" })), "D");
         // A branch that would put a tag somewhere dangerous is refused at COMPILE, even though no
         // contact has chosen that branch yet.
         assert!(matches!(
@@ -928,57 +1468,29 @@ mod tests {
         let src = "<mjml><mj-body><mj-section><mj-column>\
                    <mj-text color=\"{{ colour }}\">hi</mj-text>\
                    </mj-column></mj-section></mj-body></mjml>";
-        let mjml = marked(&nodes(src));
+        let (mjml, tags) = marked(&nodes(src));
         // In the MJML source the tag sits in an ordinary attribute of a custom element.
-        assert_eq!(classify(&mjml).unwrap(), vec![Site::Attribute]);
+        assert_eq!(classify(&mjml, tags).unwrap(), vec![Site::Attribute]);
         // `mrml` moves it into a `style` attribute on a real `div`, which is a CSS position — so
         // classifying the source would have encoded it for the wrong context entirely.
-        let html = mrml::parse(&mjml)
-            .expect("mjml parses")
-            .element
-            .render(&mrml::prelude::render::RenderOptions::default())
-            .expect("mjml renders");
+        let html = render_mjml(&mjml);
         assert!(html.contains(MARK_START), "the marker must survive mrml");
-        assert_eq!(classify(&html).unwrap(), vec![Site::Css]);
+        assert_eq!(classify(&html, tags).unwrap(), vec![Site::Css]);
     }
 
     /// The whole compile path on a real document: `mrml` wraps body content in `<!--[if mso]>`
     /// blocks and in a `<style>` head, so a tag in ordinary text has to come back `Text` and not
-    /// get caught by the comment or raw-text rules.
+    /// get caught by the comment or raw-text rules. `mrml` also DUPLICATES the button href into
+    /// the Outlook fallback, which is why the invariant is "present at least once".
     #[test]
     fn an_ordinary_merge_tag_survives_a_real_mrml_document() {
         let src = "<mjml><mj-body><mj-section><mj-column>\
                    <mj-text>Hi {{ first_name }}</mj-text>\
                    <mj-button href=\"{{ link }}\">Go</mj-button>\
                    </mj-column></mj-section></mj-body></mjml>";
-        let html = mrml::parse(marked(&nodes(src)))
-            .expect("mjml parses")
-            .element
-            .render(&mrml::prelude::render::RenderOptions::default())
-            .expect("mjml renders");
-        for l in html
-            .lines()
-            .filter(|l| l.contains("href") || l.contains(MARK_START))
-        {
-            println!("LINE {l}");
-        }
-        assert_eq!(classify(&html).unwrap(), vec![Site::Text, Site::Url]);
-    }
-
-    /// A marker index is a number in HTML that came from operator input. Written as a character
-    /// reference it slips past the raw prescan, so the classifier has to bound it rather than
-    /// resize a vector to fit.
-
-    #[test]
-    fn a_forged_marker_index_is_refused_not_allocated_for() {
-        // `~` written as `&#126;`: the raw prescan sees character references, the tokenizer sees
-        // a marker with an index that would size a vector.
-        let huge =
-            format!("<p>&#126;nmmt&#126;4294967295&#126;tmmn&#126;{MARK_START}0{MARK_END}</p>");
-        assert!(matches!(
-            classify(&huge),
-            Err(RenderError::DangerousContext { .. })
-        ));
+        let (mjml, tags) = marked(&nodes(src));
+        let html = render_mjml(&mjml);
+        assert_eq!(classify(&html, tags).unwrap(), vec![Site::Text, Site::Url]);
     }
 
     #[test]
@@ -989,13 +1501,8 @@ mod tests {
             ok("<p>{{ first_name }}</p>", name, json!({})),
             format!("<p>{name}</p>")
         );
-        let out = ok(
-            "<a href=\"{{ link }}\">x</a>",
-            "Ada",
-            json!({ "link": "https://exämple.com/ü?q=é" }),
-        );
         assert_eq!(
-            out,
+            href("{{ link }}", "https://exämple.com/ü?q=é"),
             "<a href=\"https://xn--exmple-cua.com/%C3%BC?q=%C3%A9\">x</a>"
         );
     }
@@ -1021,6 +1528,65 @@ mod tests {
             ok(src, &forged, json!({})),
             format!("Hi {forged}, we have ada@example.com on file.")
         );
+    }
+
+    /// A `MARK_START` that is not a marker is literal text an operator wrote. Dropping it deletes
+    /// six characters from the sent mail with nothing said.
+    #[test]
+    fn an_unmatched_marker_start_stays_literal_text() {
+        let src = format!("<p>a{MARK_START}b {{{{ first_name }}}}</p>");
+        assert_eq!(
+            ok(&src, "Ada", json!({})),
+            format!("<p>a{MARK_START}b Ada</p>")
+        );
+    }
+
+    /// A marker index is a number in HTML that came from operator input, so it has to be bounded
+    /// before it sizes anything — on the raw path AND on the entity-encoded one, which reach the
+    /// bound by different routes.
+    #[test]
+    fn a_forged_marker_index_is_refused_not_allocated_for() {
+        assert_eq!(MAX_TAGS, 10_000);
+        // Raw: caught by the prescan, before the resize it guards.
+        let raw = format!("<p>{MARK_START}4294967295{MARK_END}{MARK_START}0{MARK_END}</p>");
+        assert!(matches!(
+            classify(&raw, 1),
+            Err(RenderError::DangerousContext { .. })
+        ));
+        // `~` written as `&#126;`: the raw prescan sees character references, the tokenizer sees a
+        // marker with an index that would size a vector.
+        let encoded =
+            format!("<p>&#126;nmmt&#126;4294967295&#126;tmmn&#126;{MARK_START}0{MARK_END}</p>");
+        assert!(matches!(
+            classify(&encoded, 1),
+            Err(RenderError::DangerousContext { .. })
+        ));
+    }
+
+    /// RULING (fix round 1). The same renderer serves the hosted view-in-browser page, where a
+    /// `javascript:` href is stored XSS on our own origin and no inbox sanitiser stands in the
+    /// way — so the operator's own markup goes through the allowlist too, merge tag or not.
+    #[test]
+    fn a_static_url_the_operator_wrote_goes_through_the_allowlist_too() {
+        let plain = |src: &str| ok(src, "Ada", json!({}));
+        for raw in [
+            "javascript:alert(1)",
+            "java\tscript:alert(1)",
+            "data:text/html;base64,PHNjcmlwdD4=",
+            "vbscript:msgbox(1)",
+        ] {
+            assert_eq!(
+                plain(&format!("<a href=\"{raw}\">x</a>")),
+                "<a href=\"#\">x</a>",
+                "{raw:?}"
+            );
+        }
+        // A relative URL cannot name a scheme, so it is left exactly as written. M2c and M2d
+        // write unsubscribe and tracking links this way.
+        for raw in ["/u/abc", "#", "?t=1", "https://example.com/"] {
+            let src = format!("<a href=\"{raw}\">x</a>");
+            assert_eq!(plain(&src), src, "{raw:?}");
+        }
     }
 
     #[test]
