@@ -20,15 +20,11 @@
 //!
 //! What `to_mjml` guarantees to the compile step:
 //!
-//! * **A tag comes from `Run::Tag` and nowhere else.** Every other string (text runs, link text
-//!   and href, image src and alt, button label and href, the footer) is escaped with `{` turned
-//!   into `&#123;`, so `{{ first_name }}` typed into any of them reaches the recipient as that
-//!   text. The editor makes a tag an atomic token with its own UI; a second, invisible way to
-//!   write one would bypass everything that UI guarantees, and help copy that MENTIONS a merge tag
-//!   would silently substitute. A Tag run's `source` is split on the compiler's own rule (a `{{`,
-//!   then the first `}}`): the tag goes through untouched and whatever else is in the string is
-//!   escaped text. A raw `mjml` template is the opposite case, by design: there is no `Run::Tag`,
-//!   the operator wrote the source, so [`compile_mjml`] scans all of it.
+//! * **A tag may appear in a `Run::Tag` or in a URL field; everywhere else `{` is escaped.** Typed
+//!   `{{ first_name }}` in a text run, link text, button label, image alt or the footer reaches the
+//!   recipient as that text. The URL fields (`Link.href`, `Button.href`, `Image.src`) parse tags,
+//!   because they have no atomic-token path; see [`emit`] for the reasoning. A raw `mjml` template
+//!   has no `Run::Tag`, the operator wrote the source, so [`compile_mjml`] scans all of it.
 //! * **It is deterministic.** Same blocks and brand kit, same bytes. Nothing here iterates a map
 //!   or reads a clock; a re-save that reclassified a different document would leave every stored
 //!   classification stale with nothing to notice.
@@ -201,12 +197,25 @@ enum Ctx {
     Attr,
 }
 
-/// Write a Tag run's `source` into the template source: the tag verbatim, anything else in the
-/// string escaped as text. The only place a tag is let through.
+/// Write `s` into the template source with merge tags let through: a tag verbatim, anything else
+/// in the string escaped for `ctx`.
 ///
-/// The text-escaping rule is [`literal`]; this exists so a tag run is a tag and an editor bug or a
-/// forged request that puts markup in `source` still cannot produce any.
-fn emit(s: &str, out: &mut String) {
+/// THE SPLIT, in one place. In a block template a tag may appear in a `Run::Tag`, or in a URL field
+/// (`Link.href`, `Button.href`, `Image.src`, via [`url_attr`]). Everywhere else `{` is escaped by
+/// [`literal`], so `{{ first_name }}` typed there reaches the recipient as that text.
+///
+/// Why those two and no others: in a text run the editor already offers an atomic `Run::Tag`, so
+/// parsing the text too would be a second, invisible way to make a tag that bypasses the first's
+/// guarantees, and help copy that MENTIONS a tag would silently substitute. A URL field has no such
+/// token (the editor shows a plain input) so parsing is the only path and bypasses nothing, and
+/// per-recipient links (unsubscribe, tracking, personalised CTAs) are the ordinary case. R3
+/// already encodes a tag in a URL for the component it lands in and refuses one in the scheme or
+/// host. A label, alt text or footer has no tag path; if one is ever wanted that is a contract
+/// change, not a parse rule.
+///
+/// A Run::Tag's `source` goes through here too, so an editor bug or forged request that puts markup
+/// next to the tag in `source` still produces none: whatever is not the tag is escaped text.
+fn emit(s: &str, ctx: Ctx, out: &mut String) {
     let mut rest = s;
     // The compiler's rule, byte for byte: a `{{`, then the first `}}` after it.
     while let Some(start) = rest.find("{{") {
@@ -214,11 +223,11 @@ fn emit(s: &str, out: &mut String) {
             break;
         };
         let end = start + 2 + len + 2;
-        literal(&rest[..start], Ctx::Text, out);
+        literal(&rest[..start], ctx, out);
         out.push_str(&rest[start..end]);
         rest = &rest[end..];
     }
-    literal(rest, Ctx::Text, out);
+    literal(rest, ctx, out);
 }
 
 /// Escape FIRST, then turn a newline into `<br>`. Each character is handled once, so the `<br>`
@@ -243,9 +252,17 @@ fn literal(s: &str, ctx: Ctx, out: &mut String) {
     }
 }
 
+/// An attribute whose value is plain text: `{` is escaped.
 fn attr(name: &str, value: &str, out: &mut String) {
     let _ = write!(out, " {name}=\"");
     literal(value, Ctx::Attr, out);
+    out.push('"');
+}
+
+/// An attribute whose value is a URL: tags are live (see [`emit`]).
+fn url_attr(name: &str, value: &str, out: &mut String) {
+    let _ = write!(out, " {name}=\"");
+    emit(value, Ctx::Attr, out);
     out.push('"');
 }
 
@@ -272,12 +289,12 @@ fn runs(rs: &[Run], accent: &str, out: &mut String) {
             Run::Text { text, marks } => marked(marks, out, |o| literal(text, Ctx::Text, o)),
             Run::Link { href, text, marks } => {
                 out.push_str("<a");
-                attr("href", href, out);
+                url_attr("href", href, out);
                 let _ = write!(out, " style=\"color:{accent}\">");
                 marked(marks, out, |o| literal(text, Ctx::Text, o));
                 out.push_str("</a>");
             }
-            Run::Tag { source } => emit(source, out),
+            Run::Tag { source } => emit(source, Ctx::Text, out),
         }
     }
 }
@@ -299,13 +316,13 @@ fn leaf(b: &Block, accent: &str, out: &mut String) {
         }
         Block::Image { src, alt } => {
             out.push_str("<mj-image");
-            attr("src", src, out);
+            url_attr("src", src, out);
             attr("alt", alt, out);
             out.push_str(" />");
         }
         Block::Button { label, href } => {
             out.push_str("<mj-button");
-            attr("href", href, out);
+            url_attr("href", href, out);
             out.push('>');
             literal(label, Ctx::Text, out);
             out.push_str("</mj-button>");
@@ -424,7 +441,8 @@ pub enum CompileError {
 
 /// Save a `blocks` template: the whole pipeline in one call, so its order is not something a
 /// caller can get wrong. In a block template a merge tag comes from a `Run::Tag` and from nowhere
-/// else: `{{ x }}` typed into a text run, a link, a button or the footer is ordinary text.
+/// else but a URL field (`Link.href`, `Button.href`, `Image.src`): `{{ x }}` typed into a text run,
+/// a label, alt text or the footer is ordinary text.
 pub fn compile_blocks(
     blocks: &[Block],
     brand: &BrandKit,
@@ -899,7 +917,7 @@ mod tests {
                     "Use {{ first_name }} in your subject, or {{# first_name }}x{{/ first_name }}.",
                 ),
                 Run::Link {
-                    href: "https://a.example/?u={{ first_name }}".into(),
+                    href: "https://a.example/".into(),
                     text: "link {{ first_name }}".into(),
                     marks: vec![],
                 },
@@ -923,9 +941,92 @@ mod tests {
     }
 
     #[test]
+    fn a_tag_in_a_url_field_is_live_and_encoded_for_its_component() {
+        // Link.href, Button.href and Image.src are the one place besides Run::Tag that parses
+        // tags: the editor shows a URL input there, so there is no atomic token to bypass.
+        let blocks = [
+            Block::Text {
+                runs: vec![Run::Link {
+                    href: "https://app.example.com/u/{{ first_name }}?e={{ email }}".into(),
+                    text: "go".into(),
+                    marks: vec![],
+                }],
+            },
+            Block::Button {
+                label: "b".into(),
+                href: "https://app.example.com/b?e={{ email }}&n={{ first_name }}".into(),
+            },
+            Block::Image {
+                src: "https://img.example.com/{{ first_name }}.png".into(),
+                alt: "a".into(),
+            },
+        ];
+        let saved = save(&blocks, &BrandKit::default()).unwrap();
+        let out = send(&saved, "a&b/c d");
+        // email is a@b.example (see `send`): `@` is legal in a query.
+        assert!(
+            out.contains("app.example.com/u/a&amp;b%2Fc%20d?e=a@b.example"),
+            "{out}"
+        );
+        assert!(
+            out.contains("app.example.com/b?e=a@b.example&amp;n=a%26b/c%20d"),
+            "{out}"
+        );
+        assert!(out.contains("img.example.com/a&amp;b%2Fc%20d.png"), "{out}");
+    }
+
+    #[test]
+    fn a_tag_in_the_scheme_or_host_of_a_url_field_is_still_refused() {
+        let reg = Registry::from_definitions(&[]);
+        for href in [
+            "https://{{ first_name }}.example.com/",
+            "https://app.example.com@{{ first_name }}/",
+            "{{ first_name }}://app.example.com/",
+        ] {
+            let b = [Block::Button {
+                label: "b".into(),
+                href: href.into(),
+            }];
+            assert!(
+                matches!(
+                    compile_blocks(&b, &BrandKit::default(), &reg),
+                    Err(CompileError::Render(RenderError::DangerousContext { .. }))
+                ),
+                "{href}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_button_label_alt_and_footer_stay_literal_beside_a_live_href() {
+        let t = "{{ first_name }}";
+        let blocks = [
+            Block::Button {
+                label: format!("Hi {t}"),
+                href: "https://a.example/?e={{ email }}".into(),
+            },
+            Block::Image {
+                src: "https://a.example/a.png".into(),
+                alt: format!("alt {t}"),
+            },
+        ];
+        let brand = BrandKit {
+            footer_text: Some(format!("foot {t}")),
+            ..BrandKit::default()
+        };
+        let saved = save(&blocks, &brand).unwrap();
+        let out = send(&saved, "Ann");
+        assert!(out.contains("Hi {{ first_name }}"), "{out}");
+        assert!(out.contains("alt {{ first_name }}"), "{out}");
+        assert!(out.contains("foot {{ first_name }}"), "{out}");
+        assert!(out.contains("?e=a@b.example"), "{out}");
+        assert!(!out.contains("Ann"), "{out}");
+    }
+
+    #[test]
     fn every_non_tag_field_holds_tag_syntax_as_text() {
-        // Image src/alt, button label/href, heading runs, column children, footer: none of them
-        // compiles to anything but one literal node.
+        // Everything but a Run::Tag and the three URL fields: none of it compiles to anything but
+        // one literal node.
         let t = "{{ first_name }}";
         let blocks = [
             Block::Heading {
@@ -933,12 +1034,12 @@ mod tests {
                 runs: vec![text(t)],
             },
             Block::Image {
-                src: format!("https://a.example/{t}.png"),
+                src: "https://a.example/a.png".into(),
                 alt: t.into(),
             },
             Block::Button {
                 label: t.into(),
-                href: format!("https://a.example/?q={t}"),
+                href: "https://a.example/".into(),
             },
             Block::Columns {
                 children: vec![vec![para(t)]],
