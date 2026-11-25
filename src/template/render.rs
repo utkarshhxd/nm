@@ -1235,6 +1235,232 @@ fn scan(
     Ok((sites, std::mem::take(&mut st.out)))
 }
 
+// ---------------------------------------------------------------------------------------------
+// The plain-text rendition
+
+pub const TEXT_LINK_OPEN: char = '\u{1}';
+pub const TEXT_LINK_SEP: char = '\u{2}';
+pub const TEXT_LINK_CLOSE: char = '\u{3}';
+
+/// Plain text takes a value exactly as it is. Sibling of `escape_text`.
+fn plain_text(s: &str, out: &mut String) {
+    out.push_str(s);
+}
+
+enum Piece<'a> {
+    Text(&'a str),
+    Link {
+        lead: &'a str,
+        url: &'a str,
+        tail: &'a str,
+    },
+}
+
+fn pieces(text: &str) -> Result<Vec<Piece<'_>>, RenderError> {
+    let delim = [TEXT_LINK_OPEN, TEXT_LINK_SEP, TEXT_LINK_CLOSE];
+    let bad = |at: &str| RenderError::DangerousContext {
+        position: text.len() - at.len(),
+    };
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(TEXT_LINK_OPEN) {
+        let (before, after) = (&rest[..i], &rest[i + TEXT_LINK_OPEN.len_utf8()..]);
+        let end = after.find(TEXT_LINK_CLOSE).ok_or_else(|| bad(after))?;
+        let mut parts = after[..end].splitn(3, TEXT_LINK_SEP);
+        let (Some(lead), Some(url), Some(tail)) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(bad(after));
+        };
+        if before.contains(delim) || [lead, url, tail].iter().any(|p| p.contains(delim)) {
+            return Err(bad(after));
+        }
+        out.push(Piece::Text(before));
+        out.push(Piece::Link { lead, url, tail });
+        rest = &after[end + TEXT_LINK_CLOSE.len_utf8()..];
+    }
+    if rest.contains(delim) {
+        return Err(bad(rest));
+    }
+    out.push(Piece::Text(rest));
+    Ok(out)
+}
+
+struct TextWalk<'v> {
+    fills: Option<&'v [Fill]>,
+    blocks: Vec<(usize, usize)>,
+    suppress: Option<(usize, usize)>,
+    place: usize,
+}
+
+impl TextWalk<'_> {
+    fn value(&self, id: usize) -> Option<&Option<String>> {
+        match self.fills?.get(id)? {
+            Fill::Value(v) => Some(v),
+            Fill::Block(_) => None,
+        }
+    }
+
+    fn boundary(&mut self, id: usize, kind: Kind, out: &mut String) -> Result<(), RenderError> {
+        match kind {
+            Kind::Open => {
+                self.blocks.push((id, self.place));
+                if matches!(self.fills.and_then(|f| f.get(id)), Some(Fill::Block(false)))
+                    && self.suppress.is_none()
+                {
+                    self.suppress = Some((self.blocks.len(), out.len()));
+                }
+            }
+            Kind::Close => {
+                let depth = self.blocks.len();
+                match self.blocks.pop() {
+                    Some((open, place)) if open == id => {
+                        if place != self.place {
+                            return Err(RenderError::BlockStraddlesTag { index: id });
+                        }
+                    }
+                    Some(_) | None => return Err(RenderError::BlockUnbalanced { index: id }),
+                }
+                if let Some((at, len)) = self.suppress
+                    && at == depth
+                {
+                    out.truncate(len);
+                    self.suppress = None;
+                }
+            }
+            Kind::Field => {}
+        }
+        Ok(())
+    }
+
+    fn text(&mut self, s: &str, out: &mut String) -> Result<(), RenderError> {
+        for seg in segments(s) {
+            match seg {
+                Seg::Lit(l) => out.push_str(l),
+                Seg::Mark(id, Kind::Field) => {
+                    if let Some(v) = self.value(id) {
+                        plain_text(v.as_deref().unwrap_or_default(), out);
+                    }
+                }
+                Seg::Mark(id, kind) => self.boundary(id, kind, out)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn url(&mut self, whole: &str, text: &str, out: &mut String) -> Result<(), RenderError> {
+        let segs = segments(whole);
+        if !segs.iter().any(|s| matches!(s, Seg::Mark(..))) {
+            out.push_str(&static_url(whole));
+            return Ok(());
+        }
+        if let [Seg::Mark(id, Kind::Field)] = segs.as_slice() {
+            if let Some(v) = self.value(*id) {
+                out.push_str(&safe_url(v.as_deref().unwrap_or_default()));
+            }
+            return Ok(());
+        }
+        let (parts, scheme) = url_parts(&segs);
+        let dangerous = |id: usize| RenderError::DangerousContext {
+            position: position_of(text, id),
+        };
+        if scheme
+            .as_deref()
+            .is_some_and(|s| !ALLOWED_SCHEMES.contains(&s))
+            && let Some(Seg::Mark(id, _)) = segs.iter().find(|s| matches!(s, Seg::Mark(..)))
+        {
+            return Err(dangerous(*id));
+        }
+        let mut next = parts.iter();
+        for seg in &segs {
+            match seg {
+                Seg::Lit(l) => out.push_str(l),
+                Seg::Mark(id, Kind::Field) => {
+                    let part = next.next().map(|(_, p)| *p).unwrap_or(Part::Scheme);
+                    if part.is_destination() {
+                        return Err(dangerous(*id));
+                    }
+                    if let Some(v) = self.value(*id) {
+                        percent_encode(v.as_deref().unwrap_or_default(), part.keep(), out);
+                    }
+                }
+                Seg::Mark(id, kind) => self.boundary(*id, *kind, out)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn scan_text(text: &str, tags: usize, fills: Option<&[Fill]>) -> Result<String, RenderError> {
+    if tags > MAX_TAGS {
+        return Err(RenderError::DangerousContext { position: 0 });
+    }
+    let mut counts: Vec<[usize; 3]> = vec![[0; 3]; tags];
+    for (i, _) in text.match_indices(MARK_START) {
+        let Some((id, kind, _)) = id_in(&text[i + MARK_START.len()..]) else {
+            continue;
+        };
+        let Some(c) = counts.get_mut(id) else {
+            return Err(RenderError::DangerousContext { position: i });
+        };
+        c[kind as usize] += 1;
+    }
+    for (id, [field, open, close]) in counts.iter().copied().enumerate() {
+        if field + open + close == 0 {
+            return Err(RenderError::TagLost { index: id });
+        }
+        if (open > 0 || close > 0) && (open != 1 || close != 1 || field != 0) {
+            return Err(RenderError::BlockDuplicated {
+                index: id,
+                count: field + open + close,
+            });
+        }
+    }
+    let mut w = TextWalk {
+        fills,
+        blocks: Vec::new(),
+        suppress: None,
+        place: 0,
+    };
+    let mut out = String::new();
+    let mut links = 0;
+    for piece in pieces(text)? {
+        match piece {
+            Piece::Text(s) => w.text(s, &mut out)?,
+            Piece::Link { lead, url, tail } => {
+                if [lead, tail].iter().any(|p| p.contains(MARK_START)) {
+                    return Err(RenderError::DangerousContext { position: 0 });
+                }
+                links += 1;
+                w.place = links;
+                let mut resolved = String::new();
+                w.url(url, text, &mut resolved)?;
+                w.place = 0;
+                if !resolved.is_empty() && resolved != DEAD_LINK {
+                    out.push_str(lead);
+                    out.push_str(&resolved);
+                    out.push_str(tail);
+                }
+            }
+        }
+    }
+    if let Some(&(index, _)) = w.blocks.first() {
+        return Err(RenderError::BlockUnbalanced { index });
+    }
+    Ok(out)
+}
+
+pub fn classify_text(text: &str, tags: usize) -> Result<(), RenderError> {
+    scan_text(text, tags, None).map(|_| ())
+}
+
+pub fn substitute_text(
+    text: &str,
+    nodes: &[Node],
+    contact: &Contact<'_>,
+) -> Result<String, RenderError> {
+    let fills = fills(nodes, contact);
+    scan_text(text, fills.len(), Some(&fills))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1980,5 +2206,207 @@ mod tests {
             ),
             "<p>2024-03-05</p>"
         );
+    }
+}
+
+/// The plain-text rendition: one evaluator, a verbatim encoder, and links that are encoded as URLs.
+#[cfg(test)]
+mod text_tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::template::tag::{Registry, compile};
+
+    const O: char = TEXT_LINK_OPEN;
+    const S: char = TEXT_LINK_SEP;
+    const C: char = TEXT_LINK_CLOSE;
+
+    fn nodes(src: &str) -> Vec<Node> {
+        compile(src, &Registry::from_definitions(&[])).expect("the template must compile")
+    }
+
+    fn contact<'a>(first_name: &'a str, attrs: &'a Value) -> Contact<'a> {
+        Contact {
+            email: "ada@example.com",
+            first_name,
+            last_name: "Lovelace",
+            timezone: None,
+            attributes: attrs,
+        }
+    }
+
+    /// Mark `src`, classify the result as the compile step does, then fill it.
+    fn render(src: &str, first_name: &str) -> Result<String, RenderError> {
+        let n = nodes(src);
+        let (text, tags) = marked(&n);
+        classify_text(&text, tags)?;
+        substitute_text(&text, &n, &contact(first_name, &json!({})))
+    }
+
+    fn m(id: usize, suffix: &str) -> String {
+        format!("{MARK_START}{id}{suffix}{MARK_END}")
+    }
+
+    #[test]
+    fn a_value_is_written_as_the_characters_it_holds() {
+        assert_eq!(
+            render("Hi {{ first_name }}!", "A&B <i> \"q\" it's &amp;").unwrap(),
+            "Hi A&B <i> \"q\" it's &amp;!"
+        );
+    }
+
+    #[test]
+    fn a_value_is_never_read_back_as_a_tag() {
+        assert_eq!(
+            render("{{ first_name }}", "{{ email }}").unwrap(),
+            "{{ email }}"
+        );
+    }
+
+    #[test]
+    fn a_conditional_keeps_or_drops_what_is_between_its_markers() {
+        let src = "a{{# first_name }}b{{# email }}c{{/ email }}d{{/ first_name }}e{{^ first_name }}f{{/ first_name }}";
+        assert_eq!(render(src, "Ada").unwrap(), "abcde");
+        assert_eq!(render(src, "").unwrap(), "aef");
+    }
+
+    #[test]
+    fn a_link_is_its_lead_url_and_tail_when_the_url_is_usable() {
+        let src = format!("x{O} ({S}https://a.example/u/{{{{ first_name }}}}?q=1{S}){C}y");
+        // A tag in a path is percent-encoded for the path, like an `href` in the HTML part.
+        assert_eq!(
+            render(&src, "A B&C").unwrap(),
+            "x (https://a.example/u/A%20B&C?q=1)y"
+        );
+    }
+
+    #[test]
+    fn a_link_with_no_usable_url_vanishes_with_its_lead_and_tail() {
+        let whole = format!("x{O}: {S}{{{{ first_name }}}}{S}{C}y");
+        for bad in [
+            "javascript:alert(1)",
+            "not a url",
+            "https://u:p@evil.example/",
+            "",
+        ] {
+            assert_eq!(render(&whole, bad).unwrap(), "xy", "{bad:?}");
+        }
+        assert_eq!(
+            render(&whole, "https://a.example/ok").unwrap(),
+            "x: https://a.example/oky"
+        );
+        let literal = format!("x{O}: {S}javascript:alert(1){S}{C}y");
+        assert_eq!(render(&literal, "Ada").unwrap(), "xy");
+        let plain = format!("x{O}: {S}https://a.example/p{S}{C}y");
+        assert_eq!(render(&plain, "Ada").unwrap(), "x: https://a.example/py");
+    }
+
+    #[test]
+    fn a_conditional_inside_a_link_is_kept_or_dropped_inside_it() {
+        let src =
+            format!("{O}{S}https://a.example/{{{{# first_name }}}}x{{{{/ first_name }}}}{S}{C}");
+        assert_eq!(render(&src, "Ada").unwrap(), "https://a.example/x");
+        assert_eq!(render(&src, "").unwrap(), "https://a.example/");
+    }
+
+    #[test]
+    fn a_tag_that_decides_where_a_link_points_is_refused() {
+        for url in [
+            "https://{{ first_name }}.example/",
+            "{{ first_name }}://a.example/",
+            "javascript:{{ first_name }}",
+            "javascript:{{# first_name }}x{{/ first_name }}",
+        ] {
+            let src = format!("{O}{S}{url}{S}{C}");
+            assert!(
+                matches!(
+                    render(&src, "Ada"),
+                    Err(RenderError::DangerousContext { .. })
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_that_is_not_in_the_template_is_a_lost_tag() {
+        assert_eq!(
+            classify_text("nothing here", 1),
+            Err(RenderError::TagLost { index: 0 })
+        );
+    }
+
+    #[test]
+    fn a_marker_beyond_the_count_is_forged() {
+        assert!(matches!(
+            classify_text(&m(3, ""), 1),
+            Err(RenderError::DangerousContext { .. })
+        ));
+    }
+
+    #[test]
+    fn conditional_boundaries_must_be_one_open_one_close_in_order() {
+        let ok = format!("{}x{}", m(0, "o"), m(0, "c"));
+        assert_eq!(classify_text(&ok, 1), Ok(()));
+        // Duplicated, and in field form as well.
+        let twice = format!("{}x{}{}", m(0, "o"), m(0, "c"), m(0, "c"));
+        assert!(matches!(
+            classify_text(&twice, 1),
+            Err(RenderError::BlockDuplicated { index: 0, .. })
+        ));
+        let aliased = format!("{}x{}{}", m(0, "o"), m(0, "c"), m(0, ""));
+        assert!(matches!(
+            classify_text(&aliased, 1),
+            Err(RenderError::BlockDuplicated { index: 0, .. })
+        ));
+        // Open with no close, close with no open, and crossed.
+        let open_only = format!("{}x", m(0, "o"));
+        assert!(matches!(
+            classify_text(&open_only, 1),
+            Err(RenderError::BlockDuplicated { index: 0, .. })
+        ));
+        let crossed = format!("{}{}{}{}", m(0, "o"), m(1, "o"), m(0, "c"), m(1, "c"));
+        assert_eq!(
+            classify_text(&crossed, 2),
+            Err(RenderError::BlockUnbalanced { index: 0 })
+        );
+        let reversed = format!("{}{}", m(0, "c"), m(0, "o"));
+        assert_eq!(
+            classify_text(&reversed, 1),
+            Err(RenderError::BlockUnbalanced { index: 0 })
+        );
+    }
+
+    #[test]
+    fn a_conditional_may_not_start_outside_a_link_and_end_inside_it() {
+        let text = format!("{}{O}{S}https://a.example/{}{S}{C}", m(0, "o"), m(0, "c"));
+        assert_eq!(
+            classify_text(&text, 1),
+            Err(RenderError::BlockStraddlesTag { index: 0 })
+        );
+        let other_way = format!("{O}{S}https://a.example/{}{S}{C}{}", m(0, "o"), m(0, "c"));
+        assert_eq!(
+            classify_text(&other_way, 1),
+            Err(RenderError::BlockStraddlesTag { index: 0 })
+        );
+    }
+
+    #[test]
+    fn a_malformed_link_span_is_refused() {
+        for text in [
+            format!("{O}{S}https://a.example/"),
+            format!("{O}only-one-part{C}"),
+            format!("{O}{S}u{S}{C}{S}"),
+            format!("stray {C} close"),
+            format!("{O}{S}a{O}{S}b{S}{C}{S}{C}"),
+        ] {
+            assert!(
+                matches!(
+                    classify_text(&text, 0),
+                    Err(RenderError::DangerousContext { .. })
+                ),
+                "{text:?}"
+            );
+        }
     }
 }

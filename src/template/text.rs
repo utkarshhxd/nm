@@ -1,23 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The plain-text part of a message.
+//! The plain-text part of a message, generated from the BLOCK TREE and never from the rendered HTML:
+//! the tree knows a heading is a heading and a button is a call to action, where the HTML knows
+//! only tables.
 //!
 //! Plain text receives CHARACTERS, never entities. listmonk runs its alternative body through
 //! `html/template` and delivers `&amp;` and `&#39;` to people reading plain text;
 //! `the_output_contains_no_html_entities` is the test that stops this product repeating it.
 //!
-//! # Two sources, one lookup
+//! # The pipeline mirrors the HTML one
 //!
-//! [`text_from_blocks`] reads the BLOCK TREE, never the rendered HTML: the tree knows a heading is a
-//! heading and a button is a call to action, where the HTML knows only tables. It takes its merge
-//! tags through the same `tag::compile` and the same `render::substitute` as the HTML part, so a
-//! value (and a URL's percent-encoding) cannot differ between the two parts of one message. Only
-//! the encoding differs: the document handed to `substitute` is text, `substitute` HTML-escapes
-//! the values it writes, and [`unescape`] undoes exactly that, which is lossless because
-//! `substitute` escapes `&` in every context.
+//! ```text
+//! save:  blocks + brand --text source--> tag::compile --> AST --render::marked--> marked text
+//!        --render::classify_text--> refuse, or store { nodes, text }
+//! send:  render::substitute_text(stored text, stored nodes, contact) --tidy--> the message
+//! ```
 //!
-//! [`text_from_html`] is the raw-mode fallback, where there is no tree. Its input is the HTML that
-//! is actually being sent (already substituted), so there is no merge tag left to resolve.
+//! The same evaluator fills both parts (`render.rs`'s `fills`: values, filters, fallbacks,
+//! conditionals) from stored ASTs, and only the encoder differs: `render::plain_text` writes a value
+//! as it is, a link's URL gets the encoding an `href` gets. There is no registry at send, so a field
+//! archived after save cannot change what this part renders.
+//!
+//! **Assumption: the two parts cannot disagree only while [`compile_text`] and
+//! `mjml::compile_blocks` run at the same instant against the same `Registry`.** They are two
+//! compilations from two sources, each with its own AST. Compile both in one function and store
+//! both in one transaction.
 //!
 //! # What each block looks like
 //!
@@ -26,14 +33,15 @@
 //!
 //! * Heading: its own line. Levels are not told apart; underlining needs the substituted width.
 //! * Button: `Label: URL`. There is nothing to click, so the URL has to be on the page.
-//! * Link run: `text (URL)`, or the bare URL when the text already is the URL.
-//! * Image: `[alt]`, nothing at all when the alt is empty. The brackets mark it as a picture
-//!   rather than copy.
+//! * Link run: `text (URL)`, or the bare text when it already is the URL.
+//! * Image: `[alt]`, nothing at all when the alt is empty.
 //! * Divider: a rule of 40 hyphens. Spacer: nothing; the blank line between blocks is the space.
 //! * Columns: read in order, column after column.
+//! * The brand kit's footer text and postal address follow, because CAN-SPAM and CASL require the
+//!   address in the text alternative too.
 //!
-//! A URL the HTML part would disable (`javascript:`, userinfo, unparsable) is left out here too:
-//! the label stays, the link does not.
+//! A URL the HTML part would disable (`javascript:`, a bad scheme, an unparsable value from a tag)
+//! is left out here too, together with its `: ` or brackets: the label stays, the link does not.
 
 use std::cell::RefCell;
 
@@ -44,66 +52,36 @@ use html5ever::tokenizer::{
 };
 
 use super::block::{Block, Run};
-use super::render::{self, Contact};
-use super::tag::{self, Registry};
+use super::mjml::{BrandKit, CompileError};
+use super::render::{
+    self, Contact, MARK_START, RenderError, TEXT_LINK_CLOSE, TEXT_LINK_OPEN, TEXT_LINK_SEP,
+};
+use super::tag::{self, Node, Registry};
 
 const RULE: &str = "----------------------------------------";
 
-/// The plain-text part of a `blocks` template for one contact.
-///
-/// `registry` is needed because a `Run::Tag` crosses the wire as source text and the compiled AST
-/// is never stored per run; it must be the registry the template was saved under, or a field
-/// archived since then makes its tag compile-fail (the tag is then left out, with a warning, not
-/// the message). The brand kit's footer is not in the tree and so is not in this text: the caller
-/// appends it.
-pub fn text_from_blocks(blocks: &[Block], contact: &Contact<'_>, registry: &Registry) -> String {
-    let build = |tags: bool| {
-        let cx = Cx {
-            registry,
-            contact,
-            tags,
-        };
-        let mut src = String::new();
-        for b in blocks {
-            block(b, &cx, &mut src);
-            src.push_str("\n\n");
-        }
-        fill(&src, &cx)
-    };
-    // If the tags will not compile, say so and send the text without them rather than none.
-    let out = build(true).or_else(|| build(false)).unwrap_or_default();
-    tidy(&unescape(&out))
+/// Stands in for `{` in operator text so the whole template compiles as one tag source and typed
+/// `{{ x }}` stays literal (contract section 13). Put back after the markers are written.
+const BRACE: char = '\u{E000}';
+
+/// A template that has been through the whole save pipeline. `text` is the marked plain text, already
+/// classified; `nodes` is the AST it was marked from. Store both with `render::MARKER_FORMAT_VERSION`
+/// and pass them to [`render_text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextTemplate {
+    pub nodes: Vec<Node>,
+    pub text: String,
 }
 
-struct Cx<'a> {
-    registry: &'a Registry,
-    contact: &'a Contact<'a>,
-    /// `false` only on the retry after a compile failure: every tag is dropped.
-    tags: bool,
-}
-
-/// Compile `src` and substitute this contact into it, through the HTML part's own functions. The
-/// result is HTML-escaped text: see [`unescape`].
-fn fill(src: &str, cx: &Cx<'_>) -> Option<String> {
-    let nodes = tag::compile(src, cx.registry)
-        .inspect_err(|e| tracing::warn!(error = ?e, "plain text: a merge tag did not compile"))
-        .ok()?;
-    let (html, _) = render::marked(&nodes);
-    render::substitute(&html, &nodes, cx.contact)
-        .inspect_err(|e| tracing::warn!(error = ?e, "plain text: substitution was refused"))
-        .ok()
-}
-
-/// A literal, written so that `fill` reads it back as exactly these characters: nothing in it can
-/// open a tag (`<`), start a reference (`&`) or begin a merge tag (`{`).
+/// Operator text into the template source. Plain text has no entities, so the only things changed
+/// are the ones that would be read as structure: a brace (see [`BRACE`]), and the characters this
+/// module and `render.rs` use as delimiters.
 fn lit(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '{' => out.push_str("&#123;"),
+            '{' => out.push(BRACE),
+            BRACE => out.push('\u{FFFD}'),
+            TEXT_LINK_OPEN | TEXT_LINK_SEP | TEXT_LINK_CLOSE => {}
             c => out.push(c),
         }
     }
@@ -111,7 +89,7 @@ fn lit(s: &str, out: &mut String) {
 
 /// `s` with merge tags let through and everything else a literal. The rule is `mjml::emit`'s, byte
 /// for byte: a `{{`, then the first `}}` after it.
-fn emit(s: &str, tags: bool, out: &mut String) {
+fn emit(s: &str, out: &mut String) {
     let mut rest = s;
     while let Some(start) = rest.find("{{") {
         let Some(len) = rest[start + 2..].find("}}") else {
@@ -119,79 +97,47 @@ fn emit(s: &str, tags: bool, out: &mut String) {
         };
         let end = start + 2 + len + 2;
         lit(&rest[..start], out);
-        if tags {
-            out.push_str(&rest[start..end]);
-        }
+        out.push_str(&rest[start..end]);
         rest = &rest[end..];
     }
     lit(rest, out);
 }
 
-/// Undo `substitute`'s escaping: its text and attribute encoders write these and nothing else.
-/// One pass, so `&amp;lt;` comes back as `&lt;` and not `<`.
-fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let (c, len) = [
-            ("&amp;", '&'),
-            ("&lt;", '<'),
-            ("&gt;", '>'),
-            ("&quot;", '"'),
-            ("&#34;", '"'),
-            ("&#39;", '\''),
-        ]
-        .into_iter()
-        .find_map(|(e, c)| rest.starts_with(e).then_some((c, e.len())))
-        .unwrap_or(('&', 1));
-        out.push(c);
-        rest = &rest[len..];
-    }
-    out.push_str(rest);
-    out
+/// A link: `lead url tail` when the URL is usable at send, nothing when it is not.
+fn link(href: &str, lead: &str, tail: &str, out: &mut String) {
+    out.push(TEXT_LINK_OPEN);
+    out.push_str(lead);
+    out.push(TEXT_LINK_SEP);
+    emit(href, out);
+    out.push(TEXT_LINK_SEP);
+    out.push_str(tail);
+    out.push(TEXT_LINK_CLOSE);
 }
 
-/// A URL field resolved for this contact exactly as the HTML part resolves an `href`: through
-/// `substitute`, so a tag is percent-encoded for the component it lands in and an unsafe result
-/// is disabled. `None` when there is no usable link.
-fn resolve_url(href: &str, cx: &Cx<'_>) -> Option<String> {
-    let mut src = String::from("<a href=\"");
-    emit(href, cx.tags, &mut src);
-    src.push_str("\">");
-    let out = fill(&src, cx)?;
-    let url = unescape(out.strip_prefix("<a href=\"")?.strip_suffix("\">")?);
-    // `#` is the HTML part's disabled link.
-    (!url.is_empty() && url != "#").then_some(url)
-}
-
-fn runs(rs: &[Run], cx: &Cx<'_>, out: &mut String) {
+fn runs(rs: &[Run], out: &mut String) {
     for r in rs {
         match r {
             Run::Text { text, .. } => lit(text, out),
-            Run::Tag { source } => emit(source, cx.tags, out),
+            Run::Tag { source } => emit(source, out),
             Run::Link { href, text, .. } => {
-                let url = resolve_url(href, cx);
-                let same =
-                    |u: &str| text.trim() == u || text.trim() == u.trim_start_matches("mailto:");
-                match url.filter(|u| !text.trim().is_empty() && !same(u)) {
-                    Some(u) => {
-                        lit(text, out);
-                        out.push_str(" (");
-                        lit(&u, out);
-                        out.push(')');
-                    }
-                    None => lit(text, out),
+                let (t, h) = (text.trim(), href.trim());
+                if t.is_empty() {
+                    link(href, "", "", out);
+                } else if t == h || t == h.trim_start_matches("mailto:") {
+                    // The text already says where it goes; the address would only repeat it.
+                    lit(text, out);
+                } else {
+                    lit(text, out);
+                    link(href, " (", ")", out);
                 }
             }
         }
     }
 }
 
-fn block(b: &Block, cx: &Cx<'_>, out: &mut String) {
+fn block(b: &Block, out: &mut String) {
     match b {
-        Block::Text { runs: rs } | Block::Heading { runs: rs, .. } => runs(rs, cx, out),
+        Block::Text { runs: rs } | Block::Heading { runs: rs, .. } => runs(rs, out),
         Block::Image { alt, .. } => {
             if !alt.trim().is_empty() {
                 out.push('[');
@@ -200,28 +146,96 @@ fn block(b: &Block, cx: &Cx<'_>, out: &mut String) {
             }
         }
         Block::Button { label, href } => {
-            let url = resolve_url(href, cx);
-            lit(label, out);
-            if let Some(u) = url {
-                if !label.trim().is_empty() {
-                    out.push_str(": ");
-                }
-                lit(&u, out);
+            if !label.trim().is_empty() {
+                lit(label, out);
             }
+            link(
+                href,
+                if label.trim().is_empty() { "" } else { ": " },
+                "",
+                out,
+            );
         }
         Block::Divider {} => out.push_str(RULE),
         Block::Spacer { .. } => {}
         Block::Columns { children } => {
             for child in children.iter().flatten() {
-                block(child, cx, out);
+                block(child, out);
                 out.push_str("\n\n");
             }
         }
     }
 }
 
+/// The template source for `blocks` under `brand`: the tree's text with merge tags let through
+/// where the HTML lets them through (a `Run::Tag`, and a URL field) and nowhere else.
+fn source(blocks: &[Block], brand: &BrandKit) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        block(b, &mut out);
+        out.push_str("\n\n");
+    }
+    let footer: Vec<&str> = [&brand.footer_text, &brand.footer_address]
+        .into_iter()
+        .filter_map(|f| f.as_deref())
+        .filter(|f| !f.trim().is_empty())
+        .collect();
+    for f in footer {
+        lit(f, &mut out);
+        out.push('\n');
+    }
+    out
+}
+
+fn has_literal_marker(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Text(t) => t.contains(MARK_START),
+        Node::Field { .. } => false,
+        Node::Present { body, .. } | Node::Absent { body, .. } | Node::Equals { body, .. } => {
+            has_literal_marker(body)
+        }
+    })
+}
+
+fn restore_braces(nodes: &mut [Node]) {
+    for n in nodes {
+        match n {
+            Node::Text(t) => *t = t.replace(BRACE, "{"),
+            Node::Field { .. } => {}
+            Node::Present { body, .. } | Node::Absent { body, .. } | Node::Equals { body, .. } => {
+                restore_braces(body)
+            }
+        }
+    }
+}
+
+/// Save a `blocks` template's plain-text part. Run it with `mjml::compile_blocks`, in the same
+/// call and against the same `registry`: that is what makes the two parts agree.
+pub fn compile_text(
+    blocks: &[Block],
+    brand: &BrandKit,
+    registry: &Registry,
+) -> Result<TextTemplate, CompileError> {
+    // An invalid kit is an error, never a different email than the one configured.
+    brand.validate()?;
+    let mut nodes = tag::compile(&source(blocks, brand), registry).map_err(CompileError::Tag)?;
+    if has_literal_marker(&nodes) {
+        return Err(CompileError::ForgedMarker);
+    }
+    let (marked, tags) = render::marked(&nodes);
+    let text = marked.replace(BRACE, "{");
+    render::classify_text(&text, tags).map_err(CompileError::Render)?;
+    restore_braces(&mut nodes);
+    Ok(TextTemplate { nodes, text })
+}
+
+/// One contact's plain-text part from the stored template. No registry: the AST is the one stored
+/// at save, as for the HTML part.
+pub fn render_text(t: &TextTemplate, contact: &Contact<'_>) -> Result<String, RenderError> {
+    render::substitute_text(&t.text, &t.nodes, contact).map(|s| tidy(&s))
+}
+
 /// Trailing spaces off every line, no more than one blank line in a row, nothing at either end.
-/// A suppressed conditional block leaves empty paragraphs behind; this is what closes the gap.
 fn tidy(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut blank = false;
@@ -420,8 +434,9 @@ mod tests {
     use super::*;
     use crate::custom_fields::{Definition, FieldKind};
     use crate::template::block::{Mark, Run};
-    use crate::template::mjml::{BrandKit, compile_blocks};
-    use crate::template::render::substitute;
+    use crate::template::mjml::{BrandKit, CompileError, compile_blocks};
+    use crate::template::render::{MARK_START, RenderError, substitute};
+    use crate::template::tag::TagError;
 
     fn def(key: &str) -> Definition {
         Definition {
@@ -470,8 +485,16 @@ mod tests {
         }
     }
 
+    fn text_template(blocks: &[Block], brand: &BrandKit) -> TextTemplate {
+        compile_text(blocks, brand, &registry()).expect("the template must compile")
+    }
+
     fn render_as(first_name: &str, attrs: &Value, blocks: &[Block]) -> String {
-        text_from_blocks(blocks, &contact(first_name, attrs), &registry())
+        render_text(
+            &text_template(blocks, &BrandKit::default()),
+            &contact(first_name, attrs),
+        )
+        .expect("the template must render")
     }
 
     fn render(blocks: &[Block]) -> String {
@@ -702,6 +725,7 @@ mod tests {
         ])];
         let reg = registry();
         let compiled = compile_blocks(&blocks, &BrandKit::default(), &reg).unwrap();
+        let compiled_text = text_template(&blocks, &BrandKit::default());
         for (name, attrs, want) in [
             ("Ada & <Bob>", json!({}), "Hi ADA & <BOB> / there / nowhere"),
             (
@@ -711,7 +735,7 @@ mod tests {
             ),
         ] {
             let c = contact(name, &attrs);
-            let out = text_from_blocks(&blocks, &c, &reg);
+            let out = render_text(&compiled_text, &c).unwrap();
             assert_eq!(out, want);
             // The HTML part, computed from the same AST and contact, agrees about every value.
             let html = substitute(&compiled.html, &compiled.nodes, &c).unwrap();
@@ -728,7 +752,7 @@ mod tests {
         let reg = registry();
         let attrs = json!({});
         let c = contact("A B&C", &attrs);
-        let out = text_from_blocks(&blocks, &c, &reg);
+        let out = render_text(&text_template(&blocks, &BrandKit::default()), &c).unwrap();
         assert_eq!(out, "Go: https://app.example/u/A%20B&C?e=ada@example.com");
         let compiled = compile_blocks(&blocks, &BrandKit::default(), &reg).unwrap();
         let html = substitute(&compiled.html, &compiled.nodes, &c).unwrap();
@@ -766,13 +790,248 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_that_cannot_compile_is_left_out_not_the_whole_message() {
-        // A field archived after the template was saved: the registry no longer knows it.
+    fn a_tag_naming_an_unknown_field_is_refused_at_save_as_the_html_part_refuses_it() {
+        let blocks = [para(vec![text("Hello"), tag("{{ gone }}")])];
+        let err = compile_text(&blocks, &BrandKit::default(), &registry()).unwrap_err();
+        assert_eq!(
+            err,
+            CompileError::Tag(TagError::UnknownField("gone".into()))
+        );
+        let html = compile_blocks(&blocks, &BrandKit::default(), &registry()).unwrap_err();
+        assert_eq!(err, html);
+    }
+
+    #[test]
+    fn a_literal_marker_is_refused() {
+        let blocks = [para(vec![text(&format!("a {MARK_START}0~tmmn~ b"))])];
+        assert_eq!(
+            compile_text(&blocks, &BrandKit::default(), &registry()).unwrap_err(),
+            CompileError::ForgedMarker
+        );
+    }
+
+    #[test]
+    fn an_invalid_brand_kit_is_refused() {
+        let brand = BrandKit {
+            accent: Some("red; }".into()),
+            ..BrandKit::default()
+        };
+        assert!(matches!(
+            compile_text(&[], &brand, &registry()),
+            Err(CompileError::Brand(_))
+        ));
+    }
+
+    #[test]
+    fn a_tag_in_the_scheme_or_host_of_a_link_is_refused_at_save() {
+        for href in [
+            "https://{{ nickname }}.example/",
+            "{{ nickname }}://a.example/",
+            "javascript:{{ nickname }}",
+        ] {
+            let blocks = [button("Go", href)];
+            assert!(
+                matches!(
+                    compile_text(&blocks, &BrandKit::default(), &registry()),
+                    Err(CompileError::Render(RenderError::DangerousContext { .. }))
+                ),
+                "{href}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_footer_and_its_postal_address_are_in_the_text_part() {
+        let brand = BrandKit {
+            footer_text: Some("Acme Ltd, you get this because you signed up.".into()),
+            footer_address: Some("1 Main St, Springfield".into()),
+            ..BrandKit::default()
+        };
+        let out = render_text(
+            &text_template(&[para(vec![text("Body.")])], &brand),
+            &contact("Ada", &json!({})),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "Body.\n\nAcme Ltd, you get this because you signed up.\n1 Main St, Springfield"
+        );
+        // Either half alone, and a blank one is not printed.
+        let only_address = BrandKit {
+            footer_text: Some("  ".into()),
+            footer_address: Some("1 Main St".into()),
+            ..BrandKit::default()
+        };
+        let out = render_text(
+            &text_template(&[para(vec![text("Body.")])], &only_address),
+            &contact("Ada", &json!({})),
+        )
+        .unwrap();
+        assert_eq!(out, "Body.\n\n1 Main St");
+    }
+
+    #[test]
+    fn a_footer_that_is_all_there_is_has_no_leading_gap() {
+        let brand = BrandKit {
+            footer_address: Some("1 Main St".into()),
+            ..BrandKit::default()
+        };
+        let out = render_text(&text_template(&[], &brand), &contact("Ada", &json!({}))).unwrap();
+        assert_eq!(out, "1 Main St");
+    }
+
+    #[test]
+    fn typed_brace_syntax_in_the_footer_is_literal() {
+        let brand = BrandKit {
+            footer_text: Some("Hi {{ first_name }}".into()),
+            ..BrandKit::default()
+        };
+        let out = render_text(&text_template(&[], &brand), &contact("Ada", &json!({}))).unwrap();
+        assert_eq!(out, "Hi {{ first_name }}");
+    }
+
+    #[test]
+    fn a_substituted_value_with_markup_characters_arrives_verbatim() {
+        let attrs = json!({"country": "R&D <team> \"x\" it's"});
+        let out = render_as(
+            "Ada <&> Lovelace",
+            &attrs,
+            &[
+                para(vec![tag("{{ first_name }}|{{ country }}")]),
+                button("Go", "https://a.example/?n={{ first_name }}"),
+            ],
+        );
+        // The URL is percent-encoded for the component, exactly as the HTML part's href is; the
+        // text is not encoded at all.
+        assert_eq!(
+            out,
+            "Ada <&> Lovelace|R&D <team> \"x\" it's\n\nGo: https://a.example/?n=Ada%20%3C%26%3E%20Lovelace"
+        );
+    }
+
+    #[test]
+    fn a_conditional_hides_the_same_branch_the_html_part_hides() {
         let blocks = [
-            para(vec![text("Hello"), tag("{{ gone }}")]),
-            button("Go", "https://a.example/"),
+            para(vec![
+                text("before "),
+                tag("{{# country }}"),
+                text("HAS-COUNTRY"),
+                tag("{{/ country }}"),
+                tag("{{^ country }}NO-COUNTRY{{/ country }}"),
+                tag("{{# country = \"UK\" }}IS-UK{{/ country }}"),
+            ]),
+            button("Go", "https://a.example/{{# country }}x{{/ country }}"),
         ];
-        assert_eq!(render(&blocks), "Hello\n\nGo: https://a.example/");
+        let reg = registry();
+        let html_t = compile_blocks(&blocks, &BrandKit::default(), &reg).unwrap();
+        let text_t = text_template(&blocks, &BrandKit::default());
+        for attrs in [
+            json!({}),
+            json!({"country": "UK"}),
+            json!({"country": "FR"}),
+        ] {
+            let c = contact("Ada", &attrs);
+            let html = substitute(&html_t.html, &html_t.nodes, &c).unwrap();
+            let out = render_text(&text_t, &c).unwrap();
+            for branch in ["HAS-COUNTRY", "NO-COUNTRY", "IS-UK"] {
+                assert_eq!(
+                    out.contains(branch),
+                    html.contains(branch),
+                    "{branch} for {attrs}: {out:?}"
+                );
+            }
+            assert_eq!(
+                out.contains("https://a.example/x"),
+                html.contains("https://a.example/x"),
+                "{attrs}"
+            );
+        }
+        assert_eq!(
+            render_text(&text_t, &contact("Ada", &json!({"country": "UK"}))).unwrap(),
+            "before HAS-COUNTRYIS-UK\n\nGo: https://a.example/x"
+        );
+    }
+
+    #[test]
+    fn the_stored_template_needs_no_registry_to_render() {
+        // Compile under a registry that knows `country`, then render with nothing but the
+        // template and a contact: a field archived since the save cannot change the answer.
+        let blocks = [para(vec![tag("{{ country | \"nowhere\" }}")])];
+        let t = text_template(&blocks, &BrandKit::default());
+        let attrs = json!({"country": "UK"});
+        assert_eq!(render_text(&t, &contact("Ada", &attrs)).unwrap(), "UK");
+        assert_eq!(
+            render_text(&t, &contact("Ada", &json!({}))).unwrap(),
+            "nowhere"
+        );
+    }
+
+    #[test]
+    fn a_conditional_inside_a_dropped_conditional_does_not_end_the_drop_early() {
+        let nested = [para(vec![
+            tag("{{# nickname }}a{{# country }}b{{/ country }}c{{/ nickname }}"),
+            text("z"),
+        ])];
+        // Outer dropped, inner dropped; outer dropped, inner kept; outer kept, inner dropped.
+        assert_eq!(render_as("Ada", &json!({}), &nested), "z");
+        assert_eq!(render_as("Ada", &json!({"country": "UK"}), &nested), "z");
+        assert_eq!(render_as("Ada", &json!({"nickname": "A"}), &nested), "acz");
+        assert_eq!(
+            render_as("Ada", &json!({"nickname": "A", "country": "UK"}), &nested),
+            "abcz"
+        );
+    }
+
+    #[test]
+    fn a_link_delimiter_anywhere_but_where_the_builder_put_it_is_refused() {
+        use crate::template::render::classify_text;
+        let (o, s, c) = (TEXT_LINK_OPEN, TEXT_LINK_SEP, TEXT_LINK_CLOSE);
+        for bad in [
+            format!("a{s}b{o}{s}u{s}{c}"),
+            format!("{o}{s}u{s}t{o}x{c}"),
+            format!("{o}l{o}{s}u{s}{c}"),
+        ] {
+            assert!(
+                matches!(
+                    classify_text(&bad, 0),
+                    Err(RenderError::DangerousContext { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_link_text_is_just_the_url() {
+        let blank = Run::Link {
+            href: "https://a.example/x".into(),
+            text: "  ".into(),
+            marks: vec![],
+        };
+        assert_eq!(render(&[para(vec![blank])]), "https://a.example/x");
+    }
+
+    #[test]
+    fn operator_text_next_to_a_tag_in_a_tag_run_is_still_a_literal() {
+        // Text in a `Run::Tag` that is not the tag is escaped like any other text.
+        let out = render(&[para(vec![tag("a\u{2}{b} {{ first_name }}\u{E000}")])]);
+        assert_eq!(out, "a{b} Ada\u{FFFD}");
+    }
+
+    #[test]
+    fn a_button_with_no_label_is_just_its_url() {
+        assert_eq!(
+            render(&[button("  ", "https://a.example/go")]),
+            "https://a.example/go"
+        );
+    }
+
+    #[test]
+    fn operator_text_cannot_forge_the_templates_own_characters() {
+        // The link delimiters are dropped, and the stand-in for a brace is not turned into one.
+        let out = render(&[para(vec![text("a\u{1}b\u{2}c\u{3}d\u{E000}e")])]);
+        assert_eq!(out, "abcd\u{FFFD}e");
+        assert!(!out.contains('{'));
     }
 
     #[test]
