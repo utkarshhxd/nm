@@ -76,6 +76,7 @@ export default function WorkspaceLayout() {
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/suppressions" label="Suppressions" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/relays" label="Relays" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/sending-domains" label="Sending domains" />
+        <WorkspaceLink slug={workspace.slug} to="/w/$slug/brand-kit" label="Brand kit" />
         <WorkspaceLink slug={workspace.slug} to="/w/$slug/members" label="Members" />
         {admin ? (
           <>
@@ -112,6 +113,7 @@ function WorkspaceLink({
     | "/w/$slug/suppressions"
     | "/w/$slug/relays"
     | "/w/$slug/sending-domains"
+    | "/w/$slug/brand-kit"
     | "/w/$slug/members"
     | "/w/$slug/api-keys"
     | "/w/$slug/audit-log";

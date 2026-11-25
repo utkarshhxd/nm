@@ -158,6 +158,12 @@ const sendingDomainsRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/sending-domains")),
 });
 
+const brandKitRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "brand-kit",
+  component: lazyRouteComponent(() => import("./routes/brand-kit")),
+});
+
 const membersRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "members",
@@ -209,6 +215,7 @@ export const router = createRouter({
       suppressionsRoute,
       relaysRoute,
       sendingDomainsRoute,
+      brandKitRoute,
       membersRoute,
       apiKeysRoute,
       auditLogRoute,
