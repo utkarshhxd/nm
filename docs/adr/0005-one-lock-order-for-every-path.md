@@ -485,8 +485,8 @@ updates, the delete and the upsert's update arm shown to pass it.
   workspace, and it is exactly the statement that would turn the "takes nothing" rows above into
   "takes `for key share`" ones.
 - **A `delete from workspaces` appears anywhere.** That is the one change that makes `workspaces` a
-  class for **seventeen** tables at once instead of fifteen, and it is not enforced by anything
-  (see "Known and open" below, where it is already carried).
+  class for **seventeen** tables at once instead of fifteen. `nothing_in_src_deletes_a_workspace`
+  fails on it, within the blind spots listed under "Known and open" below.
 
 ### The tripwire on `tags`, and what to check rather than predict
 
@@ -532,8 +532,8 @@ is the kind of sentence that gets believed further than it is true.** What that 
 anything about the code.
 
 - **Enforced.** A new parent, a new child, a removed edge, a changed cascade action.
-- **Not enforced, and this is the bigger half.** Three of the ten rulings — `api_keys`,
-  `workspaces` and `users` — rest on "`src/` contains no `delete from` for this table", which is a
+- **Not enforced, and this is the bigger half.** Two of the ten rulings — `api_keys` and `users`
+  (`workspaces` is now held by `nothing_in_src_deletes_a_workspace`) — rest on "`src/` contains no `delete from` for this table", which is a
   grep somebody ran once. Nothing fails if a delete is added. They become classes the day one is,
   and the only thing standing between here and there is a reviewer noticing. The same is true of
   every statement-shape claim in the `relays` section above: no test sees a `take` that grows a
@@ -541,9 +541,13 @@ anything about the code.
 
 ### Known and open, carried rather than fixed
 
-- **The `delete from` grep has no enforcement**, as above. A test asserting that `src/` contains no
-  `delete from workspaces|users|api_keys` would close it and is a smaller job than it sounds; it is
-  not done here because this round's scope is `0028`'s parents.
+- **The `delete from` grep is enforced for `workspaces` only.** `nothing_in_src_deletes_a_workspace`
+  scans `src/` for a `delete from` or `truncate` of `workspaces`, tolerating case, whitespace and
+  newlines, string continuations, `public.` qualifiers and quoted identifiers; its matcher is
+  held by `the_workspace_deletion_matcher_sees_what_it_is_for`. It is blind to a table name that
+  is not spelled out in `src/` (`format!("delete from {t}")`) and to anything outside `src/`.
+  `users` and `api_keys` are still a grep somebody ran once; the same test with another table name
+  closes them.
 - **The importer's tag race**, `issues/39`, two sections above. Still open, still reproduced,
   still raising `23503` on `contact_tags_workspace_id_tag_id_fkey` when a tag is deleted
   mid-import, and still failing the whole import when it does.

@@ -1908,3 +1908,114 @@ fn no_migration_contains_a_cr_byte() {
         crlf.join(", ")
     );
 }
+
+// ---- The one statement that would invalidate the whole ADR -------------------------------------
+
+/// Whether `text` contains a statement that deletes `workspaces` rows — or truncates the table,
+/// which cascades the same way.
+///
+/// **What it tolerates:** case, any run of whitespace including newlines inside the statement, a
+/// Rust string continuation (`\` at the end of a line), an optional `only` / `table` keyword, an
+/// optional `public.` qualifier, quoted identifiers, and the statement being split across adjacent
+/// string literals (`"delete from " "workspaces"`), because quotes are dropped before matching.
+///
+/// **What it does not catch, so nobody reads a green run as more than it is:** a table name that
+/// is not spelled out in `src/` (`format!("delete from {table}")`, `concat!(…)`, a name read from
+/// a config), a statement in a file outside `src/` that the binary loads at run time, and a
+/// delete that reaches `workspaces` only through another route (`drop table`, a foreign key from a
+/// new parent's `on delete cascade`, which the foreign key graph test above is for). It errs the
+/// other way on purpose: a comment that merely *says* `delete from workspaces` also trips it.
+fn deletes_workspaces(text: &str) -> bool {
+    let flat = text
+        .to_lowercase()
+        .replace("\\\n", " ")
+        .replace("\\\r\n", " ")
+        .replace('"', "");
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    for lead in ["delete from ", "truncate "] {
+        for (at, _) in flat.match_indices(lead) {
+            let mut rest = &flat[at + lead.len()..];
+            for skip in ["table ", "only ", "public."] {
+                rest = rest.strip_prefix(skip).unwrap_or(rest);
+            }
+            if let Some(after) = rest.strip_prefix("workspaces")
+                && !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// **The matcher has to see its own target, in every shape a human will type it.** A grep test that
+/// has never matched is not evidence, so this holds the positives and the near-misses that must
+/// not match.
+#[test]
+fn the_workspace_deletion_matcher_sees_what_it_is_for() {
+    for yes in [
+        "delete from workspaces where id = $1",
+        "DELETE   FROM   Workspaces",
+        "delete\n    from\n    workspaces",
+        "\"delete from \\\n         workspaces where id = $1\"",
+        "\"delete from \\\r\n         workspaces where id = $1\"",
+        "delete from public.workspaces",
+        "delete from \"public\".\"workspaces\"",
+        "delete from only workspaces",
+        "\"delete from \" \"workspaces\"",
+        "with gone as (delete from workspaces returning id) select * from gone",
+        "truncate table workspaces cascade",
+        "TRUNCATE workspaces",
+    ] {
+        assert!(deletes_workspaces(yes), "should have matched: {yes:?}");
+    }
+    for no in [
+        "delete from workspaces_archive",
+        "delete from memberships where workspace_id = $1",
+        "delete from templates where id = $1",
+        "select * from workspaces",
+        "update workspaces set name = $2",
+        "insert into workspaces (id) values ($1)",
+        "truncate table lists",
+    ] {
+        assert!(!deletes_workspaces(no), "should not have matched: {no:?}");
+    }
+}
+
+/// **Nothing in `src/` deletes a workspace.** `workspaces` is the parent of seventeen tables, every
+/// one `on delete cascade`, so one `delete from workspaces` is every cascade in this ADR firing at
+/// once; and ADR 0005's "no exclusive taker" ruling for `workspaces` — which is why none of those
+/// seventeen is a lock class — rests on this being true. Until this test it rested on a grep
+/// somebody ran once.
+///
+/// If this fails, do not delete the offending line to go green and do not edit the test. Re-open
+/// ADR 0005's `workspaces` ruling: a delete makes it an exclusive taker, so every table in its
+/// fan-out is a class the same day and each path writing one of them has to be placed in the
+/// order.
+#[test]
+fn nothing_in_src_deletes_a_workspace() {
+    fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                walk(&path, hits);
+            } else if let Ok(bytes) = std::fs::read(&path)
+                && deletes_workspaces(&String::from_utf8_lossy(&bytes))
+            {
+                hits.push(path.display().to_string());
+            }
+        }
+    }
+    let mut hits = vec![];
+    walk(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut hits,
+    );
+    assert!(
+        hits.is_empty(),
+        "a statement that deletes or truncates `workspaces` appears in: {}. That makes `workspaces` \
+         an exclusive taker and invalidates the \"no exclusive taker\" ruling in ADR 0005 for all \
+         seventeen of its children: re-open that ruling rather than editing this test",
+        hits.join(", ")
+    );
+}
