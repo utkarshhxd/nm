@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// The brand-kit screen against its local mock (`brand-kit-source.ts`), in a real browser. The mock
-// stands in for the server, including the one refusal this screen cannot make itself: a logo URL
-// the server will not take. The screen flags such a URL while it is typed and still sends it.
+// The brand-kit screen in a real browser, with the brand-kit route stubbed at the HTTP boundary
+// the way `/api/v1/me` already is: W6 made `brand-kit-source.ts` call the server, and these tests
+// have no server behind them. The stub stands in for the one refusal this screen cannot make
+// itself — a logo URL the server will not take — and the screen flags such a URL while it is
+// typed and still sends it. What only a real server can show (an unknown palette key surviving a
+// save, a newer kit arriving under a mounted form) is in `e2e/brand-kit.spec.ts`.
 
 import AxeBuilder from "@axe-core/playwright";
 import { type Page, expect } from "@playwright/test";
@@ -10,13 +13,48 @@ import { type Page, expect } from "@playwright/test";
 import type { components } from "../api/schema";
 import { test } from "../../e2e/support/app";
 import { expectNoViolations } from "../../e2e/support/axe";
-import { LOGO_MESSAGE, contrast, isColour, resync, toDraft, toKit } from "./brand-kit-model";
-import { type BrandKit, brandKitSource } from "./brand-kit-source";
+import { LOGO_MESSAGE, contrast, isColour, logoAllowed, resync, toDraft, toKit } from "./brand-kit-model";
+import type { BrandKit } from "./brand-kit-source";
 
 type Me = components["schemas"]["MeResponse"];
 
 const WS = "11111111-1111-4111-8111-111111111111";
 const FLAG = "Use a colour written as #rgb or #rrggbb, such as #1a56db.";
+const EMPTY: BrandKit = { logo_url: null, palette: {}, font_stack: null, footer: {} };
+
+/**
+ * The brand-kit route, standing in for the server: one kit per page, `GET` answers with it and
+ * `PUT` replaces it. A workspace with no row answers an EMPTY kit and never a 404 — the server's
+ * own behaviour, pinned against the real one in `e2e/brand-kit.spec.ts`.
+ *
+ * The logo gate is the server's, and is the reason this stub exists at all: the screen sends a
+ * URL it has already flagged, and what the operator is shown is the refusal that comes back.
+ */
+async function stubKit(page: Page): Promise<void> {
+  let kit: BrandKit = structuredClone(EMPTY);
+  await page.route(/\/api\/v1\/workspaces\/[^/]+\/brand-kit$/, async (route) => {
+    if (route.request().method() === "PUT") {
+      const sent = route.request().postDataJSON() as BrandKit;
+      if (sent.logo_url !== null && !logoAllowed(sent.logo_url)) {
+        // An RFC 9457 problem as `src/error.rs` writes one, so `problemMessage` reads it the way
+        // it reads the server's.
+        return route.fulfill({
+          status: 422,
+          contentType: "application/problem+json",
+          body: JSON.stringify({
+            type: "urn:nm:problem:validation",
+            title: "Unprocessable Entity",
+            status: 422,
+            detail: "request validation failed",
+            errors: [{ field: "logo_url", message: LOGO_MESSAGE }],
+          }),
+        });
+      }
+      kit = sent;
+    }
+    return route.fulfill({ json: kit });
+  });
+}
 
 async function open(page: Page, app: string, role: "viewer" | "editor" | "admin" = "admin") {
   const me: Me = {
@@ -30,6 +68,7 @@ async function open(page: Page, app: string, role: "viewer" | "editor" | "admin"
     workspaces: [{ id: WS, name: "Acme", role, slug: "acme" }],
   };
   await page.route("**/api/v1/me", (route) => route.fulfill({ json: me }));
+  await stubKit(page);
   await page.goto(`${app}/w/acme/brand-kit`);
   await expect(page.getByRole("heading", { name: "Brand kit", level: 2 })).toBeVisible();
   await expect(page.getByLabel("Logo address")).toBeVisible();
@@ -246,14 +285,9 @@ test("contrast_is_the_wcag_ratio_and_reads_three_digit_and_either_case", () => {
   expect(contrast("#fff", "#767676")).toBe(contrast("#767676", "#fff"));
 });
 
-test("a_workspace_with_no_kit_gets_an_empty_one_not_an_error", async () => {
-  // R7 is likely to answer 404 for a workspace that has never saved a kit, which is every
-  // workspace on day one. Whatever the source is, the screen must be reachable: `get` resolves to
-  // data, and it is the empty kit, with `palette` and `footer` as objects.
-  const { data, error } = await brandKitSource.get("99999999-9999-4999-8999-999999999999");
-  expect(error).toBeUndefined();
-  expect(data).toEqual({ logo_url: null, palette: {}, font_stack: null, footer: {} });
-});
+// "a workspace with no kit gets an empty one, not a 404" was pinned here against the W5 mock.
+// It is the server's behaviour, not this screen's, so it moved to `e2e/brand-kit.spec.ts`, where
+// the real route answers it. The form below still proves the screen is usable in that state.
 
 test("a workspace with no kit opens an empty, editable form", async ({ page, app }) => {
   await open(page, app);

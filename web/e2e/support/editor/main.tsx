@@ -7,7 +7,8 @@ import { createRoot } from "react-dom/client";
 
 import { BlockEditor } from "../../../src/components/block-editor/editor";
 import type { Doc } from "../../../src/components/block-editor/model";
-import { type PreviewSource, previewSource } from "../../../src/components/block-editor/preview-source";
+import type { PreviewSource } from "../../../src/components/block-editor/preview-source";
+import { mockPreview } from "./mock-preview";
 import "../../../src/styles.css";
 
 const fixture: Doc = {
@@ -52,12 +53,14 @@ const sources: Record<string, PreviewSource> = {
   slow: () => new Promise(() => {}),
   // Fails until a test sets window.__heal.
   flaky: (doc, signal) =>
-    (window as unknown as { __heal?: boolean }).__heal ? previewSource(doc, signal) : Promise.reject(new Error("down")),
+    (window as unknown as { __heal?: boolean }).__heal ? mockPreview(doc, signal) : Promise.reject(new Error("down")),
   spellings: ok(sheet(SPELLINGS, '<style media="(prefers-color-scheme: dark)">#d{background:#000}</style>')),
   nodark: ok(sheet("")),
   leftover: ok(sheet("@media (prefers-color-scheme: dark){#a{background:#000}}@media (prefers-color-scheme){#b{background:#000}}")),
 };
-const failing = sources[new URLSearchParams(location.search).get("preview") ?? ""];
+// No `?preview=` is the mock: this harness has no server behind it, so the product's source
+// (`templatePreview`) has nothing to call. It is a test double and ships in no bundle.
+const source = sources[new URLSearchParams(location.search).get("preview") ?? ""] ?? mockPreview;
 
 const container = document.getElementById("root");
 if (!container) throw new Error("editor/index.html is missing #root");
@@ -65,6 +68,6 @@ if (!container) throw new Error("editor/index.html is missing #root");
 createRoot(container).render(
   <main className="mx-auto max-w-3xl p-6">
     <h1 className="text-xl font-semibold">Editor</h1>
-    <BlockEditor initial={initial} source={failing} onChange={(doc) => ((window as unknown as { __doc: Doc }).__doc = doc)} />
+    <BlockEditor initial={initial} source={source} onChange={(doc) => ((window as unknown as { __doc: Doc }).__doc = doc)} />
   </main>,
 );

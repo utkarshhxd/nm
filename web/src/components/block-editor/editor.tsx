@@ -23,7 +23,7 @@ import {
 } from "./model";
 import { Properties } from "./properties";
 import { Preview } from "./preview";
-import { type PreviewSource, previewSource } from "./preview-source";
+import type { PreviewSource } from "./preview-source";
 import type { Sel } from "./rich-text";
 import { edit, hrefAllowed, length, locate, setLink, toggleMark } from "./runs";
 
@@ -50,11 +50,12 @@ const isText = (b: Block | null): b is TextBlock => b?.type === "Text" || b?.typ
 export function BlockEditor({
   initial,
   onChange,
-  source = previewSource,
+  source,
 }: {
   initial: Doc;
   onChange?: (doc: Doc) => void;
-  source?: PreviewSource;
+  /** Required: the mock went with W6, so an editor with no source would preview nothing at all. */
+  source: PreviewSource;
 }) {
   const [history, setHistory] = useState<History>(() => start(initial));
   const [selected, setSelected] = useState<Loc | null>(null);
