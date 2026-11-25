@@ -8,20 +8,27 @@
 //! send:  render::substitute(stored HTML, AST, contact)        <- mrml never runs again
 //! ```
 //!
-//! [`render_mjml`] is the only `mrml` call and it is a save-time call: its output is the document
-//! that is classified and stored, so it has to be correct once, not cheap per contact. Do not add
-//! a per-contact render path here (see `render.rs` for why that is the defect).
+//! Callers use [`compile_blocks`] (a `blocks` template) or [`compile_mjml`] (a raw `mjml` one),
+//! which run the whole sequence; `to_mjml` and `render_mjml` are private so that the order cannot
+//! be got wrong by calling the obvious function. `render_mjml` is the only `mrml` call and it is a
+//! save-time call: its output is the document that is classified and stored, so it has to be
+//! correct once, not cheap per contact. Do not add a per-contact render path here (see `render.rs`
+//! for why that is the defect).
 //!
-//! [`to_mjml`] returns a template SOURCE, not yet MJML: a merge tag is left in as the operator
-//! wrote it, because its fallback literal can hold the quotes an attribute value cannot. It must
-//! go through `tag::compile` and `render::marked` before `render_mjml` sees it.
+//! `to_mjml` returns a template SOURCE, not yet MJML: a merge tag is left in as the operator
+//! wrote it, because its fallback literal can hold the quotes an attribute value cannot.
 //!
-//! Two things `to_mjml` guarantees to that compile step:
+//! What `to_mjml` guarantees to the compile step:
 //!
-//! * **Only a tag is a tag.** Every string field is split on the compiler's own rule (a `{{`, then
-//!   the first `}}`); the tag span goes through untouched and everything around it is escaped,
-//!   including any `{`, so a lone or unterminated brace can never open a tag across two fields. A
-//!   Tag run's `source` is treated the same way: whatever is not the tag is text.
+//! * **A tag comes from `Run::Tag` and nowhere else.** Every other string (text runs, link text
+//!   and href, image src and alt, button label and href, the footer) is escaped with `{` turned
+//!   into `&#123;`, so `{{ first_name }}` typed into any of them reaches the recipient as that
+//!   text. The editor makes a tag an atomic token with its own UI; a second, invisible way to
+//!   write one would bypass everything that UI guarantees, and help copy that MENTIONS a merge tag
+//!   would silently substitute. A Tag run's `source` is split on the compiler's own rule (a `{{`,
+//!   then the first `}}`): the tag goes through untouched and whatever else is in the string is
+//!   escaped text. A raw `mjml` template is the opposite case, by design: there is no `Run::Tag`,
+//!   the operator wrote the source, so [`compile_mjml`] scans all of it.
 //! * **It is deterministic.** Same blocks and brand kit, same bytes. Nothing here iterates a map
 //!   or reads a clock; a re-save that reclassified a different document would leave every stored
 //!   classification stale with nothing to notice.
@@ -32,6 +39,8 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 use super::block::{Block, Mark, Run};
+use super::render::{self, RenderError};
+use super::tag::{self, Node, Registry, TagError};
 
 const DEFAULT_BACKGROUND: &str = "#ffffff";
 const DEFAULT_TEXT: &str = "#111111";
@@ -192,8 +201,12 @@ enum Ctx {
     Attr,
 }
 
-/// Write `s` into the template source: tags verbatim, everything else escaped for `ctx`.
-fn emit(s: &str, ctx: Ctx, out: &mut String) {
+/// Write a Tag run's `source` into the template source: the tag verbatim, anything else in the
+/// string escaped as text. The only place a tag is let through.
+///
+/// The text-escaping rule is [`literal`]; this exists so a tag run is a tag and an editor bug or a
+/// forged request that puts markup in `source` still cannot produce any.
+fn emit(s: &str, out: &mut String) {
     let mut rest = s;
     // The compiler's rule, byte for byte: a `{{`, then the first `}}` after it.
     while let Some(start) = rest.find("{{") {
@@ -201,18 +214,18 @@ fn emit(s: &str, ctx: Ctx, out: &mut String) {
             break;
         };
         let end = start + 2 + len + 2;
-        literal(&rest[..start], ctx, out);
+        literal(&rest[..start], Ctx::Text, out);
         out.push_str(&rest[start..end]);
         rest = &rest[end..];
     }
-    literal(rest, ctx, out);
+    literal(rest, Ctx::Text, out);
 }
 
 /// Escape FIRST, then turn a newline into `<br>`. Each character is handled once, so the `<br>`
 /// written for a newline is never itself escaped; the other order ships `&lt;br&gt;`.
 ///
 /// `{` is escaped so that no literal can ever begin a `{{` that the compiler would pair with a
-/// `}}` in a different field.
+/// `}}` in a different field, which is also what keeps typed tag syntax inert.
 fn literal(s: &str, ctx: Ctx, out: &mut String) {
     for c in s.chars() {
         match (c, ctx) {
@@ -232,7 +245,7 @@ fn literal(s: &str, ctx: Ctx, out: &mut String) {
 
 fn attr(name: &str, value: &str, out: &mut String) {
     let _ = write!(out, " {name}=\"");
-    emit(value, Ctx::Attr, out);
+    literal(value, Ctx::Attr, out);
     out.push('"');
 }
 
@@ -256,15 +269,15 @@ fn marked(marks: &[Mark], out: &mut String, inner: impl FnOnce(&mut String)) {
 fn runs(rs: &[Run], accent: &str, out: &mut String) {
     for r in rs {
         match r {
-            Run::Text { text, marks } => marked(marks, out, |o| emit(text, Ctx::Text, o)),
+            Run::Text { text, marks } => marked(marks, out, |o| literal(text, Ctx::Text, o)),
             Run::Link { href, text, marks } => {
                 out.push_str("<a");
                 attr("href", href, out);
                 let _ = write!(out, " style=\"color:{accent}\">");
-                marked(marks, out, |o| emit(text, Ctx::Text, o));
+                marked(marks, out, |o| literal(text, Ctx::Text, o));
                 out.push_str("</a>");
             }
-            Run::Tag { source } => emit(source, Ctx::Text, out),
+            Run::Tag { source } => emit(source, out),
         }
     }
 }
@@ -294,7 +307,7 @@ fn leaf(b: &Block, accent: &str, out: &mut String) {
             out.push_str("<mj-button");
             attr("href", href, out);
             out.push('>');
-            emit(label, Ctx::Text, out);
+            literal(label, Ctx::Text, out);
             out.push_str("</mj-button>");
         }
         Block::Divider {} => out.push_str("<mj-divider />"),
@@ -312,9 +325,8 @@ fn section(inner: impl FnOnce(&mut String), out: &mut String) {
     out.push_str("</mj-column></mj-section>\n");
 }
 
-/// The template source for `blocks` under `brand`. See the module doc: compile it, mark it, then
-/// [`render_mjml`] it.
-pub fn to_mjml(blocks: &[Block], brand: &BrandKit) -> String {
+/// The template source for `blocks` under `brand`. See the module doc.
+fn to_mjml(blocks: &[Block], brand: &BrandKit) -> String {
     let accent = BrandKit::colour(&brand.accent, DEFAULT_ACCENT);
     let mut out = String::new();
     let _ = writeln!(
@@ -375,7 +387,7 @@ pub fn to_mjml(blocks: &[Block], brand: &BrandKit) -> String {
                     if i > 0 {
                         o.push_str("<br>");
                     }
-                    emit(f, Ctx::Text, o);
+                    literal(f, Ctx::Text, o);
                 }
                 o.push_str("</mj-text>");
             },
@@ -387,12 +399,62 @@ pub fn to_mjml(blocks: &[Block], brand: &BrandKit) -> String {
     out
 }
 
+/// A template that has been through the whole save pipeline and is safe to store.
+///
+/// `html` is `mrml`'s output with the merge-tag markers still in it, already classified: this is
+/// the document every send substitutes into. `nodes` is the AST it was marked from. Store both
+/// (and `render::MARKER_FORMAT_VERSION` beside them) and pass them to `render::substitute`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compiled {
+    pub nodes: Vec<Node>,
+    pub html: String,
+}
+
+/// Why a template could not be saved. Each arm is the stage that refused, with that stage's own
+/// error, so the caller can tell an operator which part of their template is wrong.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompileError {
+    #[error("merge tag: {0:?}")]
+    Tag(TagError),
+    #[error("mjml: {0}")]
+    Mjml(#[from] MjmlError),
+    #[error("a merge tag sits where no encoding is safe: {0:?}")]
+    Render(RenderError),
+}
+
+/// Save a `blocks` template: the whole pipeline in one call, so its order is not something a
+/// caller can get wrong. In a block template a merge tag comes from a `Run::Tag` and from nowhere
+/// else: `{{ x }}` typed into a text run, a link, a button or the footer is ordinary text.
+pub fn compile_blocks(
+    blocks: &[Block],
+    brand: &BrandKit,
+    registry: &Registry,
+) -> Result<Compiled, CompileError> {
+    compile(&to_mjml(blocks, brand), registry)
+}
+
+/// Save a raw `mjml` template. Unlike a block template the operator writes the source directly and
+/// there is no `Run::Tag`, so the WHOLE source is scanned for merge tags.
+pub fn compile_mjml(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
+    compile(source, registry)
+}
+
+/// compile the tags -> mark -> `mrml` once -> classify. `source` is template source, not yet
+/// MJML: a tag's fallback literal can hold quotes that an attribute cannot.
+fn compile(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
+    let nodes = tag::compile(source, registry).map_err(CompileError::Tag)?;
+    let (marked, count) = render::marked(&nodes);
+    let html = render_mjml(&marked)?;
+    render::classify(&html, count).map_err(CompileError::Render)?;
+    Ok(Compiled { nodes, html })
+}
+
 /// Render marked MJML to HTML. The only `mrml` call in the product, and a save-time one.
 ///
 /// `fonts` is emptied: the default set would add `<link>` tags to Google's servers for any font
 /// stack that names one, which is a third-party request per open, and a `HashMap` is the one place
 /// iteration order could leak into the output.
-pub fn render_mjml(mjml: &str) -> Result<String, MjmlError> {
+fn render_mjml(mjml: &str) -> Result<String, MjmlError> {
     let parsed = mrml::parse(mjml).map_err(|e| MjmlError::Parse(e.to_string()))?;
     let opts = mrml::prelude::render::RenderOptions {
         fonts: HashMap::new(),
@@ -408,8 +470,7 @@ pub fn render_mjml(mjml: &str) -> Result<String, MjmlError> {
 mod tests {
     use super::*;
     use crate::template::block::{Mark, Run};
-    use crate::template::render::{self, Contact};
-    use crate::template::tag::{self, Node, Registry};
+    use crate::template::render::Contact;
     use serde_json::json;
 
     fn text(s: &str) -> Run {
@@ -462,21 +523,10 @@ mod tests {
         ]
     }
 
-    /// The save pipeline, in the order the ruling fixes it: compile the template source, mark it,
-    /// render the marked MJML once, classify the result. `to_mjml`'s output is a template SOURCE,
-    /// not yet MJML, because a tag's fallback literal can hold the quotes an attribute cannot.
-    struct Saved {
-        nodes: Vec<Node>,
-        html: String,
-    }
+    type Saved = Compiled;
 
     fn save(blocks: &[Block], brand: &BrandKit) -> Result<Saved, String> {
-        let nodes = tag::compile(&to_mjml(blocks, brand), &Registry::from_definitions(&[]))
-            .map_err(|e| format!("compile: {e:?}"))?;
-        let (marked, count) = render::marked(&nodes);
-        let html = render_mjml(&marked).map_err(|e| format!("mrml: {e}"))?;
-        render::classify(&html, count).map_err(|e| format!("classify: {e:?}"))?;
-        Ok(Saved { nodes, html })
+        compile_blocks(blocks, brand, &Registry::from_definitions(&[])).map_err(|e| e.to_string())
     }
 
     fn send(s: &Saved, first_name: &str) -> String {
@@ -840,21 +890,106 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_in_an_href_is_classified_as_a_url_and_encoded_there() {
-        let blocks = [
-            Block::Text {
-                runs: vec![Run::Link {
-                    href: "https://a.example/u?e={{ first_name }}".into(),
-                    text: "go".into(),
+    fn a_tag_typed_into_a_text_run_is_literal_text_not_a_tag() {
+        // An operator writing help copy that MENTIONS a merge tag gets the text they typed, not
+        // the recipient's name. A tag comes from Run::Tag and nowhere else.
+        let blocks = [Block::Text {
+            runs: vec![
+                text(
+                    "Use {{ first_name }} in your subject, or {{# first_name }}x{{/ first_name }}.",
+                ),
+                Run::Link {
+                    href: "https://a.example/?u={{ first_name }}".into(),
+                    text: "link {{ first_name }}".into(),
                     marks: vec![],
-                }],
-            },
-            button("https://a.example/b?e={{ first_name }}"),
-        ];
+                },
+            ],
+        }];
         let saved = save(&blocks, &BrandKit::default()).unwrap();
-        let out = send(&saved, "a&b=c d");
-        assert!(out.contains("https://a.example/u?e=a%26b%3Dc%20d"), "{out}");
-        assert!(out.contains("https://a.example/b?e=a%26b%3Dc%20d"), "{out}");
+        assert!(
+            saved.nodes.iter().all(|n| matches!(n, Node::Text(_))),
+            "{:?}",
+            saved.nodes
+        );
+        let out = send(&saved, "Ann");
+        assert!(
+            out.contains(
+                "Use {{ first_name }} in your subject, or {{# first_name }}x{{/ first_name }}."
+            ),
+            "{out}"
+        );
+        assert!(out.contains("link {{ first_name }}"), "{out}");
+        assert!(!out.contains("Ann"), "{out}");
+    }
+
+    #[test]
+    fn every_non_tag_field_holds_tag_syntax_as_text() {
+        // Image src/alt, button label/href, heading runs, column children, footer: none of them
+        // compiles to anything but one literal node.
+        let t = "{{ first_name }}";
+        let blocks = [
+            Block::Heading {
+                level: 1,
+                runs: vec![text(t)],
+            },
+            Block::Image {
+                src: format!("https://a.example/{t}.png"),
+                alt: t.into(),
+            },
+            Block::Button {
+                label: t.into(),
+                href: format!("https://a.example/?q={t}"),
+            },
+            Block::Columns {
+                children: vec![vec![para(t)]],
+            },
+        ];
+        let brand = BrandKit {
+            footer_text: Some(t.into()),
+            footer_address: Some(t.into()),
+            ..BrandKit::default()
+        };
+        let src = to_mjml(&blocks, &brand);
+        let nodes = tag::compile(&src, &Registry::from_definitions(&[])).unwrap();
+        assert!(matches!(nodes.as_slice(), [Node::Text(_)]), "{nodes:?}");
+    }
+
+    #[test]
+    fn a_raw_mjml_template_still_parses_the_whole_source_for_tags() {
+        // The distinction is deliberate: a raw template has no Run::Tag, so its tags are in the
+        // source the operator wrote.
+        let src = "<mjml><mj-body><mj-section><mj-column><mj-text>Hi {{ first_name | \"there\" }}</mj-text></mj-column></mj-section></mj-body></mjml>";
+        let c = compile_mjml(src, &Registry::from_definitions(&[])).unwrap();
+        assert!(c.nodes.iter().any(|n| matches!(n, Node::Field { .. })));
+        assert!(send(&c, "Ann").contains("Hi Ann"));
+        assert!(send(&c, "").contains("Hi there"));
+        // The same text in a Text BLOCK is not a tag.
+        let b = save(&[para("Hi {{ first_name }}")], &BrandKit::default()).unwrap();
+        assert!(!b.nodes.iter().any(|n| matches!(n, Node::Field { .. })));
+    }
+
+    #[test]
+    fn the_public_entry_points_refuse_what_each_stage_refuses() {
+        let reg = Registry::from_definitions(&[]);
+        let tagged = |s: &str| [Block::Text { runs: vec![tag(s)] }];
+        // compile: an unknown field is named, not rendered empty.
+        assert!(matches!(
+            compile_blocks(&tagged("{{ nope }}"), &BrandKit::default(), &reg),
+            Err(CompileError::Tag(TagError::UnknownField(f))) if f == "nope"
+        ));
+        // mrml: its own message survives the wrapper.
+        assert!(matches!(
+            compile_mjml("<mjml><mj-body><mj-text>x</mj-body></mjml>", &reg),
+            Err(CompileError::Mjml(MjmlError::Parse(_)))
+        ));
+        // classify: a tag in a position no encoding makes safe is refused at save.
+        assert!(matches!(
+            compile_mjml(
+                "<mjml><mj-body><mj-raw><script>var a = \"{{ first_name }}\";</script></mj-raw></mj-body></mjml>",
+                &reg
+            ),
+            Err(CompileError::Render(RenderError::DangerousContext { .. }))
+        ));
     }
 
     #[test]
@@ -886,15 +1021,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tags_fallback_cannot_end_the_attribute_it_sits_in() {
-        // The fallback holds angle brackets and an apostrophe (it cannot hold a double quote). Compile consumes the whole tag into the
-        // AST, so mrml never sees them; the value is encoded for the URL it lands in at send.
-        let blocks = [button(
-            "{{ first_name | \"https://a.example/?q=<script>'x\" }}",
-        )];
+    fn a_tags_fallback_is_data_and_cannot_inject_markup() {
+        // The fallback holds angle brackets and an apostrophe. Compile consumes the whole tag into
+        // the AST, so mrml never sees them; the value is encoded for where it lands at send.
+        let blocks = [Block::Text {
+            runs: vec![tag("{{ first_name | \"<script>'x\" }}")],
+        }];
         let saved = save(&blocks, &BrandKit::default()).unwrap();
         let out = send(&saved, "");
         assert!(!out.contains("<script>"), "{out}");
+        assert!(out.contains("&lt;script&gt;'x"), "{out}");
     }
 
     #[test]
