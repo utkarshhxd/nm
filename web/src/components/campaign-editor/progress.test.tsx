@@ -254,7 +254,7 @@ test("a_scheduled_campaign_can_be_test_sent_by_an_editor_and_no_other_state_can"
   const log = await open(page, app, source(c), c, "editor");
   const test_ = page.getByRole("region", { name: "Test send", exact: true });
   await test_.getByLabel("Addresses").fill("qa@example.test");
-  await button(test_, "Send test").click();
+  await test_.getByRole("button", { name: "Send test", exact: true }).click();
   await expect(test_.getByRole("status")).toHaveText("Test queued to 1 address.");
   expect(log.filter((x) => x.method === "POST" && x.path.endsWith(`/campaigns/${c.id}/test`))).toHaveLength(1);
 
