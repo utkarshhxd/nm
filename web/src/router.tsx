@@ -170,6 +170,19 @@ const templateRoute = createRoute({
   component: lazyRouteComponent(() => import("./routes/template-detail")),
 });
 
+const campaignsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "campaigns",
+  component: lazyRouteComponent(() => import("./routes/campaigns")),
+});
+
+// The named export, so the one campaigns chunk serves both screens until W2 splits the detail out.
+const campaignRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "campaigns/$campaignId",
+  component: lazyRouteComponent(() => import("./routes/campaigns"), "CampaignDetail"),
+});
+
 const brandKitRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "brand-kit",
@@ -229,6 +242,8 @@ export const router = createRouter({
       sendingDomainsRoute,
       templatesRoute,
       templateRoute,
+      campaignsRoute,
+      campaignRoute,
       brandKitRoute,
       membersRoute,
       apiKeysRoute,
