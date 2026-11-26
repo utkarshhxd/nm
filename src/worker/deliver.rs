@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Signing and submitting one message, shared by every sender: confirmations, test sends and
-//! campaign messages. Moved out of `confirmation` unchanged but for three things: the relays'
+//! campaign messages. Moved out of `confirmation` unchanged but for four things: the relays'
 //! passwords come from a [`Creds`] read once per tick (spec M2c §4.7.9), [`submit`] says which relay
-//! decided, and a [`Outcome::Deferred`] drains that relay's bucket before the next one is tried.
+//! decided, a [`Outcome::Deferred`] drains that relay's bucket before the next one is tried, and a
+//! relay skipped for its rate limit or its credential reads as `Deferred` rather than `Transient`
+//! (it is the relay's trouble, so a campaign message spends no attempt on it).
 //!
 //! **The rule [`submit`] keeps: a send is covered by a token taken from the relay it goes through.**
 //! The tick spends on the first relay with tokens, while `submit` sends through the first relay
