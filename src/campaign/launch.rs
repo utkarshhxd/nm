@@ -436,14 +436,21 @@ pub async fn sweep(db: &PgPool) -> sqlx::Result<usize> {
     .bind(LAUNCH_KIND)
     .fetch_all(db)
     .await?;
+    let mut ended = 0;
     for job in &dead {
         let reason = format!(
             "{ORPHANED}; the launch gave up after {} attempts",
             job.attempts
         );
-        give_up(db, job, &reason).await?;
+        // One job that cannot be ended must not hold up the others, nor the tick's launches.
+        match give_up(db, job, &reason).await {
+            Ok(()) => ended += 1,
+            Err(e) => {
+                tracing::error!(job = %job.id, error = %e, "an orphaned launch could not be ended")
+            }
+        }
     }
-    Ok(dead.len())
+    Ok(ended)
 }
 
 /// The last attempt failed: end the campaign's launch and fail the job together.

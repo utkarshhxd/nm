@@ -20,8 +20,7 @@ use crate::{
     brand,
     custom_fields::{Definition, definitions_for},
     error::{ApiError, ApiResult},
-    segments,
-    sending_domains::{self, not_passing},
+    segments, sending_domains,
     template::{
         Authored, Doc, FreezeError, Kind, Stored, StoredError, SystemFooter,
         mjml::CompileError,
@@ -538,16 +537,7 @@ pub async fn prepare(db: &PgPool, public_url: &url::Url, c: &Campaign) -> Result
         .await
         .map_err(|e| internal(format!("{e:?}")))?
         .ok_or_else(|| missing("sending_domain_id", "a sending domain that still exists"))?;
-    let unverified = not_passing(&domain);
-    if !unverified.is_empty() && domain.send_unverified_acknowledged_at.is_none() {
-        return Err(Refusal::DomainUnverified(format!(
-            "{} has not passed its {} DNS check{}, and no admin has acknowledged sending from it \
-             anyway",
-            domain.domain,
-            unverified.join(", "),
-            if unverified.len() == 1 { "" } else { "s" },
-        )));
-    }
+    sending_domains::gate(&domain).map_err(Refusal::DomainUnverified)?;
     let local = c
         .from_local_part
         .as_deref()

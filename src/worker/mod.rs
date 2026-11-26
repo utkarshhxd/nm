@@ -371,8 +371,11 @@ impl Worker {
     /// [`launch::LAUNCH_SLICE`] of work, and a double opt-in email never waits behind a campaign.
     /// One job per tick, and a launch that hands off is claimed again by the next.
     async fn launch(&self) -> sqlx::Result<usize> {
-        // A launch whose worker died on its last attempt is claimable by nothing; end it first.
-        launch::sweep(&self.ctx.db).await?;
+        // A launch whose worker died on its last attempt is claimable by nothing; end it first. A
+        // sweep that fails is logged and the claim goes ahead: it must not hold up every launch.
+        if let Err(e) = launch::sweep(&self.ctx.db).await {
+            tracing::error!(error = %e, "orphaned launches could not be swept");
+        }
         let jobs = claim(
             &self.ctx.db,
             launch::LAUNCH_KIND,

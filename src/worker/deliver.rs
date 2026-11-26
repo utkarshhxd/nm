@@ -71,8 +71,9 @@ fn deferred(reason: String) -> Outcome {
 /// this tick nor another worker offers it more until its cool-down has passed.
 ///
 /// A relay skipped for its rate limit or its credential (deleted mid-tick included) is relay-level
-/// trouble, so it reads as `Deferred` — unless a relay already answered `Transient` about this very
-/// message, which is the better reason and spends the attempt it should.
+/// trouble, so it reads as `Deferred`. **A `Transient` from any relay outranks every later
+/// `Deferred`**, a skip or a relay's own `455` alike: the message was refused once on its own
+/// account, and that spends the attempt it should.
 pub async fn submit(
     ctx: &Ctx,
     workspace_id: Uuid,
@@ -83,9 +84,10 @@ pub async fn submit(
     bytes: &[u8],
 ) -> (Outcome, Option<Uuid>) {
     let mut last = deferred("no relay would take the message".to_owned());
-    let skip = |last: Outcome, reason: String| match last {
+    // The one preference: a message-level `Transient` already seen is kept over relay-level news.
+    let prefer = |last: Outcome, next: Outcome| match last {
         transient @ Outcome::Transient(_) => transient,
-        _ => deferred(reason),
+        _ => next,
     };
     for relay in relays {
         // The pool, never a transaction (ADR 0005): one statement.
@@ -101,9 +103,12 @@ pub async fn submit(
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    last = skip(
+                    last = prefer(
                         last,
-                        format!("relay {} is at its rate limit for this minute", relay.name),
+                        deferred(format!(
+                            "relay {} is at its rate limit for this minute",
+                            relay.name
+                        )),
                     );
                     continue;
                 }
@@ -113,18 +118,21 @@ pub async fn submit(
                         error = %e,
                         "the relay bucket could not be debited"
                     );
-                    last = skip(
+                    last = prefer(
                         last,
-                        format!("relay {}'s rate limit could not be read", relay.name),
+                        deferred(format!(
+                            "relay {}'s rate limit could not be read",
+                            relay.name
+                        )),
                     );
                     continue;
                 }
             }
         }
         let Some(password) = creds.0.get(&relay.id) else {
-            last = skip(
+            last = prefer(
                 last,
-                format!("relay {}'s password could not be read", relay.name),
+                deferred(format!("relay {}'s password could not be read", relay.name)),
             );
             continue;
         };
@@ -138,7 +146,7 @@ pub async fn submit(
                 if let Err(e) = bucket::drain(&ctx.db, relay.id, cool_down).await {
                     tracing::warn!(relay = %relay.id, error = %e, "a deferring relay could not be drained");
                 }
-                last = Outcome::Deferred { reason, cool_down };
+                last = prefer(last, Outcome::Deferred { reason, cool_down });
             }
             decided => return (decided, Some(relay.id)),
         }

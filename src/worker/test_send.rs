@@ -20,7 +20,7 @@ use super::confirmation::Ctx;
 use crate::{
     mail::{self, Outgoing},
     relay::{self, transport::Outcome},
-    sending_domains::{self, not_passing},
+    sending_domains,
     suppressions::blocking_suppression,
     users::normalize_email,
     worker::{
@@ -112,15 +112,8 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
         }
         Err(e) => return db_error("the sending domain could not be read", &e),
     };
-    let unverified = not_passing(&domain);
-    if !unverified.is_empty() && domain.send_unverified_acknowledged_at.is_none() {
-        return Outcome::Failed(format!(
-            "{} has not passed its {} DNS check{}, and no admin has acknowledged sending from it \
-             anyway",
-            domain.domain,
-            unverified.join(", "),
-            if unverified.len() == 1 { "" } else { "s" },
-        ));
+    if let Err(reason) = sending_domains::gate(&domain) {
+        return Outcome::Failed(reason);
     }
 
     let relays = match relay::enabled_relays(&ctx.db, job.workspace_id).await {

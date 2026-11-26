@@ -49,7 +49,7 @@ use crate::{
     mail::{self, Outgoing, dkim},
     public::token::{self, Purpose, Token},
     relay::{self, Relay, transport::Outcome},
-    sending_domains::{self, SendingDomain, not_passing},
+    sending_domains::{self, SendingDomain},
     template::{render::Contact, text::render_subject},
     worker::{
         BUDGET_SPENT, JOB_LEASE, RATE_LIMITED, RATE_LIMITED_WAIT,
@@ -67,6 +67,15 @@ pub const STATE_REFRESH: Duration = Duration::from_secs(1);
 /// refreshed. A refresher that errors or stalls must not stretch a pause past invariant 5's 5 s.
 const STALE_AFTER: Duration = Duration::from_secs(4);
 
+// Invariant 5's arithmetic: a send checks the map right before its write-ahead, the map is read
+// every `STATE_REFRESH`, and one older than `STALE_AFTER` stops every send. So a pause is seen
+// within `STALE_AFTER` at worst, which must stay under the 5 s the spec promises.
+// `pause_stops_new_submissions_within_five_seconds` holds the ordering half.
+const _: () = assert!(
+    STATE_REFRESH.as_secs() < STALE_AFTER.as_secs() && STALE_AFTER.as_secs() < 5,
+    "a pause must be seen within 5 s: STATE_REFRESH < STALE_AFTER < 5 s"
+);
+
 /// The flusher records what it holds at least this often (spec §4.7.6)...
 pub const FLUSH_EVERY: Duration = Duration::from_millis(250);
 /// ...or as soon as it holds this many outcomes.
@@ -82,8 +91,8 @@ type Sending = HashMap<Uuid, Option<DateTime<Utc>>>;
 /// Campaign -> its frozen content, and the `frozen_at` it was read at.
 type FrozenCache = HashMap<Uuid, (Option<DateTime<Utc>>, Arc<Frozen>)>;
 
-/// Sending domain -> the domain and its DKIM key, read once per tick.
-type Domains = HashMap<Uuid, (Arc<SendingDomain>, Option<Arc<dkim::SigningKey>>)>;
+/// (workspace, sending domain) -> the domain and its DKIM key, read once per tick.
+type Domains = HashMap<(Uuid, Uuid), (Arc<SendingDomain>, Option<Arc<dkim::SigningKey>>)>;
 
 /// The campaigns that are `sending`, and when each was frozen, as of the last refresh (when).
 #[derive(Default)]
@@ -181,8 +190,8 @@ pub struct CampaignWorker {
     states: Arc<States>,
     concurrency: usize,
     budget: Duration,
-    /// Frozen content by campaign, with the `frozen_at` it was read at: a resume that re-freezes
-    /// moves `frozen_at`, and the next tick reads the new one.
+    /// Frozen content by campaign, with the `frozen_at` it was read at. Each tick asks the database
+    /// for the current `frozen_at`: a resume that re-freezes moves it, and the new document is read.
     frozen: Mutex<FrozenCache>,
 }
 
@@ -282,10 +291,16 @@ impl CampaignWorker {
                     match hold {
                         Hold::Pause(reason) => {
                             tracing::warn!(campaign = %campaign_id, %reason, "system pause");
-                            if let Err(e) = system_pause(db, campaign_id, &reason).await {
-                                tracing::error!(campaign = %campaign_id, error = %e, "a system pause could not be written");
-                            }
-                            release(db, &held, Duration::ZERO, &reason).await;
+                            // Paused, nothing claims these again until a resume. Not paused, they
+                            // wait: released at once, the next tick would claim them straight back.
+                            let wait = match system_pause(db, campaign_id, &reason).await {
+                                Ok(()) => Duration::ZERO,
+                                Err(e) => {
+                                    tracing::error!(campaign = %campaign_id, error = %e, "a system pause could not be written");
+                                    RATE_LIMITED_WAIT
+                                }
+                            };
+                            release(db, &held, wait, &reason).await;
                         }
                         Hold::Wait(reason) => release(db, &held, RATE_LIMITED_WAIT, &reason).await,
                     }
@@ -396,30 +411,29 @@ impl CampaignWorker {
             tracing::warn!(campaign = %campaign_id, error = ?e, "{what}");
             Hold::Wait(what.to_owned())
         };
-        let at = self.states.frozen_at(campaign_id);
-        let cached = self
+        // Which rendition is current is the database's to say, every tick. The state map's copy of
+        // `frozen_at` lags by up to a refresh (more when one fails), and a resume that re-froze in
+        // that window would leave the old rendition in use, which fails `frozen_usable` and pauses
+        // the campaign the operator just resumed. One primary-key read: the document itself comes
+        // back only when it is not the one already held.
+        let held = self
             .frozen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&campaign_id)
-            .filter(|(when, _)| *when == at)
-            .map(|(_, f)| Arc::clone(f));
-        let frozen = match cached {
-            Some(f) => f,
-            None => {
-                let (column, when): (Option<Value>, Option<DateTime<Utc>>) = sqlx::query_as(
-                    "select frozen, frozen_at from campaigns where id = $1 and workspace_id = $2",
-                )
-                .bind(campaign_id)
-                .bind(ws)
-                .fetch_one(db)
-                .await
-                .map_err(|e| wait("the campaign could not be read", &e))?;
-                let Some(column) = column else {
-                    return Err(Hold::Pause(
-                        "the campaign is sending with no frozen content; cancel it".to_owned(),
-                    ));
-                };
+            .cloned();
+        let (when, column): (Option<DateTime<Utc>>, Option<Value>) = sqlx::query_as(
+            "select frozen_at, case when frozen_at is distinct from $3 then frozen end
+               from campaigns where id = $1 and workspace_id = $2",
+        )
+        .bind(campaign_id)
+        .bind(ws)
+        .bind(held.as_ref().and_then(|(at, _)| *at))
+        .fetch_one(db)
+        .await
+        .map_err(|e| wait("the campaign could not be read", &e))?;
+        let frozen = match (column, held) {
+            (Some(column), _) => {
                 let f = Arc::new(Frozen::from_column(&column).map_err(|e| {
                     Hold::Pause(format!(
                         "its frozen content cannot be read ({e}); cancel it"
@@ -430,6 +444,12 @@ impl CampaignWorker {
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(campaign_id, (when, Arc::clone(&f)));
                 f
+            }
+            (None, Some((at, f))) if at == when => f,
+            (None, _) => {
+                return Err(Hold::Pause(
+                    "the campaign is sending with no frozen content; cancel it".to_owned(),
+                ));
             }
         };
         let defs = match defs.get(&ws) {
@@ -445,7 +465,9 @@ impl CampaignWorker {
             }
         };
         frozen_usable(&frozen, &defs).map_err(|r| Hold::Pause(r.to_string()))?;
-        let (domain, key) = match domains.get(&frozen.sending_domain_id) {
+        // Keyed with the workspace, as the read it saves is scoped: a hit is as tenant-safe as it.
+        let domain_key = (ws, frozen.sending_domain_id);
+        let (domain, key) = match domains.get(&domain_key) {
             Some((d, k)) => (Arc::clone(d), k.clone()),
             None => {
                 let domain = sending_domains::by_id(db, ws, frozen.sending_domain_id)
@@ -458,23 +480,14 @@ impl CampaignWorker {
                             frozen.from.rsplit('@').next().unwrap_or_default()
                         ))
                     })?;
-                let unverified = not_passing(&domain);
-                if !unverified.is_empty() && domain.send_unverified_acknowledged_at.is_none() {
-                    return Err(Hold::Pause(format!(
-                        "{} has not passed its {} DNS check{}, and no admin has acknowledged \
-                         sending from it anyway",
-                        domain.domain,
-                        unverified.join(", "),
-                        if unverified.len() == 1 { "" } else { "s" },
-                    )));
-                }
+                sending_domains::gate(&domain).map_err(Hold::Pause)?;
                 let key = match signing_key(&self.ctx, &domain).await {
                     Ok(key) => key.map(Arc::new),
                     Err(Outcome::Transient(reason)) => return Err(Hold::Wait(reason)),
                     Err(other) => return Err(Hold::Pause(reason_of(other))),
                 };
                 let domain = Arc::new(domain);
-                domains.insert(frozen.sending_domain_id, (Arc::clone(&domain), key.clone()));
+                domains.insert(domain_key, (Arc::clone(&domain), key.clone()));
                 (domain, key)
             }
         };

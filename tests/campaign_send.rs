@@ -25,7 +25,7 @@ use common::{
 use nm::{
     campaign::{
         launch::{self, LAUNCH_KIND},
-        send::{CampaignWorker, States, refresh_until},
+        send::{CampaignWorker, States},
     },
     config::Config,
     crypto::{secrets::Secrets, suppression_hmac},
@@ -656,10 +656,10 @@ async fn two_workers_send_each_message_once(pool: PgPool) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
-    // Anything still to come would come now.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // `sent` means every message is final, so nothing is left to claim. A claim that lost its row
+    // mid-session is `a_stale_claim_never_sends`'s.
     for w in [&a, &b] {
-        f.tick(w).await;
+        assert_eq!(f.tick(w).await, 0, "a finished campaign still had work");
     }
 
     let to: Vec<String> = f.wires().iter().map(|w| header(w, "To").unwrap()).collect();
@@ -669,6 +669,68 @@ async fn two_workers_send_each_message_once(pool: PgPool) {
     assert_eq!(
         f.statuses(id).await,
         BTreeMap::from([("sent".to_owned(), 200)])
+    );
+}
+
+/// **Review focus 4: a claim that lost its row never sends it.** Worker A claims both messages and,
+/// at concurrency one, is mid-session on the first (the relay holds each reply 1.5 s). A's claim on
+/// the second lapses meanwhile — a pool wait, a suspended VM — and worker B re-claims and sends it.
+/// When A reaches that message its write-ahead finds the row is no longer its claim's, and A drops
+/// it without a word: every address once. Ordering, not time: B's claim lands inside A's reply
+/// delay because the test makes it as soon as the relay has read A's first message.
+#[sqlx::test]
+async fn a_stale_claim_never_sends(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Delayed(
+            Duration::from_millis(1_500),
+            "250 2.0.0 Ok",
+        )),
+    )
+    .await;
+    f.contacts(2, "w").await;
+    let id = f.launched().await;
+    let a = f.worker(1);
+    a.1.refresh(&f.pool).await.unwrap();
+    let first = tokio::spawn(async move { a.0.tick().await.map(|n| (n, a)) });
+    let started = Instant::now();
+    while f.sink.messages().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "A sent nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A's lease on the message it has not started runs out, and B takes it.
+    let lapsed = sqlx::query(
+        "update messages set run_after = now() where campaign_id = $1 and status = 'queued'",
+    )
+    .bind(id)
+    .execute(&f.pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(
+        lapsed, 1,
+        "the premise: A holds one message it has not started"
+    );
+    let b = f.worker(1);
+    assert_eq!(f.tick(&b).await, 1, "B re-claimed the lapsed message");
+    let (claimed, _a) = first.await.unwrap().expect("A's tick");
+    assert_eq!(claimed, 2, "the premise: A had claimed both");
+
+    let to: Vec<String> = f.wires().iter().map(|w| header(w, "To").unwrap()).collect();
+    let distinct: BTreeSet<&String> = to.iter().collect();
+    assert_eq!(distinct.len(), 2, "every recipient once");
+    assert_eq!(
+        to.len(),
+        2,
+        "a stale claim sent a message another worker had sent: {to:?}"
+    );
+    assert_eq!(
+        f.statuses(id).await,
+        BTreeMap::from([("sent".to_owned(), 2)])
     );
 }
 
@@ -794,15 +856,45 @@ async fn a_455_releases_with_the_attempt_intact_and_drains_the_bucket(pool: PgPo
     assert_eq!(f.messages(id).await[&contacts[0].1].2, 0);
 }
 
+/// **A 4xx about the message is not forgiven by a full relay after it.** Relay 1 answers `451`
+/// about this message; relay 2 answers `455`, its own limit. The message was refused once on its own
+/// account, so it spends the attempt (`Retry`), even though the last answer was relay-level.
+#[sqlx::test]
+async fn a_4xx_then_a_455_spends_the_attempt(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Reply("451 4.3.0 try again later")),
+    )
+    .await;
+    let full = Sink::start(Script::Smtp(AfterData::Reply("455 4.7.1 Server busy"))).await;
+    f.add_relay(Uuid::now_v7(), "full", full.addr, 1).await;
+    let contacts = f.contacts(1, "v").await;
+    let id = f.launched().await;
+
+    assert_eq!(f.tick(&f.worker(1)).await, 1);
+
+    assert_eq!(full.messages().len(), 1, "the premise: relay 2 was tried");
+    let (_, status, attempts) = f.messages(id).await[&contacts[0].1].clone();
+    assert_eq!(
+        (status.as_str(), attempts),
+        ("queued", 1),
+        "a message refused on its own account got its attempt back"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Invariant 5: pause.
 
-/// **Pause stops new submissions within five seconds.** A slow relay (300 ms a message), two at
-/// once, fifty queued: the loops run as `worker::run` runs them, an editor pauses, and from five
-/// seconds after the pause nothing more reaches the relay. What was in flight at the pause may
-/// finish; nothing is started after it, and nothing is lost: the rest stay queued for a resume.
+/// **Pause stops new submissions** (invariant 5). A slow relay, one send at a time, twenty queued.
+/// While the tick is mid-batch an editor pauses, and the worker's state map is read again: from
+/// that read on, nothing is started. At most the one send that had already passed its check when
+/// the map was read may still reach the relay; every other message stays queued with its attempt
+/// given back. Ordering, not time. That the map is read often enough for this to happen within
+/// 5 s of the pause is `STATE_REFRESH` and `STALE_AFTER`, pinned at compile time in
+/// `campaign::send`.
 #[sqlx::test]
 async fn pause_stops_new_submissions_within_five_seconds(pool: PgPool) {
+    const CONCURRENCY: usize = 1;
     let f = fx(
         &pool,
         Script::Smtp(AfterData::Delayed(
@@ -811,62 +903,53 @@ async fn pause_stops_new_submissions_within_five_seconds(pool: PgPool) {
         )),
     )
     .await;
-    f.contacts(50, "s").await;
+    f.contacts(20, "s").await;
     let id = f.launched().await;
-    let (worker, states) = f.worker(2);
-    let (stop, stopped) = tokio::sync::watch::channel(());
-    let until = || {
-        let mut stopped = stopped.clone();
-        async move {
-            let _ = stopped.changed().await;
-        }
-    };
-    let pool2 = f.pool.clone();
-    let refresher = {
-        let states = Arc::clone(&states);
-        let until = until();
-        tokio::spawn(async move { refresh_until(&states, &pool2, until).await })
-    };
-    let sending = {
-        let until = until();
-        tokio::spawn(async move { worker.run_until(until).await })
-    };
+    let (worker, states) = f.worker(CONCURRENCY);
+    states.refresh(&f.pool).await.unwrap();
+    let tick = tokio::spawn(async move { worker.tick().await });
     let started = Instant::now();
     while f.sink.messages().len() < 2 {
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "nothing was sent"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     f.app
         .post(&format!("/api/v1/workspaces/{}/campaigns/{id}/pause", f.ws))
         .await
         .assert_status_ok();
-    let paused_at = Instant::now();
-    tokio::time::sleep(Duration::from_secs(5).saturating_sub(paused_at.elapsed())).await;
-    let at_five = f.sink.messages().len();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let at_eight = f.sink.messages().len();
-    let _ = stop.send(());
-    sending.await.unwrap();
-    refresher.await.unwrap();
+    states.refresh(&f.pool).await.unwrap();
+    let at_refresh = f.sink.messages().len();
+    assert_eq!(
+        tick.await.unwrap().unwrap(),
+        20,
+        "the premise: one tick held them all"
+    );
 
-    assert_eq!(
-        at_five, at_eight,
-        "a message was started more than 5 s after the pause"
+    let sent = f.sink.messages().len();
+    assert!(
+        sent <= at_refresh + CONCURRENCY,
+        "{sent} reached the relay, {at_refresh} of them before the map said paused: a message \
+         was started after the pause"
     );
-    assert!(at_eight < 50, "the pause stopped nothing");
-    let s = f.statuses(id).await;
+    assert!(sent < 20, "the pause stopped nothing");
+    let rows = f.messages(id).await;
+    let queued: Vec<i32> = rows
+        .values()
+        .filter(|(_, status, _)| status == "queued")
+        .map(|(_, _, attempts)| *attempts)
+        .collect();
     assert_eq!(
-        s.get("sent").copied().unwrap_or(0),
-        i64::try_from(at_eight).unwrap()
+        queued.len(),
+        20 - sent,
+        "what was not sent is not queued: {rows:?}"
     );
-    assert_eq!(
-        s.get("queued").copied().unwrap_or(0),
-        50 - i64::try_from(at_eight).unwrap(),
-        "what was not sent is still queued: {s:?}"
+    assert!(
+        queued.iter().all(|a| *a == 0),
+        "a held message spent an attempt: {rows:?}"
     );
     assert_eq!(f.state(id).await, "paused");
 }
@@ -963,6 +1046,124 @@ async fn field_drift_mid_send_pauses_and_a_resume_after_a_resave_refreezes(pool:
     assert_eq!(f.state(id).await, "sent");
 }
 
+/// **A resume that lands between two refreshes of the state map sends from the new rendition.**
+/// The worker has the launch's rendition cached. The field it names changes type, the template is
+/// re-saved, and the campaign is paused and resumed — which re-freezes it — all before the map is
+/// read again, so the map still says "sending, frozen at launch". The next tick must read which
+/// rendition is current from the database: keyed on the map's copy, it would pick the old one, find
+/// it drifted, and pause the campaign the operator just resumed.
+#[sqlx::test]
+async fn a_resume_between_two_refreshes_uses_the_new_rendition(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query(
+        "insert into custom_fields (id, workspace_id, key, label, kind)
+         values ($1, $2, 'plan', 'Plan', 'text')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let tree = json!({"tree": {"blocks": [
+        {"type": "Text", "runs": [{"type": "Tag", "source": "{{ plan }}"}]}]}});
+    let template = format!("/api/v1/workspaces/{}/templates/{}", f.ws, f.template);
+    f.app.patch(&template).json(&tree).await.assert_status_ok();
+    let contacts = f.contacts(2, "g").await;
+    let id = f.launched().await;
+    // One message now, so the worker caches the launch's rendition; the other waits.
+    let (pool2, other) = (f.pool.clone(), contacts[1].0);
+    let later = move |hold: bool| {
+        let pool = pool2.clone();
+        async move {
+            sqlx::query(
+                "update messages
+                    set run_after = case when $3 then now() + interval '1 hour' else now() end
+                  where campaign_id = $1 and contact_id = $2",
+            )
+            .bind(id)
+            .bind(other)
+            .bind(hold)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    later(true).await;
+    let w = f.worker(1);
+    assert_eq!(f.tick(&w).await, 1);
+    assert_eq!(f.wires().len(), 1);
+
+    sqlx::query(
+        "update custom_fields set kind = 'number' where key = 'plan' and workspace_id = $1",
+    )
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.app.patch(&template).json(&tree).await.assert_status_ok();
+    // The last read of the map: the campaign is sending, frozen at launch.
+    w.1.refresh(&f.pool).await.unwrap();
+    f.app
+        .post(&format!("/api/v1/workspaces/{}/campaigns/{id}/pause", f.ws))
+        .await
+        .assert_status_ok();
+    f.app
+        .post(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/resume",
+            f.ws
+        ))
+        .await
+        .assert_status_ok();
+    later(false).await;
+
+    assert_eq!(
+        w.0.tick().await.unwrap(),
+        1,
+        "the premise: the stale map still lists it"
+    );
+
+    assert_eq!(
+        f.pause_reason(id).await,
+        None,
+        "a resumed campaign was paused again"
+    );
+    assert_eq!(f.wires().len(), 2, "the rest did not go out");
+    assert_eq!(f.state(id).await, "sent");
+}
+
+/// **A domain that stops passing its DNS checks pauses the campaign** (spec §4.4, §4.7.10: the gate
+/// is read per send batch). Nothing is sent, the reason names the domain and the check, and every
+/// message stays queued with its attempt given back.
+#[sqlx::test]
+async fn a_domain_that_fails_the_gate_mid_send_pauses_the_campaign(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.contacts(3, "h").await;
+    let id = f.launched().await;
+    sqlx::query("update sending_domains set checks = $2 where id = $1")
+        .bind(f.domain)
+        .bind(
+            json!({"spf": {"status": "fail", "reason": "no SPF record was published"},
+                     "dkim": {"status": "pass"}, "dmarc": {"status": "pass"},
+                     "return_path": {"status": "pass"}}),
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    f.tick(&f.worker(2)).await;
+
+    assert_eq!(f.sink.connections(), 0, "mail left an unverified domain");
+    assert_eq!(f.state(id).await, "paused");
+    let reason = f.pause_reason(id).await.expect("a pause reason");
+    assert!(
+        reason.contains(DOMAIN) && reason.contains("SPF"),
+        "{reason}"
+    );
+    for (_, status, attempts) in f.messages(id).await.values() {
+        assert_eq!((status.as_str(), *attempts), ("queued", 0));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Spec §4.8: test sends.
 
@@ -1027,9 +1228,12 @@ async fn a_test_send_job_is_delivered_as_a_test_and_respects_suppression(pool: P
 // ---------------------------------------------------------------------------------------------
 // Spec §4.7.8: the two loops.
 
-/// **A double opt-in email does not wait behind a campaign.** A thousand-message campaign is going
-/// out through a slow relay when a confirmation is queued; the jobs loop has it delivered within
-/// three seconds, because the messages loop is a loop of its own.
+/// **A double opt-in email does not wait behind a campaign** (spec §4.7.8). The worker's own loops
+/// run, as `worker::run` starts them, while a campaign goes out through a slow relay. Then the
+/// messages loop is wedged: the test holds the campaign's row, so the outcome flush (and with it the
+/// tick) cannot finish. A confirmation queued now is delivered all the same, because the jobs loop
+/// is a loop of its own and never waits on the messages loop. The bound is far above the real
+/// latency (about a second): it can only be missed when the two loops are sequenced.
 #[sqlx::test]
 async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
     let f = fx(
@@ -1045,7 +1249,7 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
         .execute(&f.pool)
         .await
         .unwrap();
-    f.contacts(1000, "k").await;
+    f.contacts(200, "k").await;
     let id = f.launched().await;
 
     // The worker's own composition, as `worker::run` starts it.
@@ -1061,6 +1265,14 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // The wedge: the flush's counter update needs this row, so the messages tick cannot end.
+    let mut wedge = f.pool.begin().await.unwrap();
+    let sent_before: i64 =
+        sqlx::query_scalar("select sent from campaigns where id = $1 for update")
+            .bind(id)
+            .fetch_one(&mut *wedge)
+            .await
+            .unwrap();
 
     let contact: Uuid = sqlx::query_scalar(
         "insert into contacts (id, workspace_id, email) values (gen_random_uuid(), $1,
@@ -1098,7 +1310,7 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
     .unwrap();
     let queued = Instant::now();
     let mut done = false;
-    while queued.elapsed() < Duration::from_secs(3) {
+    while queued.elapsed() < Duration::from_secs(30) {
         let completed: Option<DateTime<Utc>> =
             sqlx::query_scalar("select completed_at from jobs where id = $1")
                 .bind(job)
@@ -1111,17 +1323,24 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let still_sending = f.state(id).await == "sending";
+    let (state, sent_after): (String, i64) =
+        sqlx::query_as("select state, sent from campaigns where id = $1")
+            .bind(id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    wedge.rollback().await.unwrap();
     let _ = stop.send(());
     loops.await.unwrap();
 
     assert!(
-        still_sending,
-        "the campaign finished first, so this proves nothing"
+        state == "sending" && sent_after == sent_before,
+        "the messages loop was not held, so this proves nothing: {state}, {sent_before} -> \
+         {sent_after}"
     );
     assert!(
         done,
-        "the confirmation waited more than 3 s behind the campaign"
+        "the confirmation waited 30 s behind a held campaign: the loops are sequenced"
     );
 }
 
