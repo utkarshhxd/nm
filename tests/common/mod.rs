@@ -33,6 +33,7 @@ pub fn test_config(database_url: &str) -> Config {
         preview_timeout_ms: 1500,
         worker_pool_size: 5,
         worker_concurrency: 4,
+        worker_campaign_concurrency: 32,
     }
 }
 

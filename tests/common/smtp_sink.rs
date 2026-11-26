@@ -28,6 +28,8 @@ use tokio::{
 pub enum AfterData {
     /// Answer with this line, with no trailing CRLF: `"250 2.0.0 Ok"`, `"451 4.3.0 later"`, …
     Reply(&'static str),
+    /// Wait this long, then answer with this line: a relay that is slow to take each message.
+    Delayed(std::time::Duration, &'static str),
     /// Close the connection without answering. The message was read, and the sender cannot know
     /// whether it was queued.
     Drop,
@@ -192,6 +194,12 @@ async fn serve(stream: TcpStream, after: AfterData, seen: &Seen) -> std::io::Res
                 .push(body);
             match after {
                 AfterData::Reply(reply) => {
+                    writer.write_all(reply.as_bytes()).await?;
+                    writer.write_all(b"\r\n").await?;
+                    continue;
+                }
+                AfterData::Delayed(wait, reply) => {
+                    tokio::time::sleep(wait).await;
                     writer.write_all(reply.as_bytes()).await?;
                     writer.write_all(b"\r\n").await?;
                     continue;

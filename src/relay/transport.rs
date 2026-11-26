@@ -11,9 +11,11 @@
 //! | the relay | the outcome | retried |
 //! |---|---|---|
 //! | accepted it (2xx) | [`Outcome::Sent`] | no |
-//! | answered 4xx, `421` and `455` included | [`Outcome::Transient`] | yes, with backoff |
+//! | answered `455`, its own limit (spec M2c §4.7.4) | [`Outcome::Deferred`] | yes, by the next relay or later, no attempt spent |
+//! | answered any other 4xx, `421` included | [`Outcome::Transient`] | yes, with backoff |
 //! | answered 5xx | [`Outcome::Failed`] | no |
-//! | could not be connected to, or refused to negotiate | [`Outcome::Transient`] | yes |
+//! | could not be connected to at all | [`Outcome::Deferred`] | yes, as `455` |
+//! | refused to negotiate (TLS, AUTH) | [`Outcome::Transient`] | yes |
 //! | went quiet, or the socket broke | [`Outcome::Unknown`] | **never** |
 //!
 //! And one that reads backwards: **an acceptance that names a suppression is a failure.** OCI
@@ -87,10 +89,20 @@ const SUPPRESSION_NOTICE: &str = "suppression for user";
 /// `is_response`, and none of them answers the question this classification turns on: whether the
 /// session was ever open. A refused connection and a socket that broke after `DATA` are both
 /// "some I/O went wrong", and only the message tells them apart. So this one string is read, and
-/// `a_refused_connection_is_transient` in `tests/relay_transport.rs` goes red the day lettre
+/// `a_refused_connection_is_deferred` in `tests/relay_transport.rs` goes red the day lettre
 /// rewords it — at which point every unreachable relay would start recording `Unknown` instead of
 /// retrying, which is a lost message, not a double send.
 const NEVER_CONNECTED: &str = "Connection error";
+
+/// How long a relay that answered `455`, or could not be reached, is left alone: its bucket is
+/// drained for this long (spec M2c §4.7.4). OCI publishes no `Retry-After`.
+pub const DEFER_COOL_DOWN: Duration = Duration::from_secs(60);
+
+/// The cool-down when the `455` says the limit is a daily one, which a minute will not cure.
+pub const DAILY_COOL_DOWN: Duration = Duration::from_secs(3_600);
+
+/// What a `455` says when the limit it hit is the day's (OCI's 50,000), matched case-insensitively.
+const PER_DAY: &str = "per day";
 
 /// What the relay did with one message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +115,10 @@ pub enum Outcome {
     Failed(String),
     /// It may have been accepted. **Do not offer it again.**
     Unknown(String),
+    /// The relay, not the message, could not take it: a `455`, or no connection at all. Nothing
+    /// was submitted. Offer it to the next relay, or later, without spending an attempt; this
+    /// relay's bucket is drained for `cool_down`.
+    Deferred { reason: String, cool_down: Duration },
 }
 
 /// One pooled lettre client per relay id, rebuilt when the relay's configuration changes.
@@ -337,18 +353,28 @@ fn accepted(response: &Response) -> Outcome {
 /// still have been accepted.
 fn refused(e: &SmtpError) -> Outcome {
     let reason = e.to_string();
-    if e.is_transient() {
-        // A 4xx to any command, `421` and OCI's `455` included.
+    if e.is_transient() && e.status().is_some_and(|code| code.to_string() == "455") {
+        // OCI's own limit: the relay is full, the message is fine. Wait out the day when it says so.
+        let cool_down = if reason.to_ascii_lowercase().contains(PER_DAY) {
+            DAILY_COOL_DOWN
+        } else {
+            DEFER_COOL_DOWN
+        };
+        Outcome::Deferred { reason, cool_down }
+    } else if e.is_transient() {
+        // Any other 4xx to any command, `421` included.
         Outcome::Transient(reason)
     } else if e.is_permanent() {
         Outcome::Failed(reason)
-    } else if e.is_tls()
-        || e.is_client()
-        || e.is_transport_shutdown()
-        || reason.starts_with(NEVER_CONNECTED)
-    {
-        // Never connected, or the session was refused before the message was offered. Nothing
-        // was submitted, so there is nothing to be ambiguous about.
+    } else if reason.starts_with(NEVER_CONNECTED) {
+        // No session at all, so nothing was submitted: another relay, or this one later.
+        Outcome::Deferred {
+            reason,
+            cool_down: DEFER_COOL_DOWN,
+        }
+    } else if e.is_tls() || e.is_client() || e.is_transport_shutdown() {
+        // The session was refused before the message was offered. Nothing was submitted, so
+        // there is nothing to be ambiguous about.
         Outcome::Transient(reason)
     } else {
         // A broken socket or a reply that could not be read. lettre reports a connection lost

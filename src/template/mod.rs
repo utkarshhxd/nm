@@ -317,6 +317,13 @@ impl Stored {
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+
+    /// A send rendition's link prefix, `{public_url}/u/`, as it was frozen; `None` for a
+    /// template's own rendition. The send builds `List-Unsubscribe` from it, so the header carries
+    /// the very URL [`Ready::render`] checked the body for.
+    pub fn unsubscribe_base(&self) -> Option<&str> {
+        self.unsubscribe.as_deref()
+    }
 }
 
 /// The custom fields the STORED version of a document names, read straight out of the column.

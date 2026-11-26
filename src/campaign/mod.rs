@@ -18,10 +18,9 @@ use uuid::Uuid;
 
 use crate::{
     brand,
-    custom_fields::definitions_for,
+    custom_fields::{Definition, definitions_for},
     error::{ApiError, ApiResult},
-    segments,
-    sending_domains::{self, not_passing},
+    segments, sending_domains,
     template::{
         Authored, Doc, FreezeError, Kind, Stored, StoredError, SystemFooter,
         mjml::CompileError,
@@ -34,6 +33,7 @@ pub mod launch;
 pub mod queue;
 pub mod routes;
 pub mod schedule;
+pub mod send;
 
 /// How many content variants a campaign may carry (spec §4.9).
 pub const MAX_VARIANTS: usize = 4;
@@ -393,6 +393,30 @@ impl Frozen {
     }
 }
 
+/// Whether every variant of a frozen rendition still passes `ready` against the fields as they are
+/// now, on its OWN key (spec §4.7 ruling 10). The one predicate preview, resume and the send loop
+/// share, so what is previewed is what is sent. `Err` names the first variant that does not.
+pub fn frozen_usable(f: &Frozen, defs: &[Definition]) -> Result<(), Refusal> {
+    for (i, v) in f.variants.iter().enumerate() {
+        match v.rendition.ready(v.rendition.fingerprint(), defs) {
+            Ok(_) => {}
+            Err(StoredError::FieldsChanged(drift)) => {
+                return Err(Refusal::Drift {
+                    variant: i,
+                    fields: drift.into_iter().map(|d| d.key).collect(),
+                });
+            }
+            Err(e) => {
+                return Err(Refusal::Template {
+                    variant: i,
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // prepare
 
@@ -513,16 +537,7 @@ pub async fn prepare(db: &PgPool, public_url: &url::Url, c: &Campaign) -> Result
         .await
         .map_err(|e| internal(format!("{e:?}")))?
         .ok_or_else(|| missing("sending_domain_id", "a sending domain that still exists"))?;
-    let unverified = not_passing(&domain);
-    if !unverified.is_empty() && domain.send_unverified_acknowledged_at.is_none() {
-        return Err(Refusal::DomainUnverified(format!(
-            "{} has not passed its {} DNS check{}, and no admin has acknowledged sending from it \
-             anyway",
-            domain.domain,
-            unverified.join(", "),
-            if unverified.len() == 1 { "" } else { "s" },
-        )));
-    }
+    sending_domains::gate(&domain).map_err(Refusal::DomainUnverified)?;
     let local = c
         .from_local_part
         .as_deref()

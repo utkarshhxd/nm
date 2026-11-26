@@ -18,7 +18,9 @@
 //! of that and the ADR's enumeration must be re-run first. `tests/lock_order.rs` holds a
 //! reconstruction of this statement as `DEBIT`.
 
-use sqlx::PgExecutor;
+use std::time::Duration;
+
+use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 /// `$1` relay, `$2` workspace, `$3` the relay's limit per minute, `$4` tokens wanted.
@@ -82,4 +84,25 @@ pub async fn take(
         .fetch_optional(db)
         .await?
         .is_some())
+}
+
+/// `$1` relay, `$2` the cool-down as an interval. `pub` for `tests/lock_order.rs`, as [`TAKE`] is.
+///
+/// The update arm alone: `tokens` and `refilled_at` only, neither a key column, so it takes nothing
+/// on `relays` (ADR 0005). `refilled_at` in the future is what holds the bucket shut: [`TAKE`]'s
+/// refill clamps a negative elapsed time at zero, so no token comes back until it has passed.
+#[doc(hidden)]
+pub const DRAIN: &str =
+    "update relay_buckets set tokens = 0, refilled_at = now() + $2 where relay_id = $1";
+
+/// Empties a relay's bucket and holds it shut for `cool_down`: the relay said `455`, or could not
+/// be reached (spec M2c §4.7.4). A relay with no bucket row was never debited, so nothing was sent
+/// through it and there is nothing to drain. The pool, one statement, as [`take`].
+pub async fn drain(db: &PgPool, relay_id: Uuid, cool_down: Duration) -> sqlx::Result<()> {
+    sqlx::query(DRAIN)
+        .bind(relay_id)
+        .bind(cool_down)
+        .execute(db)
+        .await?;
+    Ok(())
 }

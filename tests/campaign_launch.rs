@@ -1265,3 +1265,64 @@ async fn a_launch_that_runs_out_of_attempts_on_database_errors_ends_the_campaign
     assert_eq!(state, "paused");
     assert!(reason.unwrap().contains("gave up after 1 attempts"));
 }
+
+/// **A launch whose worker died on its last attempt is ended by the worker tick** (R5's open end).
+/// Such a job has spent its attempts, its lease has run out, and it was never completed or failed,
+/// so nothing can claim it again: without the sweep its campaign stays `scheduled` for ever. The
+/// tick refuses it exactly as a last attempt does — `failed`, with the reason — and fails the job.
+#[sqlx::test]
+async fn a_launch_whose_worker_died_on_its_last_attempt_is_ended_by_the_tick(pool: PgPool) {
+    let f = fx(&pool).await;
+    f.contacts(f.list, 3, "ada").await;
+    let id = f.campaign(&[f.list], json!({})).await;
+    let job = f.schedule(id).await;
+    sqlx::query("update jobs set max_attempts = 1 where id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Claimed, and the worker died: no handle. Then its lease runs out.
+    assert_eq!(
+        worker::claim(&pool, LAUNCH_KIND, 1, 120)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    sqlx::query("update jobs set run_after = now() - interval '1 second' where id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        worker::claim(&pool, LAUNCH_KIND, 1, 120)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the premise: nothing can claim it again"
+    );
+
+    let ctx = Ctx {
+        db: pool.clone(),
+        secrets: Arc::clone(&f.ctx.secrets),
+        config: Arc::clone(&f.ctx.config),
+        transports: Arc::new(Transports::new()),
+    };
+    Worker::new(ctx, 1).tick().await.expect("a tick");
+
+    assert_eq!(f.state(id).await, "failed");
+    let c = campaign::load(&pool, f.ws, id).await.unwrap();
+    let reason = c.failure_reason.unwrap();
+    assert!(
+        reason.contains(nm::campaign::launch::ORPHANED) && reason.contains("gave up after 1"),
+        "{reason}"
+    );
+    let failed: Option<DateTime<Utc>> =
+        sqlx::query_scalar("select failed_at from jobs where id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(failed.is_some(), "the job was not failed");
+    assert_eq!(f.messages(id).await, 0, "nothing was resolved");
+}

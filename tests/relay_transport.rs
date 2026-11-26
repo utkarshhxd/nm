@@ -18,7 +18,7 @@ use common::smtp_sink::{AfterData, Script, Sink};
 use lettre::address::Envelope;
 use nm::relay::{
     Relay, Security,
-    transport::{JOB_LEASE, Outcome, Transports},
+    transport::{DAILY_COOL_DOWN, DEFER_COOL_DOWN, JOB_LEASE, Outcome, Transports},
 };
 use uuid::Uuid;
 
@@ -69,6 +69,7 @@ fn text(outcome: &Outcome) -> &str {
     match outcome {
         Outcome::Sent { response } => response,
         Outcome::Transient(s) | Outcome::Failed(s) | Outcome::Unknown(s) => s,
+        Outcome::Deferred { reason, .. } => reason,
     }
 }
 
@@ -106,17 +107,33 @@ async fn a_550_is_failed() {
     assert!(text(&outcome).contains("no such user here"), "{outcome:?}");
 }
 
-/// OCI Email Delivery answers `455` when the account is over its rate, and the message has to be
-/// offered again later. Classed off the 4xx family, not off a list of codes, so a reply nobody
-/// has seen yet lands on the retrying side.
+/// OCI Email Delivery answers `455` when the account is over its rate (spec M2c §4.7.4). That is the
+/// relay's limit, not the message's: `Deferred`, which spends no attempt, with the relay left alone
+/// for a minute — or for an hour when the reply says the limit is the day's, which a minute will not
+/// cure. Every other 4xx stays `Transient`, so a reply nobody has seen yet lands on the retrying
+/// side.
 #[tokio::test]
-async fn a_455_is_transient() {
+async fn a_455_is_deferred_for_a_minute_and_a_daily_455_for_an_hour() {
     let outcome = send_to(Script::Smtp(AfterData::Reply(
         "455 4.7.1 Server busy, try again later",
     )))
     .await;
-    assert!(matches!(outcome, Outcome::Transient(_)), "{outcome:?}");
+    assert!(
+        matches!(&outcome, Outcome::Deferred { cool_down, .. } if *cool_down == DEFER_COOL_DOWN),
+        "{outcome:?}"
+    );
+    assert_eq!(DEFER_COOL_DOWN, Duration::from_secs(60));
     assert!(text(&outcome).contains("455"), "{outcome:?}");
+
+    let daily = send_to(Script::Smtp(AfterData::Reply(
+        "455 4.7.1 Sending limit exceeded: 50000 messages Per Day",
+    )))
+    .await;
+    assert!(
+        matches!(&daily, Outcome::Deferred { cool_down, .. } if *cool_down == DAILY_COOL_DOWN),
+        "{daily:?}"
+    );
+    assert_eq!(DAILY_COOL_DOWN, Duration::from_secs(3_600));
 }
 
 /// **An acceptance that names a suppression is a delivery failure.** OCI accepts mail to a
@@ -148,14 +165,18 @@ async fn a_drop_after_data_is_unknown() {
     );
 }
 
-/// Nothing was submitted, so there is nothing to be ambiguous about: try again.
+/// Nothing was submitted, so there is nothing to be ambiguous about, and it is the relay's trouble,
+/// not the message's: deferred, to the next relay or later, spending no attempt.
 #[tokio::test]
-async fn a_refused_connection_is_transient() {
+async fn a_refused_connection_is_deferred() {
     let addr = Sink::unused_addr().await;
     let outcome = Transports::plaintext_for_tests()
         .send(&relay(addr), None, &envelope(), BYTES)
         .await;
-    assert!(matches!(outcome, Outcome::Transient(_)), "{outcome:?}");
+    assert!(
+        matches!(&outcome, Outcome::Deferred { cool_down, .. } if *cool_down == DEFER_COOL_DOWN),
+        "{outcome:?}"
+    );
 }
 
 /// **Review Focus 1.** The sink accepts the connection and then says nothing, ever. With no
