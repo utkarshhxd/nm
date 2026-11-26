@@ -5,7 +5,7 @@ Scope: the token layer, the primitive set, the contacts data table, and the page
 
 Binding context this proposal was written against:
 
-- Spec §7 "UI", §9 "Performance targets", §6 "Features", and `.superpowers/sdd/2026-11-07-m0-foundations/global-constraints.md`.
+- Spec §7 "UI", §9 "Performance targets", §6 "Features", and M0's global constraints (review notes kept outside the repository).
 - Spec §13.2 is still open: "UI look and feel: settle it with mockups before the M0 design system is built." That open item is why the current `web/src/lib/ui.tsx` is deliberately plain Tailwind. **This document closes §13.2 for the functional layer** (tokens, primitives, table, page patterns) and leaves one axis open: a brand display typeface, if the mockups ask for one. Everything here is designed so that adding a typeface later changes one `@theme` line and nothing else.
 - Measured baseline: the current app shell is **108,532 bytes gzipped** of the 153,600-byte budget (measured from `web/dist/.vite/manifest.json` with the same algorithm `web/scripts/check-bundle.mjs` uses). **Headroom for the shell is 45,068 bytes gzipped.** Every size figure below is measured, not estimated — see §2.4 for the method.
 
@@ -651,7 +651,7 @@ Replaces the toolbar in place when a selection exists — it does not float over
 - `web/scripts/check-bundle.mjs` — the measurement method every size figure in this document uses. `web/scripts/check-licenses.mjs` — the allow-list every dependency above was checked against.
 - `web/src/router.tsx` — every route is already `lazyRouteComponent`, which is what makes "put it in the route chunk" a real answer rather than a hope.
 - `.scratch/email-platform/spec.md` §6, §7 (UI, Security, Licensing), §9, §13 — §7 already names TanStack Virtual and xyflow; §2.4 revises only its "Radix primitives" line, with measurements. §13.2 is partly closed by §1.
-- `.superpowers/sdd/2026-11-07-m0-foundations/global-constraints.md` — "Build functional, accessible screens with plain Tailwind and no bespoke design system" was correct while §13.2 was open; this document is the proposal to supersede it.
+- M0's global constraints (review notes kept outside the repository) — "Build functional, accessible screens with plain Tailwind and no bespoke design system" was correct while §13.2 was open; this document is the proposal to supersede it.
 
 **Skills invoked**
 

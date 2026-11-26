@@ -51,7 +51,8 @@ Three things that must come with it:
 ## Related
 
 - M2b spec §5.7 (what a preview may honestly claim), §5.8 (the two silent mrml failures).
-- `.superpowers/sdd/m2b/contract-block-tree.md` §8 — the palette's frozen keys and colour format.
+- `PALETTE_KEYS` in `src/brand/routes.rs`, and the colour grammar in `BrandKit::validate` — the
+  palette's frozen keys and colour format.
 - `.scratch/email-platform/research/m2b-editor-and-mjml.md` §3 — the three client behaviours, and
   §3.3, which records that MJML's own `--dark` attributes shipped in 6.0.0-alpha.1 and that mrml
   6.0.1 targets MJML 4.18 and has none of them.

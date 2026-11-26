@@ -176,7 +176,7 @@ U = decided by the user. C = proposed during design and accepted (or not objecte
 - **Analytics:** revenue and goal tracking.
 - **Integrations:** generated SDKs (TypeScript, Python, Go, PHP), n8n / Zapier / Make connectors, HubSpot / Salesforce sync, native HTTP send adapters (e.g. SES v2 API).
 - **Team:** SSO (OIDC first, then SAML).
-- **AI** (bring your own key: OpenAI, Anthropic or local Ollama): writing assistant, subject-line ideas, building a segment from a sentence, results summaries.
+- **AI** (bring your own key for a hosted model provider, or a local Ollama): writing assistant, subject-line ideas, building a segment from a sentence, results summaries.
 - **Running it:** Helm chart, optional ClickHouse store for events.
 
 ## 7. Architecture

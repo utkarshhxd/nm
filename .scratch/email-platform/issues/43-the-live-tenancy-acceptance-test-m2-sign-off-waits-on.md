@@ -72,6 +72,11 @@ to an address already on OCI's suppression list.
 - 6 different text: change the constant to the real phrase **and** add the reply verbatim to
   `tests/worker_confirmation.rs`'s suppression test, which today asserts against the documented
   wording rather than an observed one.
+- 7 no row: Gmail's button did not reach `/u/{token}`, which is 3's failure reached campaigns, and
+  3's answer decides what changes. A row without `source_ref`: the token's `ref_id` (the campaign
+  id, set where `src/campaign/send.rs` issues the link) was lost on the way to
+  `src/public/unsubscribe.rs`, which copies it to `source_ref`; fix that path, and add the request
+  Gmail actually sent to `tests/campaign_send.rs`'s one-click test.
 
 ## Related
 

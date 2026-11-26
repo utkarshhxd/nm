@@ -1,7 +1,5 @@
 # M2c — campaigns and the send pipeline: implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** An admin sends a scheduled, optionally A/B-split campaign to lists narrowed by a segment;
 each mailable contact gets exactly one signed message with a working one-click unsubscribe and the
 postal address, and the send can be tested, paused, resumed, cancelled and watched.
@@ -11,7 +9,8 @@ written ahead (`submitting`) before SMTP; `jobs` carries only control work (`cam
 `campaign_test`). Content is compiled once per variant at launch ("freeze") with a product-owned
 footer inside the classified document, so the send path only substitutes. Two lanes: **Lane R**
 (`src/`, `migrations/`, `tests/`, `docs/`, `.scratch/`) and **Lane W** (`web/`), joined by the
-contract `.superpowers/sdd/m2c/contract.md` and, at W3, by the generated `schema.d.ts`.
+spec's rulings (`.scratch/email-platform/specs/2026-11-26-m2c-campaigns-and-send-pipeline.md`
+§4 and §5) and, at W3, by the generated `schema.d.ts`.
 
 **Tech Stack:** Rust (axum, sqlx, Postgres 16, lettre, `chrono-tz`, html5ever, `mrml 6.0.1`),
 React 19 + TanStack Router, Vite.
@@ -678,7 +677,9 @@ on the worker's own pool.
 
 # Lane W — web
 
-The contract is `.superpowers/sdd/m2c/contract.md`. Where code and contract disagree, the
+The contract is the spec's rulings
+(`.scratch/email-platform/specs/2026-11-26-m2c-campaigns-and-send-pipeline.md` §4 and §5).
+Where code and contract disagree, the
 contract wins; a change goes back to the controller.
 
 ### Task W1: campaign model, mock source, list screen

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The campaign API (contract: `.superpowers/sdd/m2c/contract.md`; spec M2c §4.1, §4.3, §4.8).
+//! The campaign API (spec M2c §4.1, §4.3, §4.8:
+//! `.scratch/email-platform/specs/2026-11-26-m2c-campaigns-and-send-pipeline.md`).
 //!
 //! **Roles** (spec §4.1): viewers read, preview and estimate; editors draft, delete drafts,
 //! test-send and pause; admins schedule, unschedule, resume, cancel and pick the winner.

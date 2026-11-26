@@ -45,7 +45,7 @@ Narrow it to "the covered filter or the snapshot changed", **not** to anything d
 `viewKey`. That needs `snapshot !== shownSnapshot` tracking — a second ref beside `shownKey`,
 holding which snapshot the rows on screen belong to. Task 11 declined exactly that once, so this
 is a decision to revisit rather than an oversight to correct, and whoever revisits it should read
-Task 11's reasoning first (`.superpowers/sdd/2026-11-12-m1b-segments/task-11-report.md`).
+Task 11's reasoning first (M1b Task 11's report, in the review notes kept outside the repository).
 
 Whatever is done, `the_rows_cannot_be_ticked_while_the_frozen_page_is_in_flight` must still go red
 when the lock is removed entirely.
