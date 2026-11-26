@@ -203,7 +203,7 @@ launch row beside it and found the two disagreeing; the row was right.)
 
 | path (M2c) | order it takes |
 |---|---|
-| `campaign::queue::claim` | `messages` rows alone, `for update skip locked`, one statement. Writes `attempts`, `run_after` and `claim_token`. Its join on `campaigns` (`state = 'sending'`) is a plain read with no locking clause |
+| `campaign::queue::claim` | `messages` rows alone, `for update skip locked`, one statement. Writes `attempts`, `run_after` and `claim_token`. Its join on `campaigns` (`state = 'sending'`) and its `exists` probe on `messages` (which campaigns have a message due, the ones the batch is split over) are plain reads with no locking clause |
 | `campaign::queue::mark_submitting` | the `messages` row alone, by primary key and `claim_token`. Writes `status` and `run_after` |
 | `campaign::queue::release` | `messages` rows alone, by primary key and `claim_token`, `status = 'queued'` only. Writes `attempts`, `run_after`, `error`, `claim_token` |
 | `campaign::queue::record` | `messages` (one `update … from unnest`, matched on `claim_token`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction. `tests/lock_order.rs` races it against `system_pause` and the sweep (`an_outcome_flush_and_a_pause_do_not_deadlock`, `an_outcome_flush_and_a_sweep_of_the_same_message_count_it_once`) |

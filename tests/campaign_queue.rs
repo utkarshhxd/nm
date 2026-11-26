@@ -134,10 +134,12 @@ async fn claim_one(pool: &PgPool, c: Uuid) -> Claimed {
 /// | `claim_token = gen_random_uuid()` | `a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing` |
 /// | `cross join lateral` | `a_batch_is_shared_fairly_across_campaigns` |
 /// | `k.state = 'sending'` | `a_paused_or_cancelled_campaign_is_never_claimed` |
+/// | `count(*) over () as due` | `sending_campaigns_with_nothing_due_take_no_share_of_the_batch` |
 #[test]
 fn the_claim_is_the_protocol() {
     let flat = CLAIM.split_whitespace().collect::<Vec<_>>().join(" ");
     for clause in [
+        "count(*) over () as due",
         "for update skip locked",
         "status = 'queued'",
         "attempts < max_attempts",
@@ -251,6 +253,32 @@ async fn a_batch_is_shared_fairly_across_campaigns(pool: PgPool) {
     let from_old = got.iter().filter(|m| m.campaign_id == old).count();
     let from_new = got.iter().filter(|m| m.campaign_id == new).count();
     assert_eq!((from_old, from_new), (250, 250));
+}
+
+/// The split is over the campaigns with a message due, not over every one that is `sending`. An
+/// A/B test waiting for its winner has nothing queued, and a recipient-local send has rows not due
+/// for hours; both stay `sending`, in any workspace. Split over them too, the live campaign below
+/// would get a fifth of the batch, and a hundred forgotten A/B tests would leave every live send a
+/// handful of messages a tick.
+#[sqlx::test]
+async fn sending_campaigns_with_nothing_due_take_no_share_of_the_batch(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let live = campaign(&pool, ws, &[], 1_000).await;
+    queue(&pool, ws, live, 1_000, "1 minute").await;
+    let elsewhere = workspace(&pool).await;
+    let mut named = vec![live];
+    for i in 0..4 {
+        let idle = campaign(&pool, elsewhere, &[], 10).await;
+        if i % 2 == 1 {
+            // Recipient-local: queued, due in an hour.
+            queue(&pool, elsewhere, idle, 10, "-1 hour").await;
+        }
+        named.push(idle);
+    }
+
+    let got = claim(&pool, &named, 500, LEASE).await.expect("claim");
+    assert_eq!(got.len(), 500, "the live campaign takes the whole batch");
+    assert!(got.iter().all(|m| m.campaign_id == live));
 }
 
 /// Review Focus 4. A worker whose lease ran out while another claim took the row must not mark

@@ -40,7 +40,8 @@ use uuid::Uuid;
 
 use crate::{relay::transport::SESSION_TIMEOUT, worker::backoff};
 
-/// Messages one tick claims, split evenly across the sending campaigns (spec §4.7.2).
+/// Messages one tick claims, split evenly across the sending campaigns that have one due (spec
+/// §4.7.2).
 pub const CAMPAIGN_BATCH: i64 = 500;
 
 /// Claims before a message gives up. The same 5 as the `messages.max_attempts` column default.
@@ -65,7 +66,7 @@ pub const SWEPT: &str = "the sending worker stopped mid-send; not retried";
 /// What the sweep leaves on a `queued` message that every attempt claimed and none submitted.
 pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; never submitted";
 
-/// The claim (spec §4.7.1–2). `$1` campaign ids, `$2` per-campaign limit, `$3` lease seconds.
+/// The claim (spec §4.7.1–2). `$1` campaign ids, `$2` the batch, `$3` lease seconds.
 ///
 /// `0026`'s protocol, per campaign: `for update skip locked` (two workers take disjoint rows, and
 /// neither waits on the other), `run_after` advanced in this statement (it is the lease),
@@ -73,6 +74,11 @@ pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; neve
 /// from ever being offered again. The lateral gives each campaign its own `limit`, so a 5M-row
 /// campaign cannot starve a small one; each lateral walks `messages_runnable` for one campaign.
 /// Each claimed row gets a fresh `claim_token` (`0034`).
+///
+/// **The batch is split over the campaigns with a message due (`due`), not over every one named.**
+/// An A/B test waiting for its winner and a recipient-local send between its recipients' mornings
+/// stay `sending` with nothing due, in any workspace; an even split over them would leave a live
+/// campaign a sliver of every batch. The `exists` probe is a plain read on `messages_runnable`.
 ///
 /// The join on `campaigns` makes "a paused or cancelled campaign is never claimed" a property of
 /// the database rather than of the caller's state map, which can be a second stale. It takes no
@@ -83,13 +89,20 @@ pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; neve
 pub const CLAIM: &str = "update messages m
         set attempts = m.attempts + 1, run_after = now() + make_interval(secs => $3),
             claim_token = gen_random_uuid()
-      where m.id in (select x.id from unnest($1::uuid[]) as c(id)
-                     join campaigns k on k.id = c.id and k.state = 'sending'
-                     cross join lateral (select id from messages
-                                          where campaign_id = c.id and status = 'queued'
-                                            and run_after <= now() and attempts < max_attempts
-                                          order by run_after, id
-                                          for update skip locked limit $2) x)
+      where m.id in (select x.id
+                       from (select c.id, count(*) over () as due
+                               from unnest($1::uuid[]) as c(id)
+                               join campaigns k on k.id = c.id and k.state = 'sending'
+                              where exists (select from messages d
+                                             where d.campaign_id = c.id and d.status = 'queued'
+                                               and d.run_after <= now()
+                                               and d.attempts < d.max_attempts)) c
+                      cross join lateral (select id from messages
+                                           where campaign_id = c.id and status = 'queued'
+                                             and run_after <= now() and attempts < max_attempts
+                                           order by run_after, id
+                                           for update skip locked
+                                           limit ($2 + c.due - 1) / c.due) x)
   returning m.id, m.workspace_id, m.campaign_id, m.contact_id, m.variant, m.attempts,
             m.max_attempts, m.claim_token";
 
@@ -108,9 +121,9 @@ pub struct Claimed {
     pub claim_token: Uuid,
 }
 
-/// Takes up to `ceil(batch / campaigns.len())` due messages from each of `campaigns` and holds
-/// them for `lease`. **The pool, one statement**: a transaction held across the sends is how a
-/// tick outlives its lease.
+/// Takes up to `ceil(batch / due)` due messages from each of the `due` campaigns in `campaigns`
+/// that have one, and holds them for `lease`. **The pool, one statement**: a transaction held
+/// across the sends is how a tick outlives its lease.
 pub async fn claim(
     db: &PgPool,
     campaigns: &[Uuid],
@@ -120,11 +133,9 @@ pub async fn claim(
     if campaigns.is_empty() || batch <= 0 {
         return Ok(Vec::new());
     }
-    let n = i64::try_from(campaigns.len()).unwrap_or(i64::MAX);
-    let per_campaign = batch / n + i64::from(batch % n != 0);
     sqlx::query_as(CLAIM)
         .bind(campaigns)
-        .bind(per_campaign)
+        .bind(batch)
         .bind(lease.as_secs_f64())
         .fetch_all(db)
         .await
