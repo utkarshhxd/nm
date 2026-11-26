@@ -23,6 +23,7 @@ import type {
   Page,
   Present,
   PreviewRequest,
+  Report,
   ScheduleRequest,
   TestSendRequest,
   TestSendResult,
@@ -48,6 +49,7 @@ export type CampaignSource = {
   resume: (ws: string, id: string) => Promise<Res<Campaign>>;
   cancel: (ws: string, id: string) => Promise<Res<Campaign>>;
   winner: (ws: string, id: string, body: WinnerRequest) => Promise<Res<Campaign>>;
+  report: (ws: string, id: string) => Promise<Res<Report>>;
   options: (ws: string) => Promise<Res<Options>>;
 };
 
@@ -96,6 +98,7 @@ export const campaignSource: CampaignSource = {
   resume: (ws, id) => res(api.POST(`${C}/resume`, at(ws, id))),
   cancel: (ws, id) => res(api.POST(`${C}/cancel`, at(ws, id))),
   winner: (ws, id, body) => res(api.POST(`${C}/winner`, { ...at(ws, id), body })),
+  report: (ws, id) => res(api.GET(`${C}/report`, at(ws, id))),
   options: async (ws) => {
     const params = { params: { path: { workspace_id: ws }, query: FIRST } };
     const [lists, segments, domains, templates] = await Promise.all([
