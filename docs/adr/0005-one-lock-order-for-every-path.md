@@ -223,12 +223,13 @@ docker compose -f docker-compose.dev.yml -p nm exec -T postgres psql -U nm -d nm
 ```
 
 `psql` is in the `postgres` service, not in the dev container, which is why the second line does
-not go through `scripts/dev.sh`. As of `0032` it answers:
+not go through `scripts/dev.sh`. As of `0033` it answers:
 
 ```
       parent         | fks | children
 ---------------------+-----+---------------------------------------------------------------
  api_keys            |   1 | selection_snapshots (n)
+ campaigns           |   2 | jobs (c), messages (a)
  contacts            |   4 | consent_log (c), contact_tags (c), jobs (c), list_memberships (c)
  forms               |   1 | form_lists (c)
  imports             |   1 | import_errors (c)
@@ -240,14 +241,20 @@ not go through `scripts/dev.sh`. As of `0032` it answers:
  users               |  12 | api_keys (n), auth_challenges (c), imports (n), invites (n),
                      |     | memberships (c), passkeys (c), recovery_codes (c), segments (n),
                      |     | selection_snapshots (n), sessions (c), suppressions (n)
- workspaces          |  17 | api_keys (c), brand_kits (c), contacts (c), custom_fields (c),
-                     |     | forms (c), imports (c), invites (c), jobs (c), lists (c),
-                     |     | memberships (c), relays (c), segments (c), selection_snapshots (c),
-                     |     | sending_domains (c), suppressions (c), tags (c), templates (c)
+ workspaces          |  18 | api_keys (c), brand_kits (c), campaigns (c), contacts (c),
+                     |     | custom_fields (c), forms (c), imports (c), invites (c), jobs (c),
+                     |     | lists (c), memberships (c), relays (c), segments (c),
+                     |     | selection_snapshots (c), sending_domains (c), suppressions (c),
+                     |     | tags (c), templates (c)
 ```
 
-**Ten parents, and every one is ruled on.** `0028` added exactly one, `relays`; `0032` added
-**none** — it added two edges, both out of `workspaces`, and two tables nothing references.
+**Eleven parents; ten are ruled on and the eleventh, `campaigns`, is ruled in R7.** `0028` added
+exactly one, `relays`; `0032` added **none** — it added two edges, both out of `workspaces`, and
+two tables nothing references. `0033` added `campaigns`, with two children (`messages (a)`,
+`jobs (c)`) and a third edge out of `workspaces`; `messages` is a table nothing references, and
+`jobs` already was one. The ruling waits for R7 because it rests on `delete_campaign`'s statement
+(`where state = 'draft'`, which cannot match a campaign that has messages or a live launch job),
+and that statement does not exist yet.
 `sending_domains`, `templates` and `brand_kits` are listed below the ten although they are not
 parents, because each was a table asked about and the answer is load-bearing.
 `tests/lock_order.rs` asserts that every **edge** of this graph —
@@ -264,7 +271,8 @@ a migration that adds an eleventh parent, a second child to an existing one, or 
 | `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
 | `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
-| `workspaces` | not a class | seventeen children since `0032` — it was fifteen, and thirteen before `0028` — and no exclusive taker (below) |
+| `campaigns` | ruled in R7 | two children, `messages` (`no action`) and `jobs` (`cascade`); a new parent as of `0033`. Provisionally not a lock class, since its only deleter will be `delete_campaign` with `where state = 'draft'`, and every child insert takes `for key share` once at the end of one statement; R7 writes that handler and rules on it |
+| `workspaces` | not a class | eighteen children since `0033` — it was seventeen after `0032`, fifteen before it, and thirteen before `0028` — and no exclusive taker (below) |
 | `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
 | `relays` | **not a class** — the evidence is four tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
 | `sending_domains` | not a parent at all | nothing references it, so no cascade reaches rows through it and the inversion this enumeration is over has nowhere to form. It is a child of `workspaces` and nothing else |
@@ -531,12 +539,12 @@ as a known gap rather than as a new finding.
 **The honest warning, since this document has now been wrong twice.** The claim above that a path
 obeying this cannot deadlock with another that obeys it is only as good as the enumeration. It said
 that while `contacts` was missing and while `form_lists` was listed as covered. What is different
-now is that the enumeration is **closed and mechanical**: ten parents, all ruled on, each with a
-reason that can be re-checked against the schema rather than against somebody's memory. If an
-eleventh parent appears, it is a new row in that table — and since `0028` that no longer depends on
+now is that the enumeration is **closed and mechanical**: eleven parents, ten ruled on and `campaigns` provisionally until R7, each with a
+reason that can be re-checked against the schema rather than against somebody's memory. If a
+twelfth parent appears, it is a new row in that table — and since `0028` that no longer depends on
 anybody remembering, because `the_foreign_key_graph_is_the_one_the_adr_rules_on` in
 `tests/lock_order.rs` fails on the migration that adds one. If a class appears that is not
-reachable from any of the ten, the method itself is unsound and that is a bigger conversation than
+reachable from any of the eleven, the method itself is unsound and that is a bigger conversation than
 another round. `issues/38` is the enforcement story this test is the first instalment of.
 
 **Be exact about how much of this is enforced, because "no longer depends on anybody remembering"
