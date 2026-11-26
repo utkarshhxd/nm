@@ -10,11 +10,10 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use serde_json::Value;
 use sqlx::PgPool;
 use utoipa::ToSchema;
 
-use super::{Campaign, Frozen};
+use super::{Campaign, frozen_column, frozen_links};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CampaignReport {
@@ -80,36 +79,26 @@ pub async fn report(db: &PgPool, c: &Campaign) -> sqlx::Result<CampaignReport> {
     .fetch_one(db)
     .await?;
 
-    let frozen: Option<Value> =
-        sqlx::query_scalar("select frozen from campaigns where workspace_id = $1 and id = $2")
-            .bind(c.workspace_id)
-            .bind(c.id)
-            .fetch_one(db)
-            .await?;
-    let frozen = match frozen.as_ref().map(Frozen::from_column) {
-        Some(Ok(f)) => Some(f),
-        Some(Err(e)) => {
-            tracing::error!(campaign = %c.id, error = %e, "a campaign report could not read the frozen rendition");
-            None
-        }
-        None => None,
-    };
-    let links = frozen
-        .iter()
-        .flat_map(|f| f.variants.iter().enumerate())
-        .flat_map(|(v, fv)| {
-            fv.rendition
-                .links()
-                .iter()
+    // The raw tables, so a rendition of another `marker_format_version` still lists its links.
+    let tables = frozen_column(db, c.workspace_id, c.id)
+        .await?
+        .as_ref()
+        .map_or_else(Vec::new, frozen_links);
+    let links = tables
+        .into_iter()
+        .enumerate()
+        .flat_map(|(v, table)| {
+            table
+                .into_iter()
                 .enumerate()
-                .map(move |(l, u)| (v as i16, l as i32, u))
+                .map(move |(l, url)| (v as i16, l as i32, url))
         })
         .map(|(variant, link, url)| {
             let (clicks, unique_clicks) = clicked.get(&(variant, link)).copied().unwrap_or((0, 0));
             LinkReport {
                 variant,
                 link,
-                url: url.clone(),
+                url,
                 clicks,
                 unique_clicks,
             }

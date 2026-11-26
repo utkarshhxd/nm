@@ -1143,6 +1143,88 @@ async fn a_resume_that_refreezes_keeps_every_earlier_link_index(pool: PgPool) {
     );
 }
 
+/// The same promise across a `marker_format_version` bump. The stored rendition no longer parses
+/// in this build, so the campaign pauses, and the resume re-freezes it. The link table is read from
+/// the raw JSON, so the re-freeze still appends to it, and the report still lists it. Read through
+/// the full parse, the table is dropped: the re-freeze puts `b` at index 0, where mail already sent
+/// says `a`, and the report lists no links.
+#[sqlx::test]
+async fn a_link_table_of_another_marker_version_survives_the_refreeze_and_the_report(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let link = |href: &str| json!({"type": "Link", "href": href, "text": "go", "marks": []});
+    let tree = |runs: Vec<Value>| json!({"tree": {"blocks": [{"type": "Text", "runs": runs}]}});
+    let template = format!("/api/v1/workspaces/{}/templates/{}", f.ws, f.template);
+    f.app
+        .patch(&template)
+        .json(&tree(vec![link("https://a.test/")]))
+        .await
+        .assert_status_ok();
+    f.contacts(2, "m").await;
+    let id = f.launched().await;
+    let links = || async {
+        sqlx::query_scalar::<_, Option<Value>>(
+            "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(links().await, Some(json!(["https://a.test/"])));
+    sqlx::query(
+        "update campaigns set frozen = jsonb_set(frozen, '{variants,0,rendition,marker_format_version}',
+             to_jsonb((frozen #>> '{variants,0,rendition,marker_format_version}')::int + 1))
+          where id = $1",
+    )
+    .bind(id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.tick(&f.worker(2)).await;
+    assert_eq!(
+        f.sink.connections(),
+        0,
+        "a rendition this build refuses was sent"
+    );
+    assert_eq!(f.state(id).await, "paused");
+
+    let report = f
+        .app
+        .get(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/report",
+            f.ws
+        ))
+        .await
+        .json::<Value>();
+    assert_eq!(
+        report["links"],
+        json!([{"variant": 0, "link": 0, "url": "https://a.test/", "clicks": 0, "unique_clicks": 0}]),
+        "the report dropped the links of a rendition this build does not parse"
+    );
+
+    f.app
+        .patch(&template)
+        .json(&tree(vec![
+            link("https://b.test/"),
+            link("https://a.test/"),
+        ]))
+        .await
+        .assert_status_ok();
+    f.app
+        .post(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/resume",
+            f.ws
+        ))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        links().await,
+        Some(json!(["https://a.test/", "https://b.test/"])),
+        "the re-freeze dropped the table of a rendition this build does not parse"
+    );
+}
+
 /// **A resume that lands between two refreshes of the state map sends from the new rendition.**
 /// The worker has the launch's rendition cached. The field it names changes type, the template is
 /// re-saved, and the campaign is paused and resumed — which re-freezes it — all before the map is

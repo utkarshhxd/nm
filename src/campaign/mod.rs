@@ -163,13 +163,43 @@ pub async fn load_frozen(
     ws: Uuid,
     id: Uuid,
 ) -> ApiResult<Option<Result<Frozen, StoredError>>> {
-    let column: Option<Value> =
-        sqlx::query_scalar("select frozen from campaigns where workspace_id = $1 and id = $2")
-            .bind(ws)
-            .bind(id)
-            .fetch_one(db)
-            .await?;
-    Ok(column.as_ref().map(Frozen::from_column))
+    Ok(frozen_column(db, ws, id)
+        .await?
+        .as_ref()
+        .map(Frozen::from_column))
+}
+
+/// `campaigns.frozen` as stored. `None` for a campaign that has not been launched.
+async fn frozen_column(db: impl PgExecutor<'_>, ws: Uuid, id: Uuid) -> sqlx::Result<Option<Value>> {
+    sqlx::query_scalar("select frozen from campaigns where workspace_id = $1 and id = $2")
+        .bind(ws)
+        .bind(id)
+        .fetch_one(db)
+        .await
+}
+
+/// Each variant's link table (`variants[i].rendition.links`), read from the raw frozen JSON and
+/// not through [`Frozen::from_column`], which refuses another `marker_format_version`: mail
+/// already sent points at these indexes whatever this build can parse (M2d spec §4.3.3). An entry
+/// that is not a string reads as `""`, so every later entry keeps its index; `""` matches no href
+/// and the click lookup refuses it.
+fn frozen_links(frozen: &Value) -> Vec<Vec<String>> {
+    let Some(variants) = frozen["variants"].as_array() else {
+        return Vec::new();
+    };
+    variants
+        .iter()
+        .map(|v| {
+            v["rendition"]["links"]
+                .as_array()
+                .map_or_else(Vec::new, |links| {
+                    links
+                        .iter()
+                        .map(|l| l.as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -610,19 +640,13 @@ pub async fn prepare(db: &PgPool, public_url: &url::Url, c: &Campaign) -> Result
         };
         templates.push((owned, compiled));
     }
-    // Each variant's link table as it is frozen now, when it reads: a re-freeze only appends to
-    // it, so an index in mail already sent keeps naming the same URL (M2d spec §4.3.3).
-    let prior: Vec<Vec<String>> = match load_frozen(db, ws, c.id)
+    // Each variant's link table as it is frozen now: a re-freeze only appends to it, so an index
+    // in mail already sent keeps naming the same URL (M2d spec §4.3.3).
+    let prior: Vec<Vec<String>> = frozen_column(db, ws, c.id)
         .await
-        .map_err(|e| internal(format!("{e:?}")))?
-    {
-        Some(Ok(f)) => f
-            .variants
-            .into_iter()
-            .map(|v| v.rendition.links().to_vec())
-            .collect(),
-        Some(Err(_)) | None => Vec::new(),
-    };
+        .map_err(internal)?
+        .as_ref()
+        .map_or_else(Vec::new, frozen_links);
 
     // The compiles: `mrml` and the classifier, on the blocking pool, holding no connection.
     let (brand_kit, public_url) = (kit.render(), public_url.clone());
