@@ -1,5 +1,7 @@
 # 49 — A brand-kit edit invalidates every stored rendition at once, and nothing recompiles them
 
+Status: closed by M2c R2 (5ba5611). Recompile on read, in memory, never written back (direction 2 without the write): a campaign freezes a fresh compile at launch, and a stored-template preview recompiles a `Stale` or `MarkerFormat` rendition. Field drift still refuses, and `Stored::ready` answers it before staleness.
+
 **Found by:** the M2b task R7 review (commit `bf5a344`), executed, not reasoned.
 **Blocks:** M2c sign-off. Not M2b.
 
@@ -57,7 +59,7 @@ produces a classified document — red first, against the planted defect.
 
 ## Where it was proved
 
-`.superpowers/sdd/m2b/review-R7.md`, Important finding 3. The review also found, and R7
+M2b's review of task R7 (kept outside the repository), Important finding 3. The review also found, and R7
 fixed under the same round, a related dead end: a template naming an archived custom field
 could neither be previewed (409, "save it again") nor saved (422, "that field has been
 archived"). That one is closed. This one is not.

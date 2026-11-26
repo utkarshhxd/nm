@@ -13,19 +13,31 @@
 //! CSS injection this whole module is shaped to prevent.
 //!
 //! **A write to `brand_kits` invalidates every stored `blocks` rendition in that workspace at
-//! once** (a raw `mjml` or `html` template never reads the kit, so it is not in the key), and
-//! nothing here regenerates them: refusing rather than recompiling is what keeps each handler to
-//! one locking statement, and re-rendering at send is the defect above. The bulk recompile path
-//! that follows from this belongs to M2c, which is where a send first depends on it —
-//! `.scratch/email-platform/issues/49-a-brand-kit-edit-invalidates-every-stored-rendition-at-once.md`.
+//! once** (a raw `mjml` or `html` template never reads the kit, so it is not in the key). Issue
+//! 49's answer is to recompile ON READ, in memory, and never write the result back: a campaign
+//! [`freeze`]s a fresh compile at launch, and a stored-template preview recompiles a `Stale` one.
+//! Neither runs at send. What still refuses is [`StoredError::FieldsChanged`]: a kit or renderer
+//! change does not change what a tag means, a field-kind change does, and that needs a human.
+//!
+//! ```text
+//! launch, once:      authored --compile_for_send (+ system footer)--> Stored, frozen on the campaign
+//! ```
 
 pub mod block;
+mod footer;
 pub mod lint;
 pub mod mjml;
 pub mod render;
 pub mod routes;
 pub mod tag;
 pub mod text;
+
+pub use footer::SystemFooter;
+
+/// The system footer's one slot: the merge-tag name of the recipient's unsubscribe token. Only
+/// `tag::Registry::system_footer()` knows it; an operator registry never does, whatever the
+/// workspace's custom fields are called.
+pub const UNSUBSCRIBE_TOKEN: &str = "unsubscribe_token";
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -139,6 +151,10 @@ pub enum StoredError {
     MarkedText,
     #[error("{}", mjml::render_message(.0))]
     Render(RenderError),
+    #[error("this message has no unsubscribe token, so its unsubscribe link would be dead")]
+    NoUnsubscribeToken,
+    #[error("the {0} part of this message lost its unsubscribe link, so it was not built")]
+    FooterLost(&'static str),
 }
 
 fn drift_message(drift: &[Drift]) -> String {
@@ -149,6 +165,17 @@ fn drift_message(drift: &[Drift]) -> String {
          and save it again.",
         names.join(", ")
     )
+}
+
+/// Why a campaign's rendition could not be frozen at launch.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum FreezeError {
+    /// The template's tags were saved against fields that have since changed type or been
+    /// purged. A recompile would silently change what they mean, so a human re-saves first.
+    #[error("{}", drift_message(.0))]
+    Drift(Vec<Drift>),
+    #[error("the template cannot be compiled for sending: {0}")]
+    Compile(CompileError),
 }
 
 /// Both renditions of one template, with everything needed to decide later whether they may still
@@ -176,6 +203,9 @@ pub struct Stored {
     text: Option<TextTemplate>,
     /// The custom fields the AST names, and the kind each had at compile time.
     fields: BTreeMap<String, FieldKind>,
+    /// A send rendition's link prefix, `{public_url}/u/`; `None` for a template's own rendition.
+    /// [`Ready::render`] refuses a message whose parts do not both carry it with the token.
+    unsubscribe: Option<String>,
 }
 
 /// `Stored`'s wire shape, and the only `Deserialize` in this file. Private, so nothing outside
@@ -188,6 +218,8 @@ struct Raw {
     html: String,
     text: Option<TextTemplate>,
     fields: BTreeMap<String, FieldKind>,
+    #[serde(default)]
+    unsubscribe: Option<String>,
 }
 
 /// A [`Stored`] that has passed every check a send depends on. Holding one is the proof the checks
@@ -227,6 +259,7 @@ impl Stored {
             html: raw.html,
             text: raw.text,
             fields: raw.fields,
+            unsubscribe: raw.unsubscribe,
         })
     }
 
@@ -237,14 +270,16 @@ impl Stored {
     /// NOW. A mismatch means the stored classification describes a document that is no longer the
     /// one this template would produce — a stale classification, which is a security bug and not a
     /// cache miss, so it is refused rather than used.
+    ///
+    /// Drift is checked BEFORE the fingerprint, and the order is load-bearing: `Stale` is
+    /// recoverable by recompiling in memory (issue 49) and `FieldsChanged` is not, so a rendition
+    /// that is both must answer `FieldsChanged`, or the recompile quietly re-reads every tag
+    /// against the new field kinds.
     pub fn ready<'a>(
         &'a self,
         fingerprint: &str,
         defs: &[Definition],
     ) -> Result<Ready<'a>, StoredError> {
-        if self.fingerprint != fingerprint {
-            return Err(StoredError::Stale);
-        }
         let drift: Vec<Drift> = self
             .fields
             .iter()
@@ -264,6 +299,9 @@ impl Stored {
         if !drift.is_empty() {
             return Err(StoredError::FieldsChanged(drift));
         }
+        if self.fingerprint != fingerprint {
+            return Err(StoredError::Stale);
+        }
         Ok(Ready(self))
     }
 }
@@ -272,6 +310,19 @@ impl Stored {
     /// The custom fields this document's merge tags name.
     pub fn field_names(&self) -> impl Iterator<Item = &str> {
         self.fields.keys().map(String::as_str)
+    }
+
+    /// The key this rendition was compiled under. A frozen campaign rendition is used with its
+    /// OWN key — a kit edited after launch must not change an in-flight campaign.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// A send rendition's link prefix, `{public_url}/u/`, as it was frozen; `None` for a
+    /// template's own rendition. The send builds `List-Unsubscribe` from it, so the header carries
+    /// the very URL [`Ready::render`] checked the body for.
+    pub fn unsubscribe_base(&self) -> Option<&str> {
+        self.unsubscribe.as_deref()
     }
 }
 
@@ -296,7 +347,14 @@ pub fn stored_field_names(compiled: &Value) -> BTreeSet<String> {
 
 impl Ready<'_> {
     /// One contact's HTML and plain-text parts, both filled from the one stored AST.
+    ///
+    /// A send rendition's message must carry this recipient's `{public_url}/u/{token}` in BOTH
+    /// parts, or it is refused. The last line of defence (review C1, I1, I2): it holds whatever
+    /// happened to the frozen document or to the parts built from it.
     pub fn render(&self, contact: &Contact<'_>) -> Result<Rendered, StoredError> {
+        if self.0.unsubscribe.is_some() && contact.unsubscribe_token.is_empty() {
+            return Err(StoredError::NoUnsubscribeToken);
+        }
         let html = render::substitute(&self.0.html, &self.0.nodes, contact)
             .map_err(StoredError::Render)?;
         let text = match &self.0.text {
@@ -312,6 +370,15 @@ impl Ready<'_> {
             None if html.contains(render::MARK_START) => return Err(StoredError::MarkedText),
             None => text::text_from_html(&html),
         };
+        if let Some(prefix) = &self.0.unsubscribe {
+            let (in_text, in_html) = render::footer_link(prefix, contact.unsubscribe_token);
+            if !render::carries_link(&html, &in_html) {
+                return Err(StoredError::FooterLost("HTML"));
+            }
+            if !render::carries_link(&text, &in_text) {
+                return Err(StoredError::FooterLost("plain-text"));
+            }
+        }
         Ok(Rendered { html, text })
     }
 }
@@ -335,17 +402,72 @@ pub fn compile(
     defs: &[Definition],
     keep_archived: &BTreeSet<String>,
 ) -> Result<Stored, CompileError> {
+    build(authored, brand, defs, keep_archived, None)
+}
+
+/// [`compile`], plus the system footer: the rendition a campaign sends (spec §4.5 ruling 4).
+///
+/// The footer's HTML goes in after `mrml` and before classification, at the operator document's
+/// real end of body, so it is part of the classified document. It carries the unsubscribe link
+/// `{public_url}/u/{token}` and, for a raw `mjml` or `html` template, the postal address (issue
+/// 51); a `blocks` template's plain-text part gains the same link. Never stored in
+/// `templates.compiled`: a template preview shows the operator's document, not the send.
+pub fn compile_for_send(
+    authored: Authored<'_>,
+    brand: &BrandKit,
+    defs: &[Definition],
+    keep_archived: &BTreeSet<String>,
+    footer: &SystemFooter<'_>,
+) -> Result<Stored, CompileError> {
+    build(authored, brand, defs, keep_archived, Some(footer))
+}
+
+/// The rendition a campaign launches with: always a fresh [`compile_for_send`], against the kit
+/// and the fields as they are now (issue 49). `stored` is the template's `templates.compiled`,
+/// read only to refuse field drift and to know which archived fields the template may keep
+/// naming. Every other way that column can be unusable — stale, another marker format,
+/// unreadable, absent — is cured by the compile this does anyway.
+///
+/// Runs `mrml`: call it in `spawn_blocking`, outside any transaction (spec §4.5 ruling 3).
+pub fn freeze(
+    stored: Option<&Value>,
+    authored: Authored<'_>,
+    brand: &BrandKit,
+    defs: &[Definition],
+    footer: &SystemFooter<'_>,
+) -> Result<Stored, FreezeError> {
+    if let Some(Ok(s)) = stored.map(Stored::from_column)
+        && let Err(StoredError::FieldsChanged(drift)) = s.ready(&fingerprint(authored, brand), defs)
+    {
+        return Err(FreezeError::Drift(drift));
+    }
+    let keep = stored.map(stored_field_names).unwrap_or_default();
+    compile_for_send(authored, brand, defs, &keep, footer).map_err(FreezeError::Compile)
+}
+
+fn build(
+    authored: Authored<'_>,
+    brand: &BrandKit,
+    defs: &[Definition],
+    keep_archived: &BTreeSet<String>,
+    footer: Option<&SystemFooter<'_>>,
+) -> Result<Stored, CompileError> {
     let registry =
         tag::Registry::from_definitions(defs).allowing(keep_archived.iter().map(String::as_str));
-    let (compiled, text) = match authored {
-        Authored::Blocks(blocks) => (
-            mjml::compile_blocks(blocks, brand, &registry)?,
-            Some(text::compile_text(blocks, brand, &registry)?),
-        ),
+    // A `blocks` template already emits the postal address from the kit; once is enough.
+    let html_footer = footer.map(|f| f.html(!matches!(authored, Authored::Blocks(_))));
+    let compiled = mjml::compile_authored(authored, brand, &registry, html_footer.as_deref())?;
+    let text = match authored {
+        Authored::Blocks(blocks) => {
+            let t = text::compile_text(blocks, brand, &registry)?;
+            Some(match footer {
+                Some(f) => text::with_footer(t, f.base())?,
+                None => t,
+            })
+        }
         // A raw template has no block tree, so there is no plain-text skeleton to compile: its
-        // text part comes from the substituted HTML at send (see `Ready::render`).
-        Authored::Mjml(source) => (mjml::compile_mjml(source, &registry)?, None),
-        Authored::Html(source) => (mjml::compile_html(source, &registry)?, None),
+        // text part comes from the substituted HTML at send (see `Ready::render`), footer and all.
+        Authored::Mjml(_) | Authored::Html(_) => None,
     };
     Ok(Stored {
         marker_format_version: MARKER_FORMAT_VERSION,
@@ -354,6 +476,7 @@ pub fn compile(
         nodes: compiled.nodes,
         html: compiled.html,
         text,
+        unsubscribe: footer.map(|f| format!("{}/u/", f.base())),
     })
 }
 
@@ -420,7 +543,9 @@ pub fn fingerprint(authored: Authored<'_>, brand: &BrandKit) -> String {
 }
 
 /// The custom fields an AST names, and the kind each has now. A system field (`email`,
-/// `first_name`, …) has no definition and is not recorded: nothing can change it.
+/// `first_name`, …) has no definition and is not recorded: nothing can change it. Nor is the
+/// footer's slot, even when a custom field is keyed like it (issues/44): that field is not what
+/// fills it, and its kind changing must not halt a campaign that is sending (review M4).
 fn field_kinds(nodes: &[Node], defs: &[Definition]) -> BTreeMap<String, FieldKind> {
     let mut out = BTreeMap::new();
     let mut pending: Vec<&[Node]> = vec![nodes];
@@ -438,6 +563,9 @@ fn field_kinds(nodes: &[Node], defs: &[Definition]) -> BTreeMap<String, FieldKin
                     key
                 }
             };
+            if key == UNSUBSCRIBE_TOKEN {
+                continue;
+            }
             if let Some(d) = defs.iter().find(|d| &d.key == key) {
                 out.insert(key.clone(), d.kind);
             }
@@ -668,9 +796,552 @@ mod tests {
                 last_name: "B",
                 timezone: None,
                 attributes: &attrs,
+                unsubscribe_token: "TOK",
             })
             .expect("renders");
         assert!(!out.text.contains(render::MARK_START), "{}", out.text);
         assert!(out.text.contains("teal"), "{}", out.text);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The send rendition (M2c R2: issues 48, 49 and 51)
+
+    const ADDRESS: &str = "1 Main St\nTown";
+    const LINK: &str = "https://mail.example.test/u/";
+
+    fn kit_with_address() -> BrandKit {
+        BrandKit {
+            footer_address: Some(ADDRESS.into()),
+            ..BrandKit::default()
+        }
+    }
+
+    fn public_url() -> url::Url {
+        "https://mail.example.test/".parse().expect("a url")
+    }
+
+    fn send_compile(authored: Authored<'_>, defs: &[Definition]) -> Result<Stored, CompileError> {
+        let url = public_url();
+        let footer = SystemFooter {
+            public_url: &url,
+            postal_address: ADDRESS,
+        };
+        compile_for_send(
+            authored,
+            &kit_with_address(),
+            defs,
+            &BTreeSet::new(),
+            &footer,
+        )
+    }
+
+    /// Compile for send, then one recipient's copy, used with the rendition's OWN key as a frozen
+    /// campaign rendition is.
+    fn send(authored: Authored<'_>, token: &str) -> Result<Rendered, CompileError> {
+        let stored = send_compile(authored, &defs())?;
+        let attrs = json!({ "colour": "teal" });
+        Ok(stored
+            .ready(stored.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: token,
+            })
+            .expect("renders"))
+    }
+
+    /// What follows the unsubscribe base in `s`, up to the first of `stop`.
+    fn token_part<'s>(s: &'s str, stop: &[char]) -> &'s str {
+        let at = s.find(LINK).unwrap_or_else(|| panic!("no link in {s}")) + LINK.len();
+        let rest = &s[at..];
+        &rest[..rest.find(stop).unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn a_raw_html_send_rendition_carries_the_postal_address_and_an_absolute_unsubscribe_link() {
+        let out = send(
+            Authored::Html("<html><body><p>Hi {{ first_name }}</p></body></html>"),
+            "TOK",
+        )
+        .expect("compiles");
+        assert!(out.html.contains("1 Main St<br>Town"), "{}", out.html);
+        assert!(
+            out.html
+                .contains(r#"href="https://mail.example.test/u/TOK""#),
+            "{}",
+            out.html
+        );
+        // The operator's tag keeps its own slot; the footer's slot comes after it.
+        assert!(out.html.contains("<p>Hi Ada</p>"), "{}", out.html);
+        assert!(
+            out.text.contains("https://mail.example.test/u/TOK"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("1 Main St"), "{}", out.text);
+    }
+
+    #[test]
+    fn a_raw_mjml_send_rendition_carries_both() {
+        let out = send(
+            Authored::Mjml(
+                "<mjml><mj-body><mj-section><mj-column><mj-text>Hi {{ first_name }}</mj-text>\
+                 </mj-column></mj-section></mj-body></mjml>",
+            ),
+            "TOK",
+        )
+        .expect("compiles");
+        assert!(out.html.contains("1 Main St<br>Town"), "{}", out.html);
+        assert!(
+            out.html
+                .contains(r#"href="https://mail.example.test/u/TOK""#),
+            "{}",
+            out.html
+        );
+        assert!(
+            out.text.contains("https://mail.example.test/u/TOK"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("1 Main St"), "{}", out.text);
+    }
+
+    #[test]
+    fn a_blocks_send_rendition_has_the_address_once_and_the_link() {
+        let out = send(Authored::Blocks(&blocks()), "TOK").expect("compiles");
+        assert_eq!(out.html.matches("1 Main St").count(), 1, "{}", out.html);
+        assert!(
+            out.html
+                .contains(r#"href="https://mail.example.test/u/TOK""#),
+            "{}",
+            out.html
+        );
+        assert_eq!(out.text.matches("1 Main St").count(), 1, "{}", out.text);
+        assert!(
+            out.text
+                .ends_with("\n\nUnsubscribe: https://mail.example.test/u/TOK"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn the_footer_sits_before_the_real_end_of_body_not_a_commented_one() {
+        let out = send(
+            Authored::Html("<html><body><p>x</p><!-- </body> --></body></html>"),
+            "TOK",
+        )
+        .expect("compiles");
+        let comment = out.html.find("<!-- </body> -->").expect("the comment");
+        let footer = out.html.find("<table role=").expect("the footer");
+        assert!(comment < footer, "{}", out.html);
+        assert!(
+            out.html
+                .ends_with("Unsubscribe</a></td></tr></table></body></html>"),
+            "{}",
+            out.html
+        );
+        // No end of body at all: the footer goes at the end.
+        let out = send(Authored::Html("<p>x</p>"), "TOK").expect("compiles");
+        assert!(
+            out.html.ends_with("Unsubscribe</a></td></tr></table>"),
+            "{}",
+            out.html
+        );
+    }
+
+    /// Each of these ends somewhere the footer would be text, not markup. The classifier alone
+    /// would pass the title, attribute and plaintext cases: the footer's slot there is text or a
+    /// URL to it, and only a browser shows that nothing is rendered.
+    #[test]
+    fn a_document_ending_inside_an_unclosed_comment_or_script_is_footer_hidden() {
+        for source in [
+            "<p>x</p><!-- unclosed",
+            "<p>x</p><script>var a = 1;",
+            "<p>x</p><script>var a = '</body>';",
+            "<p>x</p><style>p { color: red }",
+            "<p>x</p><title>x",
+            "<p>x</p><a href=\"https://x.example/",
+            "<body><p>x</p><plaintext></body>",
+            // The operator's own copy of the probe character is not a probe.
+            "<p>\u{E00F}</p><title>x",
+        ] {
+            assert_eq!(
+                send_compile(Authored::Html(source), &defs()).unwrap_err(),
+                CompileError::FooterHidden,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_operator_cannot_name_the_unsubscribe_slot() {
+        // Not even through a custom field keyed the same (issues/44: keys are not reserved).
+        let mut defs = defs();
+        defs.push(Definition {
+            key: UNSUBSCRIBE_TOKEN.into(),
+            ..defs[0].clone()
+        });
+        let tag = format!("{{{{ {UNSUBSCRIBE_TOKEN} }}}}");
+        let html = format!("<a href=\"https://x.example/{tag}\">x</a>");
+        let blocks = vec![Block::Text {
+            runs: vec![Run::Tag {
+                source: tag.clone(),
+            }],
+        }];
+        let refused = CompileError::Tag(tag::TagError::UnknownField(UNSUBSCRIBE_TOKEN.into()));
+        for authored in [Authored::Html(&html), Authored::Blocks(&blocks)] {
+            assert_eq!(send_compile(authored, &defs).unwrap_err(), refused);
+            assert_eq!(
+                compile(authored, &BrandKit::default(), &defs, &BTreeSet::new()).unwrap_err(),
+                refused
+            );
+        }
+    }
+
+    /// A merge tag cannot be written that names the slot, so the other way to reach it is a marker
+    /// the classifier reads DECODED: `~` as `&#126;`. Index 1 is the footer's here.
+    #[test]
+    fn a_character_reference_cannot_forge_the_unsubscribe_slot() {
+        let forged = "&#126;nmmt&#126;1&#126;tmmn&#126;";
+        for source in [
+            format!("<p>{{{{ first_name }}}}</p><a href=\"https://evil.example/{forged}\">x</a>"),
+            format!("<p>{{{{ first_name }}}}</p><p>{forged}</p>"),
+            // RCDATA decodes character references too, where raw text does not.
+            format!("<p>{{{{ first_name }}}}</p><textarea>{forged}</textarea>"),
+            format!("<title>{forged}</title><p>{{{{ first_name }}}}</p>"),
+        ] {
+            assert_eq!(
+                send_compile(Authored::Html(&source), &defs()).unwrap_err(),
+                CompileError::ForgedMarker,
+                "{source}"
+            );
+        }
+    }
+
+    /// Review C1. The footer goes in before the real `</body>`, and an operator conditional that
+    /// opens before it and closes after it would rewind the footer away for every recipient the
+    /// branch is not taken for — here, all of them. An ALIAS of the operator's own conditional,
+    /// written with character references, is the same thing by another route.
+    #[test]
+    fn an_operator_conditional_cannot_wrap_the_footer() {
+        let open = "&#126;nmmt&#126;0o&#126;tmmn&#126;";
+        let close = "&#126;nmmt&#126;0c&#126;tmmn&#126;";
+        for source in [
+            "<html><body><p>Hi</p>{{^ email }}</body></html>{{/ email }}".to_owned(),
+            "<html><body><p>Hi</p>{{# colour }}</body>{{/ colour }}</html>".to_owned(),
+            "<p>Hi</p>{{^ email }}</body>{{/ email }}".to_owned(),
+            format!(
+                "<html><body><p>{{{{^ email }}}}x{{{{/ email }}}}</p>{open}</body></html>{close}"
+            ),
+        ] {
+            let refused = send_compile(Authored::Html(&source), &defs())
+                .err()
+                .unwrap_or_else(|| panic!("froze with the footer inside a conditional: {source}"));
+            assert_eq!(
+                refused,
+                CompileError::Render(render::RenderError::FooterInBlock),
+                "{source}"
+            );
+        }
+    }
+
+    /// Review I1. A raw template's text part comes from its HTML, and a `<head>` left open must
+    /// not swallow the body — the footer with it.
+    #[test]
+    fn an_open_head_does_not_lose_the_footer_from_the_text_part() {
+        for source in [
+            "<html><body><p>Hi</p><head></body></html>",
+            "<p>Hi</p><head>",
+            "<html><head><p>Hi</p></html>",
+        ] {
+            let out = send(Authored::Html(source), "TOK").expect("compiles");
+            assert!(out.text.contains("Hi"), "{source}: {:?}", out.text);
+            assert!(
+                out.text.contains("https://mail.example.test/u/TOK"),
+                "{source}: {:?}",
+                out.text
+            );
+            assert!(out.text.contains("1 Main St"), "{source}: {:?}", out.text);
+        }
+    }
+
+    /// Review judged item 1: the last line. Whatever happened to the frozen document, a message
+    /// whose HTML or text part does not carry this recipient's link is not built. Planted here by
+    /// editing the frozen column so an operator conditional wraps the footer — which the freeze
+    /// would refuse, so this holds the render guard on its own.
+    #[test]
+    fn a_message_that_lost_its_footer_is_not_rendered() {
+        let stored = send_compile(Authored::Html("<p>{{^ email }}x{{/ email }}</p>"), &defs())
+            .expect("compiles");
+        let mut column = serde_json::to_value(&stored).expect("serialises");
+        let close = format!("{}0c{}", render::MARK_START, render::MARK_END);
+        let html = column["html"].as_str().expect("html").replace(&close, "") + &close;
+        column["html"] = json!(html);
+        let tampered = Stored::from_column(&column).expect("reads");
+        let attrs = json!({});
+        let out = tampered
+            .ready(tampered.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "TOK",
+            });
+        assert_eq!(out.unwrap_err(), StoredError::FooterLost("HTML"));
+    }
+
+    /// R3 carry. A token that is the front of another recipient's token must not pass on that
+    /// other link: the stored footer is edited so its link runs on past the slot (`…/u/TOK` +
+    /// `EN2`), which is what a message for `TOKEN2` looks like to a check that only asks whether
+    /// `…/u/TOK` is somewhere in the part.
+    #[test]
+    fn a_token_that_is_the_front_of_another_tokens_link_is_not_the_link() {
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs()).expect("compiles");
+        let mut column = serde_json::to_value(&stored).expect("serialises");
+        let html = column["html"].as_str().expect("html");
+        let slot_end = format!("{}\"", render::MARK_END);
+        assert_eq!(html.matches(&slot_end).count(), 1, "one slot, then a quote");
+        column["html"] = json!(html.replace(&slot_end, &format!("{}EN2\"", render::MARK_END)));
+        let tampered = Stored::from_column(&column).expect("reads");
+        let attrs = json!({});
+        let render_for = |token: &str| {
+            tampered
+                .ready(tampered.fingerprint(), &defs())
+                .expect("ready")
+                .render(&Contact {
+                    email: "a@b.example",
+                    first_name: "Ada",
+                    last_name: "B",
+                    timezone: None,
+                    attributes: &attrs,
+                    unsubscribe_token: token,
+                })
+        };
+        // The link in the part is `…/u/TOKEN2`: it is TOKEN2's, so it is not TOK's.
+        assert_eq!(
+            render_for("TOK").unwrap_err(),
+            StoredError::FooterLost("HTML")
+        );
+        // Control: the rendition as compiled builds for the same token, so the refusal above is
+        // about the run-on and not about the token.
+        stored
+            .ready(stored.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "TOK",
+            })
+            .expect("the untampered message is built");
+    }
+
+    #[test]
+    fn a_link_ends_at_a_character_no_token_is_made_of() {
+        for (part, link, ok) in [
+            ("<a href=\"https://x/u/TOK\">", "https://x/u/TOK", true),
+            ("Unsubscribe: https://x/u/TOK", "https://x/u/TOK", true),
+            ("(https://x/u/TOK)", "https://x/u/TOK", true),
+            ("https://x/u/TOKEN2", "https://x/u/TOK", false),
+            ("https://x/u/TOK.sig", "https://x/u/TOK", false),
+            ("https://x/u/TOK%20", "https://x/u/TOK", false),
+            // The first match is a prefix of another link, the second is the real one.
+            (
+                "https://x/u/TOKEN2 and https://x/u/TOK",
+                "https://x/u/TOK",
+                true,
+            ),
+        ] {
+            assert_eq!(render::carries_link(part, link), ok, "{part}");
+        }
+    }
+
+    /// Review I2. An empty token is a dead link sent to every recipient without a word.
+    #[test]
+    fn an_empty_unsubscribe_token_is_refused() {
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs()).expect("compiles");
+        let attrs = json!({});
+        let out = stored
+            .ready(stored.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "",
+            });
+        assert_eq!(out.unwrap_err(), StoredError::NoUnsubscribeToken);
+    }
+
+    /// Review M4. The footer's slot is not a custom field, whatever a custom field is keyed, so a
+    /// change to such a field must not halt a campaign that is sending.
+    #[test]
+    fn a_custom_field_keyed_like_the_slot_is_not_recorded_in_a_send_rendition() {
+        let mut defs = defs();
+        defs.push(Definition {
+            key: UNSUBSCRIBE_TOKEN.into(),
+            ..defs[0].clone()
+        });
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs).expect("compiles");
+        assert_eq!(stored.field_names().count(), 0);
+        defs[1].kind = FieldKind::Select;
+        assert!(stored.ready(stored.fingerprint(), &defs).is_ok());
+    }
+
+    #[test]
+    fn a_token_cannot_leave_its_path_component() {
+        let token = "a/../b?x=1#y";
+        for authored in [Authored::Html("<p>x</p>"), Authored::Blocks(&blocks())] {
+            let out = send(authored, token).expect("compiles");
+            for (part, stop) in [(&out.html, &['"'][..]), (&out.text, &[')', '\n', ' '][..])] {
+                let path = token_part(part, stop);
+                assert!(
+                    !path.contains(['/', '?', '#']),
+                    "the token left its path segment as {path:?}: {part}"
+                );
+            }
+        }
+    }
+
+    /// A contact's own data can hold any key (an import, a custom field keyed like the slot), and
+    /// the slot is answered before it is looked at.
+    #[test]
+    fn a_contact_value_cannot_fill_the_unsubscribe_slot() {
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs()).expect("compiles");
+        let attrs = json!({ UNSUBSCRIBE_TOKEN: "EVIL" });
+        let out = stored
+            .ready(stored.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "TOK",
+            })
+            .expect("renders");
+        assert_eq!(token_part(&out.html, &['"']), "TOK", "{}", out.html);
+    }
+
+    #[test]
+    fn the_postal_address_is_text_not_markup() {
+        let url = public_url();
+        let footer = SystemFooter {
+            public_url: &url,
+            postal_address: "<b>A&B</b> {{ email }}",
+        };
+        let stored = compile_for_send(
+            Authored::Html("<p>x</p>"),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+            &footer,
+        )
+        .expect("an address cannot name a tag or open an element");
+        // Escaped as text, `{` included, so `{{ email }}` is what the recipient reads.
+        assert!(
+            stored
+                .html
+                .contains("&lt;b&gt;A&amp;B&lt;/b&gt; &#123;&#123; email }}<br>"),
+            "{}",
+            stored.html
+        );
+    }
+
+    fn button_blocks() -> Vec<Block> {
+        vec![
+            blocks().remove(0),
+            Block::Button {
+                label: "Go".into(),
+                href: "https://x.example/".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_brand_kit_edit_does_not_stop_a_freeze() {
+        let b = button_blocks();
+        let saved = compile(
+            Authored::Blocks(&b),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+        )
+        .expect("compiles");
+        assert!(saved.html.contains("#2563eb"), "the default accent");
+        let column = serde_json::to_value(&saved).expect("serialises");
+        let painted = BrandKit {
+            accent: Some("#ff0000".into()),
+            ..kit_with_address()
+        };
+        let url = public_url();
+        let footer = SystemFooter {
+            public_url: &url,
+            postal_address: ADDRESS,
+        };
+        let frozen = freeze(
+            Some(&column),
+            Authored::Blocks(&b),
+            &painted,
+            &defs(),
+            &footer,
+        )
+        .expect("a kit edit is cured by the compile a freeze makes anyway");
+        assert!(frozen.html.contains("#ff0000"), "{}", frozen.html);
+        assert!(frozen.html.contains(LINK), "{}", frozen.html);
+    }
+
+    /// With the kit moved TOO: a stale rendition is the case a freeze recompiles, so drift has to
+    /// be answered before staleness or the recompile re-reads every tag against the new kinds.
+    #[test]
+    fn field_drift_still_refuses_a_freeze() {
+        let b = button_blocks();
+        let saved = compile(
+            Authored::Blocks(&b),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+        )
+        .expect("compiles");
+        let column = serde_json::to_value(&saved).expect("serialises");
+        let mut retyped = defs();
+        retyped[0].kind = FieldKind::Select;
+        let painted = BrandKit {
+            accent: Some("#ff0000".into()),
+            ..kit_with_address()
+        };
+        let url = public_url();
+        let footer = SystemFooter {
+            public_url: &url,
+            postal_address: ADDRESS,
+        };
+        assert_eq!(
+            freeze(
+                Some(&column),
+                Authored::Blocks(&b),
+                &painted,
+                &retyped,
+                &footer
+            )
+            .unwrap_err(),
+            FreezeError::Drift(vec![Drift {
+                key: "colour".into(),
+                was: FieldKind::Text,
+                now: Some(FieldKind::Select),
+            }])
+        );
     }
 }

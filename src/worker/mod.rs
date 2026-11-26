@@ -29,6 +29,8 @@
 //! and `jobs` is a parent of nothing.
 
 pub mod confirmation;
+pub mod deliver;
+pub mod test_send;
 
 use std::{
     collections::HashMap,
@@ -45,6 +47,10 @@ use uuid::Uuid;
 
 use self::confirmation::{Ctx, handle};
 use crate::{
+    campaign::{
+        launch,
+        send::{self, CampaignWorker, States},
+    },
     config::Config,
     crypto::secrets::Secrets,
     db,
@@ -237,7 +243,7 @@ async fn release(
 ///
 /// The shift is clamped before it is applied: `attempts` is an `int` the database will happily
 /// carry to two billion, and `1 << 2_000_000_000` is not a number.
-fn backoff(attempts: i32) -> i64 {
+pub(crate) fn backoff(attempts: i32) -> i64 {
     let shift = u32::try_from(attempts.saturating_sub(1))
         .unwrap_or(0)
         .min(32);
@@ -260,18 +266,19 @@ fn jitter(span: i64) -> i64 {
     (u64::from_le_bytes(buf) % (span as u64 + 1)) as i64
 }
 
-/// The one kind this worker runs. `kind` is deliberately open (`0023`), so a second kind is a
-/// second match arm here and not a migration.
+/// The confirmation kind. `kind` is deliberately open (`0023`), so a second kind is a second
+/// match arm here and not a migration: [`test_send::TEST_KIND`] is that second arm.
 const KIND: &str = "confirmation_email";
 
 /// What a job the tick never started carries as its reason. A **deferral**, not a failure: a job
 /// that was never attempted is always safe to retry.
-const BUDGET_SPENT: &str =
+pub(crate) const BUDGET_SPENT: &str =
     "the tick's budget (half the job lease) was spent before this job was started";
 
 /// What a job the bucket would not pay for carries. Also unattempted: the relay's limit is about
 /// this minute, and the message is still worth sending in the next one.
-const RATE_LIMITED: &str = "every relay of this workspace is at its rate limit for this minute";
+pub(crate) const RATE_LIMITED: &str =
+    "every relay of this workspace is at its rate limit for this minute";
 
 /// How long a job the bucket would not pay for stays out of reach.
 ///
@@ -281,7 +288,7 @@ const RATE_LIMITED: &str = "every relay of this workspace is at its rate limit f
 /// throttling cannot have refilled in a second. Five seconds is still far below the
 /// fifteen-second floor on [`backoff`], so a row the bucket held back is offered again sooner
 /// than one that actually failed — which is the order these two deserve.
-const RATE_LIMITED_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const RATE_LIMITED_WAIT: Duration = Duration::from_secs(5);
 
 /// What the bucket will let one workspace's share of a batch do this tick.
 enum Allowance {
@@ -355,8 +362,37 @@ impl Worker {
     /// Claims up to [`BATCH`] rows, debits the bucket once for each workspace's share of them,
     /// and sends. Returns how many rows were claimed.
     pub async fn tick(&self) -> sqlx::Result<usize> {
+        let mail = self.tick_mail(KIND).await?;
+        let tests = self.tick_mail(test_send::TEST_KIND).await?;
+        Ok(mail + tests + self.launch().await?)
+    }
+
+    /// Runs one campaign launch slice, if one is due. After the mail: a launch is up to
+    /// [`launch::LAUNCH_SLICE`] of work, and a double opt-in email never waits behind a campaign.
+    /// One job per tick, and a launch that hands off is claimed again by the next.
+    async fn launch(&self) -> sqlx::Result<usize> {
+        // A launch whose worker died on its last attempt is claimable by nothing; end it first. A
+        // sweep that fails is logged and the claim goes ahead: it must not hold up every launch.
+        if let Err(e) = launch::sweep(&self.ctx.db).await {
+            tracing::error!(error = %e, "orphaned launches could not be swept");
+        }
+        let jobs = claim(
+            &self.ctx.db,
+            launch::LAUNCH_KIND,
+            1,
+            JOB_LEASE.as_secs() as i64,
+        )
+        .await?;
+        for job in &jobs {
+            launch::handle(&self.ctx, job, launch::LAUNCH_SLICE).await;
+        }
+        Ok(jobs.len())
+    }
+
+    /// One kind of mail: `confirmation_email`, or `campaign_test`.
+    async fn tick_mail(&self, kind: &'static str) -> sqlx::Result<usize> {
         let started = Instant::now();
-        let claimed = claim(&self.ctx.db, KIND, BATCH, JOB_LEASE.as_secs() as i64).await?;
+        let claimed = claim(&self.ctx.db, kind, BATCH, JOB_LEASE.as_secs() as i64).await?;
         let total = claimed.len();
         if total == 0 {
             return Ok(0);
@@ -387,7 +423,7 @@ impl Worker {
             let held_back = jobs.split_off(allowed);
             self.release_all(&held_back, RATE_LIMITED_WAIT, RATE_LIMITED)
                 .await;
-            self.send(jobs, paid_for, started).await;
+            self.send(kind, jobs, paid_for, started).await;
         }
         Ok(total)
     }
@@ -444,7 +480,13 @@ impl Worker {
     /// Every job that was not started is **deferred**, with the reason on the row. A job that was
     /// never attempted is always safe to retry; one that was started is governed by its own
     /// outcome.
-    async fn send(&self, jobs: Vec<Claimed>, paid_for: Option<Uuid>, started: Instant) {
+    async fn send(
+        &self,
+        kind: &'static str,
+        jobs: Vec<Claimed>,
+        paid_for: Option<Uuid>,
+        started: Instant,
+    ) {
         let deadline = started + self.budget;
         let mut running: JoinSet<()> = JoinSet::new();
         for job in jobs {
@@ -468,7 +510,11 @@ impl Worker {
                     }
                     return;
                 }
-                handle(&ctx, &job, paid_for).await;
+                if kind == test_send::TEST_KIND {
+                    test_send::handle(&ctx, &job, paid_for).await;
+                } else {
+                    handle(&ctx, &job, paid_for).await;
+                }
             });
         }
         while running.join_next().await.is_some() {}
@@ -573,7 +619,7 @@ fn deleted_relay(e: &sqlx::Error) -> bool {
 ///
 /// Upwards only, into `POLL..=POLL * 1.5`. The one-second floor on claim latency is a property
 /// worth keeping as written, and a jitter that could shorten the interval would chip at it.
-fn poll_interval() -> Duration {
+pub(crate) fn poll_interval() -> Duration {
     let span = i64::try_from(POLL.as_millis() / 2).unwrap_or(0);
     POLL + Duration::from_millis(u64::try_from(jitter(span)).unwrap_or(0))
 }
@@ -614,6 +660,50 @@ fn public_url_check(public_url: &url::Url) -> Result<Option<String>, String> {
     ))
 }
 
+/// The worker's two loops and the state refresher, on `ctx`'s pool and SMTP clients, until
+/// `shutdown` resolves: the jobs loop (confirmation, test, launch) and the messages loop, side by
+/// side, so a campaign tick never sits in front of a double opt-in email (spec M2c §4.7.8).
+///
+/// `#[doc(hidden)] pub` for `tests/campaign_send.rs`, which runs it against a sink.
+#[doc(hidden)]
+pub async fn run_loops(
+    ctx: Ctx,
+    concurrency: usize,
+    campaign_concurrency: usize,
+    shutdown: impl Future<Output = ()>,
+) {
+    let pool = ctx.db.clone();
+    let messages_ctx = Ctx {
+        db: ctx.db.clone(),
+        secrets: Arc::clone(&ctx.secrets),
+        config: Arc::clone(&ctx.config),
+        transports: Arc::clone(&ctx.transports),
+    };
+    let states = Arc::new(States::default());
+    let jobs = Worker::new(ctx, concurrency);
+    let messages = CampaignWorker::new(
+        Arc::new(messages_ctx),
+        Arc::clone(&states),
+        campaign_concurrency,
+    );
+    let (stop, stopped) = tokio::sync::watch::channel(());
+    let until = || {
+        let mut stopped = stopped.clone();
+        async move {
+            let _ = stopped.changed().await;
+        }
+    };
+    tokio::join!(
+        jobs.run_until(until()),
+        messages.run_until(until()),
+        send::refresh_until(&states, &pool, until()),
+        async {
+            shutdown.await;
+            let _ = stop.send(());
+        },
+    );
+}
+
 /// Runs the worker until `shutdown` resolves. `nm worker` and `nm all` both call this; **`nm
 /// serve` does not**, which is spec M2a section 5.1: scaling the API must not multiply the send
 /// rate, and an API host's pool must not be drawn down by sending.
@@ -629,15 +719,21 @@ pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> anyhow::Res
     if cfg.auto_migrate {
         db::MIGRATOR.run(&pool).await?;
     }
-    let concurrency = cfg.worker_concurrency;
+    let (concurrency, campaign_concurrency) =
+        (cfg.worker_concurrency, cfg.worker_campaign_concurrency);
     let ctx = Ctx {
         db: pool.clone(),
         secrets: Arc::new(Secrets::new(&cfg.secret_key)),
         config: Arc::new(cfg),
         transports: Arc::new(Transports::new()),
     };
-    tracing::info!(concurrency, batch = BATCH, "worker started");
-    Worker::new(ctx, concurrency).run_until(shutdown).await;
+    tracing::info!(
+        concurrency,
+        campaign_concurrency,
+        batch = BATCH,
+        "worker started"
+    );
+    run_loops(ctx, concurrency, campaign_concurrency, shutdown).await;
     pool.close().await;
     tracing::info!("worker stopped");
     Ok(())

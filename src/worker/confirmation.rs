@@ -52,7 +52,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use lettre::{Message, address::Envelope};
+use lettre::address::Envelope;
 use serde::Deserialize;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
@@ -61,16 +61,20 @@ use crate::{
     config::Config,
     crypto::secrets::Secrets,
     error::{ApiError, ApiResult},
-    mail::{self, Outgoing, dkim},
+    mail::{self, Outgoing},
     public::token::{self, Purpose, Token},
     relay::{
-        self, Relay, bucket,
+        self,
         transport::{Outcome, Transports},
     },
-    sending_domains::{CheckResult, SendingDomain, Signing},
+    sending_domains::{SendingDomain, gate},
     suppressions::blocking_suppression,
     users::normalize_email,
-    worker::{Claimed, complete, defer, fail},
+    worker::{
+        Claimed, complete, defer,
+        deliver::{Creds, signed, signing_key, submit},
+        fail,
+    },
 };
 
 /// Everything one message needs that is not on the job row. Task 11's tick builds one and shares
@@ -112,7 +116,11 @@ pub async fn handle(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome
     let outcome = attempt(ctx, job, paid_for).await;
     let recorded = match &outcome {
         Outcome::Sent { .. } => complete(&ctx.db, job.id).await,
-        Outcome::Transient(reason) => defer(&ctx.db, job, reason).await,
+        // A relay's own limit is retried as any 4xx is here: M2c's no-attempt deferral is the
+        // campaign queue's, and this path keeps M2a's backoff (spec M2c §9).
+        Outcome::Transient(reason) | Outcome::Deferred { reason, .. } => {
+            defer(&ctx.db, job, reason).await
+        }
         // Both give up, and `Unknown` gives up precisely because it might have worked.
         Outcome::Failed(reason) | Outcome::Unknown(reason) => fail(&ctx.db, job.id, reason).await,
     };
@@ -198,15 +206,8 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
         Err(e) => return db_error("the sending domain could not be read", &e),
     };
 
-    let unverified = not_passing(&domain);
-    if !unverified.is_empty() && domain.send_unverified_acknowledged_at.is_none() {
-        return Outcome::Failed(format!(
-            "{} has not passed its {} DNS check{}, and no admin has acknowledged sending from it \
-             anyway",
-            domain.domain,
-            unverified.join(", "),
-            if unverified.len() == 1 { "" } else { "s" },
-        ));
+    if let Err(reason) = gate(&domain) {
+        return Outcome::Failed(reason);
     }
 
     let relays = match relay::enabled_relays(&ctx.db, job.workspace_id).await {
@@ -238,11 +239,17 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
         unsubscribe_url: &unsubscribe_url,
         feedback_id: &format!("confirmation:{list_id}:{}:nm", job.workspace_id),
         message_id_domain: &domain.domain,
+        reply_to: None,
+        message_id: Uuid::now_v7(),
     }) {
         Ok(message) => message,
         Err(e) => return Outcome::Failed(format!("the message could not be built: {e}")),
     };
-    let bytes = match signed(ctx, &domain, &message).await {
+    let key = match signing_key(ctx, &domain).await {
+        Ok(key) => key,
+        Err(outcome) => return outcome,
+    };
+    let bytes = match signed(&domain, key.as_ref(), &message).await {
         Ok(bytes) => bytes,
         Err(outcome) => return outcome,
     };
@@ -256,7 +263,18 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
         _ => return Outcome::Failed("the envelope's addresses could not be parsed".to_owned()),
     };
 
-    submit(ctx, job.workspace_id, &relays, paid_for, &envelope, &bytes).await
+    let creds = Creds::load(ctx, job.workspace_id, &relays).await;
+    submit(
+        ctx,
+        job.workspace_id,
+        &relays,
+        paid_for,
+        &creds,
+        &envelope,
+        &bytes,
+    )
+    .await
+    .0
 }
 
 /// A lookup that failed, recorded as something to try again later.
@@ -268,118 +286,6 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
 fn db_error(what: &str, e: &ApiError) -> Outcome {
     tracing::warn!(error = ?e, "{what}");
     Outcome::Transient(what.to_owned())
-}
-
-/// Offers the message to each relay in failover order until one of them answers decisively, and
-/// **takes a token for every relay but the one the tick already paid for**.
-///
-/// **Only [`Outcome::Transient`] falls through to the next relay.** A `Failed` is the message
-/// being refused and the next relay would refuse it too; an `Unknown` may already have been
-/// queued, and offering it to a second relay is the double-send the whole classification exists
-/// to prevent.
-async fn submit(
-    ctx: &Ctx,
-    workspace_id: Uuid,
-    relays: &[Relay],
-    paid_for: Option<Uuid>,
-    envelope: &Envelope,
-    bytes: &[u8],
-) -> Outcome {
-    let mut last = Outcome::Transient("no relay was tried".to_owned());
-    for relay in relays {
-        // The tick paid for exactly one relay. Any other one this message is offered to takes a
-        // token of its own first, because a send has to be covered by a token from the relay it
-        // actually goes through -- see this module's note on failover. The pool, never a
-        // transaction (ADR 0005): `handle` holds none, and this is one statement.
-        if paid_for != Some(relay.id) {
-            match bucket::take(
-                &ctx.db,
-                workspace_id,
-                relay.id,
-                relay.rate_limit_per_minute,
-                1,
-            )
-            .await
-            {
-                Ok(true) => {}
-                // Reachable or not, it may not be driven any harder this minute. The next relay
-                // may still take it, and if none will, the row is offered again later.
-                Ok(false) => {
-                    last = Outcome::Transient(format!(
-                        "relay {} is at its rate limit for this minute",
-                        relay.name
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        relay = %relay.id,
-                        error = %e,
-                        "the relay bucket could not be debited"
-                    );
-                    last = Outcome::Transient(format!(
-                        "relay {}'s rate limit could not be read",
-                        relay.name
-                    ));
-                    continue;
-                }
-            }
-        }
-        let password = match relay::password(&ctx.db, &ctx.secrets, workspace_id, relay.id).await {
-            Ok(password) => password,
-            Err(e) => {
-                // This relay's credential cannot be read; the next one's might be fine.
-                last = db_error(
-                    &format!("relay {}'s password could not be read", relay.name),
-                    &e,
-                );
-                continue;
-            }
-        };
-        match ctx
-            .transports
-            .send(relay, password.as_deref(), envelope, bytes)
-            .await
-        {
-            Outcome::Transient(reason) => last = Outcome::Transient(reason),
-            decided => return decided,
-        }
-    }
-    last
-}
-
-/// The message as it goes on the wire: DKIM-signed by this product when the domain says so, and
-/// lettre's own bytes when the relay signs.
-async fn signed(ctx: &Ctx, domain: &SendingDomain, message: &Message) -> Result<Vec<u8>, Outcome> {
-    if domain.signing == Signing::Relay {
-        return Ok(message.formatted());
-    }
-    let der = match crate::sending_domains::dkim_private_key(
-        &ctx.db,
-        &ctx.secrets,
-        domain.workspace_id,
-        domain.id,
-    )
-    .await
-    {
-        // Wiped on the way out: this is a private key, and it is a copy `dkim_private_key` hands
-        // over as a plain `Vec` for its caller to look after.
-        Ok(Some(der)) => zeroize::Zeroizing::new(der),
-        // `sending_domains_app_signing_has_key` makes this unwritable through the API; it is the
-        // backstop, and it must not be a send of unsigned mail from a domain that promised a
-        // signature.
-        Ok(None) => {
-            return Err(Outcome::Failed(format!(
-                "{} is app-signed and has no DKIM key",
-                domain.domain
-            )));
-        }
-        Err(e) => return Err(db_error("the DKIM key could not be read", &e)),
-    };
-    let key = dkim::key_from_der(&der)
-        .map_err(|e| Outcome::Failed(format!("the stored DKIM key cannot sign: {e}")))?;
-    dkim::signed_bytes(message, &key, &domain.domain, &domain.dkim_selector)
-        .map_err(|e| Outcome::Failed(format!("the message could not be signed: {e}")))
 }
 
 /// The workspace's sending domain.
@@ -411,37 +317,6 @@ async fn sending_domain(
         Some(domain) => crate::sending_domains::for_domain(db, workspace_id, &domain).await,
         None => Ok(None),
     }
-}
-
-/// The checks that are not `Pass`, named as an operator would recognise them.
-///
-/// **`NotChecked` counts as not passing.** A new domain's `checks` is `{}`, which reads back as
-/// four `NotChecked`s, so treating "not failing" as "fine" would let every domain nobody has
-/// checked straight through the gate — which is every domain, on the day it is added.
-///
-/// **Which checks a domain is held to is a property of the domain, not of its `checks`**, which
-/// is why this takes the whole [`SendingDomain`]. `CheckResult::NotChecked` carries two different
-/// facts on `return_path`: "nobody has run a check yet", and "there is nothing here to check",
-/// which is what [`dns::check`](crate::sending_domains::dns::check) writes when no return-path
-/// domain is configured. Only `return_path_domain` tells them apart, so the second fact is read
-/// from the column, where it lives, at the moment the question is asked — and not transcribed
-/// into the stored JSON, where it would be a copy that can disagree with the column. A verdict
-/// the checker did record is always honoured, whatever the column says.
-fn not_passing(domain: &SendingDomain) -> Vec<&'static str> {
-    let checks = &domain.checks;
-    let mut required = vec![
-        ("SPF", &checks.spf),
-        ("DKIM", &checks.dkim),
-        ("DMARC", &checks.dmarc),
-    ];
-    if domain.return_path_domain.is_some() || checks.return_path != CheckResult::NotChecked {
-        required.push(("Return-Path", &checks.return_path));
-    }
-    required
-        .into_iter()
-        .filter(|(_, result)| **result != CheckResult::Pass)
-        .map(|(name, _)| name)
-        .collect()
 }
 
 /// **The one place an unsubscribe URL comes from.** The origin is this instance's `public_url`

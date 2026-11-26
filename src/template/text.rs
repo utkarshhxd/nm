@@ -69,9 +69,14 @@ use super::mjml::{BrandKit, CompileError};
 use super::render::{
     self, Contact, MARK_START, RenderError, TEXT_LINK_CLOSE, TEXT_LINK_OPEN, TEXT_LINK_SEP,
 };
-use super::tag::{self, Node, Registry};
+use super::tag::{self, Node, Registry, TagError};
 
 const RULE: &str = "----------------------------------------";
+
+/// The elements that may appear in a `<head>`. Any other start tag ends it.
+const IN_HEAD: [&str; 8] = [
+    "title", "meta", "link", "style", "script", "base", "noscript", "template",
+];
 
 /// Stands in for `{` in operator text so the whole template compiles as one tag source and typed
 /// `{{ x }}` stays literal (contract section 13). Put back after the markers are written.
@@ -264,6 +269,67 @@ pub fn compile_text(
     Ok(TextTemplate { nodes, text })
 }
 
+/// `t` with the system footer's line appended: `Unsubscribe: {base}/u/{token}`, written as a link
+/// so the token is percent-encoded for the path it lands in, exactly as in the HTML's `href`.
+///
+/// Compiled against `Registry::system_footer()` and appended to `t`'s AST, so its slot is numbered
+/// after the template's own and no operator tag can name it. The base goes through `lit`, like
+/// every other literal here.
+pub(super) fn with_footer(t: TextTemplate, base: &str) -> Result<TextTemplate, CompileError> {
+    let mut source = String::from("\n\n");
+    source.push(TEXT_LINK_OPEN);
+    source.push_str("Unsubscribe: ");
+    source.push(TEXT_LINK_SEP);
+    lit(base, &mut source);
+    source.push_str("/u/{{ ");
+    source.push_str(super::UNSUBSCRIBE_TOKEN);
+    source.push_str(" }}");
+    source.push(TEXT_LINK_SEP);
+    source.push(TEXT_LINK_CLOSE);
+    let mut footer =
+        tag::compile(&source, &Registry::system_footer()).map_err(CompileError::Tag)?;
+    if has_literal_marker(&footer) {
+        return Err(CompileError::ForgedMarker);
+    }
+    restore_braces(&mut footer);
+    let mut nodes = t.nodes;
+    nodes.extend(footer);
+    let (text, tags) = render::marked(&nodes);
+    render::classify_text(&text, tags).map_err(CompileError::Render)?;
+    Ok(TextTemplate { nodes, text })
+}
+
+/// A subject line: the merge-tag grammar of the body, compiled against the same registry, with no
+/// markup and no markers — a subject is evaluated straight from its AST, so there is no marked text
+/// for a literal to alias.
+pub fn compile_subject(source: &str, registry: &Registry) -> Result<Vec<Node>, TagError> {
+    tag::compile(source, registry)
+}
+
+/// One contact's subject: plain text, with every control character a space. A CR or LF a contact
+/// value carries into a header would end it and start another.
+pub fn render_subject(nodes: &[Node], contact: &Contact<'_>) -> String {
+    let mut out = String::new();
+    subject(nodes, contact, &mut out);
+    out.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn subject(nodes: &[Node], c: &Contact<'_>, out: &mut String) {
+    for n in nodes {
+        match n {
+            Node::Text(t) => out.push_str(t),
+            Node::Field { .. } => out.push_str(&render::field_value(n, c).unwrap_or_default()),
+            Node::Present { body, .. } | Node::Absent { body, .. } | Node::Equals { body, .. } => {
+                if render::branch_taken(n, c) {
+                    subject(body, c, out);
+                }
+            }
+        }
+    }
+}
+
 /// One contact's plain-text part from the stored template. No registry: the AST is the one stored
 /// at save, as for the HTML part.
 pub fn render_text(t: &TextTemplate, contact: &Contact<'_>) -> Result<String, RenderError> {
@@ -376,8 +442,16 @@ impl Flow {
             "title" => TokenSinkResult::RawData(RawKind::Rcdata),
             _ => TokenSinkResult::Continue,
         };
-        if self.skip.is_some() && name != "body" {
+        if let Some(skip) = self.skip.as_deref()
+            && name != "body"
+            && (skip != "head" || IN_HEAD.contains(&name))
+        {
             return feedback;
+        }
+        // A browser's "in head" rule: any other element ends an open head, and its content is
+        // body text. Without it, `<html><head><p>Hi</p>` has no text part at all (review I1).
+        if self.skip.as_deref() == Some("head") {
+            self.skip = None;
         }
         match name {
             "script" | "style" | "title" | "head" => {
@@ -495,6 +569,7 @@ mod tests {
             last_name: "Lovelace",
             timezone: None,
             attributes: attrs,
+            unsubscribe_token: "TOK",
         }
     }
 
@@ -544,6 +619,39 @@ mod tests {
         for e in ENTITIES {
             assert!(!s.contains(e), "{e} in plain text: {s:?}");
         }
+    }
+
+    /// A CR or LF in a subject is header injection. lettre happens to fold it away today; this is
+    /// the product's own guarantee, made where the value is substituted.
+    #[test]
+    fn a_subject_tag_renders_as_plain_text_without_line_breaks() {
+        let attrs = json!({});
+        let nodes = compile_subject("Hi {{ first_name }}", &registry()).expect("compiles");
+        assert_eq!(
+            render_subject(&nodes, &contact("A\r\nBcc: x@y.test", &attrs)),
+            "Hi A  Bcc: x@y.test"
+        );
+        // C1 controls too: U+0085 is NEXT LINE, which some readers break on.
+        assert_eq!(
+            render_subject(&nodes, &contact("A\u{85}B", &attrs)),
+            "Hi A B"
+        );
+        // The body's grammar, conditionals and fallbacks included, decided as the body decides.
+        let nodes = compile_subject(
+            "{{# nickname }}Hey {{ nickname }}{{/ nickname }}{{^ nickname }}Hello{{/ nickname }} \
+             {{ last_name | upper }}\t{{ country | \"friend\" }}",
+            &registry(),
+        )
+        .expect("compiles");
+        assert_eq!(
+            render_subject(&nodes, &contact("A", &attrs)),
+            "Hello LOVELACE friend"
+        );
+        // And it is an operator registry: the footer's slot is not a name it knows.
+        assert_eq!(
+            compile_subject("{{ unsubscribe_token }}", &registry()),
+            Err(TagError::UnknownField("unsubscribe_token".into()))
+        );
     }
 
     #[test]
@@ -1285,6 +1393,15 @@ mod tests {
             text_from_html("<head><title>Subject</title><body><p>Visible</p>"),
             "Visible"
         );
+        // And so is `<body>`: the first element that cannot be in a head ends it, as a browser's
+        // "in head" rule says, and what follows is body text. Review I1.
+        assert_eq!(
+            text_from_html(
+                "<html><head><title>Subject</title><meta charset=\"utf-8\"><p>Visible</p></html>"
+            ),
+            "Visible"
+        );
+        assert_eq!(text_from_html("<p>Hi</p><head><p>There</p>"), "Hi\n\nThere");
     }
 
     #[test]

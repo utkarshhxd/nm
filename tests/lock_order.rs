@@ -1425,6 +1425,8 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
         edges,
         [
             "api_keys -> selection_snapshots (n)",
+            "campaigns -> jobs (c)",
+            "campaigns -> messages (a)",
             "contacts -> consent_log (c)",
             "contacts -> contact_tags (c)",
             "contacts -> jobs (c)",
@@ -1453,6 +1455,7 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
             "users -> suppressions (n)",
             "workspaces -> api_keys (c)",
             "workspaces -> brand_kits (c)",
+            "workspaces -> campaigns (c)",
             "workspaces -> contacts (c)",
             "workspaces -> custom_fields (c)",
             "workspaces -> forms (c)",
@@ -1674,6 +1677,76 @@ async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) 
         .expect("the lock the insert arm would have taken");
 }
 
+/// **A drain takes no lock on its relay either** (M2c R6). `bucket::DRAIN` is an update of
+/// `tokens` and `refilled_at` alone, the same short-circuit as the debit's update arm, so an
+/// exclusive holder of the `relays` row does not stand in its way. Make it write a key column and
+/// it blocks behind the wedge until the timeout names it.
+///
+/// **The control** is what makes "it did not block" evidence: a second relay with no bucket row,
+/// wedged in the same transaction, is taken from with `bucket::take`, whose *insert* arm writes the
+/// foreign key columns and so asks the wedged row for `for key share`. That take must block, so the
+/// wedge is shown to be real, and it is released only after the drain has completed.
+#[sqlx::test]
+async fn a_bucket_drain_takes_no_lock_on_its_relay(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (ws, relay) = relay_fixture(&pool, true).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let first_take = Uuid::now_v7();
+    sqlx::query(
+        "insert into relays (id, workspace_id, name, host, port, security, rate_limit_per_minute)
+         values ($1, $2, 'secondary', 'smtp.example.com', 587, 'starttls', 60)",
+    )
+    .bind(first_take)
+    .bind(ws)
+    .execute(&pool)
+    .await
+    .expect("a relay with no bucket");
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from relays where id = any($1) order by id for update")
+        .bind([relay, first_take].as_slice())
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge both relays");
+
+    let control = tokio::spawn({
+        let pool = pool.clone();
+        async move { nm::relay::bucket::take(&pool, ws, first_take, 60, 10).await }
+    });
+    settle(&mut probe, 1).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        nm::relay::bucket::drain(&pool, relay, Duration::from_secs(60)),
+    )
+    .await
+    .expect("the drain blocked behind an exclusive lock on its relay row: `relays` IS a lock class")
+    .expect("the drain");
+    held.commit().await.expect("release the wedge");
+    assert!(
+        control
+            .await
+            .expect("the control")
+            .expect("the first take's insert arm"),
+        "a first take of 10 from a limit of 60 is granted once the wedge is gone"
+    );
+
+    let (tokens, shut): (i32, bool) = sqlx::query_as(
+        "select tokens, refilled_at > now() + interval '55 seconds' from relay_buckets
+          where relay_id = $1",
+    )
+    .bind(relay)
+    .fetch_one(&pool)
+    .await
+    .expect("the bucket");
+    assert_eq!(
+        (tokens, shut),
+        (0, true),
+        "the drain did not empty and shut the bucket"
+    );
+}
+
 /// **A relay deletion waits for a debit in flight; it does not deadlock with one.** This is the
 /// `40P01` half of the ADR's split, and it is unreachable here: the debit holds a bucket row the
 /// cascade *can* see, which is exactly the condition that closes the cycle everywhere else, and
@@ -1877,6 +1950,408 @@ async fn a_template_or_brand_kit_write_takes_at_most_a_key_share_on_its_workspac
         .await
         .expect("the control")
         .expect("the insert the exclusive wedge was holding back");
+}
+
+// ---- M2c: campaigns, messages and the launch ---------------------------------------------------
+//
+// `campaigns` is not a lock class (ADR 0005, "M2c: why `campaigns` is not a class"), so none of
+// these can be the ABBA the classes above are. Each pairs two real paths that both write the
+// campaign row, wedges that row, and asks for the three things that can still go wrong: a
+// deadlock, a wait that should not exist (a sweep stuck behind a flush), and an outcome counted
+// twice or a pause overwritten. Both arrival orders are raced, because the two orders fail
+// differently: the wedge is released with the first arrival at the head of the queue for the row.
+
+/// A workspace's signed-in owner, for the routes a test drives.
+async fn signed_in(pool: &PgPool) -> TestApp {
+    let mut app = TestApp::new(pool.clone()).await;
+    app.login("owner@example.com", PW).await;
+    app
+}
+
+/// A `sending` campaign on `lists`, still resolving, and the launch job its writes are fenced on.
+async fn launching_campaign(pool: &PgPool, workspace: Uuid, lists: &[Uuid]) -> (Uuid, Uuid) {
+    let (campaign, job) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::query(
+        "insert into campaigns (id, workspace_id, name, state, list_ids, launch_job_id)
+         values ($1, $2, 'launching', 'sending', $3, $4)",
+    )
+    .bind(campaign)
+    .bind(workspace)
+    .bind(lists)
+    .bind(job)
+    .execute(pool)
+    .await
+    .expect("campaign");
+    sqlx::query(
+        "insert into jobs (id, workspace_id, kind, campaign_id, payload)
+         values ($1, $2, 'campaign_launch', $3, '{}')",
+    )
+    .bind(job)
+    .bind(workspace)
+    .bind(campaign)
+    .execute(pool)
+    .await
+    .expect("launch job");
+    (campaign, job)
+}
+
+/// A fully resolved `sending` campaign whose `total` is `total`, for the paths that record.
+async fn resolved_campaign(pool: &PgPool, workspace: Uuid, total: i64) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into campaigns (id, workspace_id, name, state, resolved, total)
+         values ($1, $2, 'resolved', 'sending', true, $3)",
+    )
+    .bind(id)
+    .bind(workspace)
+    .bind(total)
+    .execute(pool)
+    .await
+    .expect("campaign");
+    id
+}
+
+/// A message a worker holds: `submitting`, claim token set, lease `lease` from now (negative is
+/// already expired, so the sweep may take it).
+async fn held_message(
+    pool: &PgPool,
+    workspace: Uuid,
+    campaign: Uuid,
+    lease: &str,
+) -> nm::campaign::queue::Claimed {
+    let m = nm::campaign::queue::Claimed {
+        id: Uuid::now_v7(),
+        workspace_id: workspace,
+        campaign_id: campaign,
+        contact_id: Uuid::now_v7(),
+        variant: 0,
+        attempts: 1,
+        max_attempts: 5,
+        claim_token: Uuid::now_v7(),
+    };
+    sqlx::query(
+        "insert into messages (id, workspace_id, campaign_id, contact_id, status, attempts,
+                               claim_token, run_after)
+         values ($1, $2, $3, $4, 'submitting', 1, $5, now() + $6::interval)",
+    )
+    .bind(m.id)
+    .bind(workspace)
+    .bind(campaign)
+    .bind(m.contact_id)
+    .bind(m.claim_token)
+    .bind(lease)
+    .execute(pool)
+    .await
+    .expect("message");
+    m
+}
+
+/// `campaigns.id` held `for update`, standing for the one exclusive taker a campaign row could have
+/// (a deletion of a sent campaign, which does not exist: see the ADR's tripwire). It conflicts
+/// with the referential `for key share` and with every update, which is every wait below.
+async fn wedge_campaign(pool: &PgPool, id: Uuid) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from campaigns where id = $1 for update")
+        .bind(id)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the campaign row");
+    held
+}
+
+/// `(state, sent, failed, unknown, skipped, total)`.
+async fn campaign_row(pool: &PgPool, id: Uuid) -> (String, i64, i64, i64, i64, i64) {
+    sqlx::query_as(
+        "select state, sent, failed, unknown, skipped, total from campaigns where id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("campaign row")
+}
+
+async fn message_status(pool: &PgPool, id: Uuid) -> String {
+    sqlx::query_scalar("select status from messages where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("message row")
+}
+
+/// One launch batch against an operator's pause, in both arrival orders. The batch inserts its
+/// `messages` (whose foreign key asks the campaign for `for key share` at the end of that
+/// statement) and then updates the campaign's cursor and total; the pause updates the campaign
+/// alone. Neither order may fail, the batch must neither be refused nor lose its rows, and **the
+/// pause must survive the batch**: the batch's update names `resolve_cursor`, `total` and
+/// `updated_at` and never `state`, so a pause that landed first is still there afterwards.
+///
+/// **Why this cannot be an ABBA, and what it is for.** The pause is a leaf: it holds the campaign
+/// row and asks for nothing. A cycle needs both paths to hold something the other wants, so the
+/// ruling that `campaigns` is not a class stands on exactly that shape, and these are the tests
+/// that hold it. Red-first by a pause that touches `messages` after the campaign (`system_pause`
+/// for the flush, below), and here by a batch that restates `state`.
+#[sqlx::test]
+async fn a_launch_batch_and_a_pause_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, lists) = fixture(&pool, &["news"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    for batch_first in [true, false] {
+        let (campaign, job) = launching_campaign(&pool, fx.workspace, &lists).await;
+        let c = nm::campaign::load(&pool, fx.workspace, campaign)
+            .await
+            .expect("the campaign");
+        let r = nm::campaign::launch::Resolution::load(&pool, &c, job)
+            .await
+            .expect("the resolution");
+        let admin = signed_in(&pool).await;
+        let path = format!(
+            "/api/v1/workspaces/{}/campaigns/{campaign}/pause",
+            fx.workspace
+        );
+
+        let held = wedge_campaign(&pool, campaign).await;
+        let batch = {
+            let pool = pool.clone();
+            async move { nm::campaign::launch::resolve_batch(&pool, &r, None).await }
+        };
+        let pause = async move { admin.post(&path).await };
+        let (batch, pause) = if batch_first {
+            let b = tokio::spawn(batch);
+            settle(&mut probe, 1).await;
+            let p = tokio::spawn(pause);
+            settle(&mut probe, 2).await;
+            (b, p)
+        } else {
+            let p = tokio::spawn(pause);
+            settle(&mut probe, 1).await;
+            let b = tokio::spawn(batch);
+            settle(&mut probe, 2).await;
+            (b, p)
+        };
+
+        held.commit().await.expect("release the wedge");
+        let batch = batch.await.expect("the batch task").expect("the batch");
+        pause.await.expect("the pause task").assert_status_ok();
+        assert!(!batch.stale, "the batch was fenced out of its own campaign");
+        assert_eq!(
+            batch.inserted, 1,
+            "the batch lost its row (batch_first: {batch_first})"
+        );
+        let row = campaign_row(&pool, campaign).await;
+        assert_eq!(
+            (row.0.as_str(), row.5),
+            ("paused", 1),
+            "the campaign must end paused with the batch's total (batch_first: {batch_first})"
+        );
+    }
+}
+
+/// **An outcome flush against the worker's own system pause, in both orders.** This is the pair
+/// that really runs together: a tick that finds a campaign's domain gone pauses it (`system_pause`)
+/// while its flusher is still recording the outcomes of the messages sent just before. The flush
+/// takes `messages`, then the campaign's counters; the pause takes the campaign alone. Both must
+/// commit, the outcome must be counted exactly once, and the finish check must read the state the
+/// pause left: a flush that lands first finishes the campaign (`sent`), one that lands after a
+/// pause does not (`paused`, with its reason).
+///
+/// Red-first by a pause that also locks the campaign's `submitting` messages after it has the
+/// campaign row — `campaigns` before `messages`, the order ADR 0005 forbids. Only the arrival
+/// order "pause first" cycles (the pause holds the campaign and wants the message the flush holds,
+/// while the flush wants the campaign), which is the reason both orders are run.
+#[sqlx::test]
+async fn an_outcome_flush_and_a_pause_do_not_deadlock(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _) = fixture(&pool, &[]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    const REASON: &str = "its sending domain was deleted";
+
+    for flush_first in [true, false] {
+        let campaign = resolved_campaign(&pool, fx.workspace, 1).await;
+        let m = held_message(&pool, fx.workspace, campaign, "1 minute").await;
+
+        let held = wedge_campaign(&pool, campaign).await;
+        let flush = {
+            let pool = pool.clone();
+            async move {
+                let sent = nm::campaign::queue::Verdict::Sent {
+                    relay: Uuid::now_v7(),
+                    response: "250 2.0.0 Ok".to_owned(),
+                };
+                nm::campaign::queue::record(&pool, &[(m, sent)]).await
+            }
+        };
+        let pause = {
+            let pool = pool.clone();
+            async move { nm::campaign::send::system_pause(&pool, campaign, REASON).await }
+        };
+        let (flush, pause) = if flush_first {
+            let f = tokio::spawn(flush);
+            settle(&mut probe, 1).await;
+            let p = tokio::spawn(pause);
+            settle(&mut probe, 2).await;
+            (f, p)
+        } else {
+            let p = tokio::spawn(pause);
+            settle(&mut probe, 1).await;
+            let f = tokio::spawn(flush);
+            settle(&mut probe, 2).await;
+            (f, p)
+        };
+
+        held.commit().await.expect("release the wedge");
+        let (flushed, paused) = (
+            flush.await.expect("the flush task"),
+            pause.await.expect("the pause task"),
+        );
+        assert!(
+            flushed.is_ok() && paused.is_ok(),
+            "flush_first {flush_first}: flush {flushed:?}, pause {paused:?}"
+        );
+        let row = campaign_row(&pool, campaign).await;
+        let reason: Option<String> =
+            sqlx::query_scalar("select pause_reason from campaigns where id = $1")
+                .bind(campaign)
+                .fetch_one(&pool)
+                .await
+                .expect("pause_reason");
+        let want = if flush_first {
+            ("sent", None)
+        } else {
+            ("paused", Some(REASON.to_owned()))
+        };
+        assert_eq!(
+            ((row.0.as_str(), reason), row.1, row.2, row.3),
+            (want, 1, 0, 0),
+            "the outcome is counted once and the finish check read the state the pause left \
+             (flush_first: {flush_first})"
+        );
+    }
+}
+
+/// **A flush and the sweep, on the same message, in both orders** (R4's concern 6). The sweep
+/// takes `messages` `for update skip locked` and the flush's update does not skip, so each order
+/// has a different way to go wrong:
+///
+/// - **The sweep first.** It records the expired `submitting` row `unknown`; the flush then queues
+///   on that row, and when it gets it the row is no longer `submitting` and carries no token, so
+///   the flush moves nothing and counts nothing. The campaign ends `unknown = 1, sent = 0`. A flush
+///   that overwrote it would count one message twice.
+/// - **The flush first.** It holds the row; the sweep must skip it and return at once, not queue
+///   behind it. A sweep that waited would sit on the message while the flush waits on the campaign,
+///   and with two rows taken in two orders that is the cycle `skip locked` exists to prevent.
+///   The wedge is still held when the sweep returns, which is what shows it did not wait.
+///
+/// Red-first: drop the flush's `status`/`claim_token` fence (the first order counts twice), and
+/// drop `skip locked` from the sweep's first statement (the second order stops returning).
+#[sqlx::test]
+async fn an_outcome_flush_and_a_sweep_of_the_same_message_count_it_once(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _) = fixture(&pool, &[]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    for sweep_first in [true, false] {
+        let campaign = resolved_campaign(&pool, fx.workspace, 1).await;
+        let m = held_message(&pool, fx.workspace, campaign, "-1 second").await;
+        let id = m.id;
+
+        let held = wedge_campaign(&pool, campaign).await;
+        let flush = {
+            let pool = pool.clone();
+            async move {
+                let sent = nm::campaign::queue::Verdict::Sent {
+                    relay: Uuid::now_v7(),
+                    response: "250 2.0.0 Ok".to_owned(),
+                };
+                nm::campaign::queue::record(&pool, &[(m, sent)]).await
+            }
+        };
+        let sweep = {
+            let pool = pool.clone();
+            async move { nm::campaign::queue::sweep(&pool).await }
+        };
+        if sweep_first {
+            let s = tokio::spawn(sweep);
+            settle(&mut probe, 1).await;
+            let f = tokio::spawn(flush);
+            settle(&mut probe, 2).await;
+            held.commit().await.expect("release the wedge");
+            assert_eq!(s.await.expect("the sweep task").expect("the sweep"), 1);
+            f.await.expect("the flush task").expect("the flush");
+        } else {
+            let f = tokio::spawn(flush);
+            settle(&mut probe, 1).await;
+            let swept = tokio::time::timeout(Duration::from_secs(10), sweep)
+                .await
+                .expect("the sweep waited on a message a flush is recording")
+                .expect("the sweep");
+            assert_eq!(swept, 0, "the sweep took a row the flush holds");
+            held.commit().await.expect("release the wedge");
+            f.await.expect("the flush task").expect("the flush");
+        }
+
+        let (status, counted) = if sweep_first {
+            ("unknown", (0, 0, 1))
+        } else {
+            ("sent", (1, 0, 0))
+        };
+        assert_eq!(message_status(&pool, id).await, status);
+        let row = campaign_row(&pool, campaign).await;
+        assert_eq!(
+            (row.0.as_str(), row.1, row.2, row.3),
+            ("sent", counted.0, counted.1, counted.2),
+            "exactly one outcome is counted (sweep_first: {sweep_first})"
+        );
+    }
+}
+
+/// **Two sweeps at once** (R4's re-review minor): nothing ran two of them. The second must skip
+/// every exhausted `queued` message the first holds and return at once, counting nothing; the
+/// campaign's `failed` is the number of messages, not twice it. Red-first: drop `skip locked` from
+/// the sweep's second statement, and the second sweep waits on the first's rows until the timeout
+/// names it.
+#[sqlx::test]
+async fn two_sweeps_at_once_fail_each_exhausted_message_once(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _) = fixture(&pool, &[]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+
+    let campaign = resolved_campaign(&pool, fx.workspace, 3).await;
+    sqlx::query(
+        "insert into messages (id, workspace_id, campaign_id, contact_id, attempts, run_after)
+         select gen_random_uuid(), $1, $2, gen_random_uuid(), 5, now() - interval '1 second'
+           from generate_series(1, 3)",
+    )
+    .bind(fx.workspace)
+    .bind(campaign)
+    .execute(&pool)
+    .await
+    .expect("three messages claimed to their limit");
+
+    let held = wedge_campaign(&pool, campaign).await;
+    let first = tokio::spawn({
+        let pool = pool.clone();
+        async move { nm::campaign::queue::sweep(&pool).await }
+    });
+    settle(&mut probe, 1).await;
+    let second = tokio::time::timeout(Duration::from_secs(10), nm::campaign::queue::sweep(&pool))
+        .await
+        .expect("the second sweep waited on messages the first holds")
+        .expect("the second sweep");
+    assert_eq!(second, 0, "the second sweep took rows the first holds");
+
+    held.commit().await.expect("release the wedge");
+    assert_eq!(first.await.expect("the sweep task").expect("the sweep"), 3);
+    let row = campaign_row(&pool, campaign).await;
+    assert_eq!(
+        (row.0.as_str(), row.1, row.2, row.3, row.4),
+        ("sent", 0, 3, 0, 0),
+        "each message failed once, and the campaign finished"
+    );
 }
 
 // ---- Migration bytes: the issues/40 guard ------------------------------------------------------

@@ -49,11 +49,13 @@ Serving and sending are separate processes, and **`nm serve` does not send**:
 
 That split is the point. Scaling the API means more `nm serve` replicas, and it must not thereby
 multiply the send rate — four API replicas and one worker send at one worker's rate. The worker
-also has a Postgres pool of its own, `NM_WORKER_POOL_SIZE` (default 5), because `/readyz` reads an
+also has a Postgres pool of its own, `NM_WORKER_POOL_SIZE` (default 10), because `/readyz` reads an
 exhausted pool as not ready: sending drawing on the API's twenty connections would let a batch of
 mail take the API down. `NM_WORKER_CONCURRENCY` (default 4) is how many messages one tick sends at
 once; a tick claims sixteen and stops starting new sends once it has spent half the job lease, so
-it can never outlive the claim it is working under.
+it can never outlive the claim it is working under. Campaign messages go through a second loop of
+their own, `NM_WORKER_CAMPAIGN_CONCURRENCY` (default 32) at a time, so a campaign never holds up a
+confirmation email.
 
 **Sending needs `NM_PUBLIC_URL` to be `https`.** Every message carries a one-click unsubscribe
 link built from it, and a non-`https` one is refused — so on the default `http://localhost:8080`

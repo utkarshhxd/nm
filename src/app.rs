@@ -20,7 +20,7 @@ use crate::{
     http::rate_limit::{
         DNS_CHECK_PER_MINUTE, EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE,
         PUBLIC_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
-        TEMPLATE_PREVIEW_PER_MINUTE,
+        TEMPLATE_PREVIEW_PER_MINUTE, TEST_SEND_PER_MINUTE,
     },
     http::security_headers::security_headers,
     public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
@@ -76,6 +76,8 @@ pub struct AppState {
     /// Per-workspace cap on `POST /sending-domains/{id}/check`, which makes outbound DNS lookups
     /// on an authenticated request. See `http::rate_limit::DNS_CHECK_PER_MINUTE`.
     pub check_limit: Arc<RateLimiter>,
+    /// Per-workspace cap on `POST /campaigns/{id}/test`. See `http::rate_limit::TEST_SEND_PER_MINUTE`.
+    pub test_send_limit: Arc<RateLimiter>,
     /// The DNS checker's resolver, built once: it owns the sockets and the nameserver state, and a
     /// request that built its own would throw both away. See `sending_domains::dns`.
     pub resolver: Arc<dns::Resolver>,
@@ -100,6 +102,7 @@ impl AppState {
             submit_limit: Arc::new(RateLimiter::per_minute(SUBMIT_PER_MINUTE)),
             one_click_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ONE_CLICKS)),
             check_limit: Arc::new(RateLimiter::per_minute(DNS_CHECK_PER_MINUTE)),
+            test_send_limit: Arc::new(RateLimiter::per_minute(TEST_SEND_PER_MINUTE)),
             resolver: Arc::new(dns::system_resolver()?),
         })
     }

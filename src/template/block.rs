@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The block tree: what the visual editor posts and `templates.tree` stores. The wire format is
-//! `.superpowers/sdd/m2b/contract-block-tree.md`; this file implements it and does not extend it.
+//! the one the M2b plan fixes between the server and the editor
+//! (`.scratch/email-platform/plans/2026-11-25-m2b-templates-and-editor.md`: `Block` and `Run` are
+//! the serde shape the editor posts); this file implements it and does not extend it.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;

@@ -116,6 +116,37 @@ pub async fn for_domain(
     }))
 }
 
+/// The workspace's sending domain `id`, or `None` if it has none: what a campaign asks, because it
+/// names its domain by id and the domain may have been deleted since.
+pub async fn by_id(
+    db: impl PgExecutor<'_>,
+    workspace_id: Uuid,
+    id: Uuid,
+) -> ApiResult<Option<SendingDomain>> {
+    let row = sqlx::query!(
+        r#"select id, workspace_id, domain, from_name, signing as "signing: Signing",
+                  dkim_selector, return_path_domain, checks as "checks: Json<DnsChecks>",
+                  checked_at, send_unverified_acknowledged_at
+           from sending_domains where workspace_id = $1 and id = $2"#,
+        workspace_id,
+        id,
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| SendingDomain {
+        id: r.id,
+        workspace_id: r.workspace_id,
+        domain: r.domain,
+        from_name: r.from_name,
+        signing: r.signing,
+        dkim_selector: r.dkim_selector,
+        return_path_domain: r.return_path_domain,
+        checks: r.checks.0,
+        checked_at: r.checked_at,
+        send_unverified_acknowledged_at: r.send_unverified_acknowledged_at,
+    }))
+}
+
 /// The domain's decrypted DKIM private key as DER, or `None` if it has none. `404` if the domain
 /// is not in this workspace. The only place a stored key is turned back into bytes.
 pub async fn dkim_private_key(
@@ -138,4 +169,53 @@ pub async fn dkim_private_key(
             .map_err(|e| anyhow::anyhow!("sending domain {id}: {e}").into())
     })
     .transpose()
+}
+
+/// The checks that are not `Pass`, named as an operator would recognise them.
+///
+/// **`NotChecked` counts as not passing.** A new domain's `checks` is `{}`, which reads back as
+/// four `NotChecked`s, so treating "not failing" as "fine" would let every domain nobody has
+/// checked straight through the gate — which is every domain, on the day it is added.
+///
+/// **Which checks a domain is held to is a property of the domain, not of its `checks`**, which
+/// is why this takes the whole [`SendingDomain`]. `CheckResult::NotChecked` carries two different
+/// facts on `return_path`: "nobody has run a check yet", and "there is nothing here to check",
+/// which is what [`dns::check`](crate::sending_domains::dns::check) writes when no return-path
+/// domain is configured. Only `return_path_domain` tells them apart, so the second fact is read
+/// from the column, where it lives, at the moment the question is asked — and not transcribed
+/// into the stored JSON, where it would be a copy that can disagree with the column. A verdict
+/// the checker did record is always honoured, whatever the column says.
+pub fn not_passing(domain: &SendingDomain) -> Vec<&'static str> {
+    let checks = &domain.checks;
+    let mut required = vec![
+        ("SPF", &checks.spf),
+        ("DKIM", &checks.dkim),
+        ("DMARC", &checks.dmarc),
+    ];
+    if domain.return_path_domain.is_some() || checks.return_path != CheckResult::NotChecked {
+        required.push(("Return-Path", &checks.return_path));
+    }
+    required
+        .into_iter()
+        .filter(|(_, result)| **result != CheckResult::Pass)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The M2a domain gate (spec M2c §4.4): mail leaves `domain` only when every check it is held to
+/// passes, or an admin has acknowledged sending from it anyway. `Err` is the sentence an operator
+/// reads, naming the domain and the checks. The one copy of the rule: schedule, launch, every send
+/// batch, confirmations and test sends all ask it here.
+pub fn gate(domain: &SendingDomain) -> Result<(), String> {
+    let unverified = not_passing(domain);
+    if unverified.is_empty() || domain.send_unverified_acknowledged_at.is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} has not passed its {} DNS check{}, and no admin has acknowledged sending from it \
+         anyway",
+        domain.domain,
+        unverified.join(", "),
+        if unverified.len() == 1 { "" } else { "s" },
+    ))
 }

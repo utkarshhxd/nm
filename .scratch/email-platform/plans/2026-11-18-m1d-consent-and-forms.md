@@ -1,7 +1,5 @@
 # M1d — Consent, the Preference Center, and Signup Forms — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Build the subscriber's side of the product — sign up, confirm, see what you get, leave — and the append-only record that proves consent.
 
 **Architecture:** Five unauthenticated routes at top-level paths (`/c/`, `/u/`, `/f/`) authenticate by HMAC token instead of a session, following the `issue`/`parse` pattern `src/contacts/selection.rs` already uses. A new `consent_log` table records every membership status change, written by the three existing writers as well as the new ones. The confirmation email is **enqueued** into a `jobs` row; M2 drains it.

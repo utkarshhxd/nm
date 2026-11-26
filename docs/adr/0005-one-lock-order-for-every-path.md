@@ -151,7 +151,9 @@ the code disagree, the code is what runs: fix the row, and say in the commit whi
 | `sending_domains::routes::*` and the DNS checker's write-back | the `sending_domains` row alone; nothing references it |
 | `worker::claim` / `complete` / `fail` / `defer` | `jobs` rows alone, `for update skip locked`. `jobs` is a child of `lists` and `contacts` and is a parent of nothing |
 | `worker::release` | the `jobs` row alone, by primary key; the update's own row lock and no clause beyond it. It undoes the claim's `attempts` increment and pushes `run_after` for a job the tick chose not to start; it names no parent, and `jobs` is a parent of nothing |
-| `worker::confirmation::handle` | the `jobs` rows above for what it records, and **`relay::bucket::take`'s order** on the failover arm, where it takes a token for a relay the tick did not pay for. It reads `suppressions`, `sending_domains` and `relays` and writes none of them |
+| `worker::confirmation::handle` | the `jobs` rows above for what it records, and **`relay::bucket::take`'s order** on the failover arm, where it takes a token for a relay the tick did not pay for. It reads `suppressions`, `sending_domains` and `relays` and writes none of them. Since M2c R6 its submission is `worker::deliver::submit`, which on a deferral (`455`, or no connection) also runs `relay::bucket::drain`: one statement, the update arm alone |
+| `relay::bucket::drain` (M2c R6) | the `relay_buckets` row alone, **the update arm only**: it writes `tokens` and `refilled_at`, neither a key column, so no referential trigger fires and it takes nothing on `relays`. One statement on the pool, never a transaction. A relay with no bucket row matches nothing. `tests/lock_order.rs` (`a_bucket_drain_takes_no_lock_on_its_relay`) holds it against a wedged `relays` row, with a first take's insert arm on a second wedged relay as the control that shows the wedge blocks |
+| `worker::test_send::handle` (M2c R6) | as `worker::confirmation::handle`: the `jobs` row it records, and `bucket::take`'s order on the failover arm, and `drain`'s on a deferral. It reads `jobs.campaign_id`, `suppressions`, `sending_domains` and `relays` and writes none of them |
 
 **M2b's writers landed with R7**, which is the task that turned the ruling below from a claim
 about statement shapes into a claim about code. Each row is one locking statement; the reads
@@ -163,13 +165,53 @@ clause and lock nothing.
 | `template::routes::create_template` | the new `templates` row, then `workspaces` (`for key share`) through `templates_workspace_id_fkey`'s referential trigger, at the end of that one statement. Reads `custom_fields` and `brand_kits` first, both unlocked |
 | `template::routes::update_template` | the `templates` row alone. The `set` names `name`, `tree`, `source`, `compiled` and `updated_at` and never `workspace_id`, so no referential trigger fires and it takes nothing on `workspaces`. It reads the row first with a plain `select` — **no `for update`** — because it only needs the kind and whatever the patch leaves alone |
 | `template::routes::delete_template` | the `templates` row alone. The child side of a foreign key has no delete-time check, and nothing references `templates` |
-| `template::routes::preview_template` | **nothing.** It writes no row: an unsaved document is compiled in memory, and a stored rendition that is no longer usable is refused (`409 template-stale`) rather than silently recompiled and written back |
+| `template::routes::preview_template` | **nothing.** It writes no row: an unsaved document is compiled in memory; a stored rendition made stale by a brand-kit or renderer change (`Stale`, `MarkerFormat`) is recompiled in memory too (M2c R2, issue 49) and the result is never written back; one whose fields drifted, or that cannot be read, is refused (`409 template-stale`) |
 | `brand::routes::save_brand_kit` | the `brand_kits` row, and `workspaces` (`for key share`) **on the upsert's insert arm only**. The update arm's `set` names `logo_url`, `palette`, `font_stack`, `footer` and `updated_at` — never `workspace_id` — so it is the same short-circuit as `relay_buckets`' update arm |
 
 Each is `one statement on one row by primary key` plus the audit write, which takes nothing beyond
 a `RowExclusiveLock` on `audit_log` (the `delete_relay` reasoning). So each stays a terminal node
 in the wait-for graph, which is what the ruling below rests on. `templates` and `brand_kits` are
 still not lock classes and still not parents.
+
+**M2c's campaign handlers (R3).** The order is `messages`, then `campaigns`, then `jobs`. None of
+these handlers touches `messages` (a draft has none), so each is `campaigns` and then, where a job
+is queued, `jobs`. Every one authorises, validates and runs `mrml` BEFORE its transaction takes a
+row; the reads beside the writes (`lists`, `segments`, `sending_domains`, `templates`,
+`custom_fields`, `brand_kits`) are plain selects and lock nothing. The worker's paths (launch,
+claim, flush, sweep) have rows of their own in the second table below, and take their rows in
+this same order.
+
+| path (M2c R3) | order it takes |
+|---|---|
+| `campaign::routes::create_campaign` | the new `campaigns` row, then `workspaces` (`for key share`) through `campaigns_workspace_id_fkey`, at the end of that one statement |
+| `campaign::routes::update_campaign` | the `campaigns` row alone. The `set` never names `workspace_id`, so no referential trigger fires; `where state = 'draft'` makes a lost race a `409`. The read before it is a plain `select`, no `for update` |
+| `campaign::routes::pause_campaign` / `unschedule_campaign` / `cancel_campaign` | the `campaigns` row alone, by workspace and primary key and a state guard, held to commit through the audit insert and the plain read-back that follow it in the same transaction (R7 added that clause: the row said "alone" and the code is three statements). `audit_log` has no foreign keys, so the hold asks for nothing and the path stays a leaf. No key column is written |
+| `campaign::routes::resume_campaign` | the `campaigns` row alone. A re-freeze writes `frozen` and `frozen_at` in the same statement, both after `prepare` has run outside any transaction; no key column is written. Then `queue::finish_if_done` on the same row (R6: a campaign whose last messages were recorded while it was paused finishes here). When the audience is not fully resolved (`resolved = false`) it then repoints `launch_job_id` (`campaigns` again) and inserts a `campaign_launch` job (`jobs`, whose foreign key re-takes the campaign's `for key share`): `campaigns`, then `jobs`, as `choose_winner` does |
+| `campaign::routes::delete_campaign` | the `campaigns` row, then `jobs` (cascade, a draft's `campaign_test` jobs). `where state = 'draft'` cannot match a campaign with messages (`messages -> campaigns` is `no action`) or one that has launched, so this is the only deleter and `campaigns` stays out of the lock classes. A deleted draft's launch job (it may have been scheduled and unscheduled) goes the same way |
+| `campaign::routes::schedule_campaign` | the `campaigns` row (update, guarded by `state = 'draft'`), **then** the new `jobs` row, whose foreign key takes `for key share` on that same campaign and on `workspaces` at the end of its statement. `campaigns` before `jobs`, and the campaign row is already held, so the key share is a re-take, not a second lock |
+| `campaign::routes::choose_winner` | the same two, in the same order: the `campaigns` update (`state in ('sending','paused') and phase = 1 and resolved and ab_test_percent < 100`), then the phase-2 `jobs` insert |
+| `campaign::routes::test_campaign` | `jobs` inserts only, one per address, each taking `for key share` on the campaign and `workspaces` at the end of its statement. It writes no `campaigns` row |
+| `campaign::routes::preview_campaign` / `estimate_campaign` | **nothing.** The estimate reads `mailable_list_members` under `set local statement_timeout` in a transaction it rolls back |
+
+**M2c's order on its own tables is `messages`, then `campaigns`, then `jobs`** (spec §4.11). The
+message queue (R4) writes these. **No UPDATE below writes `campaign_id` or `workspace_id`**, so no
+referential trigger fires on one and none takes `for key share` on `campaigns`; an update of
+`campaigns` counters or state is `for no key update`, which a child insert's `for key share` does
+not wait on. The one statement below that does write them is an INSERT, the launch batch's into
+`messages`, and its row says so. (This paragraph said "no statement" until R7 read it against the
+launch row beside it and found the two disagreeing; the row was right.)
+
+| path (M2c) | order it takes |
+|---|---|
+| `campaign::queue::claim` | `messages` rows alone, `for update skip locked`, one statement. Writes `attempts`, `run_after` and `claim_token`. Its join on `campaigns` (`state = 'sending'`) and its `exists` probe on `messages` (which campaigns have a message due, the ones the batch is split over) are plain reads with no locking clause |
+| `campaign::queue::mark_submitting` | the `messages` row alone, by primary key and `claim_token`. Writes `status` and `run_after` |
+| `campaign::queue::release` | `messages` rows alone, by primary key and `claim_token`, `status = 'queued'` only. Writes `attempts`, `run_after`, `error`, `claim_token` |
+| `campaign::queue::record` | `messages` (one `update … from unnest`, matched on `claim_token`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction. `tests/lock_order.rs` races it against `system_pause` and the sweep (`an_outcome_flush_and_a_pause_do_not_deadlock`, `an_outcome_flush_and_a_sweep_of_the_same_message_count_it_once`) |
+| `campaign::queue::sweep` | `messages` in two statements (expired `submitting` rows to `unknown`, exhausted `queued` rows to `failed`), each `for update skip locked` so it never waits on a row a flush is recording; then `campaigns` as `record`. One transaction. Held by the same flush race, and by `two_sweeps_at_once_fail_each_exhausted_message_once` for the second statement |
+| `campaign::launch::sweep` (R6) | for each launch job whose worker died on its last attempt, the last-attempt give-up below: `campaigns` (`failed`, or a system pause, fenced on `launch_job_id`), then `jobs` (`failed_at`), one transaction. The select that finds them is a plain read |
+| `campaign::send::system_pause` (R6) | the `campaigns` row alone, by primary key and a state guard (`sending`, `paused`). Writes `state`, `pause_reason`, `updated_at`; no key column. Raced against a flush in both orders (`an_outcome_flush_and_a_pause_do_not_deadlock`), the one pair that really runs together: a tick that pauses a campaign while its flusher is recording |
+| `campaign::send::CampaignWorker::tick` (R6) | **no transaction of its own.** One statement at a time, each in the order its own row gives: `queue::sweep`, `queue::claim`, `queue::mark_submitting`, `queue::release` and `queue::record` (the flusher), `worker::debit` and `deliver::submit` (`bucket::take`), `bucket::drain`, `system_pause`. It reads `campaigns` (`frozen`), `custom_fields`, `sending_domains`, `relays` and `mailable_list_members` with plain selects. Nothing is held across an SMTP session |
+| `campaign::launch` (a batch of `resolve_batch`, and each loop of `handle`) | `messages` (the insert-select, whose foreign key takes `for key share` on the campaign at the end of that statement), then `campaigns` by primary key and `launch_job_id` (cursor and `total`; no key column). The last batch of a slice adds, in the same transaction: `campaigns` (`resolved`, then `finish_if_done`, or `launch_job_id` for the hand-off), **then** `jobs` (insert the successor, complete this job). `messages`, `campaigns`, `jobs`. The freeze (`scheduled -> sending`) and a refusal (`failed`, or a system pause) are `campaigns` then `jobs` and touch no `messages`; so is the last-attempt give-up, which ends the campaign and fails the job in one transaction. The job's own `payload` (the phase's segment snapshot) is written in a statement of its own, before any transaction opens. `prepare` and its `mrml` run before any of these transactions open. `tests/lock_order.rs` races a batch against an operator's pause in both orders (`a_launch_batch_and_a_pause_do_not_deadlock`); the hand-off, the freeze and the refusals have no race test of their own, and are `campaigns` then `jobs` for the reason given under "M2c: why `campaigns` is not a class" below: a `jobs` insert takes only `for key share` on the campaign, which no campaign update waits on |
 
 ## The rule for new code
 
@@ -223,12 +265,14 @@ docker compose -f docker-compose.dev.yml -p nm exec -T postgres psql -U nm -d nm
 ```
 
 `psql` is in the `postgres` service, not in the dev container, which is why the second line does
-not go through `scripts/dev.sh`. As of `0032` it answers:
+not go through `scripts/dev.sh`. As of `0033` it answers — and it still did when M2c R7 re-ran it
+against a database migrated from nothing to `0034`, which adds a column and no edge:
 
 ```
       parent         | fks | children
 ---------------------+-----+---------------------------------------------------------------
  api_keys            |   1 | selection_snapshots (n)
+ campaigns           |   2 | jobs (c), messages (a)
  contacts            |   4 | consent_log (c), contact_tags (c), jobs (c), list_memberships (c)
  forms               |   1 | form_lists (c)
  imports             |   1 | import_errors (c)
@@ -240,19 +284,26 @@ not go through `scripts/dev.sh`. As of `0032` it answers:
  users               |  12 | api_keys (n), auth_challenges (c), imports (n), invites (n),
                      |     | memberships (c), passkeys (c), recovery_codes (c), segments (n),
                      |     | selection_snapshots (n), sessions (c), suppressions (n)
- workspaces          |  17 | api_keys (c), brand_kits (c), contacts (c), custom_fields (c),
-                     |     | forms (c), imports (c), invites (c), jobs (c), lists (c),
-                     |     | memberships (c), relays (c), segments (c), selection_snapshots (c),
-                     |     | sending_domains (c), suppressions (c), tags (c), templates (c)
+ workspaces          |  18 | api_keys (c), brand_kits (c), campaigns (c), contacts (c),
+                     |     | custom_fields (c), forms (c), imports (c), invites (c), jobs (c),
+                     |     | lists (c), memberships (c), relays (c), segments (c),
+                     |     | selection_snapshots (c), sending_domains (c), suppressions (c),
+                     |     | tags (c), templates (c)
 ```
 
-**Ten parents, and every one is ruled on.** `0028` added exactly one, `relays`; `0032` added
-**none** — it added two edges, both out of `workspaces`, and two tables nothing references.
+**Eleven parents; ten are ruled on and the eleventh, `campaigns`, is ruled in M2c R3 and re-ruled,
+with the code read against it, in R7 (its own section below).** `0028` added
+exactly one, `relays`; `0032` added **none** — it added two edges, both out of `workspaces`, and
+two tables nothing references. `0033` added `campaigns`, with two children (`messages (a)`,
+`jobs (c)`) and a third edge out of `workspaces`; `messages` is a table nothing references, and
+`jobs` already was one. The ruling rests on `delete_campaign`'s statement (`where state = 'draft'`,
+which cannot match a campaign that has messages or one that has launched; a draft may still own an orphaned launch job from a schedule that was undone, and the cascade removes it), and that statement now
+exists: see the M2c table below.
 `sending_domains`, `templates` and `brand_kits` are listed below the ten although they are not
 parents, because each was a table asked about and the answer is load-bearing.
 `tests/lock_order.rs` asserts that every **edge** of this graph —
 each `(parent, child, on delete action)` triple, not merely the set of parents — is unchanged, so
-a migration that adds an eleventh parent, a second child to an existing one, or that turns a
+a migration that adds a twelfth parent, a second child to an existing one, or that turns a
 `cascade` into a `set null`, fails there rather than being noticed by somebody.
 
 | parent | ruling | why |
@@ -264,7 +315,8 @@ a migration that adds an eleventh parent, a second child to an existing one, or 
 | `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
 | `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
-| `workspaces` | not a class | seventeen children since `0032` — it was fifteen, and thirteen before `0028` — and no exclusive taker (below) |
+| `campaigns` | **not a class** — ruled in M2c R3, re-run and held by tests in R7 | two children, `messages` (`no action`) and `jobs` (`cascade`); a new parent as of `0033`. Its only deleter is `delete_campaign` with `where state = 'draft'`, which cannot match a campaign that has messages or one that has launched (a draft may keep an orphaned launch job from a schedule that was undone; the cascade removes it), and every child insert takes `for key share` once at the end of one statement. See the M2c table below |
+| `workspaces` | not a class | eighteen children since `0033` — it was seventeen after `0032`, fifteen before it, and thirteen before `0028` — and no exclusive taker (below) |
 | `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
 | `relays` | **not a class** — the evidence is four tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
 | `sending_domains` | not a parent at all | nothing references it, so no cascade reaches rows through it and the inversion this enumeration is over has nowhere to form. It is a child of `workspaces` and nothing else |
@@ -501,6 +553,80 @@ are enforced:
   class for **seventeen** tables at once instead of fifteen. `nothing_in_src_deletes_a_workspace`
   fails on it, within the blind spots listed under "Known and open" below.
 
+### M2c: why `campaigns` is not a class
+
+**The enumeration was re-run for this ruling**, with the query above, against a database migrated
+from nothing to `0034`: eleven parents, the same edges `the_foreign_key_graph_is_the_one_the_adr_rules_on`
+pins. `campaigns` has two children, `jobs` (`jobs_campaign_fk`, `cascade`) and `messages`
+(`messages_campaign_fk`, `no action`). `messages` has **no** foreign key to `workspaces` or to
+`contacts` — its one constraint to a parent is the composite one onto `campaigns` — so the launch
+batch's insert takes a `for key share` on the campaign row and on nothing else. The only trigger on
+`jobs`, `jobs_throttle_retention`, admits a delete that arrives through a referential action
+(`pg_trigger_depth() > 1`), which is how a draft's test jobs go with it.
+
+**The ruling.** A class exists where one path writes a child directly and another reaches the same
+rows through the parent's `on delete` action. `campaigns` has the second path in name only:
+
+- **Its only deleter is `delete_campaign`, and it matches drafts.** `where state = 'draft'` cannot
+  match a campaign that has launched, and a campaign that has messages has launched; were it ever
+  to, `messages_campaign_fk` is `no action`, so the delete would be refused rather than cascade. The
+  one thing it does cascade into is `jobs`, and `jobs` is a parent of nothing.
+- **Every child insert asks for nothing after its statement.** A `campaign_test` job or a launch job
+  takes `for key share` on the campaign at the end of its insert and then is done with it. The
+  launch batch is the one path that asks twice — the `messages` insert's key share, then the
+  `campaigns` update of the cursor and total — and both asks are for the same row, so it cannot be
+  half of a cycle on it. The update is `for no key update` and a child's `for key share` does not
+  wait on that, so an ordinary writer of a counter never makes a child insert wait either.
+- **No update of a child writes `campaign_id` or `workspace_id`**, so none of them takes the
+  parent. `record`, `sweep`, `claim`, `mark_submitting` and `release` write `messages` rows alone
+  until `record` and `sweep` reach for the campaign's counters, last, in ascending id order.
+
+**What the tests can and cannot show, said plainly.** Every other writer of a campaign row —
+`pause`, `cancel`, `unschedule`, `resume`, `system_pause`, the refusals — is a leaf or takes
+`campaigns` and then `jobs`: it holds the campaign and asks for nothing that a `messages` writer
+holds, which is the whole content of "messages, then campaigns, then jobs". A cycle needs two paths
+that each hold something the other wants, and a leaf is never one. So the race tests below cannot
+be an ABBA with the code as it stands, and they are not pretending to be one: they hold the three
+things that can still go wrong. A **deadlock**, red-first by a pause that also locks the campaign's
+messages after the campaign row — which does cycle with a flush, in the one arrival order where the
+pause is first — and that mutation is why both orders are run. A **wait that should not exist**,
+which is the sweep's `skip locked` (a sweep that queued behind a flush would be the second node of
+that cycle). And an **outcome counted twice or a pause overwritten**, which are the fence on
+`record`'s `where` and the batch's update never naming `state`. The four campaign tests below
+each wedge the campaign row `for update`, standing for the one exclusive taker a campaign could
+have; the drain test wedges its `relays` row instead.
+
+- `a_launch_batch_and_a_pause_do_not_deadlock` — a batch against the operator's pause route, both
+  orders; the pause survives and the batch keeps its row and its total.
+- `an_outcome_flush_and_a_pause_do_not_deadlock` — `record` against `system_pause`, both orders;
+  the outcome is counted once and the finish check reads the state the pause left.
+- `an_outcome_flush_and_a_sweep_of_the_same_message_count_it_once` — `record` against `sweep` on one
+  row, both orders (R4's concern 6).
+- `two_sweeps_at_once_fail_each_exhausted_message_once` — the exhausted-message statement, run twice
+  concurrently (R4's re-review minor).
+- `a_bucket_drain_takes_no_lock_on_its_relay` — the drain's update arm, with a first take's insert
+  arm as the control.
+
+**The tripwire, written as the thing to check.** `campaigns` becomes a class **the day a sent
+campaign is deletable** — a retention job, or an operator's "delete this campaign and its mail". A
+delete would take the campaign row `for update` and then reach `messages`, which is the order this
+document forbids (`messages`, then `campaigns`) and the `lists` shape exactly: the flush holds a
+message and wants the campaign, the delete holds the campaign and wants the message. The fix then
+is the one `delete_list` made: take the `messages` rows (or refuse to delete while any exist)
+before the campaign row, and rule on `no action` versus `cascade` on the way. `delete from
+campaigns` outside `delete_campaign` is the grep that fires it; like `users` and `api_keys` it is a
+grep somebody ran once, not a test. It was last run in R7 and found one deleter.
+
+**What was found re-reading the M2c rows against their code**, because the standing obligation is
+that a row and its code agree and say which was read. Two disagreements, both fixed above and in
+this commit: the paragraph that opens the M2c table said no statement writes `campaign_id` or
+`workspace_id`, which the launch batch's insert does, and the row for `pause` / `unschedule` /
+`cancel` said "alone" for what is three statements in one transaction. The code was right in both.
+Every other row — create, update, delete, schedule, resume, winner, test and preview/estimate; claim,
+mark, release, record, sweep; the launch's batch, hand-off, freeze, refusal and the orphan sweep;
+`system_pause`, the tick, `drain`, the test-send handler — was read against the statement it
+names and agrees with it.
+
 ### The tripwire on `tags`, and what to check rather than predict
 
 `tags` is quiet because of the shape of its writers, not because of anything structural — the
@@ -531,12 +657,12 @@ as a known gap rather than as a new finding.
 **The honest warning, since this document has now been wrong twice.** The claim above that a path
 obeying this cannot deadlock with another that obeys it is only as good as the enumeration. It said
 that while `contacts` was missing and while `form_lists` was listed as covered. What is different
-now is that the enumeration is **closed and mechanical**: ten parents, all ruled on, each with a
-reason that can be re-checked against the schema rather than against somebody's memory. If an
-eleventh parent appears, it is a new row in that table — and since `0028` that no longer depends on
+now is that the enumeration is **closed and mechanical**: eleven parents, eleven ruled on (`campaigns` in M2c R3), each with a
+reason that can be re-checked against the schema rather than against somebody's memory. If a
+twelfth parent appears, it is a new row in that table — and since `0028` that no longer depends on
 anybody remembering, because `the_foreign_key_graph_is_the_one_the_adr_rules_on` in
 `tests/lock_order.rs` fails on the migration that adds one. If a class appears that is not
-reachable from any of the ten, the method itself is unsound and that is a bigger conversation than
+reachable from any of the eleven, the method itself is unsound and that is a bigger conversation than
 another round. `issues/38` is the enforcement story this test is the first instalment of.
 
 **Be exact about how much of this is enforced, because "no longer depends on anybody remembering"

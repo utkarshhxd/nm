@@ -1,5 +1,7 @@
 # 50 — The template list carries every document, has no cursor, and saves render inside a transaction
 
+Status: item 1 closed by M2c R3, item 3 open. Item 1 (the list carries every document): `GET /templates` returns `TemplateSummary` (`id, name, kind, created_at, updated_at`). Item 2 (no cursor) was already served by the house `PageParams` and is closed with it: the list takes `?cursor=&limit=`. Item 3 (the save compiles inside a transaction) stays open: `create_template` and `update_template` still run `mrml` inside the open transaction, and its fix, compile before `begin`, is ADR 0005 work with a path row and a `tests/lock_order.rs` test of its own.
+
 **Found by:** the M2b final whole-branch review (findings M6, M7), and named by W6 as a
 deliberate shortcut.
 **Blocks:** nothing in M2b. Revisit before a workspace is expected to hold more than a few

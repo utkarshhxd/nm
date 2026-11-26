@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
-Status: open
+Status: closed by M2c R2 (5ba5611). The unsubscribe link is the product-owned absolute `{NM_PUBLIC_URL}/u/{token}` in the system footer, in both parts (shape 1 above).
 
 # A relative link is unusable in the plain-text part
 
@@ -56,4 +56,5 @@ M2c writes the first unsubscribe link, not after.
 - `src/template/text.rs` — where the link is written.
 - `src/template/render.rs` — `check_static_url` / `UrlCheck::Relative`, the verdict that lets a
   relative URL through untouched.
-- `.superpowers/sdd/m2b/review-R5.md` — Minor 3, where this was found.
+- M2b's review of task R5, Minor 3, where this was found (review notes are kept outside the
+  repository).

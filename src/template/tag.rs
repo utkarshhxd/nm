@@ -75,6 +75,12 @@ impl Registry {
         let mut live: HashSet<String> = SYSTEM_FIELDS.iter().map(|s| s.to_string()).collect();
         let mut archived = HashSet::new();
         for d in defs {
+            // The unsubscribe slot is the product's alone (spec §4.5 ruling 6), and a custom field
+            // may be keyed like anything (issues/44). Admitting this one would hand an operator tag
+            // the recipient's token, so it is never a name an operator registry knows.
+            if d.key == super::UNSUBSCRIBE_TOKEN {
+                continue;
+            }
             if d.archived_at.is_some() {
                 archived.insert(d.key.clone());
             } else {
@@ -87,6 +93,16 @@ impl Registry {
         // `retain(|k| !live.contains(k))` used to sit here and could not change any answer, so it
         // read as a guard while being dead; the lookup ORDER is the guard, and the test names it.
         Self { live, archived }
+    }
+
+    /// The registry the system footer is compiled against: it knows
+    /// [`UNSUBSCRIBE_TOKEN`](super::UNSUBSCRIBE_TOKEN) and nothing else, and it is the only one that
+    /// knows that.
+    pub fn system_footer() -> Self {
+        Self {
+            live: HashSet::from([super::UNSUBSCRIBE_TOKEN.to_owned()]),
+            archived: HashSet::new(),
+        }
     }
 
     /// Let `keys` be named although they are archived.
