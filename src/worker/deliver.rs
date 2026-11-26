@@ -5,7 +5,9 @@
 //! passwords come from a [`Creds`] read once per tick (spec M2c §4.7.9), [`submit`] says which relay
 //! decided, a [`Outcome::Deferred`] drains that relay's bucket before the next one is tried, and a
 //! relay skipped for its rate limit or its credential reads as `Deferred` rather than `Transient`
-//! (it is the relay's trouble, so a campaign message spends no attempt on it).
+//! (it is the relay's trouble, so a campaign message spends no attempt on it). The outcome
+//! [`submit`] returns has the recipient's address taken out of its text, because every sender
+//! stores that text.
 //!
 //! **The rule [`submit`] keeps: a send is covered by a token taken from the relay it goes through.**
 //! The tick spends on the first relay with tokens, while `submit` sends through the first relay
@@ -74,6 +76,9 @@ fn deferred(reason: String) -> Outcome {
 /// trouble, so it reads as `Deferred`. **A `Transient` from any relay outranks every later
 /// `Deferred`**, a skip or a relay's own `455` alike: the message was refused once on its own
 /// account, and that spends the attempt it should.
+///
+/// **The outcome's text never holds the recipient's address** ([`redacted`]): every sender stores
+/// it, and this is the one place all three pass through.
 pub async fn submit(
     ctx: &Ctx,
     workspace_id: Uuid,
@@ -148,10 +153,56 @@ pub async fn submit(
                 }
                 last = prefer(last, Outcome::Deferred { reason, cool_down });
             }
-            decided => return (decided, Some(relay.id)),
+            decided => return (redacted(decided, envelope), Some(relay.id)),
         }
     }
-    (last, None)
+    (redacted(last, envelope), None)
+}
+
+/// What stands for the recipient's address in a stored reply.
+const RECIPIENT: &str = "<recipient>";
+
+/// `o` with each of the envelope's recipients taken out of its text. A relay's reply is stored
+/// (`messages.error` and `messages.response`, a job's `last_error`), and one such as `550 5.1.1
+/// <bob@example.com>: Recipient address rejected` would keep the address after an erasure that
+/// leaves only a uuid (spec M2c §4.2 ruling 5): `messages` has no foreign key to `contacts`.
+fn redacted(o: Outcome, envelope: &Envelope) -> Outcome {
+    let r = |text: String| {
+        envelope.to().iter().fold(text, |text, to| {
+            let bracketed = replace_ignoring_case(&text, &format!("<{to}>"), RECIPIENT);
+            replace_ignoring_case(&bracketed, to.as_ref(), RECIPIENT)
+        })
+    };
+    match o {
+        Outcome::Sent { response } => Outcome::Sent {
+            response: r(response),
+        },
+        Outcome::Transient(t) => Outcome::Transient(r(t)),
+        Outcome::Failed(t) => Outcome::Failed(r(t)),
+        Outcome::Unknown(t) => Outcome::Unknown(r(t)),
+        Outcome::Deferred { reason, cool_down } => Outcome::Deferred {
+            reason: r(reason),
+            cool_down,
+        },
+    }
+}
+
+/// `text` with every copy of `needle`, matched without regard to ASCII case, replaced by `with`.
+fn replace_ignoring_case(text: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() {
+        return text.to_owned();
+    }
+    // ASCII lowercasing changes no byte offset, so a match in `lower` is one in `text`.
+    let (lower, needle) = (text.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(i) = lower[at..].find(&needle) {
+        out.push_str(&text[at..at + i]);
+        out.push_str(with);
+        at += i + needle.len();
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// The domain's DKIM key, read and parsed once: `None` when the relay signs. `Err` is the outcome

@@ -1234,6 +1234,113 @@ async fn a_test_send_job_is_delivered_as_a_test_and_respects_suppression(pool: P
 }
 
 // ---------------------------------------------------------------------------------------------
+// Spec §4.2 ruling 5: erasure leaves only a uuid. `messages` has no foreign key to `contacts`, so
+// erasure never reaches a message row; a relay reply that quotes the recipient must not be stored
+// with the address in it to begin with.
+
+/// Fails if `text` holds `address` in any case.
+#[track_caller]
+fn holds_no_address(text: &str, address: &str) {
+    assert!(
+        !text
+            .to_ascii_lowercase()
+            .contains(&address.to_ascii_lowercase()),
+        "the address was stored: {text}"
+    );
+}
+
+/// `(status, response, error)` of the one message sent to `quoted-1@dest.test` through a relay
+/// that answers `reply`.
+async fn stored_reply(
+    pool: &PgPool,
+    reply: &'static str,
+) -> (String, Option<String>, Option<String>) {
+    let f = fx(pool, Script::Smtp(AfterData::Reply(reply))).await;
+    f.contacts(1, "quoted").await;
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    sqlx::query_as("select status, response, error from messages where campaign_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A refusal quoting the recipient in brackets and bare, in a case of its own (a relay echoes what
+/// it likes): `messages.error` keeps the reply with `<recipient>` in both places.
+#[sqlx::test]
+async fn a_refusal_that_quotes_the_recipient_is_stored_without_the_address(pool: PgPool) {
+    let (status, _, error) = stored_reply(
+        &pool,
+        "550 5.1.1 <Quoted-1@Dest.Test>: Recipient address rejected (quoted-1@dest.test)",
+    )
+    .await;
+    let error = error.expect("the refusal is on the row");
+    assert_eq!(status, "failed");
+    holds_no_address(&error, "quoted-1@dest.test");
+    assert!(
+        error.contains("<recipient>: Recipient address rejected (<recipient>)"),
+        "{error}"
+    );
+}
+
+/// An acceptance that echoes the recipient: `messages.response` keeps it without the address.
+#[sqlx::test]
+async fn an_acceptance_that_quotes_the_recipient_is_stored_without_the_address(pool: PgPool) {
+    let (status, response, _) =
+        stored_reply(&pool, "250 2.0.0 Ok: queued for <QUOTED-1@dest.test>").await;
+    let response = response.expect("the acceptance is on the row");
+    assert_eq!(status, "sent");
+    holds_no_address(&response, "quoted-1@dest.test");
+    assert!(response.contains("queued for <recipient>"), "{response}");
+}
+
+/// A test send's refusal is kept on its job's `last_error`, which is shown: the same redaction.
+#[sqlx::test]
+async fn a_test_send_refusal_that_quotes_the_recipient_is_stored_without_the_address(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Reply(
+            "550 5.1.1 <Tester@Dest.Test>: Recipient address rejected (tester@dest.test)",
+        )),
+    )
+    .await;
+    let r = f
+        .app
+        .post(&format!("/api/v1/workspaces/{}/campaigns", f.ws))
+        .json(&json!({
+            "name": "c", "list_ids": [f.list], "sending_domain_id": f.domain,
+            "from_local_part": "news", "from_name": "Acme", "reply_to": null,
+            "variants": [{"subject": "Hi {{ first_name }}", "template_id": f.template,
+                          "from_name": null}],
+        }))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+    f.app
+        .post(&format!("/api/v1/workspaces/{}/campaigns/{id}/test", f.ws))
+        .json(&json!({"addresses": ["tester@dest.test"]}))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+
+    Worker::new(f.ctx(), 2).tick().await.expect("a tick");
+
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    let why: Option<String> =
+        sqlx::query_scalar("select last_error from jobs where kind = 'campaign_test'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    let why = why.expect("the refusal is on the job");
+    holds_no_address(&why, "tester@dest.test");
+    assert!(
+        why.contains("<recipient>: Recipient address rejected (<recipient>)"),
+        "{why}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Spec §4.7.8: the two loops.
 
 /// **A double opt-in email does not wait behind a campaign** (spec §4.7.8). The worker's own loops
