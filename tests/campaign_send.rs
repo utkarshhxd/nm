@@ -25,11 +25,15 @@ use common::{
 use nm::{
     campaign::{
         launch::{self, LAUNCH_KIND},
+        queue,
         send::{CampaignWorker, States},
     },
     config::Config,
     crypto::{secrets::Secrets, suppression_hmac},
-    public::token::{self, Purpose, Token},
+    public::{
+        token::{self, Purpose, Token},
+        track,
+    },
     relay::transport::Transports,
     worker::{self, Worker, confirmation::Ctx},
     workspaces::roles::Role,
@@ -362,7 +366,22 @@ fn unqp(s: &str) -> String {
 /// The decoded body of the MIME part whose content type starts `mime` (`text/plain`,
 /// `text/html`).
 fn part(wire: &str, mime: &str) -> String {
-    for chunk in wire.split("\r\n--") {
+    // Split on the boundaries the message declares, not on any `\r\n--`: a quoted-printable line
+    // may start `-->`, as an `mj-button`'s closing comment does.
+    let mut chunks = vec![wire];
+    for (at, m) in wire.match_indices("boundary=") {
+        let boundary = wire[at + m.len()..]
+            .trim_start_matches('"')
+            .split(['"', ';', '\r', '\n'])
+            .next()
+            .unwrap_or_default();
+        let delimiter = format!("\r\n--{boundary}");
+        chunks = chunks
+            .into_iter()
+            .flat_map(|c| c.split(delimiter.as_str()))
+            .collect();
+    }
+    for chunk in chunks {
         let Some((head, body)) = chunk.split_once("\r\n\r\n") else {
             continue;
         };
@@ -1054,6 +1073,158 @@ async fn field_drift_mid_send_pauses_and_a_resume_after_a_resave_refreezes(pool:
     assert_eq!(f.state(id).await, "sent");
 }
 
+/// M2d spec §4.3.3: a re-freeze starts from the variant's previous link table and only appends,
+/// so an index in mail already sent keeps naming the same URL. The drift fixture above, with a
+/// re-saved template that puts a new link ahead of the old one.
+#[sqlx::test]
+async fn a_resume_that_refreezes_keeps_every_earlier_link_index(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query(
+        "insert into custom_fields (id, workspace_id, key, label, kind)
+         values ($1, $2, 'plan', 'Plan', 'text')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let link = |href: &str| json!({"type": "Link", "href": href, "text": "go", "marks": []});
+    let plan = json!({"type": "Tag", "source": "{{ plan }}"});
+    let tree = |runs: Vec<Value>| json!({"tree": {"blocks": [{"type": "Text", "runs": runs}]}});
+    let template = format!("/api/v1/workspaces/{}/templates/{}", f.ws, f.template);
+    f.app
+        .patch(&template)
+        .json(&tree(vec![link("https://a.test/"), plan.clone()]))
+        .await
+        .assert_status_ok();
+    f.contacts(2, "k").await;
+    let id = f.launched().await;
+    let links = || async {
+        sqlx::query_scalar::<_, Option<Value>>(
+            "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(links().await, Some(json!(["https://a.test/"])));
+    sqlx::query(
+        "update custom_fields set kind = 'number' where key = 'plan' and workspace_id = $1",
+    )
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.tick(&f.worker(2)).await;
+    assert_eq!(f.state(id).await, "paused");
+
+    f.app
+        .patch(&template)
+        .json(&tree(vec![
+            link("https://b.test/"),
+            link("https://a.test/"),
+            plan,
+        ]))
+        .await
+        .assert_status_ok();
+    f.app
+        .post(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/resume",
+            f.ws
+        ))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        links().await,
+        Some(json!(["https://a.test/", "https://b.test/"])),
+        "the re-freeze moved a link that mail already sent points at"
+    );
+}
+
+/// The same promise across a `marker_format_version` bump. The stored rendition no longer parses
+/// in this build, so the campaign pauses, and the resume re-freezes it. The link table is read from
+/// the raw JSON, so the re-freeze still appends to it, and the report still lists it. Read through
+/// the full parse, the table is dropped: the re-freeze puts `b` at index 0, where mail already sent
+/// says `a`, and the report lists no links.
+#[sqlx::test]
+async fn a_link_table_of_another_marker_version_survives_the_refreeze_and_the_report(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    let link = |href: &str| json!({"type": "Link", "href": href, "text": "go", "marks": []});
+    let tree = |runs: Vec<Value>| json!({"tree": {"blocks": [{"type": "Text", "runs": runs}]}});
+    let template = format!("/api/v1/workspaces/{}/templates/{}", f.ws, f.template);
+    f.app
+        .patch(&template)
+        .json(&tree(vec![link("https://a.test/")]))
+        .await
+        .assert_status_ok();
+    f.contacts(2, "m").await;
+    let id = f.launched().await;
+    let links = || async {
+        sqlx::query_scalar::<_, Option<Value>>(
+            "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(links().await, Some(json!(["https://a.test/"])));
+    sqlx::query(
+        "update campaigns set frozen = jsonb_set(frozen, '{variants,0,rendition,marker_format_version}',
+             to_jsonb((frozen #>> '{variants,0,rendition,marker_format_version}')::int + 1))
+          where id = $1",
+    )
+    .bind(id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.tick(&f.worker(2)).await;
+    assert_eq!(
+        f.sink.connections(),
+        0,
+        "a rendition this build refuses was sent"
+    );
+    assert_eq!(f.state(id).await, "paused");
+
+    let report = f
+        .app
+        .get(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/report",
+            f.ws
+        ))
+        .await
+        .json::<Value>();
+    assert_eq!(
+        report["links"],
+        json!([{"variant": 0, "link": 0, "url": "https://a.test/", "clicks": 0, "unique_clicks": 0}]),
+        "the report dropped the links of a rendition this build does not parse"
+    );
+
+    f.app
+        .patch(&template)
+        .json(&tree(vec![
+            link("https://b.test/"),
+            link("https://a.test/"),
+        ]))
+        .await
+        .assert_status_ok();
+    f.app
+        .post(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/resume",
+            f.ws
+        ))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        links().await,
+        Some(json!(["https://a.test/", "https://b.test/"])),
+        "the re-freeze dropped the table of a rendition this build does not parse"
+    );
+}
+
 /// **A resume that lands between two refreshes of the state map sends from the new rendition.**
 /// The worker has the launch's rendition cached. The field it names changes type, the template is
 /// re-saved, and the campaign is paused and resumed — which re-freezes it — all before the map is
@@ -1277,7 +1448,7 @@ async fn a_refusal_that_quotes_the_recipient_is_stored_without_the_address(pool:
     )
     .await;
     let error = error.expect("the refusal is on the row");
-    assert_eq!(status, "failed");
+    assert_eq!(status, "bounced", "a 5.1.1 is a hard bounce since M2d");
     holds_no_address(&error, "quoted-1@dest.test");
     assert!(
         error.contains("<recipient>: Recipient address rejected (<recipient>)"),
@@ -1338,6 +1509,135 @@ async fn a_test_send_refusal_that_quotes_the_recipient_is_stored_without_the_add
         why.contains("<recipient>: Recipient address rejected (<recipient>)"),
         "{why}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spec M2d §4.5: the send-time hard bounce.
+
+/// Acceptance: a sink answering `550 5.1.1` leaves the message `bounced`, the address suppressed
+/// with reason `bounced`, the campaign finished, and the next campaign on the list skipping that
+/// contact. The stored refusal does not hold the address.
+#[sqlx::test]
+async fn a_550_naming_the_mailbox_bounces_and_suppresses_the_address(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Reply(
+            "550 5.1.1 <dead@example.test>: no such user",
+        )),
+    )
+    .await;
+    let contact = Uuid::now_v7();
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name)
+         values ($1, $2, 'dead@example.test', 'Dee')",
+    )
+    .bind(contact)
+    .bind(f.ws)
+    .execute(&pool)
+    .await
+    .expect("contact");
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status)
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(f.ws)
+    .bind(contact)
+    .bind(f.list)
+    .execute(&pool)
+    .await
+    .expect("membership");
+
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("select status, error from messages where campaign_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "bounced");
+    holds_no_address(
+        &error.expect("the refusal is on the row"),
+        "dead@example.test",
+    );
+    let reasons: Vec<String> = sqlx::query_scalar(
+        "select reason from suppressions where workspace_id = $1 and email = 'dead@example.test'",
+    )
+    .bind(f.ws)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reasons, ["bounced"]);
+    assert_eq!(f.state(id).await, "sent");
+
+    // The next campaign on the same list: its batch check drops the contact.
+    let (next, message) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::query(
+        "insert into campaigns (id, workspace_id, name, list_ids) values ($1, $2, 'next', $3)",
+    )
+    .bind(next)
+    .bind(f.ws)
+    .bind(vec![f.list])
+    .execute(&pool)
+    .await
+    .expect("the next campaign");
+    sqlx::query(
+        "insert into messages (id, workspace_id, campaign_id, contact_id) values ($1, $2, $3, $4)",
+    )
+    .bind(message)
+    .bind(f.ws)
+    .bind(next)
+    .bind(contact)
+    .execute(&pool)
+    .await
+    .expect("its message");
+    assert!(
+        queue::eligible(&pool, &[message]).await.unwrap().is_empty(),
+        "the next campaign would mail an address that bounced"
+    );
+}
+
+/// A 4xx and a 5xx naming no mailbox suppress nothing: the 4xx is retried, a policy refusal and a
+/// bare `550` are `failed`. Each refusal is a sink of its own, which the relay is pointed at.
+#[sqlx::test]
+async fn a_4xx_and_an_unnamed_5xx_suppress_nothing(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("451 4.1.1 later"))).await;
+    f.contacts(1, "reader").await;
+    let first = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let (_, status, attempts) = f.messages(first).await["reader-1@dest.test"].clone();
+    assert_eq!((status.as_str(), attempts), ("queued", 1));
+    // Out of the way: its retry falls due within the test, at whichever sink is current then.
+    sqlx::query("update campaigns set state = 'cancelled' where id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for refusal in ["554 5.7.1 spam", "550 no such user"] {
+        let sink = Sink::start(Script::Smtp(AfterData::Reply(refusal))).await;
+        sqlx::query("update relays set port = $2 where id = $1")
+            .bind(f.relay)
+            .bind(i32::from(sink.addr.port()))
+            .execute(&pool)
+            .await
+            .expect("point the relay at the next sink");
+        let id = f.launched().await;
+        f.send_all(&f.worker(1)).await;
+        assert_eq!(sink.delivered(), 1, "the premise: the relay read it");
+        assert_eq!(
+            f.statuses(id).await,
+            BTreeMap::from([("failed".to_owned(), 1)]),
+            "{refusal}"
+        );
+    }
+    let suppressed: i64 = sqlx::query_scalar("select count(*) from suppressions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(suppressed, 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1491,4 +1791,199 @@ async fn a_resume_of_a_campaign_with_nothing_left_finishes_it(pool: PgPool) {
     r.assert_status_ok();
     assert_eq!(r.json::<Value>()["state"], "sent");
     assert_eq!(f.state(id).await, "sent");
+}
+
+// ---------------------------------------------------------------------------------------------
+// M2d: every campaign message carries its own tracking token (spec §4.1, §4.3).
+
+impl Fx {
+    /// The template becomes one `mj-button` linking to `href`.
+    async fn button(&self, href: &str) {
+        self.app
+            .patch(&format!(
+                "/api/v1/workspaces/{}/templates/{}",
+                self.ws, self.template
+            ))
+            .json(&json!({"tree": {"blocks": [{"type": "Button", "label": "Go", "href": href}]}}))
+            .await
+            .assert_status_ok();
+    }
+}
+
+/// **Acceptance: a sent message is tracked, end to end.** The message carries one pixel and the
+/// button's tracked link, both on its own token; the unsubscribe link is the header's and is not
+/// tracked; fetching both through the app is one unique open and one unique click in the report.
+#[sqlx::test]
+async fn a_sent_message_is_tracked_end_to_end(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.button("https://a.test/go").await;
+    let contacts = f.contacts(1, "ada").await;
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let wires = f.wires();
+    assert_eq!(wires.len(), 1);
+    let (message, ..) = f.messages(id).await[&contacts[0].1];
+    let html = part(&wires[0], "text/html");
+
+    let t = track::issue(&f.secrets, message);
+    assert_eq!(
+        html.matches(&format!("{PUBLIC_URL}/o/")).count(),
+        1,
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!("src=\"{PUBLIC_URL}/o/{t}\"")),
+        "{html}"
+    );
+    let click = format!("{PUBLIC_URL}/l/{t}/0");
+    assert!(html.contains(&format!("href=\"{click}\"")), "{html}");
+    assert_eq!(
+        html.matches(&format!("{PUBLIC_URL}/l/")).count(),
+        html.matches(&click).count(),
+        "a tracked link other than the button's: {html}"
+    );
+    // The header's link is the body's, untracked, and nothing tracked points under the public URL.
+    let unsubscribe = unsubscribe_url(&wires[0]);
+    assert!(html.contains(&format!("href=\"{unsubscribe}\"")), "{html}");
+    let links: Value = sqlx::query_scalar(
+        "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(links, json!(["https://a.test/go"]));
+
+    f.app
+        .server
+        .get(&format!("/o/{t}"))
+        .await
+        .assert_status_ok();
+    let r = f.app.server.get(&format!("/l/{t}/0")).await;
+    assert_eq!(r.status_code(), StatusCode::FOUND);
+    assert_eq!(r.header("location"), "https://a.test/go");
+
+    let r = f
+        .app
+        .get(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/report",
+            f.ws
+        ))
+        .await;
+    r.assert_status_ok();
+    let report = r.json::<Value>();
+    assert_eq!(
+        (
+            &report["unique_opens"],
+            &report["unique_clicks"],
+            &report["links"][0]["clicks"]
+        ),
+        (&json!(1), &json!(1), &json!(1)),
+        "{report}"
+    );
+}
+
+/// **Anti-goal 3.** No URL the recipient is sent, the header's or any in either part, carries
+/// their address, raw or percent-encoded.
+#[sqlx::test]
+async fn no_url_in_a_sent_message_carries_the_recipients_address(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.button("https://a.test/go").await;
+    let contact = Uuid::now_v7();
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name)
+         values ($1, $2, 'alice+x@example.test', 'Alice')",
+    )
+    .bind(contact)
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status)
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(f.ws)
+    .bind(contact)
+    .bind(f.list)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let wires = f.wires();
+    assert_eq!(wires.len(), 1);
+    let wire = &wires[0];
+    assert_eq!(header(wire, "To").as_deref(), Some("alice+x@example.test"));
+
+    let mut urls = vec![unsubscribe_url(wire)];
+    for body in [part(wire, "text/html"), part(wire, "text/plain")] {
+        for (at, _) in body.match_indices("http") {
+            urls.push(
+                body[at..]
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && !"\"'<>()".contains(*c))
+                    .collect(),
+            );
+        }
+    }
+    assert!(urls.iter().any(|u| u.contains("/o/")), "{urls:#?}");
+    assert!(urls.iter().any(|u| u.contains("/l/")), "{urls:#?}");
+    for url in &urls {
+        let lower = url.to_ascii_lowercase();
+        assert!(
+            !lower.contains("alice") && !lower.contains('@') && !lower.contains("%40"),
+            "a URL carries the address: {url}"
+        );
+    }
+}
+
+/// **S2's carry: a preview and a test send mint no tracking token.** Both render the frozen
+/// rendition, link table and all, for the sample contact: the pixel reads `test` and the button
+/// links straight to its URL.
+#[sqlx::test]
+async fn preview_and_test_render_create_no_tracking_token(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.button("https://a.test/go").await;
+    let r = f
+        .app
+        .post(&format!("/api/v1/workspaces/{}/campaigns", f.ws))
+        .json(&json!({
+            "name": "c", "list_ids": [f.list], "sending_domain_id": f.domain,
+            "from_local_part": "news", "from_name": "Acme", "reply_to": null,
+            "variants": [{"subject": "Hi", "template_id": f.template, "from_name": null}],
+        }))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+    let campaign = format!("/api/v1/workspaces/{}/campaigns/{id}", f.ws);
+    let r = f
+        .app
+        .post(&format!("{campaign}/preview"))
+        .json(&json!({}))
+        .await;
+    r.assert_status_ok();
+    let preview = r.json::<Value>()["html"].as_str().unwrap().to_owned();
+    f.app
+        .post(&format!("{campaign}/test"))
+        .json(&json!({"addresses": ["tester@dest.test"]}))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    let test: String =
+        sqlx::query_scalar("select payload->>'html' from jobs where kind = 'campaign_test'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+
+    for (what, html) in [("preview", preview), ("test", test)] {
+        assert!(
+            html.contains(&format!("src=\"{PUBLIC_URL}/o/test\"")),
+            "{what}: {html}"
+        );
+        assert!(
+            html.contains("href=\"https://a.test/go\""),
+            "{what}: {html}"
+        );
+        assert!(!html.contains("/l/"), "{what} tracked a link: {html}");
+    }
 }

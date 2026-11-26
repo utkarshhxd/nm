@@ -93,6 +93,8 @@ export async function stubCampaignApi(
         return answer(await source.schedule(ws, id, body()));
       case "winner":
         return answer(await source.winner(ws, id, body()));
+      case "report":
+        return answer(await source.report(ws, id));
       case "unschedule":
       case "pause":
       case "resume":

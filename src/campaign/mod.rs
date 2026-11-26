@@ -31,6 +31,7 @@ use crate::{
 
 pub mod launch;
 pub mod queue;
+pub mod report;
 pub mod routes;
 pub mod schedule;
 pub mod send;
@@ -119,6 +120,7 @@ pub struct Campaign {
     pub total: i64,
     pub sent: i64,
     pub failed: i64,
+    pub bounced: i64,
     pub unknown: i64,
     pub skipped: i64,
     pub failure_reason: Option<String>,
@@ -135,7 +137,7 @@ macro_rules! columns {
         "id, workspace_id, name, state, list_ids, segment_id, sending_domain_id, from_local_part, \
          from_name, reply_to, variants, ab_test_percent, winner, schedule_mode, schedule_zone, \
          schedule_local, send_at, launch_job_id, phase, resolve_cursor, resolved, frozen_at, \
-         total, sent, failed, unknown, skipped, failure_reason, pause_reason, created_at, \
+         total, sent, failed, bounced, unknown, skipped, failure_reason, pause_reason, created_at, \
          updated_at, launched_at, finished_at"
     };
 }
@@ -161,13 +163,43 @@ pub async fn load_frozen(
     ws: Uuid,
     id: Uuid,
 ) -> ApiResult<Option<Result<Frozen, StoredError>>> {
-    let column: Option<Value> =
-        sqlx::query_scalar("select frozen from campaigns where workspace_id = $1 and id = $2")
-            .bind(ws)
-            .bind(id)
-            .fetch_one(db)
-            .await?;
-    Ok(column.as_ref().map(Frozen::from_column))
+    Ok(frozen_column(db, ws, id)
+        .await?
+        .as_ref()
+        .map(Frozen::from_column))
+}
+
+/// `campaigns.frozen` as stored. `None` for a campaign that has not been launched.
+async fn frozen_column(db: impl PgExecutor<'_>, ws: Uuid, id: Uuid) -> sqlx::Result<Option<Value>> {
+    sqlx::query_scalar("select frozen from campaigns where workspace_id = $1 and id = $2")
+        .bind(ws)
+        .bind(id)
+        .fetch_one(db)
+        .await
+}
+
+/// Each variant's link table (`variants[i].rendition.links`), read from the raw frozen JSON and
+/// not through [`Frozen::from_column`], which refuses another `marker_format_version`: mail
+/// already sent points at these indexes whatever this build can parse (M2d spec §4.3.3). An entry
+/// that is not a string reads as `""`, so every later entry keeps its index; `""` matches no href
+/// and the click lookup refuses it.
+fn frozen_links(frozen: &Value) -> Vec<Vec<String>> {
+    let Some(variants) = frozen["variants"].as_array() else {
+        return Vec::new();
+    };
+    variants
+        .iter()
+        .map(|v| {
+            v["rendition"]["links"]
+                .as_array()
+                .map_or_else(Vec::new, |links| {
+                    links
+                        .iter()
+                        .map(|l| l.as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -180,17 +212,27 @@ pub struct CampaignCounts {
     pub queued: i64,
     pub sent: i64,
     pub failed: i64,
+    /// Refused by the relay as a mailbox or domain that does not exist; the address is suppressed.
+    pub bounced: i64,
     pub unknown: i64,
     pub skipped: i64,
 }
 
 impl CampaignCounts {
-    pub fn new(total: i64, sent: i64, failed: i64, unknown: i64, skipped: i64) -> CampaignCounts {
+    pub fn new(
+        total: i64,
+        sent: i64,
+        failed: i64,
+        bounced: i64,
+        unknown: i64,
+        skipped: i64,
+    ) -> CampaignCounts {
         CampaignCounts {
             total,
-            queued: (total - sent - failed - unknown - skipped).max(0),
+            queued: (total - sent - failed - bounced - unknown - skipped).max(0),
             sent,
             failed,
+            bounced,
             unknown,
             skipped,
         }
@@ -273,6 +315,7 @@ impl Campaign {
             self.total,
             self.sent,
             self.failed,
+            self.bounced,
             self.unknown,
             self.skipped,
         )
@@ -597,18 +640,26 @@ pub async fn prepare(db: &PgPool, public_url: &url::Url, c: &Campaign) -> Result
         };
         templates.push((owned, compiled));
     }
+    // Each variant's link table as it is frozen now: a re-freeze only appends to it, so an index
+    // in mail already sent keeps naming the same URL (M2d spec §4.3.3).
+    let prior: Vec<Vec<String>> = frozen_column(db, ws, c.id)
+        .await
+        .map_err(internal)?
+        .as_ref()
+        .map_or_else(Vec::new, frozen_links);
 
     // The compiles: `mrml` and the classifier, on the blocking pool, holding no connection.
     let (brand_kit, public_url) = (kit.render(), public_url.clone());
     let renditions = tokio::task::spawn_blocking(move || {
-        let footer = SystemFooter {
-            public_url: &public_url,
-            postal_address: &address,
-        };
         templates
             .iter()
             .enumerate()
             .map(|(i, (owned, compiled))| {
+                let footer = SystemFooter {
+                    public_url: &public_url,
+                    postal_address: &address,
+                    prior_links: prior.get(i).map_or(&[], Vec::as_slice),
+                };
                 crate::template::freeze(
                     compiled.as_ref(),
                     owned.authored(),

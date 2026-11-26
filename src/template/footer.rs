@@ -7,11 +7,13 @@
 //! send:  authored --mrml (mjml kinds)--> operator HTML --insertion_point--> + footer --classify--> Stored
 //! ```
 //!
-//! The footer is product markup with one slot, [`UNSUBSCRIBE_TOKEN`], in the PATH of an absolute
-//! link, `{public_url}/u/{token}`. Only `tag::Registry::system_footer()` knows that name, so no
-//! operator tag can fill it, and [`insertion_point`] refuses a marker naming it anywhere in the
-//! operator's document. Nothing here guesses at the operator's layout: the footer goes where the
-//! tokenizer says the body ends, and a document whose end is not markup is refused.
+//! The footer is product markup with two slots, each in the PATH of an absolute URL: the
+//! unsubscribe link `{public_url}/u/{token}` ([`UNSUBSCRIBE_TOKEN`]) and, right after it, the open
+//! pixel `{public_url}/o/{token}` ([`TRACKING_TOKEN`], M2d spec §4.2.1). Only
+//! `tag::Registry::system_footer()` knows those names, so no operator tag can fill either, and
+//! [`insertion_point`] refuses a marker naming one anywhere in the operator's document. Nothing
+//! here guesses at the operator's layout: the footer goes where the tokenizer says the body ends,
+//! and a document whose end is not markup is refused.
 
 use std::cell::RefCell;
 
@@ -20,9 +22,9 @@ use html5ever::tokenizer::{
     BufferQueue, StartTag, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
 
-use super::UNSUBSCRIBE_TOKEN;
 use super::mjml::{self, CompileError, Ctx};
 use super::render;
+use super::{TRACKING_TOKEN, UNSUBSCRIBE_TOKEN};
 
 /// What a send rendition adds to the operator's document.
 #[derive(Debug, Clone, Copy)]
@@ -33,12 +35,16 @@ pub struct SystemFooter<'a> {
     /// The brand kit's postal address. Written into the footer of a raw `mjml` or `html` template;
     /// a `blocks` template already emits it from the brand kit, and gets it once.
     pub postal_address: &'a str,
+    /// The variant's link table before this freeze (M2d spec §4.3.3): a re-freeze only appends to
+    /// it, so an index in mail already sent keeps naming the same URL. Empty on a first freeze.
+    pub prior_links: &'a [String],
 }
 
-/// Spec §4.5 ruling 7, exactly: the markup before the address and after the slot.
+/// M2d spec §5.3, exactly: the markup before the address, between the two slots and after them.
 const OPEN: &str = r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" style="padding:16px 24px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#6b7280;">"#;
-const CLOSE: &str =
-    r#"" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a></td></tr></table>"#;
+const PIXEL: &str =
+    r#"" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a><img src=""#;
+const CLOSE: &str = r#"" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;"></td></tr></table>"#;
 
 impl SystemFooter<'_> {
     /// `public_url` without its trailing `/`, as `worker::confirmation` builds its own links.
@@ -61,6 +67,11 @@ impl SystemFooter<'_> {
         mjml::literal(self.base(), Ctx::Attr, &mut out);
         out.push_str("/u/{{ ");
         out.push_str(UNSUBSCRIBE_TOKEN);
+        out.push_str(" }}");
+        out.push_str(PIXEL);
+        mjml::literal(self.base(), Ctx::Attr, &mut out);
+        out.push_str("/o/{{ ");
+        out.push_str(TRACKING_TOKEN);
         out.push_str(" }}");
         out.push_str(CLOSE);
         out
@@ -214,5 +225,31 @@ impl TokenSink for Probe {
             Token::ParseError(_) | Token::EOFToken => st.flush(),
         }
         TokenSinkResult::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec M2d §5.3, character for character, with `{ADDRESS}` and `{BASE}` filled as M2c fills
+    /// them and each slot as the merge tag the footer registry compiles.
+    #[test]
+    fn the_footer_is_spec_5_3_exactly() {
+        let url: url::Url = "https://mail.example.test/".parse().expect("a url");
+        let footer = SystemFooter {
+            public_url: &url,
+            postal_address: "1 Main St",
+            prior_links: &[],
+        };
+        let spec = r#"<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" style="padding:16px 24px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#6b7280;">{ADDRESS}<a href="{BASE}/u/{UNSUBSCRIBE_TOKEN}" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a><img src="{BASE}/o/{TRACKING_TOKEN}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;"></td></tr></table>"#;
+        let filled = |address: &str| {
+            spec.replace("{ADDRESS}", address)
+                .replace("{BASE}", "https://mail.example.test")
+                .replace("{UNSUBSCRIBE_TOKEN}", "{{ unsubscribe_token }}")
+                .replace("{TRACKING_TOKEN}", "{{ tracking_token }}")
+        };
+        assert_eq!(footer.html(true), filled("1 Main St<br>"));
+        assert_eq!(footer.html(false), filled(""));
     }
 }

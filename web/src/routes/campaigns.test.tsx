@@ -46,6 +46,7 @@ const counts = (sent: number, total: number) => ({
   queued: total - sent,
   sent,
   failed: 0,
+  bounced: 0,
   unknown: 0,
   skipped: 0,
 });

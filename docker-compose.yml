@@ -1,0 +1,100 @@
+# Run the whole product on one machine: `docker compose up -d --build`, then https://localhost.
+# Guide: docs/run-locally.md. For Rust development use docker-compose.dev.yml instead.
+# `name:` keeps this apart from the dev stack (project `nm`), so neither touches the other's data.
+name: nm-local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env and set POSTGRES_PASSWORD}
+      POSTGRES_DB: nm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nm -d nm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: makes a private CA and a certificate for the host `mailpit`, once, into a volume.
+  # nm only speaks SMTP over TLS (STARTTLS or SMTPS), so Mailpit needs a certificate nm trusts.
+  # bundle.pem is the system roots plus that CA; nm reads it through SSL_CERT_FILE.
+  certs:
+    image: alpine:3
+    volumes:
+      - certs:/certs
+    command:
+      - sh
+      - -ec
+      - |
+        [ -s /certs/bundle.pem ] && exit 0
+        apk add --no-cache openssl ca-certificates >/dev/null
+        cd /certs
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=nm local CA" \
+          -addext "basicConstraints=critical,CA:TRUE" -keyout ca.key -out ca.pem
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=mailpit" -keyout mailpit.key -out mailpit.csr
+        printf 'subjectAltName=DNS:mailpit\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > ext.cnf
+        openssl x509 -req -in mailpit.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 825 \
+          -extfile ext.cnf -out mailpit.pem
+        chmod 644 mailpit.key
+        cat /etc/ssl/certs/ca-certificates.crt ca.pem > bundle.pem
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    environment:
+      MP_SMTP_TLS_CERT: /certs/mailpit.pem
+      MP_SMTP_TLS_KEY: /certs/mailpit.key
+    volumes:
+      - certs:/certs:ro
+    ports:
+      # Web UI, http://localhost:8025, on this machine only: it has no login and holds every
+      # caught message. SMTP (1025) stays inside the network.
+      - "127.0.0.1:8025:8025"
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  nm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
+    # Server and worker in one process. Migrations run at startup (NM_AUTO_MIGRATE defaults on).
+    command: ["all"]
+    environment:
+      NM_DATABASE_URL: postgres://nm:${POSTGRES_PASSWORD}@postgres:5432/nm
+      NM_SECRET_KEY: ${NM_SECRET_KEY:?set NM_SECRET_KEY in .env, see docs/run-locally.md}
+      # The worker refuses to send unless this is https; Caddy provides it.
+      NM_PUBLIC_URL: https://localhost
+      # Caddy sets X-Forwarded-For; trust it so rate limits and audit rows see the real client.
+      NM_TRUST_PROXY_HEADERS: "true"
+      SSL_CERT_FILE: /certs/bundle.pem
+    volumes:
+      - certs:/certs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      certs:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "127.0.0.1:443:443"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - nm
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  certs:
+  caddy_data:

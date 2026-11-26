@@ -10,6 +10,7 @@ import { type Campaign, actionsFor, awaitingWinner } from "../../routes/campaign
 import type { CampaignSource, Res } from "../../routes/campaign-source";
 import { StateBadge, campaignProblem, campaignsKey, showInstant } from "../../routes/campaigns";
 import { Preview } from "./preview";
+import { CampaignReport } from "./report";
 import { Problem, Section } from "./section";
 import { TestSend } from "./test-send";
 
@@ -17,6 +18,7 @@ import { TestSend } from "./test-send";
 const COUNTS = [
   ["sent", "Sent", "bg-success"],
   ["failed", "Failed", "bg-danger"],
+  ["bounced", "Bounced (no such mailbox; now suppressed)", "bg-danger opacity-60"],
   ["unknown", "Uncertain — never retried", "bg-warning"],
   ["skipped", "Skipped (unsubscribed or suppressed since launch)", "bg-fg-muted"],
   ["queued", "Queued", "bg-border-strong"],
@@ -108,7 +110,7 @@ export function CampaignProgress({
 
       {picking ? (
         <Section title="Pick the winner">
-          <p className="mt-4">No engagement data until tracking ships — pick on what you know.</p>
+          <p className="mt-4">Each variant&apos;s link clicks are in the report below.</p>
           <ul className="mt-4 space-y-3">
             {c.variants.map((v, i) => (
               <li key={i} className="flex flex-wrap items-center justify-between gap-3">
@@ -179,6 +181,18 @@ export function CampaignProgress({
       >
         <p>Nothing more will be sent. Emails already sent stay sent. This cannot be undone.</p>
       </ConfirmDialog>
+
+      {/* Below the picker and the verbs, so the picker's "report below" is true. */}
+      {c.launched_at !== null ? (
+        <CampaignReport
+          ws={ws}
+          id={c.id}
+          state={c.state}
+          variantCount={c.variants.length}
+          source={source}
+          slug={slug}
+        />
+      ) : null}
 
       {can.includes("test") ? (
         <Section title="Test send">

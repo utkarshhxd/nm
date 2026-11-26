@@ -207,6 +207,10 @@ launch row beside it and found the two disagreeing; the row was right.)
 | `campaign::queue::mark_submitting` | the `messages` row alone, by primary key and `claim_token`. Writes `status` and `run_after` |
 | `campaign::queue::release` | `messages` rows alone, by primary key and `claim_token`, `status = 'queued'` only. Writes `attempts`, `run_after`, `error`, `claim_token` |
 | `campaign::queue::record` | `messages` (one `update … from unnest`, matched on `claim_token`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction. `tests/lock_order.rs` races it against `system_pause` and the sweep (`an_outcome_flush_and_a_pause_do_not_deadlock`, `an_outcome_flush_and_a_sweep_of_the_same_message_count_it_once`) |
+| `campaign::queue::record` (M2d) | `A` once per bounced address in ascending lock-key order, and the `suppressions` insert for each (`suppressions::record_bounces`), then `messages`, then `campaigns` as before. One transaction. A flush with no bounce takes no `A` and no `S`. Raced by `two_flushes_bouncing_the_same_addresses_in_opposite_orders_both_commit` and `a_bounce_flush_and_a_one_click_for_the_same_address_both_commit` |
+| `campaign::routes::report_campaign` (M2d) | **nothing.** Three plain reads (`messages`, `message_clicks`, `consent_log`) and a fourth of `campaigns.frozen` for the link table, after the `load` that is the 404; no transaction |
+| `public::track::open` (M2d) | the `messages` row alone, one statement on the pool. Writes `opens` and `opened_at`, no key column. A leaf |
+| `public::track::click` (M2d) | one statement on the pool: the `messages` row (`clicks`, `clicked_at`, `opened_at`, no key column), then the `message_clicks` row, which has no foreign key and which nothing references. The lookup before it is a plain read. A leaf |
 | `campaign::queue::sweep` | `messages` in two statements (expired `submitting` rows to `unknown`, exhausted `queued` rows to `failed`), each `for update skip locked` so it never waits on a row a flush is recording; then `campaigns` as `record`. One transaction. Held by the same flush race, and by `two_sweeps_at_once_fail_each_exhausted_message_once` for the second statement |
 | `campaign::launch::sweep` (R6) | for each launch job whose worker died on its last attempt, the last-attempt give-up below: `campaigns` (`failed`, or a system pause, fenced on `launch_job_id`), then `jobs` (`failed_at`), one transaction. The select that finds them is a plain read |
 | `campaign::send::system_pause` (R6) | the `campaigns` row alone, by primary key and a state guard (`sending`, `paused`). Writes `state`, `pause_reason`, `updated_at`; no key column. Raced against a flush in both orders (`an_outcome_flush_and_a_pause_do_not_deadlock`), the one pair that really runs together: a tick that pauses a campaign while its flusher is recording |
@@ -266,7 +270,9 @@ docker compose -f docker-compose.dev.yml -p nm exec -T postgres psql -U nm -d nm
 
 `psql` is in the `postgres` service, not in the dev container, which is why the second line does
 not go through `scripts/dev.sh`. As of `0033` it answers — and it still did when M2c R7 re-ran it
-against a database migrated from nothing to `0034`, which adds a column and no edge:
+against a database migrated from nothing to `0034`, which adds a column and no edge, and when M2d
+re-ran it against a database migrated from nothing to `0035`: unchanged, because `message_clicks`
+has no foreign key (spec M2d §4.7.2; `pg_constraint` shows none to or from it):
 
 ```
       parent         | fks | children
@@ -626,6 +632,36 @@ Every other row — create, update, delete, schedule, resume, winner, test and p
 mark, release, record, sweep; the launch's batch, hand-off, freeze, refusal and the orphan sweep;
 `system_pause`, the tick, `drain`, the test-send handler — was read against the statement it
 names and agrees with it.
+
+### M2d: the two families
+
+This document now orders two families. The **address family** is the order at the top, `A, L, S,
+contacts, M, C`. The **campaign family** is M2c's `messages`, then `campaigns`, then `jobs`. **The
+address family comes before the campaign family** (spec M2d §4.5.7): `A, L, S, contacts, M, C`,
+then `messages, campaigns, jobs`.
+
+**Every path that takes both already does so.** The public form (`public::forms::apply`) inserts
+its confirmation jobs after its consent rows, and erasure reaches `jobs` through the cascade from
+`contacts`. Both reach `jobs` last. No path takes a campaign-family row and then an address-family
+one.
+
+**The bounce flush is the first path to take `A` and `S` and then `messages`.** `record` takes `A`
+once per bounced address, in ascending lock-key order, with each address's `suppressions` insert
+after its lock. Then it writes `messages`, then `campaigns`, in one transaction (the M2d `record`
+row above). It is also the first path to take `A` for many addresses in one transaction, the case
+`lock_address`'s SHORTCUT names. The ascending order is what keeps two flushes that share
+addresses from cycling, and a flush bounds how many it holds. A second multi-address writer that
+locks out of key order deadlocks with this one.
+
+**Against a one-click on the same address**, both take `A` first and then write that address's
+`suppressions` row, so they queue on `A`. The second finds the first's row and keeps it
+(issues/27). A flush that wrote its suppression before taking `A` would cycle with a one-click
+granted `A` first, on the uncommitted row.
+
+- `two_flushes_bouncing_the_same_addresses_in_opposite_orders_both_commit`: a third transaction
+  holds X's lock, and the flushes bounce `[X, Y]` and `[Y, X]`. Red-first by dropping the sort.
+- `a_bounce_flush_and_a_one_click_for_the_same_address_both_commit`: both arrival orders.
+  Red-first by inserting the suppression before taking `A`.
 
 ### The tripwire on `tags`, and what to check rather than predict
 

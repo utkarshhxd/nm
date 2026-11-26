@@ -206,6 +206,10 @@ pub struct Contact<'a> {
     /// can name that slot. There is no `From<&contacts::Contact>`, because a default here would be
     /// an unsubscribe link with no token in it, sent without a word.
     pub unsubscribe_token: &'a str,
+    /// This message's tracking token, which fills the footer's
+    /// [`TRACKING_TOKEN`](super::TRACKING_TOKEN) slot and every tracked link. `None` for a test
+    /// send or a preview: links are left as written and the pixel's slot renders `test`.
+    pub tracking_token: Option<&'a str>,
 }
 
 impl Contact<'_> {
@@ -217,9 +221,10 @@ impl Contact<'_> {
             "first_name" => self.first_name.to_owned(),
             "last_name" => self.last_name.to_owned(),
             "timezone" => self.timezone.unwrap_or_default().to_owned(),
-            // Answered before `attributes`, so a contact value stored under this key never fills
-            // the slot.
+            // Answered before `attributes`, so a contact value stored under either key never
+            // fills the slot.
             super::UNSUBSCRIBE_TOKEN => self.unsubscribe_token.to_owned(),
+            super::TRACKING_TOKEN => self.tracking_token.unwrap_or("test").to_owned(),
             _ => match self.attributes.get(key)? {
                 Value::Array(a) => a.iter().filter_map(scalar).collect::<Vec<_>>().join(", "),
                 other => scalar(other)?,
@@ -365,7 +370,39 @@ pub(super) fn classify_send(
     tags: usize,
     footer_from: usize,
 ) -> Result<Vec<Site>, RenderError> {
-    scan(html, tags, None, footer_from).map(|(sites, _)| sites)
+    scan(html, tags, None, footer_from, Links::Off).map(|(sites, ..)| sites)
+}
+
+/// Spec §4.3.2: the canonical form of an operator-written `a` or `area` href that is tracked, or
+/// `None`. The static allowlist's own verdict, narrowed to `http` and `https`, and never anything
+/// under the public URL `base` (without its trailing `/`): the unsubscribe link, an operator's
+/// hard-coded `/u/` or confirm link. The caller passes only an href with no merge-tag marker in
+/// it, so no contact value can reach the result.
+pub(super) fn tracked_url(href: &str, base: &str) -> Option<String> {
+    match check_static_url(href) {
+        UrlCheck::Allowed(u) if matches!(u.scheme(), "http" | "https") => {
+            let u = u.to_string();
+            let under_base = u
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with('/'));
+            (!under_base).then_some(u)
+        }
+        _ => None,
+    }
+}
+
+/// A send rendition's link table (spec §4.3.3): `prior`, the variant's table before this freeze,
+/// then each tracked URL of a static `a`/`area` href not already in it, in document order. Walked
+/// by the serialiser that renders, in classify mode, so a link inside any conditional branch is
+/// seen and the table names exactly what a render can rewrite.
+pub(super) fn tracked_links(html: &str, base: &str, prior: &[String]) -> Vec<String> {
+    let links = Links::Collect {
+        base,
+        table: prior.to_vec(),
+    };
+    // `html` is a document `classify_send` has just accepted, so this cannot fail; were it to, no
+    // new link is tracked and every one is sent as the operator wrote it.
+    scan(html, 0, None, usize::MAX, links).map_or_else(|_| prior.to_vec(), |(.., table)| table)
 }
 
 /// The footer's link for `token`, as the footer writes it: the token percent-encoded as one path
@@ -401,13 +438,22 @@ pub(super) fn carries_link(haystack: &str, link: &str) -> bool {
 /// document if it is given the wrong one. Store the HTML `classify` accepted and pass that. A value is substituted and then written out; it is never read back, so
 /// a contact whose `first_name` is the text `{{ email }}` gets that text and not somebody's
 /// address.
+///
+/// `links` is a send rendition's `(base, table)`. With `contact.tracking_token` `Some(t)`, a static
+/// `a`/`area` href whose [`tracked_url`] is at position `i` of the table is written
+/// `{base}/l/{t}/{i}`; every other URL is written exactly as without it.
 pub fn substitute(
     html: &str,
     nodes: &[Node],
     contact: &Contact<'_>,
+    links: Option<(&str, &[String])>,
 ) -> Result<String, RenderError> {
     let fills = fills(nodes, contact);
-    scan(html, fills.len(), Some(&fills), usize::MAX).map(|(_, out)| out)
+    let links = match (links, contact.tracking_token) {
+        (Some((base, table)), Some(token)) => Links::Rewrite { base, table, token },
+        _ => Links::Off,
+    };
+    scan(html, fills.len(), Some(&fills), usize::MAX, links).map(|(_, out, _)| out)
 }
 
 /// [`substitute`] for a template that is already the document being sent, with no MJML step.
@@ -421,7 +467,7 @@ pub fn substitute(
 #[cfg(test)]
 fn render_html(nodes: &[Node], contact: &Contact<'_>) -> Result<String, RenderError> {
     let (html, _) = marked(nodes);
-    substitute(&html, nodes, contact)
+    substitute(&html, nodes, contact, None)
 }
 
 /// A field tag's value for this contact: the stored value through its filter, or the fallback.
@@ -840,6 +886,23 @@ struct Sink<'v> {
     st: RefCell<St<'v>>,
 }
 
+/// What the serialiser does with a static `a`/`area` href (spec §4.3.1): the one branch click
+/// tracking adds to the function that owns static URLs.
+enum Links<'v> {
+    Off,
+    /// Freezing: each [`tracked_url`] not already in `table` is appended to it.
+    Collect {
+        base: &'v str,
+        table: Vec<String>,
+    },
+    /// One message: an href whose tracked URL is in `table` points at the click route instead.
+    Rewrite {
+        base: &'v str,
+        table: &'v [String],
+        token: &'v str,
+    },
+}
+
 /// Where in the document's STRUCTURE a marker sits. A conditional is dropped by rewinding the
 /// output between its two markers, so both ends must be in the same place: the rewind has to
 /// delete a whole region, not the back half of a start tag.
@@ -885,6 +948,7 @@ struct St<'v> {
     /// whether one of its markers was read inside a conditional.
     footer_from: usize,
     footer_in_block: bool,
+    links: Links<'v>,
 }
 
 impl<'v> St<'v> {
@@ -1011,7 +1075,8 @@ impl<'v> St<'v> {
         }
     }
 
-    fn attr_value(&mut self, value: &str, site: Site) {
+    /// `link`: this is the `href` of an `a` or `area` element, which click tracking may rewrite.
+    fn attr_value(&mut self, value: &str, site: Site, link: bool) {
         // The place is taken here rather than by the caller on purpose: an attribute value that
         // was serialised without a fresh sequence number would share a `Place` with the previous
         // one, and a conditional straddling the two would pass for one kept inside a single
@@ -1023,17 +1088,23 @@ impl<'v> St<'v> {
         );
         self.attr_seq += 1;
         self.place = Place::Attr(self.attr_seq);
-        self.attr_value_inner(value, site);
+        self.attr_value_inner(value, site, link);
         self.place = Place::Text;
     }
 
-    fn attr_value_inner(&mut self, value: &str, site: Site) {
+    fn attr_value_inner(&mut self, value: &str, site: Site, link: bool) {
         let segs = segments(value);
         if site == Site::Url {
             if segs.iter().any(|s| matches!(s, Seg::Mark(..))) {
+                // A merge tag in a link: never tracked, because its table entry would hold
+                // contact data (spec §4.3.2).
                 self.url_attr(&segs);
             } else {
-                escape_attr(&static_url(value), &mut self.out);
+                let url = link
+                    .then(|| self.tracked(value))
+                    .flatten()
+                    .unwrap_or_else(|| static_url(value));
+                escape_attr(&url, &mut self.out);
             }
             return;
         }
@@ -1044,6 +1115,31 @@ impl<'v> St<'v> {
                     self.record(*id, site);
                     self.emit(*id, *kind, site);
                 }
+            }
+        }
+    }
+
+    /// A static `a`/`area` href under [`Links`]: the click route's URL when this message rewrites
+    /// it, else `None` and the caller writes [`static_url`] as it always has. The token goes in as
+    /// one path segment, as the footer's slots do.
+    fn tracked(&mut self, href: &str) -> Option<String> {
+        match &mut self.links {
+            Links::Off => None,
+            Links::Collect { base, table } => {
+                if let Some(url) = tracked_url(href, base)
+                    && !table.contains(&url)
+                {
+                    table.push(url);
+                }
+                None
+            }
+            Links::Rewrite { base, table, token } => {
+                let url = tracked_url(href, base)?;
+                let index = table.iter().position(|t| *t == url)?;
+                let mut out = format!("{base}/l/");
+                percent_encode(token, Part::Path.keep(), &mut out);
+                let _ = write!(out, "/{index}");
+                Some(out)
             }
         }
     }
@@ -1142,7 +1238,8 @@ impl<'v> St<'v> {
             // Every attribute is re-serialised with double quotes, whatever the source wrote, so
             // the encoder never has to guess which character ends this value.
             self.out.push_str("=\"");
-            self.attr_value(&a.value, attr_site(name, n, http_equiv));
+            let link = n == "href" && matches!(name, "a" | "area");
+            self.attr_value(&a.value, attr_site(name, n, http_equiv), link);
             self.out.push('"');
         }
         if tag.self_closing {
@@ -1222,12 +1319,14 @@ impl TokenSink for Sink<'_> {
 /// "`mrml` dropped this tag" from a silent `Ok(vec![])` into a refusal.
 ///
 /// `footer_from` is the first slot of a send rendition's system footer, `usize::MAX` for none.
-fn scan(
+/// The third value is the link table [`Links::Collect`] built; empty for any other `links`.
+fn scan<'v>(
     html: &str,
     tags: usize,
-    fills: Option<&[Fill]>,
+    fills: Option<&'v [Fill]>,
     footer_from: usize,
-) -> Result<(Vec<Site>, String), RenderError> {
+    links: Links<'v>,
+) -> Result<(Vec<Site>, String, Vec<String>), RenderError> {
     if tags > MAX_TAGS {
         return Err(RenderError::DangerousContext { position: 0 });
     }
@@ -1294,6 +1393,7 @@ fn scan(
                 text: String::new(),
                 footer_from,
                 footer_in_block: false,
+                links,
             }),
         },
         TokenizerOpts::default(),
@@ -1342,7 +1442,11 @@ fn scan(
     if st.forged {
         return Err(RenderError::DangerousContext { position: 0 });
     }
-    Ok((sites, std::mem::take(&mut st.out)))
+    let table = match std::mem::replace(&mut st.links, Links::Off) {
+        Links::Collect { table, .. } => table,
+        Links::Off | Links::Rewrite { .. } => Vec::new(),
+    };
+    Ok((sites, std::mem::take(&mut st.out), table))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1627,6 +1731,7 @@ mod tests {
             timezone: None,
             attributes: attrs,
             unsubscribe_token: "TOK",
+            tracking_token: None,
         }
     }
 
@@ -1997,7 +2102,7 @@ mod tests {
         assert_eq!(classify(&html, tags).unwrap(), vec![Site::Css]);
 
         let attrs = json!({ "colour": "red;background:url(https://evil.example/p.png)" });
-        let out = substitute(&html, &ast, &contact("Ada", &attrs)).unwrap();
+        let out = substitute(&html, &ast, &contact("Ada", &attrs), None).unwrap();
         assert!(
             !out.contains("background:url("),
             "a contact value injected a CSS declaration: {out}"
@@ -2189,7 +2294,8 @@ mod tests {
             substitute(
                 &doubled,
                 &nodes("<p>{{ first_name }}</p>"),
-                &contact("Ada", &json!({}))
+                &contact("Ada", &json!({})),
+                None
             )
             .unwrap(),
             "<p>AdaAda</p>"
@@ -2254,7 +2360,7 @@ mod tests {
                 "{:?}",
                 classify(&forged, tags)
             );
-            assert!(substitute(&forged, &ast, &contact("Ada", &json!({}))).is_err());
+            assert!(substitute(&forged, &ast, &contact("Ada", &json!({})), None).is_err());
         }
     }
 
@@ -2323,6 +2429,33 @@ mod tests {
             "<p>2024-03-05</p>"
         );
     }
+
+    /// Spec §4.3.2's predicate, one href at a time: absolute `http`/`https` through the static
+    /// allowlist, canonicalised, and never under the public URL.
+    #[test]
+    fn tracked_url_takes_http_and_https_off_the_public_url_and_nothing_else() {
+        let base = "https://mail.example.test";
+        for (href, want) in [
+            ("https://a.test/x", Some("https://a.test/x")),
+            ("HTTP://B.TEST", Some("http://b.test/")),
+            (
+                "https://mail.example.test.evil.test/",
+                Some("https://mail.example.test.evil.test/"),
+            ),
+            ("https://mail.example.test/u/abc", None),
+            ("HTTPS://MAIL.EXAMPLE.TEST:443/l/x/0", None),
+            ("https://mail.example.test", None),
+            ("mailto:a@b.test", None),
+            ("tel:+100", None),
+            ("javascript:alert(1)", None),
+            ("#top", None),
+            ("/relative", None),
+            ("//evil.test/", None),
+            ("https://", None),
+        ] {
+            assert_eq!(tracked_url(href, base).as_deref(), want, "{href}");
+        }
+    }
 }
 
 /// The plain-text rendition: one evaluator, a verbatim encoder, and links that are encoded as URLs.
@@ -2349,6 +2482,7 @@ mod text_tests {
             timezone: None,
             attributes: attrs,
             unsubscribe_token: "TOK",
+            tracking_token: None,
         }
     }
 

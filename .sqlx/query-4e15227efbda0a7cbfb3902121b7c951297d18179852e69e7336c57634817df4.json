@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select c.frozen #>> array['variants', m.variant::text, 'rendition', 'links', $2]\n             from messages m\n             join campaigns c on c.id = m.campaign_id and c.workspace_id = m.workspace_id\n            where m.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "?column?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4e15227efbda0a7cbfb3902121b7c951297d18179852e69e7336c57634817df4"
+}

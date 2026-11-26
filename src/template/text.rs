@@ -570,6 +570,7 @@ mod tests {
             timezone: None,
             attributes: attrs,
             unsubscribe_token: "TOK",
+            tracking_token: None,
         }
     }
 
@@ -896,7 +897,7 @@ mod tests {
             let out = render_text(&compiled_text, &c).unwrap();
             assert_eq!(out, want);
             // The HTML part, computed from the same AST and contact, agrees about every value.
-            let html = substitute(&compiled.html, &compiled.nodes, &c).unwrap();
+            let html = substitute(&compiled.html, &compiled.nodes, &c, None).unwrap();
             assert!(html.contains(&escaped(want)), "{html}");
         }
     }
@@ -913,7 +914,7 @@ mod tests {
         let out = render_text(&text_template(&blocks, &BrandKit::default()), &c).unwrap();
         assert_eq!(out, "Go: https://app.example/u/A%20B&C?e=ada@example.com");
         let compiled = compile_blocks(&blocks, &BrandKit::default(), &reg).unwrap();
-        let html = substitute(&compiled.html, &compiled.nodes, &c).unwrap();
+        let html = substitute(&compiled.html, &compiled.nodes, &c, None).unwrap();
         assert!(
             html.contains("https://app.example/u/A%20B&amp;C?e=ada@example.com"),
             "{html}"
@@ -1089,7 +1090,7 @@ mod tests {
             json!({"country": "FR"}),
         ] {
             let c = contact("Ada", &attrs);
-            let html = substitute(&html_t.html, &html_t.nodes, &c).unwrap();
+            let html = substitute(&html_t.html, &html_t.nodes, &c, None).unwrap();
             let out = render_text(&text_t, &c).unwrap();
             for branch in ["HAS-COUNTRY", "NO-COUNTRY", "IS-UK"] {
                 assert_eq!(

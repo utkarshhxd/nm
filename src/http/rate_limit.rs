@@ -231,6 +231,21 @@ pub const PUBLIC_PER_MINUTE: u32 = 60;
 /// ceiling on confirmations, neither of which M1d has.
 pub const SUBMIT_PER_MINUTE: u32 = 10;
 
+/// How many requests one **IP address** may make to the tracking routes, `GET /o/{token}` and
+/// `GET /l/{token}/{link}`, per window (M2d spec §4.1.3). Keyed like [`PUBLIC_PER_MINUTE`] (the
+/// /64, `MAX_KEYS`) but its own limiter and its own map, so the burst after a send cannot spend the
+/// confirm and unsubscribe budget.
+///
+/// Six hundred, ten times the public pages', because the crowd behind one address is bigger here:
+/// a link scanner fetches every link of every message it is handed, an office opens a campaign
+/// together, and a mail provider's image proxy fetches pixels for all its users. Over budget the
+/// pixel still answers its GIF and records nothing; a click answers `429`.
+///
+/// The trap [`PUBLIC_PER_MINUTE`] describes reaches these routes too: behind a reverse proxy with
+/// `trust_proxy_headers` off, every open and click on the internet shares this one budget, and
+/// Apple's image proxies may exceed it and lose opens.
+pub const TRACK_PER_MINUTE: u32 = 600;
+
 /// How many test-send requests one workspace may make per window (spec M2c §4.8). Its own budget:
 /// a test freezes the campaign (`mrml` on the request task) and queues up to
 /// [`MAX_TEST_ADDRESSES`] real emails, so it is the one campaign call that can reach people's

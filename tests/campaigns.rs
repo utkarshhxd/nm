@@ -1560,7 +1560,8 @@ async fn a_winner_is_chosen_once_after_the_test_cohort_is_resolved(pool: PgPool)
     assert_eq!(v["awaiting_winner"], true);
     assert_eq!(
         v["counts"],
-        json!({"total": 10, "queued": 0, "sent": 10, "failed": 0, "unknown": 0, "skipped": 0})
+        json!({"total": 10, "queued": 0, "sent": 10, "failed": 0, "bounced": 0, "unknown": 0,
+               "skipped": 0})
     );
     // A variant that does not exist.
     let r = pick(2).await;

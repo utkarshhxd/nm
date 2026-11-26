@@ -1,0 +1,15 @@
+# An allowlist: nothing enters the build context unless it is named here, so a local folder
+# (another checkout, editor or machine settings) can never reach an image build or its cache.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!rust-toolchain.toml
+!src/
+!migrations/
+!.sqlx/
+!web/
+web/node_modules
+web/dist
+web/test-results
+web/playwright-report

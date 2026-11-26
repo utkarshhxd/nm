@@ -20,7 +20,7 @@ use crate::{
     http::rate_limit::{
         DNS_CHECK_PER_MINUTE, EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE,
         PUBLIC_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
-        TEMPLATE_PREVIEW_PER_MINUTE, TEST_SEND_PER_MINUTE,
+        TEMPLATE_PREVIEW_PER_MINUTE, TEST_SEND_PER_MINUTE, TRACK_PER_MINUTE,
     },
     http::security_headers::security_headers,
     public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
@@ -66,6 +66,10 @@ pub struct AppState {
     /// need not own, so it gets a much smaller allowance of its own.
     /// See `http::rate_limit::SUBMIT_PER_MINUTE`.
     pub submit_limit: Arc<RateLimiter>,
+    /// Per-**IP** cap on the tracking routes, `/o/` and `/l/`. Its own limiter and its own map, so
+    /// the opens and clicks after a send never spend `public_limit`.
+    /// See `http::rate_limit::TRACK_PER_MINUTE`.
+    pub track_limit: Arc<RateLimiter>,
     /// Instance-wide cap on one-click unsubscribes *in the database at once*. `POST /u/{token}`
     /// with an RFC 8058 body may never answer `429` (spec §4's second anti-goal), so the limiter
     /// above cannot bound it and something else has to: without this, repeats of one genuine link
@@ -100,6 +104,7 @@ impl AppState {
             import_limit: Arc::new(RateLimiter::per_minute(IMPORT_PER_MINUTE)),
             public_limit: Arc::new(RateLimiter::per_minute(PUBLIC_PER_MINUTE)),
             submit_limit: Arc::new(RateLimiter::per_minute(SUBMIT_PER_MINUTE)),
+            track_limit: Arc::new(RateLimiter::per_minute(TRACK_PER_MINUTE)),
             one_click_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ONE_CLICKS)),
             check_limit: Arc::new(RateLimiter::per_minute(DNS_CHECK_PER_MINUTE)),
             test_send_limit: Arc::new(RateLimiter::per_minute(TEST_SEND_PER_MINUTE)),
@@ -184,8 +189,9 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     if !cfg.trust_proxy_headers && !is_local_url(&cfg.public_url) {
         tracing::warn!(
             "trust_proxy_headers is off, so rate limiting keys on the peer address. If NM is \
-             behind a reverse proxy, every public page request (/c/, /u/, /f/) counts against one \
-             shared limit and subscribers will be refused. Set it only if the proxy is yours."
+             behind a reverse proxy, every public page request (/c/, /u/, /f/) and every open and \
+             click (/o/, /l/) counts against one shared limit and subscribers will be refused. \
+             Set it only if the proxy is yours."
         );
     }
     if let Some(addr) = cfg.metrics_listen {

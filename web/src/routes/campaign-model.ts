@@ -30,10 +30,13 @@ export type Mode = S["ScheduleMode"];
 export type Variant = Present<S["CampaignVariant"]>;
 /** `send_at` is the server-resolved instant; the earliest zone's for `recipient_local`. */
 export type Schedule = Present<S["CampaignSchedule"]>;
-/** `queued = total - sent - failed - unknown - skipped`, in flight included. */
+/** `queued = total - sent - failed - bounced - unknown - skipped`, in flight included. */
 export type Counts = S["CampaignCounts"];
 export type Campaign = Present<S["CampaignView"]>;
 export type CampaignSummary = Present<S["CampaignSummary"]>;
+/** The campaign report: counts, and the clicks of every tracked link (0-based `variant` and `link`). */
+export type Report = Present<S["CampaignReport"]>;
+export type LinkReport = Present<S["LinkReport"]>;
 
 export type EditableFields = Pick<
   Campaign,

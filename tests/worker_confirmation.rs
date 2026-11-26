@@ -802,7 +802,9 @@ async fn an_unknown_outcome_does_not_fail_over_to_the_next_relay(pool: PgPool) {
 }
 
 /// And the mirror, so the rule above is "`Unknown` stops" and not "nothing ever fails over": a
-/// `5xx` is equally final at the next relay, which would refuse it for the same reason.
+/// `5xx` is equally final at the next relay, which would refuse it for the same reason. Since M2d a
+/// `5.1.1` is a `Bounced`, which a confirmation records as a failure and suppresses nothing for
+/// (spec M2d §4.5.4).
 #[sqlx::test]
 async fn a_permanent_refusal_does_not_fail_over_to_the_next_relay(pool: PgPool) {
     let w = World::new(
@@ -816,7 +818,7 @@ async fn a_permanent_refusal_does_not_fail_over_to_the_next_relay(pool: PgPool) 
     let id = w.enqueue_one().await;
     let outcome = w.tick_one().await;
 
-    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Bounced(_)), "{outcome:?}");
     assert_eq!(w.sink.connections(), 1);
     assert_eq!(
         second.connections(),
@@ -824,6 +826,14 @@ async fn a_permanent_refusal_does_not_fail_over_to_the_next_relay(pool: PgPool) 
         "a 5xx was offered to a second relay that would refuse it too"
     );
     assert!(w.row(id).await.failed_at.is_some());
+    let suppressions: i64 = sqlx::query_scalar("select count(*) from suppressions")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        suppressions, 0,
+        "a confirmation's bounce suppressed the address"
+    );
 }
 
 /// **Invariant 5.** OCI accepts mail to a suppressed address rather than rejecting it, answering

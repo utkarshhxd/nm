@@ -294,7 +294,19 @@ mod tests {
     #[test]
     fn the_subscribers_pages_are_never_the_spa() {
         let src = Map::new(&[("index.html", INDEX)]);
-        for path in ["/c", "/c/", "/c/abc.def", "/u", "/u/", "/f", "/f/signup"] {
+        for path in [
+            "/c",
+            "/c/",
+            "/c/abc.def",
+            "/u",
+            "/u/",
+            "/f",
+            "/f/signup",
+            "/o",
+            "/o/x",
+            "/l",
+            "/l/x/0",
+        ] {
             assert_eq!(
                 serve_web(&src, path, None).status(),
                 StatusCode::NOT_FOUND,
@@ -303,7 +315,7 @@ mod tests {
         }
         // Near misses, which are the SPA's and must stay the SPA's: the character after a prefix
         // has to be a `/` or nothing at all.
-        for path in ["/contacts", "/forms", "/customers"] {
+        for path in ["/contacts", "/forms", "/customers", "/login", "/options"] {
             assert_eq!(
                 serve_web(&src, path, None).status(),
                 StatusCode::OK,

@@ -75,10 +75,10 @@ impl Registry {
         let mut live: HashSet<String> = SYSTEM_FIELDS.iter().map(|s| s.to_string()).collect();
         let mut archived = HashSet::new();
         for d in defs {
-            // The unsubscribe slot is the product's alone (spec §4.5 ruling 6), and a custom field
-            // may be keyed like anything (issues/44). Admitting this one would hand an operator tag
-            // the recipient's token, so it is never a name an operator registry knows.
-            if d.key == super::UNSUBSCRIBE_TOKEN {
+            // The footer's slots are the product's alone (spec §4.5 ruling 6, M2d §4.2.2), and a
+            // custom field may be keyed like anything (issues/44). Admitting one would hand an
+            // operator tag the recipient's token, so neither is a name an operator registry knows.
+            if d.key == super::UNSUBSCRIBE_TOKEN || d.key == super::TRACKING_TOKEN {
                 continue;
             }
             if d.archived_at.is_some() {
@@ -96,11 +96,15 @@ impl Registry {
     }
 
     /// The registry the system footer is compiled against: it knows
-    /// [`UNSUBSCRIBE_TOKEN`](super::UNSUBSCRIBE_TOKEN) and nothing else, and it is the only one that
-    /// knows that.
+    /// [`UNSUBSCRIBE_TOKEN`](super::UNSUBSCRIBE_TOKEN) and
+    /// [`TRACKING_TOKEN`](super::TRACKING_TOKEN) and nothing else, and it is the only one that
+    /// knows either.
     pub fn system_footer() -> Self {
         Self {
-            live: HashSet::from([super::UNSUBSCRIBE_TOKEN.to_owned()]),
+            live: HashSet::from([
+                super::UNSUBSCRIBE_TOKEN.to_owned(),
+                super::TRACKING_TOKEN.to_owned(),
+            ]),
             archived: HashSet::new(),
         }
     }
