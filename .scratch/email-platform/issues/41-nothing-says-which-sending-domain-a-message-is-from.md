@@ -1,4 +1,14 @@
-Status: ready-for-human
+Status: open — campaign half closed by M2c; the transactional default remains, for M5
+
+**Closed by M2c (R3, R5, R6):** a campaign carries `sending_domain_id`, `from_local_part`, an
+optional `from_name` per variant and an optional `reply_to`, and header From and envelope From are
+`{from_local_part}@{domain}` (spec M2c §4.4). A campaign message, and the test send of a campaign,
+no longer take the workspace's first domain by name.
+
+**Still open, and narrowed to this:** the confirmation email keeps the alphabetical shortcut below,
+so a workspace with two sending domains has its double opt-in mail come from whichever sorts first.
+The fix is the default flag (option 1 below), which needs its own delete rule and screen and belongs
+to M5. The rest of this record is as M2a wrote it and is true of the confirmation path only.
 
 # Nothing says which sending domain a message is from
 

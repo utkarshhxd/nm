@@ -2,10 +2,11 @@ Status: needs-triage
 
 # The live-tenancy acceptance test M2 sign-off waits on, and nothing local can answer
 
-M2a's spec §8.1 asks six questions that only a real OCI tenancy can answer. They lived in the
-spec's open questions, which is the right place to *record* a question and the wrong place to
-track work: a spec is read once per milestone and a worklist is read before sign-off. Merging the
-M2a branch is fine; **declaring M2 accepted is not, until these six have answers.**
+M2a's spec §8.1 asks six questions that only a real OCI tenancy can answer, and M2c adds a seventh
+(below). They lived in the spec's open questions, which is the right place to *record* a question
+and the wrong place to track work: a spec is read once per milestone and a worklist is read before
+sign-off. Merging the M2a branch is fine; **declaring M2 accepted is not, until these seven have
+answers.**
 
 Question 6 is the one with teeth. Invariant 5 — "an accepted suppression reply is recorded as a
 failure" — rests on a string literal in `src/relay/transport.rs`
@@ -18,7 +19,7 @@ Send a seed message through the real OCI tenancy to a Gmail address and a Yahoo 
 raw headers on arrival, and record the answers verbatim rather than in summary. Then send one more
 to an address already on OCI's suppression list.
 
-## The six questions, what each decides, and what the bad answer costs
+## The seven questions, what each decides, and what the bad answer costs
 
 1. **Does OCI's `DKIM-Signature` `h=` include `List-Unsubscribe` and `List-Unsubscribe-Post`?**
    Decides whether relay signing is enough for one-click unsubscribe. If it does not, a receiver
@@ -48,6 +49,19 @@ to an address already on OCI's suppression list.
    tells an operator that someone received mail who did not** — spec §4's anti-goal, reached
    silently, with no failed row and nothing to look at. Record the full reply line; a paraphrase
    is not an answer, because what is being verified is a substring.
+
+7. **Does a Gmail one-click unsubscribe on a real campaign message land in `consent_log` with
+   `source_ref` = the campaign id?** Added by M2c. Every campaign message carries an https
+   `List-Unsubscribe` pair pointing at `{NM_PUBLIC_URL}/u/{token}`, and the token's `ref_id` is the
+   campaign id, so the row that a one-click writes should name the campaign (and `token_jti` the
+   message). The in-process tests prove that for a POST of the exact URL a message carries; they
+   cannot prove that Gmail's own button POSTs that URL, to that host, with that body, through
+   whatever it does to the header on the way. Send a campaign of one to a Gmail address, press
+   Gmail's "Unsubscribe", and read the `consent_log` row. A row with no `source_ref`, or no row,
+   means one of Q3's failure modes has reached campaigns, and the campaign's own unsubscribe count
+   is wrong with nothing to say so.
+
+**M2c merged without these. M2 sign-off waits on all seven.**
 
 ## What a bad answer changes in code
 

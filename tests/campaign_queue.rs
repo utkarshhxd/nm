@@ -827,6 +827,93 @@ async fn a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing(pool:
     );
 }
 
+/// **The replay test above only tried `Retry` and `Deferred`**, and the other verdicts do not move
+/// a row to the same place. `Sent`, `Failed`, `Unknown` and a `Retry` on its last attempt are final
+/// and each counts; `Skipped` reads from `queued`, so it needs the second claim not yet marked.
+/// A replay of any of them from the first claim must touch neither the second claim's row nor the
+/// campaign's counters. Red-first: drop the token from `record`'s `where`.
+#[sqlx::test]
+async fn a_replayed_flush_of_any_verdict_from_an_earlier_claim_touches_nothing(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    // Two claims of one row, the first released: `attempts` recurs, the token does not.
+    let two_claims = |c: Uuid| {
+        let pool = pool.clone();
+        async move {
+            queue(&pool, ws, c, 1, "1 minute").await;
+            let first = claim_one(&pool, c).await;
+            release(
+                &pool,
+                std::slice::from_ref(&first),
+                Duration::ZERO,
+                "budget",
+            )
+            .await
+            .expect("release");
+            (first, claim_one(&pool, c).await)
+        }
+    };
+
+    // `submitting` under the second claim: every verdict that reads from `submitting`.
+    let c = campaign(&pool, ws, &[], 1).await;
+    let (first, second) = two_claims(c).await;
+    assert!(mark_submitting(&pool, &second).await.expect("mark"));
+    let at_the_relay = snapshot(&pool, second.id).await;
+    let held = counters(&pool, c).await;
+    // The first claim spent its last attempt, so a `Retry` from it reads as final.
+    let spent = Claimed {
+        attempts: first.max_attempts,
+        ..first.clone()
+    };
+    for (who, replayed) in [
+        (
+            &first,
+            Verdict::Sent {
+                relay: Uuid::now_v7(),
+                response: "250 replayed".into(),
+            },
+        ),
+        (&first, Verdict::Failed("550 replayed".into())),
+        (
+            &first,
+            Verdict::Unknown("broken after DATA, replayed".into()),
+        ),
+        (&spent, Verdict::Retry("451 replayed".into())),
+    ] {
+        record(&pool, &[(who.clone(), replayed.clone())])
+            .await
+            .expect("record");
+        assert_eq!(
+            snapshot(&pool, second.id).await,
+            at_the_relay,
+            "a replayed {replayed:?} moved a row that is at the relay"
+        );
+        assert_eq!(
+            counters(&pool, c).await,
+            held,
+            "a replayed {replayed:?} was counted"
+        );
+    }
+
+    // `Skipped` reads from `queued`: a row the second claim holds but has not marked.
+    let c = campaign(&pool, ws, &[], 1).await;
+    let (first, second) = two_claims(c).await;
+    let queued = snapshot(&pool, second.id).await;
+    let held = counters(&pool, c).await;
+    record(&pool, &[(first, Verdict::Skipped("replayed".into()))])
+        .await
+        .expect("record");
+    assert_eq!(
+        snapshot(&pool, second.id).await,
+        queued,
+        "a replayed Skipped moved a row another claim holds"
+    );
+    assert_eq!(
+        counters(&pool, c).await,
+        held,
+        "a replayed Skipped was counted"
+    );
+}
+
 /// The mark restarts the lease at `SUBMIT_LEASE`, counted from the mark, so a send started as its
 /// claim lease runs out is not swept while the session, render and signing are still running.
 #[sqlx::test]

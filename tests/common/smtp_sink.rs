@@ -62,6 +62,11 @@ pub enum Script {
 #[derive(Default)]
 struct Seen {
     connections: AtomicUsize,
+    /// Messages read to their terminating `.`, whether or not their bytes were kept.
+    delivered: AtomicUsize,
+    /// Count the messages and drop their bytes: a benchmark that sends 100,000 would otherwise
+    /// hold half a gigabyte of them.
+    discard: bool,
     messages: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -81,11 +86,24 @@ impl Drop for Sink {
 impl Sink {
     /// Starts a sink on a port the kernel chooses, and returns once it is listening.
     pub async fn start(script: Script) -> Sink {
+        Sink::start_with(script, false).await
+    }
+
+    /// A sink that counts what it receives ([`Sink::delivered`]) and keeps none of it, for the
+    /// throughput benchmark. [`Sink::messages`] stays empty.
+    pub async fn start_discarding(script: Script) -> Sink {
+        Sink::start_with(script, true).await
+    }
+
+    async fn start_with(script: Script, discard: bool) -> Sink {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the sink");
         let addr = listener.local_addr().expect("the sink's address");
-        let seen: Arc<Seen> = Arc::default();
+        let seen: Arc<Seen> = Arc::new(Seen {
+            discard,
+            ..Seen::default()
+        });
         let watched = Arc::clone(&seen);
         let accepting = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -128,6 +146,11 @@ impl Sink {
         self.seen.connections.load(Ordering::Relaxed)
     }
 
+    /// How many messages have been read to their terminating `.`.
+    pub fn delivered(&self) -> usize {
+        self.seen.delivered.load(Ordering::Relaxed)
+    }
+
     /// The bytes of each message read to its terminating `.`, in arrival order, dot-stuffing and
     /// all. What a test reads the headers off.
     pub fn messages(&self) -> Vec<Vec<u8>> {
@@ -150,6 +173,10 @@ impl Sink {
 /// Answers one connection. An I/O error is the far end going away, which ends the connection and
 /// nothing else.
 async fn serve(stream: TcpStream, after: AfterData, seen: &Seen) -> std::io::Result<()> {
+    // Without this a reply written in two pieces (the line, then its CRLF) waits on Nagle for the
+    // client's delayed ACK, 40 ms a message. That is the sink's latency and not the product's, and
+    // the throughput benchmark read it as the relay's until it was found.
+    stream.set_nodelay(true)?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     writer.write_all(b"220 sink.test ESMTP\r\n").await?;
@@ -188,10 +215,13 @@ async fn serve(stream: TcpStream, after: AfterData, seen: &Seen) -> std::io::Res
             }
             // Recorded before the reply, so a message is on record even where the sink's whole
             // job is to go quiet afterwards — which is exactly the `Drop` and `Hang` cases.
-            seen.messages
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(body);
+            seen.delivered.fetch_add(1, Ordering::Relaxed);
+            if !seen.discard {
+                seen.messages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(body);
+            }
             match after {
                 AfterData::Reply(reply) => {
                     writer.write_all(reply.as_bytes()).await?;
