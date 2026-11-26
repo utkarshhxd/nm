@@ -30,6 +30,7 @@ use crate::{
     },
 };
 
+pub mod launch;
 pub mod queue;
 pub mod routes;
 pub mod schedule;

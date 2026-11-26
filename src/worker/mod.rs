@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use self::confirmation::{Ctx, handle};
 use crate::{
+    campaign::launch,
     config::Config,
     crypto::secrets::Secrets,
     db,
@@ -355,6 +356,28 @@ impl Worker {
     /// Claims up to [`BATCH`] rows, debits the bucket once for each workspace's share of them,
     /// and sends. Returns how many rows were claimed.
     pub async fn tick(&self) -> sqlx::Result<usize> {
+        let mail = self.tick_mail().await?;
+        Ok(mail + self.launch().await?)
+    }
+
+    /// Runs one campaign launch slice, if one is due. After the mail: a launch is up to
+    /// [`launch::LAUNCH_SLICE`] of work, and a double opt-in email never waits behind a campaign.
+    /// One job per tick, and a launch that hands off is claimed again by the next.
+    async fn launch(&self) -> sqlx::Result<usize> {
+        let jobs = claim(
+            &self.ctx.db,
+            launch::LAUNCH_KIND,
+            1,
+            JOB_LEASE.as_secs() as i64,
+        )
+        .await?;
+        for job in &jobs {
+            launch::handle(&self.ctx, job, launch::LAUNCH_SLICE).await;
+        }
+        Ok(jobs.len())
+    }
+
+    async fn tick_mail(&self) -> sqlx::Result<usize> {
         let started = Instant::now();
         let claimed = claim(&self.ctx.db, KIND, BATCH, JOB_LEASE.as_secs() as i64).await?;
         let total = claimed.len();

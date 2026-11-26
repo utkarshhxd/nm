@@ -203,6 +203,7 @@ counters or state is `for no key update`, which a child insert's `for key share`
 | `campaign::queue::release` | `messages` rows alone, by primary key and `claim_token`, `status = 'queued'` only. Writes `attempts`, `run_after`, `error`, `claim_token` |
 | `campaign::queue::record` | `messages` (one `update … from unnest`, matched on `claim_token`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction |
 | `campaign::queue::sweep` | `messages` in two statements (expired `submitting` rows to `unknown`, exhausted `queued` rows to `failed`), each `for update skip locked` so it never waits on a row a flush is recording; then `campaigns` as `record`. One transaction |
+| `campaign::launch` (a batch of `resolve_batch`, and each loop of `handle`) | `messages` (the insert-select, whose foreign key takes `for key share` on the campaign at the end of that statement), then `campaigns` by primary key and `launch_job_id` (cursor and `total`; no key column). The last batch of a slice adds, in the same transaction: `campaigns` (`resolved`, then `finish_if_done`, or `launch_job_id` for the hand-off), **then** `jobs` (insert the successor, complete this job). `messages`, `campaigns`, `jobs`. The freeze (`scheduled -> sending`) and a refusal (`failed`, or a system pause) are `campaigns` then `jobs` and touch no `messages`. `prepare` and its `mrml` run before any of these transactions open |
 
 ## The rule for new code
 
