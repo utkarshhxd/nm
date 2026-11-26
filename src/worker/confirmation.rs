@@ -67,7 +67,7 @@ use crate::{
         self, Relay, bucket,
         transport::{Outcome, Transports},
     },
-    sending_domains::{CheckResult, SendingDomain, Signing},
+    sending_domains::{SendingDomain, Signing, not_passing},
     suppressions::blocking_suppression,
     users::normalize_email,
     worker::{Claimed, complete, defer, fail},
@@ -238,6 +238,8 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
         unsubscribe_url: &unsubscribe_url,
         feedback_id: &format!("confirmation:{list_id}:{}:nm", job.workspace_id),
         message_id_domain: &domain.domain,
+        reply_to: None,
+        message_id: Uuid::now_v7(),
     }) {
         Ok(message) => message,
         Err(e) => return Outcome::Failed(format!("the message could not be built: {e}")),
@@ -411,37 +413,6 @@ async fn sending_domain(
         Some(domain) => crate::sending_domains::for_domain(db, workspace_id, &domain).await,
         None => Ok(None),
     }
-}
-
-/// The checks that are not `Pass`, named as an operator would recognise them.
-///
-/// **`NotChecked` counts as not passing.** A new domain's `checks` is `{}`, which reads back as
-/// four `NotChecked`s, so treating "not failing" as "fine" would let every domain nobody has
-/// checked straight through the gate — which is every domain, on the day it is added.
-///
-/// **Which checks a domain is held to is a property of the domain, not of its `checks`**, which
-/// is why this takes the whole [`SendingDomain`]. `CheckResult::NotChecked` carries two different
-/// facts on `return_path`: "nobody has run a check yet", and "there is nothing here to check",
-/// which is what [`dns::check`](crate::sending_domains::dns::check) writes when no return-path
-/// domain is configured. Only `return_path_domain` tells them apart, so the second fact is read
-/// from the column, where it lives, at the moment the question is asked — and not transcribed
-/// into the stored JSON, where it would be a copy that can disagree with the column. A verdict
-/// the checker did record is always honoured, whatever the column says.
-fn not_passing(domain: &SendingDomain) -> Vec<&'static str> {
-    let checks = &domain.checks;
-    let mut required = vec![
-        ("SPF", &checks.spf),
-        ("DKIM", &checks.dkim),
-        ("DMARC", &checks.dmarc),
-    ];
-    if domain.return_path_domain.is_some() || checks.return_path != CheckResult::NotChecked {
-        required.push(("Return-Path", &checks.return_path));
-    }
-    required
-        .into_iter()
-        .filter(|(_, result)| **result != CheckResult::Pass)
-        .map(|(name, _)| name)
-        .collect()
 }
 
 /// **The one place an unsubscribe URL comes from.** The origin is this instance's `public_url`

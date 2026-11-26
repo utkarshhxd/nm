@@ -1,5 +1,7 @@
 # 49 — A brand-kit edit invalidates every stored rendition at once, and nothing recompiles them
 
+Status: closed by M2c R2 (5ba5611). Recompile on read, in memory, never written back (direction 2 without the write): a campaign freezes a fresh compile at launch, and a stored-template preview recompiles a `Stale` or `MarkerFormat` rendition. Field drift still refuses, and `Stored::ready` answers it before staleness.
+
 **Found by:** the M2b task R7 review (commit `bf5a344`), executed, not reasoned.
 **Blocks:** M2c sign-off. Not M2b.
 

@@ -85,6 +85,18 @@ pub mod actions {
     // Metadata names which palette and footer keys were set, never their values: `footer.address`
     // is a postal address.
     pub const BRAND_KIT_UPDATED: &str = "brand_kit.updated";
+    // Metadata names the campaign, ids, counts and the schedule. Never an address, a subject or
+    // any content: a test send records how many addresses, not which.
+    pub const CAMPAIGN_CREATED: &str = "campaign.created";
+    pub const CAMPAIGN_UPDATED: &str = "campaign.updated";
+    pub const CAMPAIGN_DELETED: &str = "campaign.deleted";
+    pub const CAMPAIGN_SCHEDULED: &str = "campaign.scheduled";
+    pub const CAMPAIGN_UNSCHEDULED: &str = "campaign.unscheduled";
+    pub const CAMPAIGN_PAUSED: &str = "campaign.paused";
+    pub const CAMPAIGN_RESUMED: &str = "campaign.resumed";
+    pub const CAMPAIGN_CANCELLED: &str = "campaign.cancelled";
+    pub const CAMPAIGN_WINNER_CHOSEN: &str = "campaign.winner_chosen";
+    pub const CAMPAIGN_TEST_SENT: &str = "campaign.test_sent";
 }
 
 /// Who did it. The audit table has no foreign keys, so ids may outlive their rows.

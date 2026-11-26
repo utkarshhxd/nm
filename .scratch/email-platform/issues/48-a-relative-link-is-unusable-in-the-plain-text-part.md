@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
-Status: open
+Status: closed by M2c R2 (5ba5611). The unsubscribe link is the product-owned absolute `{NM_PUBLIC_URL}/u/{token}` in the system footer, in both parts (shape 1 above).
 
 # A relative link is unusable in the plain-text part
 

@@ -116,6 +116,12 @@ pub enum ConfigError {
     SecretKeyLength(usize),
     #[error("invalid configuration: {0}")]
     Invalid(Box<figment::Error>),
+    #[error(
+        "NM_PUBLIC_URL must not have a query or a fragment: every link the product mails is \
+         built as {{NM_PUBLIC_URL}}/u/{{token}}, and a `?` or `#` in it would put the token there \
+         instead of in the path"
+    )]
+    PublicUrlQuery,
 }
 
 /// Shape of the merged env/TOML values before validation.
@@ -204,6 +210,9 @@ impl Config {
             }
             (None, None) => return Err(ConfigError::MissingSecretKey),
         };
+        if raw.public_url.query().is_some() || raw.public_url.fragment().is_some() {
+            return Err(ConfigError::PublicUrlQuery);
+        }
         Ok(Config {
             database_url: raw.database_url.ok_or(ConfigError::MissingDatabaseUrl)?,
             listen: raw.listen,
@@ -301,6 +310,26 @@ mod tests {
         assert_eq!(c.log_format, LogFormat::Pretty);
         assert_eq!(c.worker_pool_size, 9);
         assert_eq!(c.worker_concurrency, 2);
+    }
+
+    /// Every link the product mails is `{public_url}/{prefix}/{token}`, so a query or fragment here
+    /// would carry the token into that component instead of the path. Review M6.
+    #[test]
+    fn a_public_url_with_a_query_or_fragment_is_refused() {
+        for bad in [
+            "https://mail.example.test/?a=1",
+            "https://mail.example.test/#top",
+        ] {
+            let mut p = base();
+            p.push(("NM_PUBLIC_URL", bad));
+            let e = Config::from_figment(figment_with(&p))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} was accepted"));
+            assert!(e.to_string().contains("NM_PUBLIC_URL"), "{bad}: {e}");
+        }
+        let mut p = base();
+        p.push(("NM_PUBLIC_URL", "https://mail.example.test/nm/"));
+        Config::from_figment(figment_with(&p)).expect("a path is fine");
     }
 
     #[test]

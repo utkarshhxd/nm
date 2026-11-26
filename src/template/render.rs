@@ -154,6 +154,9 @@ pub enum RenderError {
     /// module has been bitten three times by exactly that kind of observation, so the pairing is
     /// required rather than assumed.
     BlockUnbalanced { index: usize },
+    /// A send rendition's system footer sits inside a conditional, so every recipient the branch
+    /// is not taken for would get no unsubscribe link and no postal address.
+    FooterInBlock,
 }
 
 /// The attributes whose value is a URL the browser will fetch or navigate to. Anything here gets
@@ -198,29 +201,25 @@ pub struct Contact<'a> {
     pub timezone: Option<&'a str>,
     /// Custom field values by key, as the `contacts.attributes` column stores them.
     pub attributes: &'a Value,
-}
-
-impl<'a> From<&'a crate::contacts::Contact> for Contact<'a> {
-    fn from(c: &'a crate::contacts::Contact) -> Self {
-        Contact {
-            email: &c.email,
-            first_name: &c.first_name,
-            last_name: &c.last_name,
-            timezone: c.timezone.as_deref(),
-            attributes: &c.attributes,
-        }
-    }
+    /// This message's unsubscribe token, which fills the system footer's
+    /// [`UNSUBSCRIBE_TOKEN`](super::UNSUBSCRIBE_TOKEN) slot and nothing else: no operator registry
+    /// can name that slot. There is no `From<&contacts::Contact>`, because a default here would be
+    /// an unsubscribe link with no token in it, sent without a word.
+    pub unsubscribe_token: &'a str,
 }
 
 impl Contact<'_> {
     /// The value a tag names, or `None` when it is absent or empty — the two are the same thing to
     /// a template, and `{{^ x }}` has to agree with `{{ x | "…" }}` about which it is.
-    fn value(&self, key: &str) -> Option<String> {
+    pub(super) fn value(&self, key: &str) -> Option<String> {
         let v = match key {
             "email" => self.email.to_owned(),
             "first_name" => self.first_name.to_owned(),
             "last_name" => self.last_name.to_owned(),
             "timezone" => self.timezone.unwrap_or_default().to_owned(),
+            // Answered before `attributes`, so a contact value stored under this key never fills
+            // the slot.
+            super::UNSUBSCRIBE_TOKEN => self.unsubscribe_token.to_owned(),
             _ => match self.attributes.get(key)? {
                 Value::Array(a) => a.iter().filter_map(scalar).collect::<Vec<_>>().join(", "),
                 other => scalar(other)?,
@@ -320,14 +319,20 @@ fn fills(nodes: &[Node], c: &Contact<'_>) -> Vec<Fill> {
         .iter()
         .map(|slot| match slot {
             Slot::Field(n) => Fill::Value(field_value(n, c)),
-            Slot::Block(n) => Fill::Block(match n {
-                Node::Present { key, .. } => c.value(key).is_some(),
-                Node::Absent { key, .. } => c.value(key).is_none(),
-                Node::Equals { key, value, .. } => c.value(key).as_deref() == Some(value.as_str()),
-                Node::Text(_) | Node::Field { .. } => false,
-            }),
+            Slot::Block(n) => Fill::Block(branch_taken(n, c)),
         })
         .collect()
+}
+
+/// Whether this contact takes a conditional's branch. One definition, so a subject and a body
+/// cannot disagree about it.
+pub(super) fn branch_taken(n: &Node, c: &Contact<'_>) -> bool {
+    match n {
+        Node::Present { key, .. } => c.value(key).is_some(),
+        Node::Absent { key, .. } => c.value(key).is_none(),
+        Node::Equals { key, value, .. } => c.value(key).as_deref() == Some(value.as_str()),
+        Node::Text(_) | Node::Field { .. } => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -349,7 +354,42 @@ fn fills(nodes: &[Node], c: &Contact<'_>) -> Vec<Fill> {
 /// It is sound for the refusal decision, which is all it is used for. A preview that wants to show
 /// an operator *where* each tag landed needs more than this.
 pub fn classify(html: &str, tags: usize) -> Result<Vec<Site>, RenderError> {
-    scan(html, tags, None).map(|(sites, _)| sites)
+    classify_send(html, tags, usize::MAX)
+}
+
+/// [`classify`] for a send rendition, whose slots from `footer_from` on are the system footer's.
+/// Also refuses a footer marker read inside a conditional: dropping that branch would rewind the
+/// footer out of the message (review C1).
+pub(super) fn classify_send(
+    html: &str,
+    tags: usize,
+    footer_from: usize,
+) -> Result<Vec<Site>, RenderError> {
+    scan(html, tags, None, footer_from).map(|(sites, _)| sites)
+}
+
+/// The footer's link for `token`, as the footer writes it: the token percent-encoded as one path
+/// segment, exactly as a URL attribute encodes a value there. `(plain text, HTML attribute)`.
+pub(super) fn footer_link(prefix: &str, token: &str) -> (String, String) {
+    let mut text = prefix.to_owned();
+    percent_encode(token, Part::Path.keep(), &mut text);
+    let mut html = String::new();
+    escape_attr(&text, &mut html);
+    (text, html)
+}
+
+/// Whether `haystack` holds `link` as a whole link, not as the front of a longer one.
+///
+/// A plain substring test lets a token that is a prefix of another recipient's token pass on that
+/// other link. The character after the match must not be one a token is made of: a letter or
+/// digit, `-`, `.`, `_`, `~`, or the `%` that starts an escape. Anything else (a quote, a space,
+/// `)`, `<`, the end) ends the link. Wider than a real token's alphabet on purpose: it only has to
+/// refuse a continuation, never to accept a link a token could not have made.
+pub(super) fn carries_link(haystack: &str, link: &str) -> bool {
+    haystack.match_indices(link).any(|(at, _)| {
+        !haystack[at + link.len()..]
+            .starts_with(|c: char| c.is_ascii_alphanumeric() || "-._~%".contains(c))
+    })
 }
 
 /// One contact's copy of the already-classified document.
@@ -367,7 +407,7 @@ pub fn substitute(
     contact: &Contact<'_>,
 ) -> Result<String, RenderError> {
     let fills = fills(nodes, contact);
-    scan(html, fills.len(), Some(&fills)).map(|(_, out)| out)
+    scan(html, fills.len(), Some(&fills), usize::MAX).map(|(_, out)| out)
 }
 
 /// [`substitute`] for a template that is already the document being sent, with no MJML step.
@@ -385,7 +425,7 @@ fn render_html(nodes: &[Node], contact: &Contact<'_>) -> Result<String, RenderEr
 }
 
 /// A field tag's value for this contact: the stored value through its filter, or the fallback.
-fn field_value(node: &Node, c: &Contact<'_>) -> Option<String> {
+pub(super) fn field_value(node: &Node, c: &Contact<'_>) -> Option<String> {
     let Node::Field {
         key,
         filter,
@@ -470,6 +510,14 @@ fn segments(s: &str) -> Vec<Seg<'_>> {
         out.push(Seg::Lit(rest));
     }
     out
+}
+
+/// The index of every marker in `s`, read exactly as [`classify`] reads one.
+pub(super) fn marker_indices(s: &str) -> impl Iterator<Item = usize> + '_ {
+    segments(s).into_iter().filter_map(|seg| match seg {
+        Seg::Mark(id, _) => Some(id),
+        Seg::Lit(_) => None,
+    })
 }
 
 /// The inside of a marker that has just had its `MARK_START` consumed: the index, which of the
@@ -742,6 +790,18 @@ fn url_parts(segs: &[Seg<'_>]) -> (Vec<(usize, Part)>, Option<String>) {
     (parts, scheme)
 }
 
+/// The elements whose contents the tokenizer must be told to read as raw text, and how. A tokenizer
+/// has no tree builder to say so itself. Shared with `footer`, which must agree with this
+/// classifier about where markup is and where it is only text.
+pub(super) fn raw_kind(name: &str) -> Option<RawKind> {
+    match name {
+        "script" => Some(RawKind::ScriptData),
+        "style" | "xmp" | "iframe" | "noembed" | "noframes" => Some(RawKind::Rawtext),
+        "title" | "textarea" => Some(RawKind::Rcdata),
+        _ => None,
+    }
+}
+
 /// An attribute's site, by element and attribute name.
 fn attr_site(elem: &str, name: &str, http_equiv: bool) -> Site {
     // An event handler's value is JavaScript the browser parses AFTER decoding entities, so
@@ -821,6 +881,10 @@ struct St<'v> {
     /// Character tokens arrive in chunks split at `&`, `<` and NUL; a run is buffered so a marker
     /// can never be half in one chunk and half in the next.
     text: String,
+    /// The first slot of a send rendition's system footer (`usize::MAX` when there is none), and
+    /// whether one of its markers was read inside a conditional.
+    footer_from: usize,
+    footer_in_block: bool,
 }
 
 impl<'v> St<'v> {
@@ -829,6 +893,12 @@ impl<'v> St<'v> {
     }
 
     fn record(&mut self, id: usize, site: Site) {
+        // Every sighting comes through here, decoded, in document order, before the marker's
+        // own `emit`: so `depth` is the number of conditionals open around it, character-reference
+        // aliases of the operator's own included.
+        if id >= self.footer_from && self.depth > 0 {
+            self.footer_in_block = true;
+        }
         if id >= MAX_TAGS {
             self.forged = true;
             return;
@@ -1080,14 +1150,14 @@ impl<'v> St<'v> {
         }
         self.out.push('>');
 
-        let (raw, feedback) = match name {
-            "script" => (Raw::Script, Some(RawKind::ScriptData)),
-            "style" => (Raw::Style, Some(RawKind::Rawtext)),
-            "xmp" | "iframe" | "noembed" | "noframes" => (Raw::Other, Some(RawKind::Rawtext)),
-            "title" | "textarea" => (Raw::Rcdata, Some(RawKind::Rcdata)),
-            _ => (Raw::Data, None),
+        let feedback = raw_kind(name);
+        self.raw = match feedback {
+            None => Raw::Data,
+            Some(RawKind::ScriptData) => Raw::Script,
+            Some(RawKind::Rcdata) => Raw::Rcdata,
+            Some(_) if name == "style" => Raw::Style,
+            Some(_) => Raw::Other,
         };
-        self.raw = raw;
         match feedback {
             Some(k) => TokenSinkResult::RawData(k),
             None => TokenSinkResult::Continue,
@@ -1150,10 +1220,13 @@ impl TokenSink for Sink<'_> {
 ///
 /// `tags` is how many markers the template emitted. Pre-sizing the table with it is what turns
 /// "`mrml` dropped this tag" from a silent `Ok(vec![])` into a refusal.
+///
+/// `footer_from` is the first slot of a send rendition's system footer, `usize::MAX` for none.
 fn scan(
     html: &str,
     tags: usize,
     fills: Option<&[Fill]>,
+    footer_from: usize,
 ) -> Result<(Vec<Site>, String), RenderError> {
     if tags > MAX_TAGS {
         return Err(RenderError::DangerousContext { position: 0 });
@@ -1219,6 +1292,8 @@ fn scan(
                 blocks: Vec::new(),
                 block_err: None,
                 text: String::new(),
+                footer_from,
+                footer_in_block: false,
             }),
         },
         TokenizerOpts::default(),
@@ -1241,6 +1316,9 @@ fn scan(
     }
     if let Some(&(index, _)) = st.blocks.first() {
         return Err(RenderError::BlockUnbalanced { index });
+    }
+    if st.footer_in_block {
+        return Err(RenderError::FooterInBlock);
     }
     // Fail closed, twice over. A marker the tokenizer never handed back is a position nobody
     // classified; a marker that is not in the document at all is a merge tag `mrml` threw away,
@@ -1548,6 +1626,7 @@ mod tests {
             last_name: "Lovelace",
             timezone: None,
             attributes: attrs,
+            unsubscribe_token: "TOK",
         }
     }
 
@@ -2269,6 +2348,7 @@ mod text_tests {
             last_name: "Lovelace",
             timezone: None,
             attributes: attrs,
+            unsubscribe_token: "TOK",
         }
     }
 

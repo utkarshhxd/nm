@@ -1425,6 +1425,8 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
         edges,
         [
             "api_keys -> selection_snapshots (n)",
+            "campaigns -> jobs (c)",
+            "campaigns -> messages (a)",
             "contacts -> consent_log (c)",
             "contacts -> contact_tags (c)",
             "contacts -> jobs (c)",
@@ -1453,6 +1455,7 @@ async fn the_foreign_key_graph_is_the_one_the_adr_rules_on(pool: PgPool) {
             "users -> suppressions (n)",
             "workspaces -> api_keys (c)",
             "workspaces -> brand_kits (c)",
+            "workspaces -> campaigns (c)",
             "workspaces -> contacts (c)",
             "workspaces -> custom_fields (c)",
             "workspaces -> forms (c)",

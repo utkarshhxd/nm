@@ -447,6 +447,8 @@ mod tests {
             unsubscribe_url: &unsubscribe_url,
             feedback_id: "camp1:list1:nm",
             message_id_domain: "brand.test",
+            reply_to: Some("replies@brand.test"),
+            message_id: uuid::Uuid::now_v7(),
         })
         .expect("a message")
     }
@@ -590,6 +592,7 @@ mod tests {
             [
                 "from",
                 "to",
+                "reply-to",
                 "subject",
                 "date",
                 "message-id",
