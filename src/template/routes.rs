@@ -877,7 +877,9 @@ async fn preview(
         Authoring::Mjml(_) => lint::lint(&render::marked(&stored.nodes).0, None).map(|mut f| {
             f.push(Finding::new(
                 Rule::NotChecked,
-                "a raw MJML template's links are not checked: the link check reads the block                  tree, and this template has none. The style checks above did run. Nothing                  here is a statement about its links."
+                "a raw MJML template's links are not checked: the link check reads the block \
+                 tree, and this template has none. The style checks above did run. Nothing \
+                 here is a statement about its links."
                     .to_owned(),
                 None,
             ));
@@ -885,7 +887,9 @@ async fn preview(
         }),
         Authoring::Html(_) => Ok(vec![Finding::new(
             Rule::NotChecked,
-            "a raw HTML template is not link-checked or style-checked: both checks read MJML or              the block tree, and this template has neither. Nothing below is a statement about              its links."
+            "a raw HTML template is not link-checked or style-checked: both checks read MJML or \
+             the block tree, and this template has neither. Nothing below is a statement about \
+             its links."
                 .to_owned(),
             None,
         )]),

@@ -32,11 +32,11 @@ export type PreviewResult = {
 export type PreviewSource = (doc: Doc, signal: AbortSignal) => Promise<PreviewResult>;
 
 /**
- * The sentences for the refusals a preview of UNSAVED work can get. A rejection's message is
- * shown under the panel's "unavailable" alert. A code not listed here shows the server's own
- * sentence: for a `422 validation` that is the field's message, which names the merge tag that
- * will not compile. `409 template-stale` is not listed because it cannot happen here — it comes
- * only from previewing what is STORED (an empty body), and these sources always send a document.
+ * The sentences for the refusals a preview can get. A rejection's message is shown under the
+ * panel's "unavailable" alert. A code not listed here shows the server's own sentence: for a
+ * `422 validation` that is the field's message, which names the merge tag that will not compile.
+ * `409 template-stale` comes only from previewing what is STORED (`storedPreview`, an empty
+ * body); a preview of unsaved work always sends a document and cannot receive it.
  */
 export const PREVIEW_PROBLEMS = {
   "not-found": "This template no longer exists. It may have been deleted in another window.",

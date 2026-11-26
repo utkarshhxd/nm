@@ -1044,7 +1044,9 @@ async fn a_raw_mjml_template_with_a_quoted_fallback_in_a_link_saves_and_previews
     // A quoted fallback inside an attribute: compile lifts it into the AST, so `mrml` parses the
     // MARKED source and the template is valid. The check must read that same string; handed the
     // raw source, `mrml` cannot parse it and every preview of a valid template was a 422.
-    let source = "<mjml><mj-body><mj-section><mj-column><mj-button                   href=\"https://x.example/?n={{ first_name | \"friend\" }}\">Go</mj-button>                  </mj-column></mj-section></mj-body></mjml>";
+    let source = "<mjml><mj-body><mj-section><mj-column><mj-button \
+                  href=\"https://x.example/?n={{ first_name | \"friend\" }}\">Go</mj-button> \
+                  </mj-column></mj-section></mj-body></mjml>";
     let r = t
         .editor
         .post(&templates_path(t.id))
