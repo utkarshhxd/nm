@@ -20,6 +20,7 @@ use crate::{
     http::rate_limit::{
         DNS_CHECK_PER_MINUTE, EXPORT_PER_MINUTE, IMPORT_PER_MINUTE, PREVIEW_PER_MINUTE,
         PUBLIC_PER_MINUTE, RateLimiter, SELECTION_PER_MINUTE, SUBMIT_PER_MINUTE,
+        TEMPLATE_PREVIEW_PER_MINUTE,
     },
     http::security_headers::security_headers,
     public::unsubscribe::MAX_CONCURRENT_ONE_CLICKS,
@@ -38,6 +39,10 @@ pub struct AppState {
     /// Per-workspace cap on `POST /segments/preview`, which a viewer may call on a debounce and
     /// which may hold a pooled connection for 1.5 seconds.
     pub preview_limit: Arc<RateLimiter>,
+    /// Per-workspace cap on `POST /templates/{id}/preview`. Its OWN limiter: the block editor
+    /// previews on a debounce and would otherwise spend the segment builder's budget in the same
+    /// workspace. See `http::rate_limit::TEMPLATE_PREVIEW_PER_MINUTE`.
+    pub template_preview_limit: Arc<RateLimiter>,
     /// Per-workspace cap on `POST /contacts/selection`, the most expensive endpoint in the
     /// product: it materialises the match, measured at 4,887 ms and 158 MB for a million rows.
     pub selection_limit: Arc<RateLimiter>,
@@ -86,6 +91,7 @@ impl AppState {
             secrets,
             webauthn,
             preview_limit: Arc::new(RateLimiter::per_minute(PREVIEW_PER_MINUTE)),
+            template_preview_limit: Arc::new(RateLimiter::per_minute(TEMPLATE_PREVIEW_PER_MINUTE)),
             selection_limit: Arc::new(RateLimiter::per_minute(SELECTION_PER_MINUTE)),
             export_limit: Arc::new(RateLimiter::per_minute(EXPORT_PER_MINUTE)),
             export_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),

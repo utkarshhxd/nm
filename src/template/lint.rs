@@ -45,6 +45,12 @@ pub enum Rule {
     UnencodedSpace,
     AtRuleInInlineStyle,
     MisspelledInlineAttribute,
+    /// A merge tag names a custom field that has been archived. Added by R7: a stored template may
+    /// be re-saved while it still names one, so the operator has to be able to SEE which ones.
+    ArchivedField,
+    /// Some part of this template has no checker at all, so an empty findings list would read as a
+    /// clean bill of health for something nothing looked at. Added by R7.
+    NotChecked,
 }
 
 impl Rule {
@@ -66,12 +72,22 @@ impl Rule {
             Rule::UnencodedSpace => Severity::Warning,
             // The template still sends; only the discarded rule is missing. Contract section 12.
             Rule::AtRuleInInlineStyle | Rule::MisspelledInlineAttribute => Severity::Warning,
+            // The tag still renders the value every contact already has, so the email is not
+            // wrong for anyone — but no NEW contact can be given one, so the operator wants to
+            // know before the field quietly means nothing.
+            Rule::ArchivedField => Severity::Warning,
+            // Nothing is wrong with the email; something simply went unchecked, and saying so is
+            // the whole point of the finding.
+            Rule::NotChecked => Severity::Warning,
         }
     }
 
     fn check(self) -> Check {
         match self {
-            Rule::AtRuleInInlineStyle | Rule::MisspelledInlineAttribute => Check::Lint,
+            Rule::AtRuleInInlineStyle
+            | Rule::MisspelledInlineAttribute
+            | Rule::ArchivedField
+            | Rule::NotChecked => Check::Lint,
             _ => Check::Link,
         }
     }
@@ -90,7 +106,10 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn new(rule: Rule, message: String, at: Option<Vec<usize>>) -> Self {
+    /// `pub(crate)` so R7's handler can add the two findings whose subject is not in this module:
+    /// an archived field a stored template still names, and a template part nothing checked.
+    /// Severity still comes from `Rule::severity()` and is not re-derived at the boundary.
+    pub(crate) fn new(rule: Rule, message: String, at: Option<Vec<usize>>) -> Self {
         Self {
             check: rule.check(),
             severity: rule.severity(),

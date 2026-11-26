@@ -2973,7 +2973,7 @@ export interface components {
          *     human message is not that.
          * @enum {string}
          */
-        Rule: "malformed_url" | "unsupported_scheme" | "empty_href" | "tag_in_link_position" | "mailto_without_address" | "unencoded_space" | "at_rule_in_inline_style" | "misspelled_inline_attribute";
+        Rule: "malformed_url" | "unsupported_scheme" | "empty_href" | "tag_in_link_position" | "mailto_without_address" | "unencoded_space" | "at_rule_in_inline_style" | "misspelled_inline_attribute" | "archived_field" | "not_checked";
         Run: {
             marks: components["schemas"]["Mark"][];
             text: string;
@@ -8255,7 +8255,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description rate-limited: too many previews for this workspace */
+            /** @description rate-limited: too many template previews for this workspace. Its own budget, not the segment preview's. */
             429: {
                 headers: {
                     [name: string]: unknown;
