@@ -248,13 +248,69 @@ async fn blocking(
 /// erase. A bulk path writing N addresses in ONE transaction would hold N locks in the shared lock
 /// table (`out of shared memory ... increase max_locks_per_transaction`), and two concurrent bulk
 /// writers taking them in different orders would deadlock. Such a path must batch into short
-/// sub-transactions and acquire the locks in sorted key order.
+/// sub-transactions and acquire the locks in sorted key order. [`record_bounces`] is one: it sorts,
+/// and the outcome flush it runs in bounds how many it takes.
 async fn lock_address(db: &mut PgConnection, hmac: &[u8; 32]) -> sqlx::Result<()> {
-    let key = i64::from_be_bytes(hmac[..8].try_into().expect("32 bytes"));
-    sqlx::query!("select pg_advisory_xact_lock($1)", key)
+    sqlx::query!("select pg_advisory_xact_lock($1)", lock_key(hmac))
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// The advisory lock key [`lock_address`] takes for an address's HMAC.
+fn lock_key(hmac: &[u8; 32]) -> i64 {
+    i64::from_be_bytes(hmac[..8].try_into().expect("32 bytes"))
+}
+
+/// Suppresses each address a relay hard-bounced at send (spec M2d §4.5.2): a workspace `address`
+/// row, reason `bounced`, source `send`. `bounces` is `(workspace_id, email, note)`. Returns how
+/// many rows it wrote: an address already blocked in that workspace keeps the row it has (`on
+/// conflict do nothing`, issues/27), and a replayed flush writes nothing.
+///
+/// **The locks are taken in ascending [`lock_key`] order**, each address once. Two flushes
+/// bouncing the same addresses in different orders deadlock otherwise. The caller writes
+/// `messages` and `campaigns` after this, never before: the address family before the campaign
+/// family (ADR 0005, "M2d: the two families").
+///
+/// An address that does not normalise is skipped and logged without the address.
+pub async fn record_bounces(
+    db: &mut PgConnection,
+    secrets: &Secrets,
+    bounces: &[(Uuid, &str, String)],
+) -> sqlx::Result<u64> {
+    let mut keyed = Vec::with_capacity(bounces.len());
+    for (workspace_id, email, note) in bounces {
+        let Ok(email) = normalize_email(email) else {
+            tracing::error!(
+                workspace = %workspace_id,
+                "a bounced address does not normalise, so it was not suppressed"
+            );
+            continue;
+        };
+        let hmac = suppression_hmac(secrets, &email);
+        keyed.push((lock_key(&hmac), hmac, *workspace_id, email, note));
+    }
+    keyed.sort_by_key(|(key, hmac, ws, ..)| (*key, *hmac, *ws));
+    keyed.dedup_by(|a, b| (a.1, a.2) == (b.1, b.2));
+    let mut written = 0;
+    for (_, hmac, workspace_id, email, note) in &keyed {
+        lock_address(db, hmac).await?;
+        written += sqlx::query!(
+            "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source, \
+             note) values ($1, $2, 'address', $3, $4, 'bounced', 'send', $5) \
+             on conflict (workspace_id, scope, email_hmac, domain) \
+             where lifted_at is null and scope <> 'list' do nothing",
+            Uuid::now_v7(),
+            workspace_id,
+            email,
+            hmac.as_slice(),
+            note,
+        )
+        .execute(&mut *db)
+        .await?
+        .rows_affected();
+    }
+    Ok(written)
 }
 
 /// Takes [`lock_address`] for a caller that is about to branch on what it finds about an address

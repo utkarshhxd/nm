@@ -121,8 +121,11 @@ pub async fn handle(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome
         Outcome::Transient(reason) | Outcome::Deferred { reason, .. } => {
             defer(&ctx.db, job, reason).await
         }
-        // Both give up, and `Unknown` gives up precisely because it might have worked.
-        Outcome::Failed(reason) | Outcome::Unknown(reason) => fail(&ctx.db, job.id, reason).await,
+        // All three give up, and `Unknown` gives up precisely because it might have worked. A
+        // bounce suppresses nothing here (spec M2d §4.5.4).
+        Outcome::Failed(reason) | Outcome::Bounced(reason) | Outcome::Unknown(reason) => {
+            fail(&ctx.db, job.id, reason).await
+        }
     };
     if let Err(e) = recorded {
         // Nothing else can be done from here, and silence would be the worst of it: a `complete`

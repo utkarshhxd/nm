@@ -1,8 +1,5 @@
 # M2b — templates, the block editor, and MJML: implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to
-> implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** An operator composes an email in a block editor, personalises it with merge tags that
 cannot become an injection vector, and sees honest previews of it — HTML, dark, and plain text.
 

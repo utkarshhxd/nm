@@ -41,8 +41,6 @@ later milestones:
 
 They are not exclusive: (1) is the fallback (2) would use.
 
-## Why this is `ready-for-human` rather than `needs-triage`
-
 It is a product decision, not a technical one. Whoever owns the product should say whether a
 workspace is expected to have several sending domains at all. If the answer is "rarely, and
 campaigns will pick", then (1) is enough forever. If workspaces routinely send as several brands,

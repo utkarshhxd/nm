@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 /**
- * The campaign shapes as the wire carries them (`.superpowers/sdd/m2c/contract.md` section 2) and
- * the one rule table the screens share: what a role may do to a campaign in a state (section 4).
+ * The campaign shapes as the wire carries them (the states and fields of spec M2c §4.1 and §5,
+ * `.scratch/email-platform/specs/2026-11-26-m2c-campaigns-and-send-pipeline.md`) and the one rule
+ * table the screens share: what a role may do to a campaign in a state (§4.1).
  *
  * **`actionsFor` hides controls and nothing else.** The server runs the same table on every
  * request; a stale `/me` here is never the reason anything is allowed.

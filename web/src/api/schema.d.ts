@@ -560,6 +560,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["report_campaign"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/campaigns/{id}/resume": {
         parameters: {
             query?: never;
@@ -1792,6 +1808,11 @@ export interface components {
         };
         /** @description Contract section 2. `queued` is what is left: in flight included. */
         CampaignCounts: {
+            /**
+             * Format: int64
+             * @description Refused by the relay as a mailbox or domain that does not exist; the address is suppressed.
+             */
+            bounced: number;
             /** Format: int64 */
             failed: number;
             /** Format: int64 */
@@ -1819,6 +1840,35 @@ export interface components {
         };
         CampaignPreviewRequest: {
             variant?: number | null;
+        };
+        CampaignReport: {
+            /** Format: int64 */
+            bounced: number;
+            /** Format: int64 */
+            failed: number;
+            /**
+             * @description Every link in every variant's frozen table, ordered by `(variant, link)`; empty before a
+             *     launch.
+             */
+            links: components["schemas"]["LinkReport"][];
+            /** Format: int64 */
+            sent: number;
+            /**
+             * Format: int64
+             * @description Messages with at least one click.
+             */
+            unique_clicks: number;
+            /**
+             * Format: int64
+             * @description Messages opened at least once. Approximate: a mail client may preload the pixel, and one
+             *     that blocks images never loads it.
+             */
+            unique_opens: number;
+            /**
+             * Format: int64
+             * @description Contacts who unsubscribed through this campaign's message, counted once however many lists.
+             */
+            unsubscribed: number;
         };
         /** @description The schedule as typed, and the instant the server resolved it to. */
         CampaignSchedule: {
@@ -2383,6 +2433,29 @@ export interface components {
          * @enum {string}
          */
         Kind: "blocks" | "mjml" | "html";
+        LinkReport: {
+            /**
+             * Format: int64
+             * @description Clicks, repeats included.
+             */
+            clicks: number;
+            /**
+             * Format: int32
+             * @description 0-based position in the variant's link table.
+             */
+            link: number;
+            /**
+             * Format: int64
+             * @description Messages that clicked this link.
+             */
+            unique_clicks: number;
+            url: string;
+            /**
+             * Format: int32
+             * @description 0-based.
+             */
+            variant: number;
+        };
         List: {
             /** Format: date-time */
             created_at: string;
@@ -5575,6 +5648,37 @@ export interface operations {
             };
             /** @description rate-limited: the template-preview budget */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    report_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignReport"];
+                };
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

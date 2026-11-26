@@ -63,9 +63,9 @@ not, so crash recovery could report a selection of 417,004 contacts with zero me
 
 1. Start Postgres: `docker compose -f docker-compose.dev.yml -p nm up -d`.
 2. All six dimensions have reported; `final-d6-report.md` is the last of them. The dimension
-   briefs and every report are in the review workspace under
-   `.superpowers/sdd/2026-11-12-m1b-segments/` (git-ignored scratch — if you ran `git clean -fdx`
-   it is gone, and `git log` is then your only recovery map).
+   briefs and every report are in M1b's review workspace, which is git-ignored scratch outside
+   the tracked tree (if you ran `git clean -fdx` it is gone, and `git log` is then your only
+   recovery map).
 3. M1b is already merged into `main` and pushed, so there is no PR left to open.
 4. M1c follows. Its contract is already referenced by a comment in the CSV export's multi-select
    escaping — find it before you design M1c's import.

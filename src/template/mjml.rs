@@ -739,8 +739,9 @@ mod tests {
             timezone: None,
             attributes: &attrs,
             unsubscribe_token: "TOK",
+            tracking_token: None,
         };
-        render::substitute(&s.html, &s.nodes, &c).unwrap()
+        render::substitute(&s.html, &s.nodes, &c, None).unwrap()
     }
 
     fn html_of(blocks: &[Block]) -> String {

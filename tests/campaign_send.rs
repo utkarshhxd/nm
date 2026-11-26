@@ -25,6 +25,7 @@ use common::{
 use nm::{
     campaign::{
         launch::{self, LAUNCH_KIND},
+        queue,
         send::{CampaignWorker, States},
     },
     config::Config,
@@ -672,35 +673,32 @@ async fn two_workers_send_each_message_once(pool: PgPool) {
     );
 }
 
+/// Waits until the sink has read `n` messages to their end.
+async fn reached(sink: &Sink, n: usize, what: &str) {
+    let started = Instant::now();
+    while sink.delivered() < n {
+        assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// **Review focus 4: a claim that lost its row never sends it.** Worker A claims both messages and,
-/// at concurrency one, is mid-session on the first (the relay holds each reply 1.5 s). A's claim on
-/// the second lapses meanwhile — a pool wait, a suspended VM — and worker B re-claims and sends it.
-/// When A reaches that message its write-ahead finds the row is no longer its claim's, and A drops
-/// it without a word: every address once. Ordering, not time: B's claim lands inside A's reply
-/// delay because the test makes it as soon as the relay has read A's first message.
+/// at concurrency one, is mid-session on the first: the relay holds its reply until the test lets
+/// it go. A's claim on the second lapses meanwhile — a pool wait, a suspended VM — and worker B
+/// re-claims it and has it at the relay too. Only then are the replies let go. When A reaches that
+/// message its write-ahead finds the row is no longer its claim's, and A drops it without a word:
+/// every address once. Ordering, not time: A cannot move past its first message until the test
+/// releases it, so a test that stalls anywhere still sets the scene it describes.
 #[sqlx::test]
 async fn a_stale_claim_never_sends(pool: PgPool) {
-    let f = fx(
-        &pool,
-        Script::Smtp(AfterData::Delayed(
-            Duration::from_millis(1_500),
-            "250 2.0.0 Ok",
-        )),
-    )
-    .await;
+    let f = fx(&pool, Script::Smtp(AfterData::Held("250 2.0.0 Ok"))).await;
     f.contacts(2, "w").await;
     let id = f.launched().await;
     let a = f.worker(1);
+    let a_states = Arc::clone(&a.1);
     a.1.refresh(&f.pool).await.unwrap();
     let first = tokio::spawn(async move { a.0.tick().await.map(|n| (n, a)) });
-    let started = Instant::now();
-    while f.sink.messages().is_empty() {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "A sent nothing"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    reached(&f.sink, 1, "A sent nothing").await;
 
     // A's lease on the message it has not started runs out, and B takes it.
     let lapsed = sqlx::query(
@@ -716,7 +714,18 @@ async fn a_stale_claim_never_sends(pool: PgPool) {
         "the premise: A holds one message it has not started"
     );
     let b = f.worker(1);
-    assert_eq!(f.tick(&b).await, 1, "B re-claimed the lapsed message");
+    b.1.refresh(&f.pool).await.unwrap();
+    let second = tokio::spawn(async move { b.0.tick().await });
+    reached(&f.sink, 2, "B did not send the lapsed message").await;
+    // A's map is read again just before the release, so a slow test cannot leave A to read
+    // "not sending" and stop short of the write-ahead this is about.
+    a_states.refresh(&f.pool).await.unwrap();
+    f.sink.release();
+    assert_eq!(
+        second.await.unwrap().expect("B's tick"),
+        1,
+        "B re-claimed the lapsed message"
+    );
     let (claimed, _a) = first.await.unwrap().expect("A's tick");
     assert_eq!(claimed, 2, "the premise: A had claimed both");
 
@@ -1046,6 +1055,76 @@ async fn field_drift_mid_send_pauses_and_a_resume_after_a_resave_refreezes(pool:
     assert_eq!(f.state(id).await, "sent");
 }
 
+/// M2d spec §4.3.3: a re-freeze starts from the variant's previous link table and only appends,
+/// so an index in mail already sent keeps naming the same URL. The drift fixture above, with a
+/// re-saved template that puts a new link ahead of the old one.
+#[sqlx::test]
+async fn a_resume_that_refreezes_keeps_every_earlier_link_index(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query(
+        "insert into custom_fields (id, workspace_id, key, label, kind)
+         values ($1, $2, 'plan', 'Plan', 'text')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let link = |href: &str| json!({"type": "Link", "href": href, "text": "go", "marks": []});
+    let plan = json!({"type": "Tag", "source": "{{ plan }}"});
+    let tree = |runs: Vec<Value>| json!({"tree": {"blocks": [{"type": "Text", "runs": runs}]}});
+    let template = format!("/api/v1/workspaces/{}/templates/{}", f.ws, f.template);
+    f.app
+        .patch(&template)
+        .json(&tree(vec![link("https://a.test/"), plan.clone()]))
+        .await
+        .assert_status_ok();
+    f.contacts(2, "k").await;
+    let id = f.launched().await;
+    let links = || async {
+        sqlx::query_scalar::<_, Option<Value>>(
+            "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(links().await, Some(json!(["https://a.test/"])));
+    sqlx::query(
+        "update custom_fields set kind = 'number' where key = 'plan' and workspace_id = $1",
+    )
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.tick(&f.worker(2)).await;
+    assert_eq!(f.state(id).await, "paused");
+
+    f.app
+        .patch(&template)
+        .json(&tree(vec![
+            link("https://b.test/"),
+            link("https://a.test/"),
+            plan,
+        ]))
+        .await
+        .assert_status_ok();
+    f.app
+        .post(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/resume",
+            f.ws
+        ))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        links().await,
+        Some(json!(["https://a.test/", "https://b.test/"])),
+        "the re-freeze moved a link that mail already sent points at"
+    );
+}
+
 /// **A resume that lands between two refreshes of the state map sends from the new rendition.**
 /// The worker has the launch's rendition cached. The field it names changes type, the template is
 /// re-saved, and the campaign is paused and resumed — which re-freezes it — all before the map is
@@ -1226,14 +1305,252 @@ async fn a_test_send_job_is_delivered_as_a_test_and_respects_suppression(pool: P
 }
 
 // ---------------------------------------------------------------------------------------------
+// Spec §4.2 ruling 5: erasure leaves only a uuid. `messages` has no foreign key to `contacts`, so
+// erasure never reaches a message row; a relay reply that quotes the recipient must not be stored
+// with the address in it to begin with.
+
+/// Fails if `text` holds `address` in any case.
+#[track_caller]
+fn holds_no_address(text: &str, address: &str) {
+    assert!(
+        !text
+            .to_ascii_lowercase()
+            .contains(&address.to_ascii_lowercase()),
+        "the address was stored: {text}"
+    );
+}
+
+/// `(status, response, error)` of the one message sent to `quoted-1@dest.test` through a relay
+/// that answers `reply`.
+async fn stored_reply(
+    pool: &PgPool,
+    reply: &'static str,
+) -> (String, Option<String>, Option<String>) {
+    let f = fx(pool, Script::Smtp(AfterData::Reply(reply))).await;
+    f.contacts(1, "quoted").await;
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    sqlx::query_as("select status, response, error from messages where campaign_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A refusal quoting the recipient in brackets and bare, in a case of its own (a relay echoes what
+/// it likes): `messages.error` keeps the reply with `<recipient>` in both places.
+#[sqlx::test]
+async fn a_refusal_that_quotes_the_recipient_is_stored_without_the_address(pool: PgPool) {
+    let (status, _, error) = stored_reply(
+        &pool,
+        "550 5.1.1 <Quoted-1@Dest.Test>: Recipient address rejected (quoted-1@dest.test)",
+    )
+    .await;
+    let error = error.expect("the refusal is on the row");
+    assert_eq!(status, "bounced", "a 5.1.1 is a hard bounce since M2d");
+    holds_no_address(&error, "quoted-1@dest.test");
+    assert!(
+        error.contains("<recipient>: Recipient address rejected (<recipient>)"),
+        "{error}"
+    );
+}
+
+/// An acceptance that echoes the recipient: `messages.response` keeps it without the address.
+#[sqlx::test]
+async fn an_acceptance_that_quotes_the_recipient_is_stored_without_the_address(pool: PgPool) {
+    let (status, response, _) =
+        stored_reply(&pool, "250 2.0.0 Ok: queued for <QUOTED-1@dest.test>").await;
+    let response = response.expect("the acceptance is on the row");
+    assert_eq!(status, "sent");
+    holds_no_address(&response, "quoted-1@dest.test");
+    assert!(response.contains("queued for <recipient>"), "{response}");
+}
+
+/// A test send's refusal is kept on its job's `last_error`, which is shown: the same redaction.
+#[sqlx::test]
+async fn a_test_send_refusal_that_quotes_the_recipient_is_stored_without_the_address(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Reply(
+            "550 5.1.1 <Tester@Dest.Test>: Recipient address rejected (tester@dest.test)",
+        )),
+    )
+    .await;
+    let r = f
+        .app
+        .post(&format!("/api/v1/workspaces/{}/campaigns", f.ws))
+        .json(&json!({
+            "name": "c", "list_ids": [f.list], "sending_domain_id": f.domain,
+            "from_local_part": "news", "from_name": "Acme", "reply_to": null,
+            "variants": [{"subject": "Hi {{ first_name }}", "template_id": f.template,
+                          "from_name": null}],
+        }))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+    f.app
+        .post(&format!("/api/v1/workspaces/{}/campaigns/{id}/test", f.ws))
+        .json(&json!({"addresses": ["tester@dest.test"]}))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+
+    Worker::new(f.ctx(), 2).tick().await.expect("a tick");
+
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    let why: Option<String> =
+        sqlx::query_scalar("select last_error from jobs where kind = 'campaign_test'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    let why = why.expect("the refusal is on the job");
+    holds_no_address(&why, "tester@dest.test");
+    assert!(
+        why.contains("<recipient>: Recipient address rejected (<recipient>)"),
+        "{why}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spec M2d §4.5: the send-time hard bounce.
+
+/// Acceptance: a sink answering `550 5.1.1` leaves the message `bounced`, the address suppressed
+/// with reason `bounced`, the campaign finished, and the next campaign on the list skipping that
+/// contact. The stored refusal does not hold the address.
+#[sqlx::test]
+async fn a_550_naming_the_mailbox_bounces_and_suppresses_the_address(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Reply(
+            "550 5.1.1 <dead@example.test>: no such user",
+        )),
+    )
+    .await;
+    let contact = Uuid::now_v7();
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name)
+         values ($1, $2, 'dead@example.test', 'Dee')",
+    )
+    .bind(contact)
+    .bind(f.ws)
+    .execute(&pool)
+    .await
+    .expect("contact");
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status)
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(f.ws)
+    .bind(contact)
+    .bind(f.list)
+    .execute(&pool)
+    .await
+    .expect("membership");
+
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("select status, error from messages where campaign_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "bounced");
+    holds_no_address(
+        &error.expect("the refusal is on the row"),
+        "dead@example.test",
+    );
+    let reasons: Vec<String> = sqlx::query_scalar(
+        "select reason from suppressions where workspace_id = $1 and email = 'dead@example.test'",
+    )
+    .bind(f.ws)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reasons, ["bounced"]);
+    assert_eq!(f.state(id).await, "sent");
+
+    // The next campaign on the same list: its batch check drops the contact.
+    let (next, message) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::query(
+        "insert into campaigns (id, workspace_id, name, list_ids) values ($1, $2, 'next', $3)",
+    )
+    .bind(next)
+    .bind(f.ws)
+    .bind(vec![f.list])
+    .execute(&pool)
+    .await
+    .expect("the next campaign");
+    sqlx::query(
+        "insert into messages (id, workspace_id, campaign_id, contact_id) values ($1, $2, $3, $4)",
+    )
+    .bind(message)
+    .bind(f.ws)
+    .bind(next)
+    .bind(contact)
+    .execute(&pool)
+    .await
+    .expect("its message");
+    assert!(
+        queue::eligible(&pool, &[message]).await.unwrap().is_empty(),
+        "the next campaign would mail an address that bounced"
+    );
+}
+
+/// A 4xx and a 5xx naming no mailbox suppress nothing: the 4xx is retried, a policy refusal and a
+/// bare `550` are `failed`. Each refusal is a sink of its own, which the relay is pointed at.
+#[sqlx::test]
+async fn a_4xx_and_an_unnamed_5xx_suppress_nothing(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("451 4.1.1 later"))).await;
+    f.contacts(1, "reader").await;
+    let first = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let (_, status, attempts) = f.messages(first).await["reader-1@dest.test"].clone();
+    assert_eq!((status.as_str(), attempts), ("queued", 1));
+    // Out of the way: its retry falls due within the test, at whichever sink is current then.
+    sqlx::query("update campaigns set state = 'cancelled' where id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for refusal in ["554 5.7.1 spam", "550 no such user"] {
+        let sink = Sink::start(Script::Smtp(AfterData::Reply(refusal))).await;
+        sqlx::query("update relays set port = $2 where id = $1")
+            .bind(f.relay)
+            .bind(i32::from(sink.addr.port()))
+            .execute(&pool)
+            .await
+            .expect("point the relay at the next sink");
+        let id = f.launched().await;
+        f.send_all(&f.worker(1)).await;
+        assert_eq!(sink.delivered(), 1, "the premise: the relay read it");
+        assert_eq!(
+            f.statuses(id).await,
+            BTreeMap::from([("failed".to_owned(), 1)]),
+            "{refusal}"
+        );
+    }
+    let suppressed: i64 = sqlx::query_scalar("select count(*) from suppressions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(suppressed, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Spec §4.7.8: the two loops.
 
 /// **A double opt-in email does not wait behind a campaign** (spec §4.7.8). The worker's own loops
-/// run, as `worker::run` starts them, while a campaign goes out through a slow relay. Then the
-/// messages loop is wedged: the test holds the campaign's row, so the outcome flush (and with it the
-/// tick) cannot finish. A confirmation queued now is delivered all the same, because the jobs loop
-/// is a loop of its own and never waits on the messages loop. The bound is far above the real
-/// latency (about a second): it can only be missed when the two loops are sequenced.
+/// run, as `worker::run` starts them, while a campaign goes out through a slow relay. The messages
+/// loop is wedged from the start: the test holds the campaign's row before the loops run, so the
+/// outcome flush (and with it the tick) cannot finish, and the campaign is still sending however
+/// slowly the test reaches each step. A confirmation queued once the campaign is going out is
+/// delivered all the same, because the jobs loop is a loop of its own and never waits on the
+/// messages loop. The bound is far above the real latency (about a second): it can only be missed
+/// when the two loops are sequenced.
 #[sqlx::test]
 async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
     let f = fx(
@@ -1252,20 +1569,9 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
     f.contacts(200, "k").await;
     let id = f.launched().await;
 
-    // The worker's own composition, as `worker::run` starts it.
-    let (stop, mut stopped) = tokio::sync::watch::channel(());
-    let loops = tokio::spawn(worker::run_loops(f.ctx(), 4, 32, async move {
-        let _ = stopped.changed().await;
-    }));
-    let started = Instant::now();
-    while f.sink.messages().len() < 10 {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the campaign never started"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // The wedge: the flush's counter update needs this row, so the messages tick cannot end.
+    // The wedge, before the loops start: the flush's counter update needs this row, so the
+    // messages tick cannot end and the campaign cannot finish. Claims, write-aheads and sends
+    // read the row without locking it and go on.
     let mut wedge = f.pool.begin().await.unwrap();
     let sent_before: i64 =
         sqlx::query_scalar("select sent from campaigns where id = $1 for update")
@@ -1273,6 +1579,13 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
             .fetch_one(&mut *wedge)
             .await
             .unwrap();
+
+    // The worker's own composition, as `worker::run` starts it.
+    let (stop, mut stopped) = tokio::sync::watch::channel(());
+    let loops = tokio::spawn(worker::run_loops(f.ctx(), 4, 32, async move {
+        let _ = stopped.changed().await;
+    }));
+    reached(&f.sink, 10, "the campaign never started").await;
 
     let contact: Uuid = sqlx::query_scalar(
         "insert into contacts (id, workspace_id, email) values (gen_random_uuid(), $1,

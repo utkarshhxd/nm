@@ -8,9 +8,13 @@
 
 use std::time::Duration;
 
-use nm::campaign::queue::{
-    CLAIM, Claimed, EXHAUSTED, MESSAGE_MAX_ATTEMPTS, SUBMIT_LEASE, SWEPT, Verdict, claim, eligible,
-    finish_if_done, mark_submitting, record, release, sweep,
+use nm::{
+    campaign::queue::{
+        CLAIM, Claimed, EXHAUSTED, MESSAGE_MAX_ATTEMPTS, SUBMIT_LEASE, SWEPT, Verdict, claim,
+        eligible, finish_if_done, mark_submitting, record, release, sweep,
+    },
+    config::SecretKey,
+    crypto::{secrets::Secrets, suppression_hmac},
 };
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::time::timeout;
@@ -121,6 +125,11 @@ async fn claim_one(pool: &PgPool, c: Uuid) -> Claimed {
     got.remove(0)
 }
 
+/// What a bounce's suppression is keyed with.
+fn secrets() -> Secrets {
+    Secrets::new(&SecretKey([7u8; 32]))
+}
+
 /// The claim is `0026`'s protocol per campaign, read clause by clause. Every clause except the
 /// ordering also has a behavioural test below that goes red without it:
 ///
@@ -134,10 +143,12 @@ async fn claim_one(pool: &PgPool, c: Uuid) -> Claimed {
 /// | `claim_token = gen_random_uuid()` | `a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing` |
 /// | `cross join lateral` | `a_batch_is_shared_fairly_across_campaigns` |
 /// | `k.state = 'sending'` | `a_paused_or_cancelled_campaign_is_never_claimed` |
+/// | `count(*) over () as due` | `sending_campaigns_with_nothing_due_take_no_share_of_the_batch` |
 #[test]
 fn the_claim_is_the_protocol() {
     let flat = CLAIM.split_whitespace().collect::<Vec<_>>().join(" ");
     for clause in [
+        "count(*) over () as due",
         "for update skip locked",
         "status = 'queued'",
         "attempts < max_attempts",
@@ -253,6 +264,32 @@ async fn a_batch_is_shared_fairly_across_campaigns(pool: PgPool) {
     assert_eq!((from_old, from_new), (250, 250));
 }
 
+/// The split is over the campaigns with a message due, not over every one that is `sending`. An
+/// A/B test waiting for its winner has nothing queued, and a recipient-local send has rows not due
+/// for hours; both stay `sending`, in any workspace. Split over them too, the live campaign below
+/// would get a fifth of the batch, and a hundred forgotten A/B tests would leave every live send a
+/// handful of messages a tick.
+#[sqlx::test]
+async fn sending_campaigns_with_nothing_due_take_no_share_of_the_batch(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let live = campaign(&pool, ws, &[], 1_000).await;
+    queue(&pool, ws, live, 1_000, "1 minute").await;
+    let elsewhere = workspace(&pool).await;
+    let mut named = vec![live];
+    for i in 0..4 {
+        let idle = campaign(&pool, elsewhere, &[], 10).await;
+        if i % 2 == 1 {
+            // Recipient-local: queued, due in an hour.
+            queue(&pool, elsewhere, idle, 10, "-1 hour").await;
+        }
+        named.push(idle);
+    }
+
+    let got = claim(&pool, &named, 500, LEASE).await.expect("claim");
+    assert_eq!(got.len(), 500, "the live campaign takes the whole batch");
+    assert!(got.iter().all(|m| m.campaign_id == live));
+}
+
 /// Review Focus 4. A worker whose lease ran out while another claim took the row must not mark
 /// it: the claim's `attempts` is the fence.
 #[sqlx::test]
@@ -345,7 +382,9 @@ async fn a_late_outcome_after_the_sweep_does_not_overwrite_unknown(pool: PgPool)
         relay: Uuid::now_v7(),
         response: "250 ok".into(),
     };
-    record(&pool, &[(m.clone(), sent)]).await.expect("record");
+    record(&pool, &secrets(), &[(m.clone(), sent)])
+        .await
+        .expect("record");
 
     assert_eq!(row(&pool, m.id).await.0, "unknown");
     let (_, sent, _, unknown, _) = counters(&pool, c).await;
@@ -363,9 +402,13 @@ async fn a_retry_spends_an_attempt_and_the_fifth_fails(pool: PgPool) {
         let m = claim_one(&pool, c).await;
         assert_eq!(m.attempts, attempt);
         assert!(mark_submitting(&pool, &m).await.expect("mark"));
-        record(&pool, &[(m.clone(), Verdict::Retry("451 later".into()))])
-            .await
-            .expect("record");
+        record(
+            &pool,
+            &secrets(),
+            &[(m.clone(), Verdict::Retry("451 later".into()))],
+        )
+        .await
+        .expect("record");
         let (status, attempts, error) = row(&pool, m.id).await;
         assert_eq!(attempts, attempt, "a retry keeps the attempt it spent");
         assert_eq!(error.as_deref(), Some("451 later"));
@@ -400,6 +443,7 @@ async fn a_deferral_and_a_release_spend_no_attempt(pool: PgPool) {
 
     record(
         &pool,
+        &secrets(),
         &[(deferred.clone(), Verdict::Deferred("455 busy".into()))],
     )
     .await
@@ -449,6 +493,7 @@ async fn recording_moves_the_counters_and_finishes_the_campaign(pool: PgPool) {
 
     record(
         &pool,
+        &secrets(),
         &[
             (
                 s.clone(),
@@ -466,6 +511,7 @@ async fn recording_moves_the_counters_and_finishes_the_campaign(pool: PgPool) {
 
     record(
         &pool,
+        &secrets(),
         &[
             (u.clone(), Verdict::Unknown("broke after DATA".into())),
             (
@@ -514,7 +560,9 @@ async fn an_awaiting_winner_campaign_does_not_finish(pool: PgPool) {
         relay: Uuid::now_v7(),
         response: "250".into(),
     };
-    record(&pool, &[(m, sent)]).await.expect("record");
+    record(&pool, &secrets(), &[(m, sent)])
+        .await
+        .expect("record");
     assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0));
 
     // Control: the same campaign in phase 2 is done.
@@ -726,7 +774,9 @@ async fn a_campaign_still_resolving_does_not_finish(pool: PgPool) {
         relay: Uuid::now_v7(),
         response: "250".into(),
     };
-    record(&pool, &[(m, sent)]).await.expect("record");
+    record(&pool, &secrets(), &[(m, sent)])
+        .await
+        .expect("record");
     assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0));
 
     // Control: once resolution is done, the same campaign finishes.
@@ -816,7 +866,7 @@ async fn a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing(pool:
         Verdict::Retry("451 replayed".into()),
         Verdict::Deferred("455 replayed".into()),
     ] {
-        record(&pool, &[(first.clone(), replayed)])
+        record(&pool, &secrets(), &[(first.clone(), replayed)])
             .await
             .expect("record");
     }
@@ -879,7 +929,7 @@ async fn a_replayed_flush_of_any_verdict_from_an_earlier_claim_touches_nothing(p
         ),
         (&spent, Verdict::Retry("451 replayed".into())),
     ] {
-        record(&pool, &[(who.clone(), replayed.clone())])
+        record(&pool, &secrets(), &[(who.clone(), replayed.clone())])
             .await
             .expect("record");
         assert_eq!(
@@ -899,9 +949,13 @@ async fn a_replayed_flush_of_any_verdict_from_an_earlier_claim_touches_nothing(p
     let (first, second) = two_claims(c).await;
     let queued = snapshot(&pool, second.id).await;
     let held = counters(&pool, c).await;
-    record(&pool, &[(first, Verdict::Skipped("replayed".into()))])
-        .await
-        .expect("record");
+    record(
+        &pool,
+        &secrets(),
+        &[(first, Verdict::Skipped("replayed".into()))],
+    )
+    .await
+    .expect("record");
     assert_eq!(
         snapshot(&pool, second.id).await,
         queued,
@@ -933,4 +987,159 @@ async fn a_mark_leases_the_whole_send_from_the_mark(pool: PgPool) {
         wait > lease - 10.0 && wait <= lease,
         "the mark left {wait}s of lease, not ~{lease}s"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spec M2d §4.5: the send-time hard bounce.
+
+fn bounced(email: &str) -> Verdict {
+    Verdict::Bounced {
+        reason: "permanent error (550): 5.1.1 <recipient>: no such user".into(),
+        email: email.into(),
+    }
+}
+
+/// `(scope, email, email_hmac, reason, source, note)` of every suppression in `ws`.
+type SuppressionRow = (String, String, Vec<u8>, String, String, Option<String>);
+
+async fn suppressions_in(pool: &PgPool, ws: Uuid) -> Vec<SuppressionRow> {
+    sqlx::query_as(
+        "select scope, email, email_hmac, reason, source, note from suppressions
+          where workspace_id = $1 order by id",
+    )
+    .bind(ws)
+    .fetch_all(pool)
+    .await
+    .expect("suppressions")
+}
+
+async fn bounced_count(pool: &PgPool, c: Uuid) -> i64 {
+    sqlx::query_scalar("select bounced from campaigns where id = $1")
+        .bind(c)
+        .fetch_one(pool)
+        .await
+        .expect("campaign row")
+}
+
+/// Spec M2d §4.5.2: the message is `bounced`, counted as `bounced` and not `failed`, and its
+/// address is suppressed in the workspace, normalised and keyed by its HMAC. A replay of the same
+/// flush counts nothing and writes no second row.
+#[sqlx::test]
+async fn a_bounce_is_recorded_counted_and_suppressed_once(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 2).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    let m = claim_one(&pool, c).await;
+    assert!(mark_submitting(&pool, &m).await.expect("mark"));
+    let flush = [(m.clone(), bounced("Dead@Example.test"))];
+
+    record(&pool, &secrets(), &flush).await.expect("record");
+    record(&pool, &secrets(), &flush).await.expect("a replay");
+
+    assert_eq!(row(&pool, m.id).await.0, "bounced");
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 0, 0, 0, 0));
+    assert_eq!(bounced_count(&pool, c).await, 1);
+    assert_eq!(
+        suppressions_in(&pool, ws).await,
+        [(
+            "address".to_owned(),
+            "dead@example.test".to_owned(),
+            suppression_hmac(&secrets(), "dead@example.test").to_vec(),
+            "bounced".to_owned(),
+            "send".to_owned(),
+            Some(format!("hard bounce 5.1.1 at send, campaign {c}")),
+        )]
+    );
+}
+
+/// Spec M2d §4.5.3: the finish check counts `bounced`.
+#[sqlx::test]
+async fn a_campaign_whose_last_message_bounced_finishes(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    let m = claim_one(&pool, c).await;
+    assert!(mark_submitting(&pool, &m).await.expect("mark"));
+
+    record(&pool, &secrets(), &[(m, bounced("dead@example.test"))])
+        .await
+        .expect("record");
+
+    assert_eq!(counters(&pool, c).await.0, "sent");
+}
+
+/// issues/27: an address already blocked keeps the row it has, and the flush still commits.
+#[sqlx::test]
+async fn an_address_already_blocked_keeps_its_row(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    sqlx::query(
+        "insert into suppressions (id, workspace_id, scope, email, email_hmac, reason, source)
+         values ($1, $2, 'address', $3, $4, 'unsubscribed_all', 'one_click')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(ws)
+    .bind("dead@example.test")
+    .bind(suppression_hmac(&secrets(), "dead@example.test").as_slice())
+    .execute(&pool)
+    .await
+    .expect("an opt-out");
+    let m = claim_one(&pool, c).await;
+    assert!(mark_submitting(&pool, &m).await.expect("mark"));
+
+    record(
+        &pool,
+        &secrets(),
+        &[(m.clone(), bounced("dead@example.test"))],
+    )
+    .await
+    .expect("the flush commits");
+
+    assert_eq!(row(&pool, m.id).await.0, "bounced");
+    let reasons: Vec<String> = suppressions_in(&pool, ws)
+        .await
+        .into_iter()
+        .map(|r| r.3)
+        .collect();
+    assert_eq!(reasons, ["unsubscribed_all"]);
+}
+
+/// Invariant 5: the outcome and the suppression commit together. A flush that fails after its
+/// suppression was written leaves neither the `bounced` status nor the suppression behind, and its
+/// retry writes both. The failure is a trigger refusing the counters, the last write a flush makes.
+#[sqlx::test]
+async fn a_bounce_and_its_suppression_commit_together(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    let m = claim_one(&pool, c).await;
+    assert!(mark_submitting(&pool, &m).await.expect("mark"));
+    sqlx::raw_sql(
+        "create function refuse_counters() returns trigger language plpgsql
+           as $$ begin raise exception 'the counters refused'; end $$;
+         create trigger refuse_counters before update on campaigns
+           for each row execute function refuse_counters();",
+    )
+    .execute(&pool)
+    .await
+    .expect("the trigger");
+    let flush = [(m.clone(), bounced("dead@example.test"))];
+
+    record(&pool, &secrets(), &flush)
+        .await
+        .expect_err("the counters refused");
+    assert_eq!(row(&pool, m.id).await.0, "submitting");
+    assert!(
+        suppressions_in(&pool, ws).await.is_empty(),
+        "the suppression outlived its flush"
+    );
+
+    sqlx::raw_sql("drop trigger refuse_counters on campaigns")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+    record(&pool, &secrets(), &flush).await.expect("the retry");
+    assert_eq!(row(&pool, m.id).await.0, "bounced");
+    assert_eq!(suppressions_in(&pool, ws).await.len(), 1);
 }

@@ -59,7 +59,7 @@ produces a classified document — red first, against the planted defect.
 
 ## Where it was proved
 
-`.superpowers/sdd/m2b/review-R7.md`, Important finding 3. The review also found, and R7
+M2b's review of task R7 (kept outside the repository), Important finding 3. The review also found, and R7
 fixed under the same round, a related dead end: a template naming an archived custom field
 could neither be previewed (409, "save it again") nor saved (422, "that field has been
 archived"). That one is closed. This one is not.

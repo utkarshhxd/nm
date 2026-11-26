@@ -8,9 +8,9 @@ import { normalize } from "./runs";
  * and undo is a stack of these, not the browser's.
  *
  * `Block` and `Run` mirror the Rust enums in `src/template/block.rs` variant for variant, in the
- * shape `.superpowers/sdd/m2b/contract-block-tree.md` fixes. They are
- * the contract between the lanes: what the editor serialises is what the server parses. Every
- * variant name below is a Rust variant name.
+ * shape the M2b plan fixes (`.scratch/email-platform/plans/2026-11-25-m2b-templates-and-editor.md`).
+ * They are the contract between the lanes: what the editor serialises is what the server parses.
+ * Every variant name below is a Rust variant name.
  *
  * Every operation names exactly one block. Selecting across blocks is not supported (spec 5.1),
  * so no operation takes a range, and one that is handed several is rejected, never half-applied.
@@ -19,7 +19,7 @@ import { normalize } from "./runs";
 export type Mark = "bold" | "italic";
 
 /**
- * Inline content, as the cross-lane contract fixes it (`.superpowers/sdd/m2b/contract-block-tree.md`).
+ * Inline content, as the cross-lane contract fixes it (`Run` in `src/template/block.rs`).
  * `marks` is always present, `[]` when empty, and is a set: bold and italic can sit on one run.
  * A mark list is replaced, never mutated, because a split leaves two runs holding the same array
  * and history holds both.

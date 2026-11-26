@@ -12,6 +12,22 @@
 //! bash scripts/dev.sh cargo test --release --test campaign_bench -- --ignored --nocapture
 //! ```
 //!
+//! The two tests take turns on [`ONE_AT_A_TIME`]: libtest runs `--ignored` tests in parallel
+//! threads of one process, and the million-contact build of the second would otherwise share the
+//! database and the cores with the timed send of the first.
+//!
+//! **The figures in spec §5 (3,173 to 3,403 messages/s) are from a laptop VM, not the reference
+//! box**: 16 logical CPUs visible, capped to 8 for the test and for Postgres alike, so that the
+//! worker, the sink and the database share eight. The cap, then the run:
+//!
+//! ```text
+//! docker update --cpuset-cpus 0-7 nm-postgres-1
+//! bash scripts/dev.sh taskset -c 0-7 cargo test --release --test campaign_bench -- --ignored --nocapture
+//! ```
+//!
+//! The same machine uncapped gave 2,068/s in a session that had just built the million-contact
+//! workspace. The cap stays on the Postgres container until it is updated again or recreated.
+//!
 //! The 1,500 messages/s of spec §4.10 is asserted **only** when `NM_BENCH_REFERENCE=1`, which is
 //! what the run on the 8 vCPU reference box sets; anywhere else the number is printed and recorded,
 //! not gated. `NM_BENCH_CONTACTS` shrinks the list for a smoke run, `NM_BENCH_WORKSPACE` sets the
@@ -61,6 +77,9 @@ use uuid::Uuid;
 
 const KEY_PEM: &str = include_str!("fixtures/dkim/signing-2048-pkcs8.pem");
 const TARGET_PER_SECOND: f64 = 1500.0;
+
+/// Held for the whole of each test, so the two measurements never overlap (see the module docs).
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn env_count(name: &str, default: i64) -> i64 {
     std::env::var(name)
@@ -354,6 +373,7 @@ fn machine() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "a measurement, not a gate: see the module docs for the command"]
 async fn sends_at_the_section_nine_rate_to_a_sink() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let contacts = env_count("NM_BENCH_CONTACTS", 100_000);
     let scratch = Scratch::create().await;
     let f = fx(&scratch.url).await;
@@ -426,6 +446,7 @@ async fn sends_at_the_section_nine_rate_to_a_sink() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "a measurement, not a gate: see the module docs for the command"]
 async fn a_small_list_in_a_large_workspace_launches_inside_the_lease() {
+    let _turn = ONE_AT_A_TIME.lock().await;
     let workspace = env_count("NM_BENCH_WORKSPACE", 1_000_000);
     let members = 1_000;
     let scratch = Scratch::create().await;

@@ -56,4 +56,5 @@ M2c writes the first unsubscribe link, not after.
 - `src/template/text.rs` — where the link is written.
 - `src/template/render.rs` — `check_static_url` / `UrlCheck::Relative`, the verdict that lets a
   relative URL through untouched.
-- `.superpowers/sdd/m2b/review-R5.md` — Minor 3, where this was found.
+- M2b's review of task R5, Minor 3, where this was found (review notes are kept outside the
+  repository).

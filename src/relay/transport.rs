@@ -13,7 +13,8 @@
 //! | accepted it (2xx) | [`Outcome::Sent`] | no |
 //! | answered `455`, its own limit (spec M2c §4.7.4) | [`Outcome::Deferred`] | yes, by the next relay or later, no attempt spent |
 //! | answered any other 4xx, `421` included | [`Outcome::Transient`] | yes, with backoff |
-//! | answered 5xx | [`Outcome::Failed`] | no |
+//! | answered 5xx naming the recipient's mailbox or domain ([`HARD_BOUNCE_CODES`]) | [`Outcome::Bounced`] | no |
+//! | answered any other 5xx | [`Outcome::Failed`] | no |
 //! | could not be connected to at all | [`Outcome::Deferred`] | yes, as `455` |
 //! | refused to negotiate (TLS, AUTH) | [`Outcome::Transient`] | yes |
 //! | went quiet, or the socket broke | [`Outcome::Unknown`] | **never** |
@@ -104,6 +105,21 @@ pub const DAILY_COOL_DOWN: Duration = Duration::from_secs(3_600);
 /// What a `455` says when the limit it hit is the day's (OCI's 50,000), matched case-insensitively.
 const PER_DAY: &str = "per day";
 
+/// The enhanced status codes that name the recipient's mailbox or domain (RFC 3463, RFC 7505): a
+/// 5xx carrying one is a hard bounce (spec M2d §4.5.1). Every other 5xx stays `Failed`, because a
+/// relay that refuses every message (bad credentials, a blocked sender) must never turn into a
+/// suppressed audience.
+pub const HARD_BOUNCE_CODES: [&str; 6] = ["5.1.1", "5.1.2", "5.1.3", "5.1.6", "5.1.10", "5.2.1"];
+
+/// The first whitespace-separated word of `reply`, trimmed of a trailing `:`, `,` or `;`, that is
+/// one of [`HARD_BOUNCE_CODES`].
+pub fn hard_bounce_code(reply: &str) -> Option<&'static str> {
+    reply
+        .split_whitespace()
+        .map(|w| w.trim_end_matches([':', ',', ';']))
+        .find_map(|w| HARD_BOUNCE_CODES.into_iter().find(|c| *c == w))
+}
+
 /// What the relay did with one message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -113,6 +129,9 @@ pub enum Outcome {
     Transient(String),
     /// It will never be accepted. Do not offer it again.
     Failed(String),
+    /// A permanent reply naming the recipient ([`hard_bounce_code`]). Final as `Failed` is, and
+    /// never offered to another relay; a campaign suppresses the address.
+    Bounced(String),
     /// It may have been accepted. **Do not offer it again.**
     Unknown(String),
     /// The relay, not the message, could not take it: a `455`, or no connection at all. Nothing
@@ -365,7 +384,12 @@ fn refused(e: &SmtpError) -> Outcome {
         // Any other 4xx to any command, `421` included.
         Outcome::Transient(reason)
     } else if e.is_permanent() {
-        Outcome::Failed(reason)
+        // Only a 5xx reaches here: a 4xx is never a bounce, whatever its enhanced code.
+        if hard_bounce_code(&reason).is_some() {
+            Outcome::Bounced(reason)
+        } else {
+            Outcome::Failed(reason)
+        }
     } else if reason.starts_with(NEVER_CONNECTED) {
         // No session at all, so nothing was submitted: another relay, or this one later.
         Outcome::Deferred {
@@ -466,6 +490,31 @@ mod tests {
             build(&relay, None, false),
             Err(Outcome::Failed(_))
         ));
+    }
+
+    /// Spec M2d §4.5.1: only the codes that name the recipient's mailbox or domain, matched as a
+    /// whole word. Sender, policy, size and authentication refusals, a bare `550` and a code that
+    /// merely starts like one are not bounces.
+    #[test]
+    fn hard_bounce_codes_name_the_recipient_and_nothing_else() {
+        for (reply, code) in [
+            ("permanent error (550): 5.1.1 no such user", "5.1.1"),
+            ("permanent error (550): 5.1.10 null MX", "5.1.10"),
+            ("permanent error (550): 5.2.1 mailbox disabled", "5.2.1"),
+            ("permanent error (550): 5.1.1: unknown", "5.1.1"),
+        ] {
+            assert_eq!(hard_bounce_code(reply), Some(code), "{reply}");
+        }
+        for reply in [
+            "permanent error (535): 5.7.8 authentication failed",
+            "permanent error (554): 5.7.1 rejected as spam",
+            "permanent error (550): 5.1.7 bad sender",
+            "permanent error (552): 5.3.4 too big",
+            "permanent error (550): no such user",
+            "permanent error (550): 5.1.11 x",
+        ] {
+            assert_eq!(hard_bounce_code(reply), None, "{reply}");
+        }
     }
 
     #[test]

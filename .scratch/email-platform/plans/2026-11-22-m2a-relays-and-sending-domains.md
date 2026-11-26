@@ -1,9 +1,5 @@
 # M2a — relays, sending domains, and the first real send: implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
-> (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** A double opt-in confirmation email enqueued by an M1d form is built, signed, and
 delivered through a configured relay, and the subscriber's link confirms their subscription.
 

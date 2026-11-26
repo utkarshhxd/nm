@@ -20,6 +20,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, tcp::OwnedReadHalf},
+    sync::watch,
     task::{JoinHandle, JoinSet},
 };
 
@@ -30,6 +31,10 @@ pub enum AfterData {
     Reply(&'static str),
     /// Wait this long, then answer with this line: a relay that is slow to take each message.
     Delayed(std::time::Duration, &'static str),
+    /// Answer with this line once the test calls [`Sink::release`], and not before: a relay that
+    /// is mid-session on a message for exactly as long as the test needs it to be, however slowly
+    /// the test runs.
+    Held(&'static str),
     /// Close the connection without answering. The message was read, and the sender cannot know
     /// whether it was queued.
     Drop,
@@ -68,6 +73,8 @@ struct Seen {
     /// hold half a gigabyte of them.
     discard: bool,
     messages: Mutex<Vec<Vec<u8>>>,
+    /// `true` once [`Sink::release`] has let every [`AfterData::Held`] reply go.
+    released: watch::Sender<bool>,
 }
 
 pub struct Sink {
@@ -161,6 +168,11 @@ impl Sink {
             .clone()
     }
 
+    /// Lets every [`AfterData::Held`] reply go, those already waiting and any still to come.
+    pub fn release(&self) {
+        self.seen.released.send_replace(true);
+    }
+
     /// An address with nothing listening on it: the kernel chose the port and we handed it back.
     pub async fn unused_addr() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -230,6 +242,14 @@ async fn serve(stream: TcpStream, after: AfterData, seen: &Seen) -> std::io::Res
                 }
                 AfterData::Delayed(wait, reply) => {
                     tokio::time::sleep(wait).await;
+                    writer.write_all(reply.as_bytes()).await?;
+                    writer.write_all(b"\r\n").await?;
+                    continue;
+                }
+                AfterData::Held(reply) => {
+                    // `wait_for` reads the current value first, so a release that came before
+                    // this message did is not missed.
+                    let _ = seen.released.subscribe().wait_for(|go| *go).await;
                     writer.write_all(reply.as_bytes()).await?;
                     writer.write_all(b"\r\n").await?;
                     continue;

@@ -332,7 +332,7 @@ campaigns  id uuid pk, workspace_id → workspaces cascade, unique (workspace_id
            total/sent/failed/unknown/skipped bigint default 0, failure_reason text,
            pause_reason text, created_at, updated_at, launched_at, finished_at
            index campaigns_live (state) where state in ('sending','paused')
-messages   id uuid pk (v4, `gen_random_uuid()`; see below), workspace_id, campaign_id, contact_id (no fk), variant smallint,
+messages   id uuid pk (v4, no default: the launch insert generates it; see below), workspace_id, campaign_id, contact_id (no fk), variant smallint,
            status text check ('queued','submitting','sent','failed','unknown','skipped'),
            attempts int ≥ 0, max_attempts int > 0 default 5, run_after timestamptz,
            relay_id uuid, response text, error text, created_at, sent_at,
@@ -344,13 +344,18 @@ jobs       + campaign_id uuid, fk (workspace_id, campaign_id) → campaigns casc
            check (kind not in ('campaign_launch','campaign_test') or campaign_id is not null)
 ```
 
-**`messages.id` is a v4, amended by R7.** This section said v7. `0033` generates `gen_random_uuid()`
-because Postgres 16 has no `uuidv7()`, and a v4 primary key scatters index writes, which was the
-worry. `campaign_bench` measured it (100,000 recipients, app-signed, three merge tags, a sink
-relay, one worker at concurrency 64, pool 16): 3,173, 3,403 and 3,375 messages/s with the box
-capped to 8 CPUs, against the 1,500 asked for (§4.10), and 2,068 with all 16 visible. The target is
-met with a v4, so no SQL v7 generator and no migration were added. Revisit it if a measurement on
-a table of tens of millions of rows says otherwise: this one is 100,000.
+**`messages.id` is a v4, amended by R7.** This section said v7. `0033` gives `messages.id` no
+default; the launch batch's insert generates it with `gen_random_uuid()`
+(`src/campaign/launch.rs`, `batch_sql`), because Postgres 16 has no `uuidv7()`, and a v4
+primary key scatters index writes, which was the worry. `campaign_bench` measured it (100,000
+recipients, app-signed, three merge tags, a sink relay, one worker at concurrency 64, pool 16):
+3,173, 3,403 and 3,375 messages/s against the 1,500 asked for (§4.10), and 2,068 with all 16 CPUs
+visible. **These runs were on a laptop VM capped at 8 CPUs, not on the reference box**, with the
+worker, the sink and Postgres sharing the eight (the command is in `tests/campaign_bench.rs`), so
+the target is met on a dev box and the reference run is still owed. The 1,500/s gate is asserted
+only under `NM_BENCH_REFERENCE=1`; anywhere else the number is printed, not checked. No SQL v7
+generator and no migration were added. Revisit it if a measurement on a table of tens of millions
+of rows says otherwise: this one is 100,000.
 
 ## 6. Correctness invariants
 

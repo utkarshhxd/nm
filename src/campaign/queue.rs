@@ -30,7 +30,8 @@
 //!
 //! Lock order (ADR 0005): [`claim`], [`mark_submitting`] and [`release`] are one statement on
 //! `messages` rows and write no key column. [`record`] and [`sweep`] take `messages`, then
-//! `campaigns` by primary key in ascending id order, in one transaction.
+//! `campaigns` by primary key in ascending id order, in one transaction. A [`record`] carrying a
+//! bounce takes each bounced address's lock and its `suppressions` row first.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -38,9 +39,15 @@ use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::{relay::transport::SESSION_TIMEOUT, worker::backoff};
+use crate::{
+    crypto::secrets::Secrets,
+    relay::transport::{SESSION_TIMEOUT, hard_bounce_code},
+    suppressions,
+    worker::backoff,
+};
 
-/// Messages one tick claims, split evenly across the sending campaigns (spec §4.7.2).
+/// Messages one tick claims, split evenly across the sending campaigns that have one due (spec
+/// §4.7.2).
 pub const CAMPAIGN_BATCH: i64 = 500;
 
 /// Claims before a message gives up. The same 5 as the `messages.max_attempts` column default.
@@ -65,7 +72,7 @@ pub const SWEPT: &str = "the sending worker stopped mid-send; not retried";
 /// What the sweep leaves on a `queued` message that every attempt claimed and none submitted.
 pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; never submitted";
 
-/// The claim (spec §4.7.1–2). `$1` campaign ids, `$2` per-campaign limit, `$3` lease seconds.
+/// The claim (spec §4.7.1–2). `$1` campaign ids, `$2` the batch, `$3` lease seconds.
 ///
 /// `0026`'s protocol, per campaign: `for update skip locked` (two workers take disjoint rows, and
 /// neither waits on the other), `run_after` advanced in this statement (it is the lease),
@@ -73,6 +80,11 @@ pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; neve
 /// from ever being offered again. The lateral gives each campaign its own `limit`, so a 5M-row
 /// campaign cannot starve a small one; each lateral walks `messages_runnable` for one campaign.
 /// Each claimed row gets a fresh `claim_token` (`0034`).
+///
+/// **The batch is split over the campaigns with a message due (`due`), not over every one named.**
+/// An A/B test waiting for its winner and a recipient-local send between its recipients' mornings
+/// stay `sending` with nothing due, in any workspace; an even split over them would leave a live
+/// campaign a sliver of every batch. The `exists` probe is a plain read on `messages_runnable`.
 ///
 /// The join on `campaigns` makes "a paused or cancelled campaign is never claimed" a property of
 /// the database rather than of the caller's state map, which can be a second stale. It takes no
@@ -83,13 +95,20 @@ pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; neve
 pub const CLAIM: &str = "update messages m
         set attempts = m.attempts + 1, run_after = now() + make_interval(secs => $3),
             claim_token = gen_random_uuid()
-      where m.id in (select x.id from unnest($1::uuid[]) as c(id)
-                     join campaigns k on k.id = c.id and k.state = 'sending'
-                     cross join lateral (select id from messages
-                                          where campaign_id = c.id and status = 'queued'
-                                            and run_after <= now() and attempts < max_attempts
-                                          order by run_after, id
-                                          for update skip locked limit $2) x)
+      where m.id in (select x.id
+                       from (select c.id, count(*) over () as due
+                               from unnest($1::uuid[]) as c(id)
+                               join campaigns k on k.id = c.id and k.state = 'sending'
+                              where exists (select from messages d
+                                             where d.campaign_id = c.id and d.status = 'queued'
+                                               and d.run_after <= now()
+                                               and d.attempts < d.max_attempts)) c
+                      cross join lateral (select id from messages
+                                           where campaign_id = c.id and status = 'queued'
+                                             and run_after <= now() and attempts < max_attempts
+                                           order by run_after, id
+                                           for update skip locked
+                                           limit ($2 + c.due - 1) / c.due) x)
   returning m.id, m.workspace_id, m.campaign_id, m.contact_id, m.variant, m.attempts,
             m.max_attempts, m.claim_token";
 
@@ -108,9 +127,9 @@ pub struct Claimed {
     pub claim_token: Uuid,
 }
 
-/// Takes up to `ceil(batch / campaigns.len())` due messages from each of `campaigns` and holds
-/// them for `lease`. **The pool, one statement**: a transaction held across the sends is how a
-/// tick outlives its lease.
+/// Takes up to `ceil(batch / due)` due messages from each of the `due` campaigns in `campaigns`
+/// that have one, and holds them for `lease`. **The pool, one statement**: a transaction held
+/// across the sends is how a tick outlives its lease.
 pub async fn claim(
     db: &PgPool,
     campaigns: &[Uuid],
@@ -120,11 +139,9 @@ pub async fn claim(
     if campaigns.is_empty() || batch <= 0 {
         return Ok(Vec::new());
     }
-    let n = i64::try_from(campaigns.len()).unwrap_or(i64::MAX);
-    let per_campaign = batch / n + i64::from(batch % n != 0);
     sqlx::query_as(CLAIM)
         .bind(campaigns)
-        .bind(per_campaign)
+        .bind(batch)
         .bind(lease.as_secs_f64())
         .fetch_all(db)
         .await
@@ -200,6 +217,9 @@ pub enum Verdict {
     Deferred(String),
     /// A 5xx, or the suppression notice. Final.
     Failed(String),
+    /// A 5xx naming the recipient's mailbox or domain. Final, recorded from `submitting`, and the
+    /// address `email` is suppressed in the same transaction.
+    Bounced { reason: String, email: String },
     /// The session broke after `DATA`: it may have been delivered. Final, never retried.
     Unknown(String),
     /// Not mailable at the batch's check. Final, and recorded from `queued`: it never reached
@@ -207,17 +227,41 @@ pub enum Verdict {
     Skipped(String),
 }
 
-/// Records a flush of outcomes: one statement over the messages, then each touched campaign's
-/// counters and finish check, all in one transaction.
+/// Records a flush of outcomes: the suppression of every bounced address, one statement over the
+/// messages, then each touched campaign's counters and finish check, all in one transaction.
 ///
 /// Every verdict is predicated on the state it leaves — `Skipped` from `queued`, every other from
 /// `submitting` — and on the claim's token, so an outcome that arrives after the sweep wrote
 /// `unknown`, or a replayed flush after another claim took the row, changes nothing and counts
 /// nothing. Recording clears the token: one claim, one outcome.
-pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Result<()> {
+///
+/// **A bounce suppresses its address even when the message moved nothing** (spec M2d §4.5.2): the
+/// relay's answer is a fact about the address, whatever the sweep did to the row meanwhile.
+/// The relay text stored here is already redacted: every verdict carrying one comes from
+/// `worker::deliver::submit`.
+pub async fn record(
+    db: &PgPool,
+    secrets: &Secrets,
+    outcomes: &[(Claimed, Verdict)],
+) -> sqlx::Result<()> {
     if outcomes.is_empty() {
         return Ok(());
     }
+    let bounces: Vec<(Uuid, &str, String)> = outcomes
+        .iter()
+        .filter_map(|(m, v)| match v {
+            Verdict::Bounced { reason, email } => Some((
+                m.workspace_id,
+                email.as_str(),
+                format!(
+                    "hard bounce {} at send, campaign {}",
+                    hard_bounce_code(reason).unwrap_or("unknown"),
+                    m.campaign_id
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
     let len = outcomes.len();
     let mut ids = Vec::with_capacity(len);
     let mut tokens = Vec::with_capacity(len);
@@ -278,6 +322,15 @@ pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Resul
                 None,
                 Some(e.as_str()),
             ),
+            Verdict::Bounced { reason: e, .. } => (
+                "bounced",
+                "submitting",
+                0,
+                None,
+                None,
+                None,
+                Some(e.as_str()),
+            ),
             Verdict::Unknown(e) => (
                 "unknown",
                 "submitting",
@@ -301,6 +354,7 @@ pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Resul
     }
 
     let mut tx = db.begin().await?;
+    suppressions::record_bounces(&mut tx, secrets, &bounces).await?;
     let moved: Vec<(Uuid, String)> = sqlx::query_as(
         "update messages m
             set status = u.status,
@@ -411,7 +465,7 @@ pub async fn finish_if_done(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::R
         "update campaigns set state = 'sent', finished_at = now()
           where id = $1 and state = 'sending' and resolved
             and (ab_test_percent is null or ab_test_percent = 100 or phase = 2)
-            and total = sent + failed + unknown + skipped",
+            and total = sent + failed + bounced + unknown + skipped",
     )
     .bind(campaign_id)
     .execute(db)
@@ -423,21 +477,23 @@ pub async fn finish_if_done(db: &mut PgConnection, campaign_id: Uuid) -> sqlx::R
 /// in ascending id order (so two flushes lock campaigns in the same order), then runs the finish
 /// check. `queued` rows (a retry, a deferral) count nothing.
 async fn count(db: &mut PgConnection, moved: Vec<(Uuid, String)>) -> sqlx::Result<()> {
-    let mut by_campaign: BTreeMap<Uuid, [i64; 4]> = BTreeMap::new();
+    let mut by_campaign: BTreeMap<Uuid, [i64; 5]> = BTreeMap::new();
     for (campaign, status) in moved {
         let slot = match status.as_str() {
             "sent" => 0,
             "failed" => 1,
             "unknown" => 2,
             "skipped" => 3,
+            "bounced" => 4,
             _ => continue,
         };
         by_campaign.entry(campaign).or_default()[slot] += 1;
     }
-    for (campaign, [sent, failed, unknown, skipped]) in by_campaign {
+    for (campaign, [sent, failed, unknown, skipped, bounced]) in by_campaign {
         sqlx::query(
             "update campaigns set sent = sent + $2, failed = failed + $3,
-                                  unknown = unknown + $4, skipped = skipped + $5
+                                  unknown = unknown + $4, skipped = skipped + $5,
+                                  bounced = bounced + $6
               where id = $1",
         )
         .bind(campaign)
@@ -445,6 +501,7 @@ async fn count(db: &mut PgConnection, moved: Vec<(Uuid, String)>) -> sqlx::Resul
         .bind(failed)
         .bind(unknown)
         .bind(skipped)
+        .bind(bounced)
         .execute(&mut *db)
         .await?;
         finish_if_done(db, campaign).await?;

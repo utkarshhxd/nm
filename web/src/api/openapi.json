@@ -1915,6 +1915,50 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/report": {
+      "get": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "report_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/campaigns/{id}/resume": {
       "post": {
         "tags": [
@@ -6908,10 +6952,16 @@
           "queued",
           "sent",
           "failed",
+          "bounced",
           "unknown",
           "skipped"
         ],
         "properties": {
+          "bounced": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Refused by the relay as a mailbox or domain that does not exist; the address is suppressed."
+          },
           "failed": {
             "type": "integer",
             "format": "int64"
@@ -6989,6 +7039,54 @@
           }
         },
         "additionalProperties": false
+      },
+      "CampaignReport": {
+        "type": "object",
+        "required": [
+          "sent",
+          "failed",
+          "bounced",
+          "unique_opens",
+          "unique_clicks",
+          "unsubscribed",
+          "links"
+        ],
+        "properties": {
+          "bounced": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LinkReport"
+            },
+            "description": "Every link in every variant's frozen table, ordered by `(variant, link)`; empty before a\nlaunch."
+          },
+          "sent": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unique_clicks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages with at least one click."
+          },
+          "unique_opens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages opened at least once. Approximate: a mail client may preload the pixel, and one\nthat blocks images never loads it."
+          },
+          "unsubscribed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Contacts who unsubscribed through this campaign's message, counted once however many lists."
+          }
+        }
       },
       "CampaignSchedule": {
         "type": "object",
@@ -8270,6 +8368,41 @@
           "mjml",
           "html"
         ]
+      },
+      "LinkReport": {
+        "type": "object",
+        "required": [
+          "variant",
+          "link",
+          "url",
+          "clicks",
+          "unique_clicks"
+        ],
+        "properties": {
+          "clicks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Clicks, repeats included."
+          },
+          "link": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0-based position in the variant's link table."
+          },
+          "unique_clicks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Messages that clicked this link."
+          },
+          "url": {
+            "type": "string"
+          },
+          "variant": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0-based."
+          }
+        }
       },
       "List": {
         "type": "object",

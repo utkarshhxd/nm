@@ -1,7 +1,5 @@
 # M1a Contact Core Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** A workspace can hold contacts with typed custom fields, organise them into lists and tags with per-list subscription status, block addresses with workspace and instance-wide suppressions, erase a contact for GDPR, and act on a million-row selection — through the REST API and a web UI that stays usable at ten million rows.
 
 **Architecture:**
