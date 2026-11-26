@@ -41,10 +41,11 @@ Later starts are quick. The build uses two CPU jobs so it fits in 8 GB of memory
 
 Check it is up: open <https://localhost/healthz>. It should say `ok`.
 
-Ports used on your machine: **443** (the app, through Caddy) and **8025** (Mailpit's inbox). If
-something else already uses 443, change `"443:443"` to `"8443:443"` in `docker-compose.yml`, and
-also set `NM_PUBLIC_URL: https://localhost:8443` for the `nm` service and use
-`https://localhost:8443` everywhere below.
+Ports used on your machine: **443** (the app, through Caddy) and **8025** (Mailpit's inbox). Both
+listen on `127.0.0.1` only, so other computers on your network cannot reach them. If something
+else already uses 443, change `"127.0.0.1:443:443"` to `"127.0.0.1:8443:443"` in
+`docker-compose.yml`, and also set `NM_PUBLIC_URL: https://localhost:8443` for the `nm` service and
+use `https://localhost:8443` everywhere below.
 
 ## 3. Open the app and make the first account
 
@@ -104,8 +105,13 @@ in the Sending domains page.
    and the template. Use **Send test** to try it, or schedule it to send now.
 4. Open <http://localhost:8025>. The message appears in Mailpit's inbox (a test send is marked
    `[Test]`). The unsubscribe link in the footer goes to `https://localhost/u/...`, which is NM;
-   click it (accept the certificate warning again if asked). Links you put in the template are
-   delivered as written: this build has no click tracking yet, so they are not rewritten.
+   click it (accept the certificate warning again if asked).
+5. A campaign message is tracked. It carries a 1×1 image from `https://localhost/o/...`, so
+   opening it with images shown records an open. Each link you put in the template becomes
+   `https://localhost/l/...`: a click goes through NM, which records it and redirects to the
+   address you wrote. A test send keeps its links as written and records nothing.
+6. Open the campaign in NM. Its **Report** section shows what was sent, failed and bounced, the
+   opens and clicks, the clicks on each link and the unsubscribes. Press **Refresh** to update it.
 
 ## Stop, restart, reset
 

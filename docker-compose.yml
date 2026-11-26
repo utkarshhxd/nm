@@ -50,7 +50,9 @@ services:
     volumes:
       - certs:/certs:ro
     ports:
-      - "8025:8025" # web UI, http://localhost:8025. SMTP (1025) stays inside the network.
+      # Web UI, http://localhost:8025, on this machine only: it has no login and holds every
+      # caught message. SMTP (1025) stays inside the network.
+      - "127.0.0.1:8025:8025"
     depends_on:
       certs:
         condition: service_completed_successfully
@@ -84,7 +86,7 @@ services:
   caddy:
     image: caddy:2-alpine
     ports:
-      - "443:443"
+      - "127.0.0.1:443:443"
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
