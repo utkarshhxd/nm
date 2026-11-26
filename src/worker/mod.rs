@@ -237,7 +237,7 @@ async fn release(
 ///
 /// The shift is clamped before it is applied: `attempts` is an `int` the database will happily
 /// carry to two billion, and `1 << 2_000_000_000` is not a number.
-fn backoff(attempts: i32) -> i64 {
+pub(crate) fn backoff(attempts: i32) -> i64 {
     let shift = u32::try_from(attempts.saturating_sub(1))
         .unwrap_or(0)
         .min(32);
