@@ -169,6 +169,15 @@ export function actionsFor(
   return out;
 }
 
+/** The fields the editor shows an error on: a refusal naming any other is shown as a sentence instead. */
+const SHOWN =
+  /^(list_ids|segment_id|sending_domain_id|from_local_part|reply_to|ab_test_percent|variants|schedule.(local|zone|mode)|variants[d+].(subject|template_id))$/;
+
+/** Whether the refusal names a field the editor shows, so its sentence is already on that field. */
+export function namesShownField(error: unknown): boolean {
+  return Object.keys(fieldErrors(error)).some((k) => SHOWN.test(k));
+}
+
 /** `{ field, message }` entries of a 422 `validation` problem, by field name. */
 export function fieldErrors(error: unknown): Record<string, string> {
   const list = (error as { errors?: { field?: unknown; message?: unknown }[] } | null)?.errors;
@@ -187,10 +196,9 @@ export function fromAddress(name: string, local: string, domain: string): string
 
 /**
  * The instant a `datetime-local` value is in an IANA zone, as RFC 3339 UTC; `null` for a value or
- * zone that is not one. The confirmation dialog shows this before the server has answered.
- *
- * shortcut: a time inside a DST gap or overlap resolves to one of its two readings, not by the
- * RFC 5545 rule. The server's `send_at`, shown once scheduled, is the authority.
+ * zone that is not one. The confirmation dialog shows this before the server has answered, so it
+ * follows the server's rule (RFC 5545): a wall-clock time inside a spring-forward gap moves forward
+ * by the gap, and one that happens twice in a fall-back overlap takes its first occurrence.
  */
 export function resolveLocal(local: string, zone: string): string | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(local);
@@ -211,9 +219,15 @@ export function resolveLocal(local: string, zone: string): string | null {
       const p = Object.fromEntries(fmt.formatToParts(t).map((x) => [x.type, Number(x.value)]));
       return Date.UTC(p["year"]!, p["month"]! - 1, p["day"]!, p["hour"]!, p["minute"]!) - t;
     };
-    // The offset at the guess may differ from the one at the answer across a DST change: ask twice.
-    const first = wall - offset(wall);
-    return new Date(wall - offset(first)).toISOString();
+    const DAY = 86_400_000;
+    // The offsets either side of any change near this wall time (a change moves a clock by hours).
+    const before = offset(wall - DAY);
+    const after = offset(wall + DAY);
+    // An offset is right when the instant it gives has that offset. Two are right in an overlap
+    // (the earlier instant is the first occurrence); none is right in a gap, where the pre-change
+    // offset moves the time forward by the gap.
+    const fits = [...new Set([before, after])].map((o) => wall - o).filter((t) => offset(t) === wall - t);
+    return new Date(fits.length > 0 ? Math.min(...fits) : wall - before).toISOString();
   } catch {
     return null;
   }

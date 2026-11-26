@@ -58,6 +58,10 @@ export type MockState = {
   /** shortcut: one set of options for every workspace; give it per-workspace the day a test needs two. */
   options: Options;
   estimate: Estimate;
+  /** What `update` answers instead of saving, e.g. a 409 `campaign-state`. */
+  updateRefusal?: unknown;
+  /** What `test` answers instead of queueing. */
+  testRefusal?: unknown;
   /** What `schedule` answers instead of scheduling, e.g. a 409 `postal-address-required`. */
   scheduleRefusal?: unknown;
   /** Wait this long before answering, so a test can look at the screen between ask and answer. */
@@ -183,6 +187,7 @@ export function mockCampaignSource(seed: Partial<MockState> = {}): CampaignSourc
     },
     update: (ws, id, body) =>
       on(ws, id, (c) => {
+        if (s.updateRefusal !== undefined) return no(s.updateRefusal);
         if (c.state !== "draft") return no(wrongState(id, c.state, "draft"));
         // The server checks each variant's template against the workspace; the mock against its options.
         const bad = (body.variants ?? []).flatMap((v, i) =>
@@ -209,6 +214,7 @@ export function mockCampaignSource(seed: Partial<MockState> = {}): CampaignSourc
     estimate: (ws, id) => on(ws, id, () => ok(s.estimate)),
     test: (ws, id, body) =>
       on(ws, id, (c) => {
+        if (s.testRefusal !== undefined) return no(s.testRefusal);
         if (c.state !== "draft" && c.state !== "scheduled") {
           return no(wrongState(id, c.state, "draft or scheduled"));
         }

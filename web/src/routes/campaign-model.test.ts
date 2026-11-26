@@ -181,6 +181,17 @@ test("a_local_time_resolves_to_the_instant_in_its_zone", () => {
   // The clock changed at 07:00Z that day; the offset at the naive guess is the old one.
   expect(resolveLocal("2027-03-14T05:00", "America/New_York")).toBe("2027-03-14T09:00:00.000Z");
   expect(resolveLocal("2027-07-01T09:30", "Asia/Kolkata")).toBe("2027-07-01T04:00:00.000Z"); // +05:30
+});
+
+test("a_time_in_a_dst_gap_or_overlap_resolves_by_the_rfc_5545_rule", () => {
+  // Gap: 02:30 does not exist on 14 March in New York (02:00 EST jumps to 03:00 EDT). It moves
+  // forward by the gap, to 03:30 EDT.
+  expect(resolveLocal("2027-03-14T02:30", "America/New_York")).toBe("2027-03-14T07:30:00.000Z");
+  // Overlap: 01:30 happens twice on 31 October in London (BST, then GMT). The first one.
+  expect(resolveLocal("2027-10-31T01:30", "Europe/London")).toBe("2027-10-31T00:30:00.000Z");
+  // Either side of them is ordinary.
+  expect(resolveLocal("2027-03-14T03:30", "America/New_York")).toBe("2027-03-14T07:30:00.000Z");
+  expect(resolveLocal("2027-10-31T02:30", "Europe/London")).toBe("2027-10-31T02:30:00.000Z");
   expect(resolveLocal("2027-07-01T09:30", "Not/AZone")).toBeNull();
   expect(resolveLocal("tomorrow", "UTC")).toBeNull();
 });

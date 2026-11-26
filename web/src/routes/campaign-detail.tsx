@@ -24,6 +24,7 @@ import {
   actionsFor,
   estimateText,
   fieldErrors,
+  namesShownField,
   fromAddress,
   initForm,
   resolveLocal,
@@ -149,9 +150,9 @@ function Editor({ c, ws, slug, role }: { c: Campaign; ws: string; slug: string; 
       qc.setQueryData(detailKey, data);
       await qc.invalidateQueries({ queryKey: campaignsKey(ws) });
     },
-    // A refusal that names a schedule field is shown on that field, so the dialog gets out of its way.
+    // A refusal that names a field is shown on that field, so the dialog gets out of its way.
     onError: (e) => {
-      if (Object.keys(fieldErrors(e)).some((k) => k.startsWith("schedule."))) setConfirming(false);
+      if (namesShownField(e)) setConfirming(false);
     },
   });
 
@@ -185,7 +186,7 @@ function Editor({ c, ws, slug, role }: { c: Campaign; ws: string; slug: string; 
   const from = fromAddress(c.from_name ?? "", c.from_local_part ?? "", domain);
 
   const sectionNote = (section: string) =>
-    save.isError && save.variables?.section === section && Object.keys(errors).length === 0 ? (
+    save.isError && save.variables?.section === section && !namesShownField(save.error) ? (
       <Problem error={save.error} slug={slug} templates={usedTemplates} />
     ) : null;
   const saveRow = (section: string, label: string, patch: UpdateCampaign) => (
@@ -257,7 +258,7 @@ function Editor({ c, ws, slug, role }: { c: Campaign; ws: string; slug: string; 
       ) : null}
       {can.includes("test") ? (
         <Section title="Test send">
-          <TestSend ws={ws} id={c.id} variantCount={c.variants.length} />
+          <TestSend ws={ws} id={c.id} variantCount={c.variants.length} slug={slug} templates={usedTemplates} />
         </Section>
       ) : null}
       <Section title="Preview">

@@ -9,13 +9,25 @@ import { campaignSource } from "../../routes/campaign-source";
 import { Button } from "../button";
 import { Alert } from "../field";
 import { CONTROL } from "../input";
-import { SelectField } from "./section";
+import { Problem, SelectField } from "./section";
 
 /** Addresses are split on commas, semicolons and any whitespace. */
 const split = (text: string) => text.split(/[\s,;]+/).filter(Boolean);
 
 /** Sends the saved campaign to one to five addresses. The server counts them and says so if there are too many. */
-export function TestSend({ ws, id, variantCount }: { ws: string; id: string; variantCount: number }) {
+export function TestSend({
+  ws,
+  id,
+  variantCount,
+  slug,
+  templates,
+}: {
+  ws: string;
+  id: string;
+  variantCount: number;
+  slug: string;
+  templates: { id: string; name: string }[];
+}) {
   const [text, setText] = useState("");
   const [variant, setVariant] = useState("0");
   const send = useMutation({
@@ -45,10 +57,14 @@ export function TestSend({ ws, id, variantCount }: { ws: string; id: string; var
         className={`${CONTROL} mt-1`}
         value={text}
         aria-invalid={field ? true : undefined}
-        aria-describedby={send.error ? "test-addresses-error" : undefined}
+        aria-describedby={field ? "test-addresses-error" : undefined}
         onChange={(e) => setText(e.target.value)}
       />
-      {send.error ? <Alert id="test-addresses-error">{problemMessage(send.error, "The test could not be sent.")}</Alert> : null}
+      {send.error && field ? (
+        <Alert id="test-addresses-error">{problemMessage(send.error, "The test could not be sent.")}</Alert>
+      ) : send.error ? (
+        <Problem error={send.error} slug={slug} templates={templates} />
+      ) : null}
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <Button
           busy={send.isPending}

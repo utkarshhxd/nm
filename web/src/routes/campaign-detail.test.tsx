@@ -268,3 +268,42 @@ test("a_campaign_that_is_not_a_draft_shows_its_state_and_no_editor", async ({ pa
   expect(await page.getByRole("region", { name: "Audience" }).count()).toBe(0);
   expect(await page.getByRole("button", { name: "Send", exact: true }).count()).toBe(0);
 });
+
+for (const [name, refusal, sentence] of [
+  ["a_409_campaign_state", problem(409, "campaign-state", "campaign is scheduled; it must be draft"), "campaign is scheduled; it must be draft"],
+  ["a_429", problem(429, "rate-limited", "Too many requests. Try again in a minute."), "Too many requests. Try again in a minute."],
+  // A 422 that names a field the editor does not have must still be seen.
+  ["a_422_on_a_field_the_editor_does_not_show", problem(422, "validation", "request validation failed", [{ field: "name", message: "A campaign needs a name." }]), "A campaign needs a name."],
+] as const) {
+  test(`a_save_refused_with_${name}_shows_the_servers_sentence_by_the_save_button`, async ({ page, app }) => {
+    await open(page, app, draft({ variants: [VARIANT] }), "editor", { updateRefusal: refusal });
+    const content = region(page, "Content");
+    await content.getByRole("button", { name: "Save content" }).click();
+    await expect(content.getByRole("alert")).toHaveText(sentence);
+    await expect(content.getByRole("status")).toHaveText(""); // and no "Saved."
+  });
+}
+
+test("a_422_on_a_non_schedule_field_from_send_closes_the_dialog_onto_that_field", async ({ page, app }) => {
+  const c = draft({ variants: [VARIANT] });
+  await open(page, app, c, "admin", {
+    scheduleRefusal: problem(422, "validation", "request validation failed", [
+      { field: "sending_domain_id", message: "Choose a sending domain." },
+    ]),
+  });
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.getByRole("dialog", { name: "Send campaign" }).getByRole("button", { name: "Send now" }).click();
+  await expect(region(page, "Sender").getByRole("alert")).toHaveText("Choose a sending domain.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("a_409_on_test_send_carries_the_same_fix_link_as_the_editors_409s", async ({ page, app }) => {
+  await open(page, app, draft({ variants: [VARIANT] }), "editor", {
+    testRefusal: problem(409, "postal-address-required", "Set a postal address first."),
+  });
+  const test_ = region(page, "Test send");
+  await test_.getByLabel("Addresses").fill("a@example.com");
+  await test_.getByRole("button", { name: "Send test" }).click();
+  await expect(test_.getByRole("alert")).toHaveText("Set a postal address first.");
+  await expect(test_.getByRole("link", { name: "Open the brand kit" })).toHaveAttribute("href", "/w/acme/brand-kit");
+});
