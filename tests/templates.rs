@@ -992,14 +992,12 @@ async fn a_patch_that_sends_null_is_refused_rather_than_ignored(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn a_failed_check_is_an_error_not_an_empty_findings_list(pool: PgPool) {
+async fn a_raw_mjml_template_with_a_quoted_fallback_in_a_link_saves_and_previews(pool: PgPool) {
     let t = tenant(&pool, "acme").await;
-    // A merge tag's fallback LITERAL may contain `<`. `tag::compile` lifts the literal into the
-    // AST, so what `mrml` parses at save is the MARKED source and the template is accepted —
-    // while `lint` is handed the RAW source, which `mrml` cannot parse. So `LintError` is
-    // reachable from an ordinary save and this is not a dead branch.
-    let source = "<mjml><mj-body><mj-section><mj-column><mj-text>{{ first_name | \"<\" }}\
-                  </mj-text></mj-column></mj-section></mj-body></mjml>";
+    // A quoted fallback inside an attribute: compile lifts it into the AST, so `mrml` parses the
+    // MARKED source and the template is valid. The check must read that same string; handed the
+    // raw source, `mrml` cannot parse it and every preview of a valid template was a 422.
+    let source = "<mjml><mj-body><mj-section><mj-column><mj-button                   href=\"https://x.example/?n={{ first_name | \"friend\" }}\">Go</mj-button>                  </mj-column></mj-section></mj-body></mjml>";
     let r = t
         .editor
         .post(&templates_path(t.id))
@@ -1008,12 +1006,18 @@ async fn a_failed_check_is_an_error_not_an_empty_findings_list(pool: PgPool) {
     r.assert_status(StatusCode::CREATED);
     let id = Uuid::parse_str(r.json::<serde_json::Value>()["id"].as_str().unwrap()).unwrap();
 
-    // Contract section 12: the panel reads an empty list as a pass, so a checker that could not
-    // RUN must fail. `200 {"findings": []}` here would be the lie that section names.
     let r = preview_stored(&t, id).await;
-    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(r.text().contains("template-uncheckable"), "{}", r.text());
-    assert!(r.text().contains("could not be checked"), "{}", r.text());
+    r.assert_status_ok();
+    // The link check never ran on a raw template, so an empty list would read as a pass.
+    let body = r.json::<serde_json::Value>();
+    let findings = body["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{body}");
+    assert_eq!(findings[0]["rule"], "not_checked");
+    assert!(findings[0]["at"].is_null());
+    assert!(
+        findings[0]["message"].as_str().unwrap().contains("links are not checked"),
+        "{body}"
+    );
 }
 
 #[sqlx::test]

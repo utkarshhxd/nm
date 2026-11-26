@@ -871,20 +871,26 @@ async fn preview(
     // compiled document's URL attributes if raw HTML templates turn out to need link findings.
     let mut findings = match &authoring {
         Authoring::Blocks(doc) => lint::lint("", Some(&doc.blocks)),
-        Authoring::Mjml(source) => lint::lint(source, None),
+        // The MARKED source, because that is the string `mrml` parsed at save: the raw source can
+        // hold a tag fallback (`{{ x | "a" }}` inside an attribute) that compile lifts out and
+        // `mrml` cannot parse in place, which would refuse every preview of a valid template.
+        Authoring::Mjml(_) => lint::lint(&render::marked(&stored.nodes).0, None).map(|mut f| {
+            f.push(Finding::new(
+                Rule::NotChecked,
+                "a raw MJML template's links are not checked: the link check reads the block                  tree, and this template has none. The style checks above did run. Nothing                  here is a statement about its links."
+                    .to_owned(),
+                None,
+            ));
+            f
+        }),
         Authoring::Html(_) => Ok(vec![Finding::new(
             Rule::NotChecked,
-            "a raw HTML template is not link-checked or style-checked: both checks read MJML or \
-             the block tree, and this template has neither. Nothing below is a statement about \
-             its links."
+            "a raw HTML template is not link-checked or style-checked: both checks read MJML or              the block tree, and this template has neither. Nothing below is a statement about              its links."
                 .to_owned(),
             None,
         )]),
     }
-    .map_err(|e| ApiError::UnprocessableDetail {
-        code: "template-uncheckable",
-        detail: e.to_string(),
-    })?;
+    .map_err(uncheckable)?;
     findings.extend(archived_findings(&stored, &defs));
 
     Ok(PreviewResult {
@@ -894,9 +900,33 @@ async fn preview(
     })
 }
 
+/// A check that could not run is a refusal, never a clean result (contract section 12).
+fn uncheckable(e: lint::LintError) -> ApiError {
+    ApiError::UnprocessableDetail {
+        code: "template-uncheckable",
+        detail: e.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_check_is_a_422_template_uncheckable_never_an_empty_list() {
+        // The API can no longer reach `LintError` through a template that saved (lint reads the
+        // marked source `mrml` already parsed), so the mapping is pinned here, against sources
+        // that genuinely fail `lint`.
+        for (source, blocks) in [("<mjml><mj-body>", None), ("  ", None)] {
+            let e = uncheckable(lint::lint(source, blocks).unwrap_err());
+            let ApiError::UnprocessableDetail { code, detail } = &e else {
+                panic!("not a 422 detail: {e:?}");
+            };
+            assert_eq!(*code, "template-uncheckable");
+            assert!(detail.contains("could not be checked") || detail.contains("nothing to check"));
+            assert_eq!(e.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
 
     #[test]
     fn a_columns_block_counts_its_children() {
