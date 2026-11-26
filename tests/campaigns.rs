@@ -164,6 +164,25 @@ async fn a_campaign_job_must_name_its_campaign(pool: PgPool) {
         .expect("other kind");
 }
 
+/// Invariant 9 for `jobs`: the key is composite on `workspace_id`, so a launch job of one workspace
+/// cannot point the worker at another workspace's campaign.
+#[sqlx::test]
+async fn a_campaign_job_cannot_name_another_workspaces_campaign(pool: PgPool) {
+    let a = workspace(&pool, "a").await;
+    let b = workspace(&pool, "b").await;
+    let campaign_of_a = campaign(&pool, a).await;
+
+    let err = job(&pool, b, "campaign_launch", Some(campaign_of_a))
+        .await
+        .expect_err("cross-workspace campaign job");
+    assert_eq!(refusal(&err), ("23503".into(), "jobs_campaign_fk".into()));
+
+    // Control: the same job under its own workspace is accepted.
+    job(&pool, a, "campaign_launch", Some(campaign_of_a))
+        .await
+        .expect("own workspace");
+}
+
 #[sqlx::test]
 async fn deleting_a_draft_takes_its_fresh_test_jobs_with_it(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
