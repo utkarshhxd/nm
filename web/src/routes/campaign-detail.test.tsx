@@ -307,3 +307,31 @@ test("a_409_on_test_send_carries_the_same_fix_link_as_the_editors_409s", async (
   await expect(test_.getByRole("alert")).toHaveText("Set a postal address first.");
   await expect(test_.getByRole("link", { name: "Open the brand kit" })).toHaveAttribute("href", "/w/acme/brand-kit");
 });
+
+test("a_422_on_a_variants_subject_shows_on_that_variant_and_not_again_by_the_save_button", async ({ page, app }) => {
+  const sentence = "A subject cannot be empty.";
+  await open(page, app, draft({ variants: [VARIANT, { ...VARIANT, subject: "B" }] }), "editor", {
+    updateRefusal: problem(422, "validation", "request validation failed", [
+      { field: "variants[1].subject", message: sentence },
+    ]),
+  });
+  const content = region(page, "Content");
+  await content.getByRole("button", { name: "Save content" }).click();
+  await expect(content.getByRole("group", { name: "Variant 2" }).getByRole("alert")).toHaveText(sentence);
+  // One look, once it is on screen: the field has it, so the save row does not say it again.
+  expect(await content.getByRole("alert").count()).toBe(1);
+});
+
+test("a_422_on_a_variants_template_from_send_closes_the_dialog_onto_that_variant", async ({ page, app }) => {
+  const sentence = "That template does not exist.";
+  const c = draft({ variants: [VARIANT], sending_domain_id: DOMAIN, from_local_part: "hello" });
+  await open(page, app, c, "admin", {
+    scheduleRefusal: problem(422, "validation", "request validation failed", [
+      { field: "variants[0].template_id", message: sentence },
+    ]),
+  });
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.getByRole("dialog", { name: "Send campaign" }).getByRole("button", { name: "Send now" }).click();
+  await expect(region(page, "Content").getByRole("group", { name: "Variant 1" }).getByRole("alert")).toHaveText(sentence);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});

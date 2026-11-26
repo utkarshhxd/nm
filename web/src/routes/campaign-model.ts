@@ -171,7 +171,7 @@ export function actionsFor(
 
 /** The fields the editor shows an error on: a refusal naming any other is shown as a sentence instead. */
 const SHOWN =
-  /^(list_ids|segment_id|sending_domain_id|from_local_part|reply_to|ab_test_percent|variants|schedule.(local|zone|mode)|variants[d+].(subject|template_id))$/;
+  /^(list_ids|segment_id|sending_domain_id|from_local_part|reply_to|ab_test_percent|variants|schedule\.(local|zone|mode)|variants\[\d+\]\.(subject|template_id))$/;
 
 /** Whether the refusal names a field the editor shows, so its sentence is already on that field. */
 export function namesShownField(error: unknown): boolean {
