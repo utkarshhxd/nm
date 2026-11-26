@@ -4,7 +4,7 @@ import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-q
 import { Link, useNavigate } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
-import { problemText } from "../api/client";
+import { problemDetail, problemMessage, problemType } from "../api/client";
 import { Badge, type BadgeGlyph, type BadgeVariant } from "../components/badge";
 import { Button } from "../components/button";
 import { Dialog } from "../components/dialog";
@@ -54,10 +54,22 @@ const instant = new Intl.DateTimeFormat("en-GB", {
 });
 export const showInstant = (iso: string | null) => (iso ? `${instant.format(new Date(iso))} UTC` : "—");
 
-export const CAMPAIGN_PROBLEMS = {
+const CAMPAIGN_PROBLEMS: Record<string, string> = {
   "insufficient-role": "Your role cannot change campaigns. It takes editor or above.",
   "not-found": "This campaign no longer exists. It may have been deleted in another window.",
 };
+
+/**
+ * The sentence for a refusal. The server's own `detail` wins when it says something about this
+ * request; when it is only the status in words ("resource not found", "insufficient role") the
+ * screen's sentence is the fallback, because it says what to do.
+ */
+export function campaignProblem(error: unknown, fallback: string): string {
+  const code = problemType(error).replace("urn:nm:problem:", "");
+  const detail = problemDetail(error, "").toLowerCase();
+  const plain = detail === "" || detail === code.replaceAll("-", " ") || detail === "resource not found";
+  return (plain ? CAMPAIGN_PROBLEMS[code] : undefined) ?? problemMessage(error, fallback);
+}
 
 const PAGE = 50;
 
@@ -79,7 +91,7 @@ function AllCampaigns({ ws, slug, role }: { ws: string; slug: string; role: Role
       const r = await campaignSource.list(ws, { limit: PAGE, ...(pageParam ? { after: pageParam } : {}) });
       if (!r.ok) {
         throw new Error(
-          problemText(r.error, CAMPAIGN_PROBLEMS, "The campaigns could not be loaded."),
+          campaignProblem(r.error, "The campaigns could not be loaded."),
         );
       }
       return r.data;
@@ -203,7 +215,7 @@ function NewCampaignForm({ ws, slug, onCancel }: { ws: string; slug: string; onC
       const r = await campaignSource.create(ws, { name });
       if (!r.ok) {
         throw new Error(
-          problemText(r.error, CAMPAIGN_PROBLEMS, "The campaign could not be created."),
+          campaignProblem(r.error, "The campaign could not be created."),
         );
       }
       return r.data;

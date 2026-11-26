@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// The campaign editor in a real browser, on the in-memory source (see campaigns.test.tsx for why
-// the seed travels in `window.__nmCampaignSeed`). W3 moves these to stubbing the real API.
+// The campaign editor in a real browser. The screen makes real HTTP calls; `campaign-stub.ts`
+// answers them from the in-memory source, so the wire is the production one.
 
 import { type Page, expect } from "@playwright/test";
 
 import { test } from "../../e2e/support/app";
 import type { components } from "../api/schema";
-import { blankCampaign, type MockState } from "./campaign-source";
+import { blankCampaign, mockCampaignSource, type MockState } from "./campaign-mock";
+import { stubCampaignApi } from "./campaign-stub";
 import type { Campaign } from "./campaign-model";
 
 type Me = components["schemas"]["MeResponse"];
@@ -39,7 +40,14 @@ const VARIANT = { subject: "Hello", template_id: T1, from_name: null };
 
 const draft = (over: Partial<Campaign> = {}) => blankCampaign(ACME, { name: "Spring sale", ...over });
 
-async function open(page: Page, app: string, c: Campaign, role: Role = "editor", more: Partial<MockState> = {}) {
+/** Routes for `c`'s screen, not yet visited: `more` seeds the source, `zones` the workspaces' time zones. */
+async function routes(
+  page: Page,
+  c: Campaign,
+  role: Role = "editor",
+  more: Partial<MockState> = {},
+  zones: Record<string, string> = {},
+) {
   const me: Me = {
     csrf_token: "t",
     display_name: "Ada",
@@ -54,9 +62,18 @@ async function open(page: Page, app: string, c: Campaign, role: Role = "editor",
     ],
   };
   await page.route("**/api/v1/me", (route) => route.fulfill({ json: me }));
-  await page.addInitScript((s) => {
-    (window as unknown as { __nmCampaignSeed: unknown }).__nmCampaignSeed = s;
-  }, { campaigns: [c], options: OPTIONS, ...more });
+  await stubCampaignApi(page, mockCampaignSource({ campaigns: [c], options: OPTIONS, ...more }), zones);
+}
+
+async function open(
+  page: Page,
+  app: string,
+  c: Campaign,
+  role: Role = "editor",
+  more: Partial<MockState> = {},
+  zones: Record<string, string> = {},
+) {
+  await routes(page, c, role, more, zones);
   await page.goto(`${app}/w/acme/campaigns/${c.id}`);
   await expect(page.getByRole("heading", { name: c.name, level: 2 })).toBeVisible();
 }
@@ -334,4 +351,39 @@ test("a_422_on_a_variants_template_from_send_closes_the_dialog_onto_that_variant
   await page.getByRole("dialog", { name: "Send campaign" }).getByRole("button", { name: "Send now" }).click();
   await expect(region(page, "Content").getByRole("group", { name: "Variant 1" }).getByRole("alert")).toHaveText(sentence);
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("the_schedule_starts_in_the_workspaces_own_zone", async ({ page, app }) => {
+  await open(page, app, draft(), "admin", {}, { [ACME]: "Asia/Tokyo" });
+  await region(page, "Schedule").getByLabel("Send at").check();
+  await expect(region(page, "Schedule").getByLabel("Zone")).toHaveValue("Asia/Tokyo");
+});
+
+test("a_404_shows_the_servers_sentence_when_it_says_something_and_the_screens_own_when_it_does_not", async ({
+  page,
+  app,
+}) => {
+  const c = draft();
+  await routes(page, c, "admin");
+  // The API call only: the page's own address ends the same way.
+  const api = `**/api/v1/workspaces/*/campaigns/${c.id}`;
+  const answer = (detail: string) =>
+    page.route(api, (route) =>
+      route.fulfill({
+        status: 404,
+        contentType: "application/problem+json",
+        body: JSON.stringify(problem(404, "not-found", detail)),
+      }),
+    );
+
+  await answer("campaign was removed by ada@example.com at 09:14");
+  await page.goto(`${app}/w/acme/campaigns/${c.id}`);
+  await expect(page.getByText("campaign was removed by ada@example.com at 09:14")).toBeVisible();
+  await expect(page.getByText("no longer exists")).toHaveCount(0);
+
+  // The server's bare "resource not found" says nothing the screen cannot say better.
+  await page.unroute(api);
+  await answer("resource not found");
+  await page.goto(`${app}/w/acme/campaigns/${c.id}`);
+  await expect(page.getByText("This campaign no longer exists.")).toBeVisible();
 });

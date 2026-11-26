@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// The campaign list in a real browser. There is no campaign API yet, so the screen runs on the
-// in-memory source (`campaign-source.ts`); the browser cannot reach that module from here, so the
-// seed travels in `window.__nmCampaignSeed`, set before the page's scripts run. W3 swaps the
-// source for the real API and these tests move to stubbing it at the HTTP boundary.
+// The campaign list in a real browser. The screen makes real HTTP calls; `campaign-stub.ts` answers
+// them from the in-memory source, so the wire is the production one and the app carries no mock.
 
 import { type Page, expect } from "@playwright/test";
 
 import { test } from "../../e2e/support/app";
 import type { components } from "../api/schema";
-import { blankCampaign, type MockState } from "./campaign-source";
+import { blankCampaign, mockCampaignSource, type MockState } from "./campaign-mock";
+import { stubCampaignApi } from "./campaign-stub";
 
 type Me = components["schemas"]["MeResponse"];
 type Role = Me["workspaces"][number]["role"];
@@ -38,9 +37,7 @@ async function open(
     ],
   };
   await page.route("**/api/v1/me", (route) => route.fulfill({ json: me }));
-  await page.addInitScript((s) => {
-    (window as unknown as { __nmCampaignSeed: unknown }).__nmCampaignSeed = s;
-  }, seed);
+  await stubCampaignApi(page, mockCampaignSource(seed));
   await page.goto(`${app}/w/acme/${path}`);
 }
 

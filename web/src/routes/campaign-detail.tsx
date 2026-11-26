@@ -4,9 +4,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
 import { useState } from "react";
 
-import { problemText } from "../api/client";
+import { api } from "../api/client";
 import { Button } from "../components/button";
 import { Audience } from "../components/campaign-editor/audience";
+import { CampaignProgress } from "../components/campaign-editor/progress";
 import { Content } from "../components/campaign-editor/content";
 import { Preview } from "../components/campaign-editor/preview";
 import { Schedule, type Sched } from "../components/campaign-editor/schedule";
@@ -23,6 +24,7 @@ import {
   type UpdateCampaign,
   actionsFor,
   estimateText,
+  pollMs,
   fieldErrors,
   namesShownField,
   fromAddress,
@@ -31,7 +33,7 @@ import {
   toFields,
 } from "./campaign-model";
 import { campaignSource } from "./campaign-source";
-import { CAMPAIGN_PROBLEMS, StateBadge, campaignsKey, showInstant } from "./campaigns";
+import { StateBadge, campaignProblem, campaignsKey, showInstant } from "./campaigns";
 import { useWorkspace } from "./workspace-layout";
 
 export default function CampaignDetail() {
@@ -44,9 +46,22 @@ export default function CampaignDetail() {
     queryFn: async () => {
       const r = await campaignSource.get(ws, campaignId);
       if (!r.ok) {
-        throw new Error(problemText(r.error, CAMPAIGN_PROBLEMS, "The campaign could not be loaded."));
+        throw new Error(campaignProblem(r.error, "The campaign could not be loaded."));
       }
       return r.data;
+    },
+    retry: false,
+    // Only a sending campaign changes under the screen; every other state waits for a person.
+    refetchInterval: (q) => pollMs(q.state.data?.state),
+  });
+  // The schedule starts in the workspace's own zone. Waiting for it keeps the zone field from
+  // changing under someone who has started typing; if it cannot be read, UTC is the stated fallback.
+  const zone = useQuery({
+    queryKey: [...campaignsKey(ws), "zone"],
+    enabled: workspace !== null && campaign.data?.state === "draft",
+    queryFn: async () => {
+      const { data, response } = await api.GET("/api/v1/workspaces/{id}", { params: { path: { id: ws } } });
+      return response.ok && data ? data.timezone : "UTC";
     },
     retry: false,
   });
@@ -59,51 +74,38 @@ export default function CampaignDetail() {
         <ErrorState title="The campaign could not be loaded." onRetry={() => void campaign.refetch()}>
           {campaign.error.message}
         </ErrorState>
-      ) : campaign.data.state === "draft" ? (
-        <Editor c={campaign.data} ws={ws} slug={workspace.slug} role={workspace.role} />
+      ) : campaign.data.state !== "draft" ? (
+        <CampaignProgress
+          campaign={campaign.data}
+          source={campaignSource}
+          ws={ws}
+          slug={workspace.slug}
+          role={workspace.role}
+        />
+      ) : zone.isPending ? (
+        <Skeleton label="Loading campaign" rows={3} />
       ) : (
-        <CampaignProgress c={campaign.data} />
+        <Editor c={campaign.data} ws={ws} slug={workspace.slug} role={workspace.role} zone={zone.data ?? "UTC"} />
       )}
     </section>
   );
 }
 
-/**
- * shortcut: W3 replaces this with the progress screen. Until then a campaign that has left draft
- * shows its name, state and send time.
- */
-function CampaignProgress({ c }: { c: Campaign }) {
-  return (
-    <>
-      <h2 className="text-xl font-semibold wrap-anywhere">{c.name}</h2>
-      <p className="mt-2 flex flex-wrap items-center gap-3">
-        <StateBadge state={c.state} />
-        <span className="text-fg-muted">Send at {showInstant(c.schedule?.send_at ?? null)}</span>
-      </p>
-      {c.pause_reason ? <p className="mt-2">{c.pause_reason}</p> : null}
-      {c.failure_reason ? <p className="mt-2">{c.failure_reason}</p> : null}
-    </>
-  );
-}
-
-// The schedule starts at "now" in UTC: `/me` does not carry the workspace's zone yet.
-const NOW: Sched = { when: "now", local: "", zone: "UTC", mode: "instant" };
-
-function Editor({ c, ws, slug, role }: { c: Campaign; ws: string; slug: string; role: Role }) {
+function Editor({ c, ws, slug, role, zone }: { c: Campaign; ws: string; slug: string; role: Role; zone: string }) {
   const qc = useQueryClient();
   const can = actionsFor(c.state, role, c);
   const editable = can.includes("edit");
   const detailKey = [...campaignsKey(ws), c.id];
 
   const [form, setForm] = useState<EditorForm>(() => initForm(c));
-  const [sched, setSched] = useState<Sched>(NOW);
+  const [sched, setSched] = useState<Sched>({ when: "now", local: "", zone, mode: "instant" });
   const [confirming, setConfirming] = useState(false);
 
   const campaignOptions = useQuery({
     queryKey: [...campaignsKey(ws), "options"],
     queryFn: async () => {
       const r = await campaignSource.options(ws);
-      if (!r.ok) throw new Error(problemText(r.error, CAMPAIGN_PROBLEMS, "The lists, domains and templates could not be loaded."));
+      if (!r.ok) throw new Error(campaignProblem(r.error, "The lists, domains and templates could not be loaded."));
       return r.data;
     },
     retry: false,
@@ -112,7 +114,7 @@ function Editor({ c, ws, slug, role }: { c: Campaign; ws: string; slug: string; 
     queryKey: [...detailKey, "estimate"],
     queryFn: async () => {
       const r = await campaignSource.estimate(ws, c.id);
-      if (!r.ok) throw new Error(problemText(r.error, CAMPAIGN_PROBLEMS, "The audience could not be counted."));
+      if (!r.ok) throw new Error(campaignProblem(r.error, "The audience could not be counted."));
       return r.data;
     },
     retry: false,

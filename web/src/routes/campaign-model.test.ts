@@ -19,7 +19,7 @@ import {
   resolveLocal,
   toFields,
 } from "./campaign-model";
-import { blankCampaign, mockCampaignSource } from "./campaign-source";
+import { blankCampaign, mockCampaignSource } from "./campaign-mock";
 import type { Role } from "../lib/roles";
 
 const WS = "11111111-1111-4111-8111-111111111111";

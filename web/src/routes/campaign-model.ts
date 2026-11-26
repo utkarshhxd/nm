@@ -8,75 +8,31 @@
  * request; a stale `/me` here is never the reason anything is allowed.
  */
 
+import type { components } from "../api/schema";
 import { type Role, atLeast } from "../lib/roles";
 
-export type CampaignState =
-  | "draft"
-  | "scheduled"
-  | "sending"
-  | "paused"
-  | "sent"
-  | "cancelled"
-  | "failed";
-export type Mode = "instant" | "recipient_local";
+type S = components["schemas"];
 
-export type Variant = { subject: string; template_id: string; from_name: string | null };
+/**
+ * The generator writes a nullable response key as `key?: T | null`; the server always sends the
+ * key, as `null` (nothing in `src/campaign` skips a field). So the screens read a present key. This
+ * is the one place that says so, and the one place wire names meet the screens' names below.
+ */
+export type Present<T> = T extends readonly (infer U)[]
+  ? Present<U>[]
+  : T extends object
+    ? { [K in keyof T]-?: Present<T[K]> }
+    : T;
 
-export type Schedule = {
-  mode: Mode;
-  /** IANA name. */
-  zone: string;
-  /** `YYYY-MM-DDTHH:MM`, no zone; `null` is "send now". */
-  local: string | null;
-  /** The server-resolved instant; the earliest zone's for `recipient_local`. */
-  send_at: string | null;
-};
-
+export type CampaignState = S["CampaignState"];
+export type Mode = S["ScheduleMode"];
+export type Variant = Present<S["CampaignVariant"]>;
+/** `send_at` is the server-resolved instant; the earliest zone's for `recipient_local`. */
+export type Schedule = Present<S["CampaignSchedule"]>;
 /** `queued = total - sent - failed - unknown - skipped`, in flight included. */
-export type Counts = {
-  total: number;
-  queued: number;
-  sent: number;
-  failed: number;
-  unknown: number;
-  skipped: number;
-};
-
-export type Campaign = {
-  id: string;
-  workspace_id: string;
-  name: string;
-  state: CampaignState;
-  list_ids: string[];
-  segment_id: string | null;
-  sending_domain_id: string | null;
-  from_local_part: string | null;
-  from_name: string | null;
-  reply_to: string | null;
-  /** 1..4 once saved with content; empty on a fresh draft. */
-  variants: Variant[];
-  /** 10..100, only with 2+ variants; 100 is a pure split. */
-  ab_test_percent: number | null;
-  winner: number | null;
-  awaiting_winner: boolean;
-  schedule: Schedule | null;
-  counts: Counts;
-  failure_reason: string | null;
-  pause_reason: string | null;
-  created_at: string;
-  updated_at: string;
-  launched_at: string | null;
-  finished_at: string | null;
-};
-
-export type CampaignSummary = {
-  id: string;
-  name: string;
-  state: CampaignState;
-  send_at: string | null;
-  counts: Counts;
-  updated_at: string;
-};
+export type Counts = S["CampaignCounts"];
+export type Campaign = Present<S["CampaignView"]>;
+export type CampaignSummary = Present<S["CampaignSummary"]>;
 
 export type EditableFields = Pick<
   Campaign,
@@ -89,31 +45,24 @@ export type EditableFields = Pick<
   | "variants"
   | "ab_test_percent"
 >;
-export type NewCampaign = { name: string } & Partial<EditableFields>;
+export type NewCampaign = S["NewCampaign"];
 /** Absent is unchanged; `null` clears. */
-export type UpdateCampaign = Partial<EditableFields> & { name?: string };
+export type UpdateCampaign = S["UpdateCampaign"];
 
-export type ScheduleRequest = { mode: Mode; zone: string; local: string | null };
-/** 1..5 addresses; `variant` defaults to 0. */
-export type TestSendRequest = { addresses: string[]; variant?: number };
-export type TestSendResult = { queued: number };
-export type WinnerRequest = { variant: number };
-export type PreviewRequest = { variant?: number };
-export type CampaignPreview = { subject: string; html: string; text: string };
+export type ScheduleRequest = S["ScheduleRequest"];
+export type TestSendRequest = S["TestSendRequest"];
+export type TestSendResult = S["TestSendResult"];
+export type WinnerRequest = S["WinnerRequest"];
+export type PreviewRequest = S["CampaignPreviewRequest"];
+export type CampaignPreview = S["CampaignPreview"];
 /** `null` with `exact: false` is "too many to count quickly". */
-export type Estimate = { count: number | null; exact: boolean };
+export type Estimate = Present<S["CampaignEstimate"]>;
 
 export type Page<T> = { data: T[]; next_cursor: string | null };
 
 /** A pick-list entry for the editor: a list, a segment or a sending domain (its domain name). */
 export type Option = { id: string; name: string };
-export type TemplateSummary = {
-  id: string;
-  name: string;
-  kind: "blocks" | "mjml" | "html";
-  created_at: string;
-  updated_at: string;
-};
+export type TemplateSummary = S["TemplateSummary"];
 export type Options = {
   lists: Option[];
   segments: Option[];
@@ -136,6 +85,10 @@ export type Action =
   | "resume"
   | "cancel"
   | "winner";
+
+/** How often the screen asks again: every 2 s while sending, never otherwise. */
+export const POLL_MS = 2000;
+export const pollMs = (s: CampaignState | undefined): number | false => (s === "sending" ? POLL_MS : false);
 
 /** The one state the editor may change. */
 export function canEdit(s: CampaignState): boolean {
