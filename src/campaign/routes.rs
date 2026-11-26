@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use super::{
     Campaign, CampaignCounts, CampaignEstimate, CampaignPreview, CampaignSummary, CampaignView,
-    Frozen, LOCAL_FORMAT, MAX_VARIANTS, Mode, Refusal, State as CampaignState, Variant, load,
-    load_frozen, prepare, schedule,
+    Frozen, LOCAL_FORMAT, MAX_VARIANTS, Mode, Refusal, State as CampaignState, Variant,
+    frozen_usable, load, load_frozen, prepare, schedule,
 };
 use crate::{
     app::AppState,
@@ -1201,7 +1201,7 @@ pub async fn resume_campaign(
     let defs = definitions_for(&state.pool, workspace_id).await?;
     let usable = matches!(
         load_frozen(&state.pool, workspace_id, id).await?,
-        Some(Ok(f)) if frozen_usable(&f, &defs)
+        Some(Ok(f)) if frozen_usable(&f, &defs).is_ok()
     );
     let refrozen: Option<Frozen> = if usable {
         None
@@ -1231,6 +1231,11 @@ pub async fn resume_campaign(
         }
     }
     .rows_affected();
+    if n == 1 {
+        // Everything may have been recorded while it was paused, and no flush is left to notice:
+        // without this it would sit in `sending` with nothing queued, for ever. The same row.
+        super::queue::finish_if_done(&mut tx, id).await?;
+    }
     if n == 1 && !campaign.resolved {
         // A system pause (or an admin's) may have ended the launch job, leaving the audience half
         // resolved with nothing to finish it. A new job takes over from the stored cursor, with the
@@ -1362,14 +1367,6 @@ pub async fn choose_winner(
 // ---------------------------------------------------------------------------------------------
 // Preview, test send, estimate
 
-/// Whether every variant of a frozen rendition still passes `ready` against the fields as they are
-/// now, on its OWN key (spec §4.7 ruling 10).
-fn frozen_usable(f: &Frozen, defs: &[Definition]) -> bool {
-    f.variants
-        .iter()
-        .all(|v| v.rendition.ready(v.rendition.fingerprint(), defs).is_ok())
-}
-
 /// One variant of `frozen` as one recipient gets it: `(subject, html, text)`.
 fn render_for(
     frozen: &Frozen,
@@ -1435,7 +1432,7 @@ pub async fn preview_campaign(
             campaign.frozen_at,
             load_frozen(&state.pool, workspace_id, id).await?,
         ) {
-            (Some(_), Some(Ok(f))) if frozen_usable(&f, &defs) => Some(f),
+            (Some(_), Some(Ok(f))) if frozen_usable(&f, &defs).is_ok() => Some(f),
             _ => None,
         };
         let frozen = match kept {

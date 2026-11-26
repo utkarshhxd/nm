@@ -1677,6 +1677,47 @@ async fn a_debit_of_an_existing_bucket_takes_no_lock_on_its_relay(pool: PgPool) 
         .expect("the lock the insert arm would have taken");
 }
 
+/// **A drain takes no lock on its relay either** (M2c R6). `bucket::DRAIN` is an update of
+/// `tokens` and `refilled_at` alone, the same short-circuit as the debit's update arm, so an
+/// exclusive holder of the `relays` row does not stand in its way. Make it write a key column and
+/// it blocks behind the wedge until the timeout names it.
+#[sqlx::test]
+async fn a_drain_takes_no_lock_on_its_relay(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (_, relay) = relay_fixture(&pool, true).await;
+
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select 1 from relays where id = $1 for update")
+        .bind(relay)
+        .fetch_all(&mut *held)
+        .await
+        .expect("wedge the relay");
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        nm::relay::bucket::drain(&pool, relay, Duration::from_secs(60)),
+    )
+    .await
+    .expect("the drain blocked behind an exclusive lock on its relay row: `relays` IS a lock class")
+    .expect("the drain");
+    held.commit().await.expect("release the wedge");
+
+    let (tokens, shut): (i32, bool) = sqlx::query_as(
+        "select tokens, refilled_at > now() + interval '55 seconds' from relay_buckets
+          where relay_id = $1",
+    )
+    .bind(relay)
+    .fetch_one(&pool)
+    .await
+    .expect("the bucket");
+    assert_eq!(
+        (tokens, shut),
+        (0, true),
+        "the drain did not empty and shut the bucket"
+    );
+}
+
 /// **A relay deletion waits for a debit in flight; it does not deadlock with one.** This is the
 /// `40P01` half of the ADR's split, and it is unreachable here: the debit holds a bucket row the
 /// cascade *can* see, which is exactly the condition that closes the cycle everywhere else, and

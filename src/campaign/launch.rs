@@ -415,6 +415,37 @@ pub async fn handle(ctx: &Ctx, job: &worker::Claimed, slice: Duration) {
     }
 }
 
+/// What a launch job whose worker died on its last attempt is failed with.
+pub const ORPHANED: &str = "the launch worker stopped during its last attempt";
+
+/// Ends every launch whose worker died on its last attempt: attempts spent, lease expired, never
+/// completed or failed. Nothing can claim such a job, so without this its campaign waits for ever.
+/// Each is refused as [`handle`] refuses a last attempt: `scheduled` becomes `failed`, `sending`
+/// or `paused` a system pause, the reason written, the job failed. Returns how many it ended.
+///
+/// Two workers sweeping the same job is harmless: the campaign's update is fenced on
+/// `launch_job_id` and its state, so the second changes nothing there.
+pub async fn sweep(db: &PgPool) -> sqlx::Result<usize> {
+    let dead: Vec<worker::Claimed> = sqlx::query_as(
+        "select id, workspace_id, payload, contact_id, list_id, attempts, max_attempts, created_at
+           from jobs
+          where kind = $1 and failed_at is null and completed_at is null
+            and attempts >= max_attempts and run_after <= now()
+          order by run_after, id limit 16",
+    )
+    .bind(LAUNCH_KIND)
+    .fetch_all(db)
+    .await?;
+    for job in &dead {
+        let reason = format!(
+            "{ORPHANED}; the launch gave up after {} attempts",
+            job.attempts
+        );
+        give_up(db, job, &reason).await?;
+    }
+    Ok(dead.len())
+}
+
 /// The last attempt failed: end the campaign's launch and fail the job together.
 async fn give_up(db: &PgPool, job: &worker::Claimed, reason: &str) -> sqlx::Result<()> {
     let id: Option<Uuid> =

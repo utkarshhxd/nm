@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     brand,
-    custom_fields::definitions_for,
+    custom_fields::{Definition, definitions_for},
     error::{ApiError, ApiResult},
     segments,
     sending_domains::{self, not_passing},
@@ -34,6 +34,7 @@ pub mod launch;
 pub mod queue;
 pub mod routes;
 pub mod schedule;
+pub mod send;
 
 /// How many content variants a campaign may carry (spec §4.9).
 pub const MAX_VARIANTS: usize = 4;
@@ -391,6 +392,30 @@ impl Frozen {
             variants,
         })
     }
+}
+
+/// Whether every variant of a frozen rendition still passes `ready` against the fields as they are
+/// now, on its OWN key (spec §4.7 ruling 10). The one predicate preview, resume and the send loop
+/// share, so what is previewed is what is sent. `Err` names the first variant that does not.
+pub fn frozen_usable(f: &Frozen, defs: &[Definition]) -> Result<(), Refusal> {
+    for (i, v) in f.variants.iter().enumerate() {
+        match v.rendition.ready(v.rendition.fingerprint(), defs) {
+            Ok(_) => {}
+            Err(StoredError::FieldsChanged(drift)) => {
+                return Err(Refusal::Drift {
+                    variant: i,
+                    fields: drift.into_iter().map(|d| d.key).collect(),
+                });
+            }
+            Err(e) => {
+                return Err(Refusal::Template {
+                    variant: i,
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------

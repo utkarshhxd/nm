@@ -57,6 +57,10 @@ pub struct Config {
     /// How many messages one tick sends at once. Four waves of `worker::BATCH`, which is the
     /// arithmetic the tick's budget — half of `JOB_LEASE` — is sized against.
     pub worker_concurrency: usize,
+    /// How many campaign messages the messages loop has at a relay at once
+    /// (`NM_WORKER_CAMPAIGN_CONCURRENCY`, spec M2c §4.7.8). Separate from `worker_concurrency`, so
+    /// a campaign never sits in front of a double opt-in email.
+    pub worker_campaign_concurrency: usize,
 }
 
 /// Hand-written so the database URL (it carries the password) never reaches logs.
@@ -75,6 +79,7 @@ impl fmt::Debug for Config {
             preview_timeout_ms,
             worker_pool_size,
             worker_concurrency,
+            worker_campaign_concurrency,
         } = self;
         f.debug_struct("Config")
             .field("database_url", &"***")
@@ -90,6 +95,7 @@ impl fmt::Debug for Config {
             // reads a `Debug` of this struct to check.
             .field("worker_pool_size", worker_pool_size)
             .field("worker_concurrency", worker_concurrency)
+            .field("worker_campaign_concurrency", worker_campaign_concurrency)
             .finish()
     }
 }
@@ -147,6 +153,8 @@ struct Raw {
     worker_pool_size: u32,
     #[serde(default = "default_worker_concurrency")]
     worker_concurrency: usize,
+    #[serde(default = "default_worker_campaign_concurrency")]
+    worker_campaign_concurrency: usize,
 }
 
 fn default_listen() -> SocketAddr {
@@ -171,15 +179,21 @@ fn default_preview_timeout_ms() -> u64 {
 }
 
 /// Small on purpose. A worker is one process claiming batches of `worker::BATCH`, and the pool is
-/// sized for the sends in flight plus the row each one records, not for the API's traffic.
+/// sized for the sends in flight plus the row each one records, not for the API's traffic. Ten
+/// since M2c: the jobs loop and the messages loop share it (`issues/33`).
 fn default_worker_pool_size() -> u32 {
-    5
+    10
 }
 
 /// Four messages at once: `worker::BATCH / 4` waves, which is what the tick's budget is sized
 /// against (spec M2a section 5.2).
 fn default_worker_concurrency() -> usize {
     4
+}
+
+/// Spec M2c §4.7.8.
+fn default_worker_campaign_concurrency() -> usize {
+    32
 }
 
 /// TOML layer for an explicitly requested config file; a missing or unreadable
@@ -225,6 +239,7 @@ impl Config {
             preview_timeout_ms: raw.preview_timeout_ms,
             worker_pool_size: raw.worker_pool_size,
             worker_concurrency: raw.worker_concurrency,
+            worker_campaign_concurrency: raw.worker_campaign_concurrency,
         })
     }
 }
@@ -286,10 +301,11 @@ mod tests {
         assert_eq!(c.log_format, LogFormat::Json);
         assert_eq!(c.preview_timeout_ms, 1500, "spec M1b section 5's budget");
         assert_eq!(
-            c.worker_pool_size, 5,
+            c.worker_pool_size, 10,
             "the worker's own pool, not the API's twenty"
         );
         assert_eq!(c.worker_concurrency, 4);
+        assert_eq!(c.worker_campaign_concurrency, 32);
         assert_eq!(c.secret_key, SecretKey([1; 32]));
     }
 
@@ -303,6 +319,7 @@ mod tests {
             ("NM_LOG_FORMAT", "pretty"),
             ("NM_WORKER_POOL_SIZE", "9"),
             ("NM_WORKER_CONCURRENCY", "2"),
+            ("NM_WORKER_CAMPAIGN_CONCURRENCY", "7"),
         ]);
         let c = Config::from_figment(figment_with(&p)).unwrap();
         assert!(!c.auto_migrate && c.trust_proxy_headers);
@@ -310,6 +327,7 @@ mod tests {
         assert_eq!(c.log_format, LogFormat::Pretty);
         assert_eq!(c.worker_pool_size, 9);
         assert_eq!(c.worker_concurrency, 2);
+        assert_eq!(c.worker_campaign_concurrency, 7);
     }
 
     /// Every link the product mails is `{public_url}/{prefix}/{token}`, so a query or fragment here
@@ -423,7 +441,11 @@ mod tests {
         assert!(!dbg.contains("hunter2"), "{dbg}");
         // The destructuring above forces every field to be named; these two are the ones this
         // milestone added, and naming them is the redaction decision being recorded.
-        for field in ["worker_pool_size", "worker_concurrency"] {
+        for field in [
+            "worker_pool_size",
+            "worker_concurrency",
+            "worker_campaign_concurrency",
+        ] {
             assert!(dbg.contains(field), "{field} is missing from {dbg}");
         }
     }
