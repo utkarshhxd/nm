@@ -6,7 +6,19 @@
 
 import { expect, test } from "@playwright/test";
 
-import { type Action, type CampaignState, actionsFor, awaitingWinner, canEdit } from "./campaign-model";
+import {
+  type Action,
+  type CampaignState,
+  actionsFor,
+  awaitingWinner,
+  canEdit,
+  fieldErrors,
+  estimateText,
+  fromAddress,
+  initForm,
+  resolveLocal,
+  toFields,
+} from "./campaign-model";
 import { blankCampaign, mockCampaignSource } from "./campaign-source";
 import type { Role } from "../lib/roles";
 
@@ -160,4 +172,65 @@ test("the_mock_records_a_winner_only_while_one_is_awaited", async () => {
   ];
   const other = mockCampaignSource({ campaigns: never });
   for (const c of never) expect(await other.winner(WS, c.id, { variant: 1 }), c.name).toMatchObject(refused);
+});
+
+test("a_local_time_resolves_to_the_instant_in_its_zone", () => {
+  expect(resolveLocal("2027-03-01T09:30", "UTC")).toBe("2027-03-01T09:30:00.000Z");
+  expect(resolveLocal("2027-07-01T09:30", "Europe/London")).toBe("2027-07-01T08:30:00.000Z"); // BST
+  expect(resolveLocal("2027-01-15T09:30", "America/New_York")).toBe("2027-01-15T14:30:00.000Z"); // EST
+  // The clock changed at 07:00Z that day; the offset at the naive guess is the old one.
+  expect(resolveLocal("2027-03-14T05:00", "America/New_York")).toBe("2027-03-14T09:00:00.000Z");
+  expect(resolveLocal("2027-07-01T09:30", "Asia/Kolkata")).toBe("2027-07-01T04:00:00.000Z"); // +05:30
+  expect(resolveLocal("2027-07-01T09:30", "Not/AZone")).toBeNull();
+  expect(resolveLocal("tomorrow", "UTC")).toBeNull();
+});
+
+test("field_errors_are_read_by_the_name_the_server_gives_them", () => {
+  const error = {
+    errors: [
+      { field: "variants[0].template_id", message: "That template does not exist." },
+      { field: "name", message: "A campaign needs a name." },
+    ],
+  };
+  expect(fieldErrors(error)).toEqual({
+    "variants[0].template_id": "That template does not exist.",
+    name: "A campaign needs a name.",
+  });
+  expect(fieldErrors({ status: 409 })).toEqual({});
+  expect(fieldErrors(null)).toEqual({});
+});
+
+test("the_from_address_is_name_then_local_part_at_domain", () => {
+  expect(fromAddress("Acme News", "hello", "mail.acme.test")).toBe("Acme News <hello@mail.acme.test>");
+  expect(fromAddress("", "hello", "mail.acme.test")).toBe("hello@mail.acme.test");
+  expect(fromAddress("Acme", "", "mail.acme.test")).toBeNull();
+  expect(fromAddress("Acme", "hello", "")).toBeNull();
+});
+
+test("the_form_goes_to_the_wire_with_blanks_as_null_and_the_percentage_only_for_a_split", () => {
+  const one = initForm(blankCampaign(WS, { name: "New" }));
+  expect(one.variants).toHaveLength(1); // a fresh draft still shows one variant to fill in
+  expect(toFields({ ...one, from_name: " ", reply_to: "a@b.test " })).toMatchObject({
+    from_name: null,
+    reply_to: "a@b.test",
+    segment_id: null,
+    ab_test_percent: null,
+  });
+  const v = { subject: "S", template_id: "t", from_name: "" };
+  const split = { ...one, variants: [v, v], ab_test_percent: "30" };
+  expect(toFields(split).ab_test_percent).toBe(30);
+  expect(toFields(split).variants[0]).toEqual({ subject: "S", template_id: "t", from_name: null });
+  // Back to one variant: the stale percentage does not travel.
+  expect(toFields({ ...split, variants: [v] }).ab_test_percent).toBeNull();
+  // A saved split starts at its saved percentage, and at 100 (a pure split) when it has none.
+  const saved = blankCampaign(WS, { name: "S", variants: [{ ...v, from_name: null }, { ...v, from_name: null }] });
+  expect(initForm(saved).ab_test_percent).toBe("100");
+  expect(initForm({ ...saved, ab_test_percent: 20 }).ab_test_percent).toBe("20");
+});
+
+test("an_estimate_reads_as_a_count_or_as_too_many_to_count", () => {
+  expect(estimateText({ count: 1234, exact: true })).toBe("1,234 recipients");
+  expect(estimateText({ count: 1, exact: true })).toBe("1 recipient");
+  expect(estimateText({ count: 1200, exact: false })).toBe("About 1,200 recipients");
+  expect(estimateText({ count: null, exact: false })).toBe("Too many to count quickly");
 });

@@ -180,7 +180,7 @@ const campaignsRoute = createRoute({
 const campaignRoute = createRoute({
   getParentRoute: () => workspaceRoute,
   path: "campaigns/$campaignId",
-  component: lazyRouteComponent(() => import("./routes/campaigns"), "CampaignDetail"),
+  component: lazyRouteComponent(() => import("./routes/campaign-detail")),
 });
 
 const brandKitRoute = createRoute({

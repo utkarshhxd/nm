@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
 import { problemText } from "../api/client";
@@ -242,46 +242,5 @@ function NewCampaignForm({ ws, slug, onCancel }: { ws: string; slug: string; onC
         </Button>
       </div>
     </form>
-  );
-}
-
-/**
- * shortcut: W1's stand-in for the campaign screen, so "New campaign" has somewhere to land and
- * another workspace's id shows the 404 sentence. W2 replaces the body, keeping the named export.
- */
-export function CampaignDetail() {
-  const { workspace } = useWorkspace();
-  const { campaignId } = useParams({ from: "/w/$slug/campaigns/$campaignId" });
-  const ws = workspace?.id ?? "";
-  const campaign = useQuery({
-    queryKey: [...campaignsKey(ws), campaignId],
-    enabled: workspace !== null,
-    queryFn: async () => {
-      const r = await campaignSource.get(ws, campaignId);
-      if (!r.ok) {
-        throw new Error(problemText(r.error, CAMPAIGN_PROBLEMS, "The campaign could not be loaded."));
-      }
-      return r.data;
-    },
-    retry: false,
-  });
-  if (!workspace) return null;
-  return (
-    <section className="mt-8">
-      {campaign.isPending ? (
-        <Skeleton label="Loading campaign" rows={3} />
-      ) : campaign.isError ? (
-        <ErrorState title="The campaign could not be loaded." onRetry={() => void campaign.refetch()}>
-          {campaign.error.message}
-        </ErrorState>
-      ) : (
-        <>
-          <h2 className="text-xl font-semibold">{campaign.data.name}</h2>
-          <p className="mt-2">
-            <StateBadge state={campaign.data.state} />
-          </p>
-        </>
-      )}
-    </section>
   );
 }

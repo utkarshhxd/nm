@@ -58,6 +58,8 @@ export type MockState = {
   /** shortcut: one set of options for every workspace; give it per-workspace the day a test needs two. */
   options: Options;
   estimate: Estimate;
+  /** What `schedule` answers instead of scheduling, e.g. a 409 `postal-address-required`. */
+  scheduleRefusal?: unknown;
   /** Wait this long before answering, so a test can look at the screen between ask and answer. */
   delayMs: number;
 };
@@ -71,6 +73,11 @@ const problem = (status: number, code: string, detail: string) => ({
 const notFound = () => problem(404, "not-found", "resource not found");
 const wrongState = (id: string, state: CampaignState, wanted: string) =>
   problem(409, "campaign-state", `campaign ${id} is ${state}; it must be ${wanted}`);
+
+const invalid = (errors: { field: string; message: string }[]) => ({
+  ...problem(422, "validation", "request validation failed"),
+  errors,
+});
 
 const NONE = { total: 0, queued: 0, sent: 0, failed: 0, unknown: 0, skipped: 0 };
 
@@ -177,6 +184,13 @@ export function mockCampaignSource(seed: Partial<MockState> = {}): CampaignSourc
     update: (ws, id, body) =>
       on(ws, id, (c) => {
         if (c.state !== "draft") return no(wrongState(id, c.state, "draft"));
+        // The server checks each variant's template against the workspace; the mock against its options.
+        const bad = (body.variants ?? []).flatMap((v, i) =>
+          s.options.templates.some((t) => t.id === v.template_id)
+            ? []
+            : [{ field: `variants[${i}].template_id`, message: "That template does not exist." }],
+        );
+        if (bad.length > 0) return no(invalid(bad));
         Object.assign(c, body, { updated_at: new Date().toISOString() });
         return ok(structuredClone(c));
       }),
@@ -194,19 +208,26 @@ export function mockCampaignSource(seed: Partial<MockState> = {}): CampaignSourc
       }),
     estimate: (ws, id) => on(ws, id, () => ok(s.estimate)),
     test: (ws, id, body) =>
-      on(ws, id, (c) =>
-        c.state === "draft" || c.state === "scheduled"
-          ? ok({ queued: body.addresses.length })
-          : no(wrongState(id, c.state, "draft or scheduled")),
-      ),
-    schedule: (ws, id, body) =>
-      move(ws, id, ["draft"], "scheduled", (c) => {
-        // Naive: `local` is read as UTC. The real rule (RFC 5545 DST handling) is the server's.
-        c.schedule = {
-          ...body,
-          send_at: body.local === null ? new Date().toISOString() : `${body.local}:00.000Z`,
-        };
+      on(ws, id, (c) => {
+        if (c.state !== "draft" && c.state !== "scheduled") {
+          return no(wrongState(id, c.state, "draft or scheduled"));
+        }
+        const n = body.addresses.length;
+        if (n < 1 || n > 5) {
+          return no(invalid([{ field: "addresses", message: "Send a test to between 1 and 5 addresses." }]));
+        }
+        return ok({ queued: n });
       }),
+    schedule: (ws, id, body) =>
+      s.scheduleRefusal !== undefined
+        ? on(ws, id, () => no(s.scheduleRefusal))
+        : move(ws, id, ["draft"], "scheduled", (c) => {
+            // Naive: `local` is read as UTC. The real rule (RFC 5545 DST handling) is the server's.
+            c.schedule = {
+              ...body,
+              send_at: body.local === null ? new Date().toISOString() : `${body.local}:00.000Z`,
+            };
+          }),
     unschedule: (ws, id) => move(ws, id, ["scheduled"], "draft", (c) => (c.schedule = null)),
     pause: (ws, id) => move(ws, id, ["sending"], "paused"),
     resume: (ws, id) => move(ws, id, ["paused"], "sending"),

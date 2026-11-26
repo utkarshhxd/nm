@@ -168,3 +168,109 @@ export function actionsFor(
   if (admin && awaitingWinner({ ...c, state: s })) out.push("winner");
   return out;
 }
+
+/** `{ field, message }` entries of a 422 `validation` problem, by field name. */
+export function fieldErrors(error: unknown): Record<string, string> {
+  const list = (error as { errors?: { field?: unknown; message?: unknown }[] } | null)?.errors;
+  const out: Record<string, string> = {};
+  for (const e of list ?? []) {
+    if (typeof e.field === "string" && typeof e.message === "string") out[e.field] ??= e.message;
+  }
+  return out;
+}
+
+/** `Name <local@domain>`, or `local@domain` with no name; `null` while either half is missing. */
+export function fromAddress(name: string, local: string, domain: string): string | null {
+  if (local === "" || domain === "") return null;
+  return name === "" ? `${local}@${domain}` : `${name} <${local}@${domain}>`;
+}
+
+/**
+ * The instant a `datetime-local` value is in an IANA zone, as RFC 3339 UTC; `null` for a value or
+ * zone that is not one. The confirmation dialog shows this before the server has answered.
+ *
+ * shortcut: a time inside a DST gap or overlap resolves to one of its two readings, not by the
+ * RFC 5545 rule. The server's `send_at`, shown once scheduled, is the authority.
+ */
+export function resolveLocal(local: string, zone: string): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(local);
+  if (!m) return null;
+  const wall = Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!);
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+    });
+    /** The zone's offset from UTC, in ms, at instant `t`. */
+    const offset = (t: number) => {
+      const p = Object.fromEntries(fmt.formatToParts(t).map((x) => [x.type, Number(x.value)]));
+      return Date.UTC(p["year"]!, p["month"]! - 1, p["day"]!, p["hour"]!, p["minute"]!) - t;
+    };
+    // The offset at the guess may differ from the one at the answer across a DST change: ask twice.
+    const first = wall - offset(wall);
+    return new Date(wall - offset(first)).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+/** What the editor's inputs hold: every value a string, `""` where the wire has `null`. */
+export type EditorForm = {
+  list_ids: string[];
+  segment_id: string;
+  sending_domain_id: string;
+  from_local_part: string;
+  from_name: string;
+  reply_to: string;
+  variants: { subject: string; template_id: string; from_name: string }[];
+  ab_test_percent: string;
+};
+
+export const BLANK_VARIANT = { subject: "", template_id: "", from_name: "" };
+
+/** A fresh draft has no variants; the editor always shows at least one to fill in. */
+export function initForm(c: Campaign): EditorForm {
+  return {
+    list_ids: c.list_ids,
+    segment_id: c.segment_id ?? "",
+    sending_domain_id: c.sending_domain_id ?? "",
+    from_local_part: c.from_local_part ?? "",
+    from_name: c.from_name ?? "",
+    reply_to: c.reply_to ?? "",
+    variants:
+      c.variants.length > 0
+        ? c.variants.map((v) => ({ ...v, from_name: v.from_name ?? "" }))
+        : [{ ...BLANK_VARIANT }],
+    ab_test_percent: c.variants.length > 1 ? String(c.ab_test_percent ?? 100) : "",
+  };
+}
+
+/**
+ * The wire form of the inputs. The percentage goes only with 2+ variants, so a removed second
+ * variant cannot leave a stale percentage behind.
+ */
+export function toFields(f: EditorForm): EditableFields {
+  const text = (s: string) => (s.trim() === "" ? null : s.trim());
+  return {
+    list_ids: f.list_ids,
+    segment_id: text(f.segment_id),
+    sending_domain_id: text(f.sending_domain_id),
+    from_local_part: text(f.from_local_part),
+    from_name: text(f.from_name),
+    reply_to: text(f.reply_to),
+    variants: f.variants.map((v) => ({ subject: v.subject, template_id: v.template_id, from_name: text(v.from_name) })),
+    ab_test_percent: f.variants.length > 1 && f.ab_test_percent !== "" ? Number(f.ab_test_percent) : null,
+  };
+}
+
+/** The sentence for an estimate; `null` with `exact: false` is the server saying it stopped counting. */
+export function estimateText(e: Estimate): string {
+  if (e.count === null) return "Too many to count quickly";
+  const n = `${e.count.toLocaleString("en-GB")} ${e.count === 1 ? "recipient" : "recipients"}`;
+  return e.exact ? n : `About ${n}`;
+}
