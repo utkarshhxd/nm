@@ -1,6 +1,6 @@
 # NM — roadmap and status
 
-*As of 26 November 2026. NM is the working name.*
+*As of 27 November 2026. NM is the working name.*
 
 NM is a self-hosted email-marketing platform. It replaces our Interspire installation. It covers
 contacts and consent, campaigns, automation and an API, and it is built to send at volume with
@@ -17,13 +17,20 @@ something usable that is merged to `main`.
 | **M1 Audience** | Contacts and custom fields, lists, tags, the segment engine, CSV import, suppressions, double opt-in, signup forms, preference centre, consent log | **Done** 21 Nov (four slices) |
 | **M2a** Relays and sending domains | SMTP relays with failover, sending domains with a live SPF/DKIM/DMARC checker, in-app DKIM signing, the send worker, the first real email | **Done** 22 Nov |
 | **M2b** Templates and editor | Block editor, hand-written MJML/HTML, brand kits, safe personalisation (merge tags escaped for where they land), preview with lint and link checks | **Done** 26 Nov |
-| **M2c** Campaigns and send pipeline | Campaigns with audiences, scheduling across time zones, test sends, A/B splits, the send pipeline with pause/resume/cancel and progress, and one-click unsubscribe | **In progress.** Estimate **28–30 Nov** |
-| **M2d** Tracking | Open and click tracking, tracking domains | Estimate early December |
-| **M3** Feedback loop | Bounce and complaint intake, automatic suppression, automatic pause on bad signals, bot filtering, analytics | Estimate mid December |
+| **M2c** Campaigns and send pipeline | Campaigns with audiences, scheduling across time zones, test sends, A/B splits, the send pipeline with pause/resume/cancel and progress, and one-click unsubscribe | **Done** 26 Nov |
+| **M2d** Tracking (launch cut) | Open and click tracking, send-time hard bounces into suppression, a campaign report, and a local run package | **Done** 27 Nov. Tracking switches and custom tracking domains move to a later slice. |
+| **M3** Feedback loop | Bounces and complaints the relay reports after the send, automatic pause on bad signals, bot filtering, analytics, automatic A/B winner | Estimate mid December |
 | **M4** Automation | Flow builder, automation engine, triggers and steps, versioning | Estimate late December. This is the largest milestone. |
 | **M5** Platform | Complete API, bulk endpoints, transactional sends, outgoing webhooks | Estimate early January |
 | **M6** Migration | Interspire and listmonk importers. Our first brand moves over. | Estimate early-to-mid January |
 | **M7** Hardening and v1.0 | Benchmarks, security review, documentation, packaging | Estimate mid January |
+
+## Launch
+
+The first usable product, campaign sending plus tracking, is complete with M2c and M2d. It runs
+locally with one command (`docs/run-locally.md`): the app, its database, and a local mail catcher
+for trying sends safely. Moving it into our Kubernetes cluster comes next, once the local trial is
+signed off. What was deliberately left out of the launch cut is listed in `issues/54`.
 
 ## When is v1 done
 
@@ -61,7 +68,7 @@ Every slice goes through the same steps before it reaches `main`:
 
 ## M2c in detail
 
-*In progress. Ten tasks in two tracks, server and web, built in parallel where they do not depend
+*Done 26 November. Ten tasks in two tracks, server and web, built in parallel where they do not depend
 on each other.*
 
 | Task | What it builds | Depends on |
@@ -82,7 +89,7 @@ on each other.*
   It is fixed when the send starts, so it cannot change mid-send.
 - **Scheduling** in a named time zone.
 - **Test sends** to explicit addresses.
-- **A/B splits.** Automatic winner selection needs open and click data, so it arrives with M2d.
+- **A/B splits.** Automatic winner selection needs open and click data, so it arrives with M3; at launch the winner is picked by hand, guided by clicks per link.
 - **Send pipeline:**
   - Respects each relay's rate limit, with failover between relays.
   - Never mails the same contact twice for one campaign, even after a crash.
