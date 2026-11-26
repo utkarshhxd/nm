@@ -83,7 +83,7 @@ export default function CampaignDetail() {
           role={workspace.role}
         />
       ) : zone.isPending ? (
-        <Skeleton label="Loading campaign" rows={3} />
+        <Skeleton label="Loading the time zone" rows={3} />
       ) : (
         <Editor c={campaign.data} ws={ws} slug={workspace.slug} role={workspace.role} zone={zone.data ?? "UTC"} />
       )}

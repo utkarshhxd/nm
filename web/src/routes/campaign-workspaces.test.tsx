@@ -165,7 +165,7 @@ test("every_cache_key_carries_the_workspace_so_the_other_workspaces_answer_never
   api.hold("zone");
   api.release("detail");
   await api.arrived("zone");
-  await waiting("Loading campaign");
+  await waiting("Loading the time zone");
   await expect(page.getByRole("region", { name: "Schedule", exact: true })).toHaveCount(0);
   api.release("zone");
 
