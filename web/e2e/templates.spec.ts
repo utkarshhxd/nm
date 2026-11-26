@@ -260,6 +260,32 @@ test("a_hand_written_template_edits_its_source_and_the_kind_cannot_change", asyn
   expect(patched.status()).toBe(422);
 });
 
+test("a_hand_written_template_says_its_links_were_not_checked_in_the_real_servers_own_words", async () => {
+  // The preview is NOT stubbed here: the sentence on screen is what `preview_template` answers.
+  await page.unroute(PREVIEW);
+  // A quoted fallback inside an attribute: valid, and refused at preview before the lint fix.
+  const MJML = `<mjml><mj-body><mj-section><mj-column><mj-button href="https://x.example/?n={{ first_name | "friend" }}">Go</mj-button></mj-column></mj-section></mj-body></mjml>`;
+  for (const [kind, source, said] of [
+    ["html", "<p>Hi</p>", "a raw HTML template is not link-checked or style-checked"],
+    ["mjml", MJML, "a raw MJML template's links are not checked"],
+  ] as const) {
+    const created = await admin.request.post(`${base()}/templates`, {
+      data: { name: `Real ${kind}`, kind, source },
+      headers: { "X-CSRF-Token": csrf },
+    });
+    expect(created.status(), `create ${kind}`).toBe(201);
+    const { id } = (await created.json()) as { id: string };
+    await page.goto(`/w/${SLUG}/templates/${id}`);
+    const findings = page.getByRole("list", { name: "Findings" });
+    await expect(findings).toContainText(said, { timeout: 15_000 });
+    await expect(findings).toContainText("Warning");
+    await expect(page.getByText("No findings.")).toHaveCount(0);
+    await expect(page.getByTestId("preview-links")).toHaveText(
+      "Links are checked for form, not for whether they resolve.",
+    );
+  }
+});
+
 test("a_deleted_template_leaves_the_list_and_the_screen_behind_it", async () => {
   await openTemplates();
   await page.getByRole("button", { name: "Delete Raw", exact: true }).click();

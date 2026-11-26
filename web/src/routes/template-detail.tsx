@@ -8,7 +8,7 @@ import { api, problemText } from "../api/client";
 import { BlockEditor } from "../components/block-editor/editor";
 import type { Doc } from "../components/block-editor/model";
 import { Preview } from "../components/block-editor/preview";
-import { sourcePreview, templatePreview } from "../components/block-editor/preview-source";
+import { sourcePreview, storedPreview, templatePreview } from "../components/block-editor/preview-source";
 import { Button } from "../components/button";
 import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
@@ -125,6 +125,7 @@ function Edit({ ws, template, canEdit }: { ws: string; template: Template; canEd
   // fresh closure on every keystroke would be a request on every keystroke.
   const preview = useMemo(() => templatePreview(ws, template.id), [ws, template.id]);
   const previewSource = useMemo(() => sourcePreview(ws, template.id), [ws, template.id]);
+  const stored = useMemo(() => storedPreview(ws, template.id), [ws, template.id]);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -153,13 +154,16 @@ function Edit({ ws, template, canEdit }: { ws: string; template: Template; canEd
       <p className="mt-1 text-fg-muted">{kindName(template.kind)}</p>
 
       {!canEdit ? (
-        // shortcut: a viewer reads the name and the kind and no more. The editor has no
-        // read-only mode, and showing its controls to somebody whose save the server will
-        // refuse is a trap. Give this screen the stored preview when a viewer needs the email
-        // itself — `POST …/preview` with an empty body is that, and takes viewer.
-        <p className="mt-4 text-fg-muted">
-          Your role can read templates but not change them. It takes editor or above.
-        </p>
+        // A viewer reads the email as stored and gets no editor: showing its controls to somebody
+        // whose save the server will refuse is a trap. The stored preview (`{}`) takes viewer.
+        <>
+          <p className="mt-4 text-fg-muted">
+            Your role can read templates but not change them. It takes editor or above.
+          </p>
+          <div className="mt-6">
+            <Preview doc={null} source={stored} />
+          </div>
+        </>
       ) : (
         <>
           <div className="mt-4 max-w-xl">

@@ -37,7 +37,8 @@ export function Preview<T>({
   /** What is previewed: the block tree, or the MJML or HTML a hand-written template holds. */
   doc: T;
   source: (doc: T, signal: AbortSignal) => Promise<PreviewResult>;
-  onLocate: (at: Loc) => void;
+  /** Absent where there is no editor to take the operator to (a viewer's read-only preview). */
+  onLocate?: (at: Loc) => void;
 }) {
   const [mode, setMode] = useState<Mode>("desktop");
   const [state, setState] = useState<State>({ result: null, failed: false, reason: "", busy: true });
@@ -75,6 +76,10 @@ export function Preview<T>({
       </div>
       <p data-testid="preview-scope" className="text-sm text-fg-muted">
         Drawn by your browser, not by an email client. Use it for layout and wording, then send a test to the apps your readers use.
+      </p>
+      {/* Spec 5.9: an operator who believes a dead link was checked is worse off than one who knows it was not. */}
+      <p data-testid="preview-links" className="text-sm text-fg-muted">
+        Links are checked for form, not for whether they resolve.
       </p>
       {failed && (
         <p role="alert" className="text-danger-text">
@@ -152,7 +157,7 @@ export function Preview<T>({
               </span>
               <span>{f.message}</span>
               <span className="text-sm text-fg-muted">{f.check === "lint" ? "lint" : "link check"}</span>
-              {f.at && (
+              {f.at && onLocate && (
                 <Button variant="ghost" aria-label={`Show block ${f.at.map((n) => n + 1).join(".")}`} onClick={() => onLocate(f.at as Loc)}>
                   Show block
                 </Button>

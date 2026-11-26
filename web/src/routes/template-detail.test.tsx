@@ -324,6 +324,24 @@ test("a_viewer_is_not_offered_the_editor_or_the_save", async ({ page, app }) => 
   await expect(page.getByRole("button", { name: /^Delete / })).toHaveCount(0);
 });
 
+test("a_viewer_previews_the_stored_rendition_with_an_empty_body_and_is_offered_no_editor", async ({ page, app }) => {
+  const bodies: unknown[] = [];
+  await open(page, app, {
+    role: "viewer",
+    preview: (route, request) => {
+      bodies.push(request.postDataJSON());
+      return route.fulfill(OK_PREVIEW);
+    },
+  });
+  // `{}` is the server's stored-preview mode, the one a viewer may call: never `{tree}` or `{source}`.
+  await expect(page.getByTitle("Email preview")).toBeVisible();
+  expect(bodies).toEqual([{}]);
+  await expect(page.getByRole("region", { name: "Preview and checks" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Block editor" })).toHaveCount(0);
+  await expect(page.getByRole("textbox")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Save template" })).toHaveCount(0);
+});
+
 test("switching_workspace_never_shows_the_last_workspaces_templates", async ({ page, app }) => {
   // Two workspaces this person belongs to. The list is cached per workspace; a cache keyed
   // without it would paint Acme's rows on Other's page while Other's own request is in flight.

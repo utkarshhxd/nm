@@ -47,6 +47,10 @@ export const PREVIEW_PROBLEMS = {
   // The checks could not RUN. This is not an empty findings list, and the panel must not show it
   // as one; it reaches the panel as a rejection for exactly that reason.
   "template-uncheckable": "This template could not be checked, so nothing has been checked.",
+  // Only the stored preview can get this. The server's own sentence says "save it again", which a
+  // viewer cannot do.
+  "template-stale":
+    "This template's stored copy is out of date. Someone who can edit it needs to open it and save it again.",
 };
 
 /**
@@ -57,7 +61,7 @@ export const PREVIEW_PROBLEMS = {
 async function ask(
   ws: string,
   id: string,
-  body: { tree: Doc } | { source: string },
+  body: { tree: Doc } | { source: string } | Record<string, never>,
   signal: AbortSignal,
 ): Promise<PreviewResult> {
   const { data, error } = await api.POST(
@@ -80,6 +84,16 @@ async function ask(
     })),
   };
 }
+
+/**
+ * The STORED rendition, read-only: an empty body is the server's stored-preview mode, which takes
+ * a viewer. This is the only preview a role below editor gets, and it can answer `409
+ * template-stale` where the unsaved ones cannot.
+ */
+export const storedPreview =
+  (ws: string, id: string) =>
+  (_doc: null, signal: AbortSignal): Promise<PreviewResult> =>
+    ask(ws, id, {}, signal);
 
 /** The block tree in the editor. */
 export const templatePreview =

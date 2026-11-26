@@ -86,6 +86,7 @@ test("every_mode_says_the_preview_is_the_browser_not_an_email_client", async ({ 
   for (const m of ["Desktop", "Mobile", "Dark", "Plain text"]) {
     await mode(page, m);
     await expect(page.getByTestId("preview-scope")).toContainText("your browser");
+    await expect(page.getByTestId("preview-links")).toHaveText("Links are checked for form, not for whether they resolve.");
   }
 });
 

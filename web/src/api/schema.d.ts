@@ -4796,7 +4796,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description a colour outside `#rgb`/`#rrggbb`, a font stack that is not a list of family names, a logo that is not http or https, a palette or footer that is not an object, or an unknown field */
+            /** @description a colour outside `#rgb`/`#rrggbb`, a font stack that is not a list of family names, a logo that is not http or https, a footer holding a character the renderer reserves, a palette or footer that is not an object, or an unknown field */
             422: {
                 headers: {
                     [name: string]: unknown;
