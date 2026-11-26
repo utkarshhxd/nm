@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { type BrowserContext, type Page, expect, test } from "@playwright/test";
+import { type BrowserContext, type Locator, type Page, expect, test } from "@playwright/test";
 
 import { ADMIN_EMAIL, ADMIN_PASSWORD } from "./support/server";
 
@@ -64,7 +64,7 @@ async function signIn(p: Page, email: string, password: string): Promise<void> {
 }
 
 const region = (p: Page, name: string) => p.getByRole("region", { name, exact: true });
-const button = (p: Page, name: string) => p.getByRole("button", { name, exact: true });
+const button = (p: Page | Locator, name: string) => p.getByRole("button", { name, exact: true });
 /** The state pill: a rounded span, so "Scheduled" never matches the sentence beside it. */
 const badge = (p: Page, name: string) => p.locator("span.rounded-full").filter({ hasText: name });
 
