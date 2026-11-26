@@ -30,6 +30,7 @@ const counts = (c: Partial<Campaign["counts"]>) => ({
   queued: 0,
   sent: 0,
   failed: 0,
+  bounced: 0,
   unknown: 0,
   skipped: 0,
   ...c,

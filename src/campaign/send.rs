@@ -45,6 +45,7 @@ use super::{
     queue::{self, CAMPAIGN_BATCH, Claimed, Recipient, Verdict},
 };
 use crate::{
+    crypto::secrets::Secrets,
     custom_fields::{Definition, definitions_for},
     mail::{self, Outgoing, dkim},
     public::token::{self, Purpose, Token},
@@ -259,7 +260,7 @@ impl CampaignWorker {
             }
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let flusher = tokio::spawn(flush(db.clone(), rx));
+        let flusher = tokio::spawn(flush(db.clone(), Arc::clone(&self.ctx.secrets), rx));
 
         let mut by_campaign: BTreeMap<Uuid, Vec<(Claimed, Recipient)>> = BTreeMap::new();
         for m in claimed {
@@ -503,7 +504,7 @@ impl CampaignWorker {
 fn reason_of(o: Outcome) -> String {
     match o {
         Outcome::Sent { response } => response,
-        Outcome::Transient(r) | Outcome::Failed(r) | Outcome::Unknown(r) => r,
+        Outcome::Transient(r) | Outcome::Failed(r) | Outcome::Bounced(r) | Outcome::Unknown(r) => r,
         Outcome::Deferred { reason, .. } => reason,
     }
 }
@@ -585,7 +586,7 @@ async fn deliver(ctx: &Ctx, m: &Claimed, r: &Recipient, c: &Content, route: &Rou
     };
     let bytes = match signed(&c.domain, c.key.as_deref(), &message).await {
         Ok(bytes) => bytes,
-        Err(outcome) => return verdict(outcome, None),
+        Err(outcome) => return verdict(outcome, None, &r.email),
     };
     let envelope = match (c.frozen.from.parse(), r.email.parse()) {
         (Ok(from), Ok(to)) => match Envelope::new(Some(from), vec![to]) {
@@ -604,11 +605,11 @@ async fn deliver(ctx: &Ctx, m: &Claimed, r: &Recipient, c: &Content, route: &Rou
         &bytes,
     )
     .await;
-    verdict(outcome, relay)
+    verdict(outcome, relay, &r.email)
 }
 
-/// Spec §4.7.4's table.
-fn verdict(o: Outcome, relay: Option<Uuid>) -> Verdict {
+/// Spec §4.7.4's table. `email` is the recipient's, which a bounce suppresses.
+fn verdict(o: Outcome, relay: Option<Uuid>, email: &str) -> Verdict {
     match (o, relay) {
         (Outcome::Sent { response }, Some(relay)) => Verdict::Sent { relay, response },
         // `submit` names the relay of every decided outcome; were it ever missing, a delivery
@@ -617,6 +618,10 @@ fn verdict(o: Outcome, relay: Option<Uuid>) -> Verdict {
         (Outcome::Transient(r), _) => Verdict::Retry(r),
         (Outcome::Deferred { reason, .. }, _) => Verdict::Deferred(reason),
         (Outcome::Failed(r), _) => Verdict::Failed(r),
+        (Outcome::Bounced(reason), _) => Verdict::Bounced {
+            reason,
+            email: email.to_owned(),
+        },
         (Outcome::Unknown(r), _) => Verdict::Unknown(r),
     }
 }
@@ -624,7 +629,11 @@ fn verdict(o: Outcome, relay: Option<Uuid>) -> Verdict {
 /// Records outcomes as they arrive: every [`FLUSH_EVERY`], or at [`FLUSH_AT`], and whatever is left
 /// when the tick closes the channel. A flush that fails is kept and tried again: the claim token
 /// makes a replay touch nothing another claim holds.
-async fn flush(db: PgPool, mut rx: mpsc::UnboundedReceiver<(Claimed, Verdict)>) {
+async fn flush(
+    db: PgPool,
+    secrets: Arc<Secrets>,
+    mut rx: mpsc::UnboundedReceiver<(Claimed, Verdict)>,
+) {
     let mut held: Vec<(Claimed, Verdict)> = Vec::new();
     let mut every = tokio::time::interval(FLUSH_EVERY);
     loop {
@@ -633,19 +642,19 @@ async fn flush(db: PgPool, mut rx: mpsc::UnboundedReceiver<(Claimed, Verdict)>) 
                 Some(outcome) => {
                     held.push(outcome);
                     if held.len() >= FLUSH_AT {
-                        record(&db, &mut held).await;
+                        record(&db, &secrets, &mut held).await;
                     }
                 }
                 None => break,
             },
-            _ = every.tick() => record(&db, &mut held).await,
+            _ = every.tick() => record(&db, &secrets, &mut held).await,
         }
     }
     for _ in 0..3 {
         if held.is_empty() {
             return;
         }
-        record(&db, &mut held).await;
+        record(&db, &secrets, &mut held).await;
         if !held.is_empty() {
             tokio::time::sleep(FLUSH_EVERY).await;
         }
@@ -660,11 +669,11 @@ async fn flush(db: PgPool, mut rx: mpsc::UnboundedReceiver<(Claimed, Verdict)>) 
     }
 }
 
-async fn record(db: &PgPool, held: &mut Vec<(Claimed, Verdict)>) {
+async fn record(db: &PgPool, secrets: &Secrets, held: &mut Vec<(Claimed, Verdict)>) {
     if held.is_empty() {
         return;
     }
-    match queue::record(db, held).await {
+    match queue::record(db, secrets, held).await {
         Ok(()) => held.clear(),
         Err(e) => tracing::warn!(error = %e, "a flush of outcomes failed; it will be retried"),
     }

@@ -54,7 +54,9 @@ pub async fn handle(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome
         Outcome::Transient(reason) | Outcome::Deferred { reason, .. } => {
             defer(&ctx.db, job, reason).await
         }
-        Outcome::Failed(reason) | Outcome::Unknown(reason) => fail(&ctx.db, job.id, reason).await,
+        Outcome::Failed(reason) | Outcome::Bounced(reason) | Outcome::Unknown(reason) => {
+            fail(&ctx.db, job.id, reason).await
+        }
     };
     if let Err(e) = recorded {
         tracing::error!(job = %job.id, error = %e, "a test send's outcome could not be recorded");

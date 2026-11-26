@@ -7,7 +7,8 @@
 //! relay skipped for its rate limit or its credential reads as `Deferred` rather than `Transient`
 //! (it is the relay's trouble, so a campaign message spends no attempt on it). The outcome
 //! [`submit`] returns has the recipient's address taken out of its text, because every sender
-//! stores that text.
+//! stores that text. An [`Outcome::Bounced`] (M2d) is decided like a `Failed` and returns at once:
+//! the next relay would refuse the same mailbox.
 //!
 //! **The rule [`submit`] keeps: a send is covered by a token taken from the relay it goes through.**
 //! The tick spends on the first relay with tokens, while `submit` sends through the first relay
@@ -179,6 +180,7 @@ fn redacted(o: Outcome, envelope: &Envelope) -> Outcome {
         },
         Outcome::Transient(t) => Outcome::Transient(r(t)),
         Outcome::Failed(t) => Outcome::Failed(r(t)),
+        Outcome::Bounced(t) => Outcome::Bounced(r(t)),
         Outcome::Unknown(t) => Outcome::Unknown(r(t)),
         Outcome::Deferred { reason, cool_down } => Outcome::Deferred {
             reason: r(reason),

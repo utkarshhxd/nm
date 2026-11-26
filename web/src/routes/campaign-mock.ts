@@ -54,7 +54,7 @@ const invalid = (errors: { field: string; message: string }[]) => ({
 const present = (vs: { subject: string; template_id: string; from_name?: string | null }[]) =>
   vs.map((v) => ({ ...v, from_name: v.from_name ?? null }));
 
-const NONE = { total: 0, queued: 0, sent: 0, failed: 0, unknown: 0, skipped: 0 };
+const NONE = { total: 0, queued: 0, sent: 0, failed: 0, bounced: 0, unknown: 0, skipped: 0 };
 
 /** A fresh draft, as `POST /campaigns` makes one. Tests use it to build seeds. */
 export function blankCampaign(ws: string, over: Partial<Campaign> & { name: string }): Campaign {

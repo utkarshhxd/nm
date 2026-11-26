@@ -25,6 +25,7 @@ use common::{
 use nm::{
     campaign::{
         launch::{self, LAUNCH_KIND},
+        queue,
         send::{CampaignWorker, States},
     },
     config::Config,
@@ -1277,7 +1278,7 @@ async fn a_refusal_that_quotes_the_recipient_is_stored_without_the_address(pool:
     )
     .await;
     let error = error.expect("the refusal is on the row");
-    assert_eq!(status, "failed");
+    assert_eq!(status, "bounced", "a 5.1.1 is a hard bounce since M2d");
     holds_no_address(&error, "quoted-1@dest.test");
     assert!(
         error.contains("<recipient>: Recipient address rejected (<recipient>)"),
@@ -1338,6 +1339,135 @@ async fn a_test_send_refusal_that_quotes_the_recipient_is_stored_without_the_add
         why.contains("<recipient>: Recipient address rejected (<recipient>)"),
         "{why}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spec M2d §4.5: the send-time hard bounce.
+
+/// Acceptance: a sink answering `550 5.1.1` leaves the message `bounced`, the address suppressed
+/// with reason `bounced`, the campaign finished, and the next campaign on the list skipping that
+/// contact. The stored refusal does not hold the address.
+#[sqlx::test]
+async fn a_550_naming_the_mailbox_bounces_and_suppresses_the_address(pool: PgPool) {
+    let f = fx(
+        &pool,
+        Script::Smtp(AfterData::Reply(
+            "550 5.1.1 <dead@example.test>: no such user",
+        )),
+    )
+    .await;
+    let contact = Uuid::now_v7();
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name)
+         values ($1, $2, 'dead@example.test', 'Dee')",
+    )
+    .bind(contact)
+    .bind(f.ws)
+    .execute(&pool)
+    .await
+    .expect("contact");
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status)
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(f.ws)
+    .bind(contact)
+    .bind(f.list)
+    .execute(&pool)
+    .await
+    .expect("membership");
+
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+
+    assert_eq!(f.sink.delivered(), 1, "the premise: the relay read it");
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("select status, error from messages where campaign_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "bounced");
+    holds_no_address(
+        &error.expect("the refusal is on the row"),
+        "dead@example.test",
+    );
+    let reasons: Vec<String> = sqlx::query_scalar(
+        "select reason from suppressions where workspace_id = $1 and email = 'dead@example.test'",
+    )
+    .bind(f.ws)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reasons, ["bounced"]);
+    assert_eq!(f.state(id).await, "sent");
+
+    // The next campaign on the same list: its batch check drops the contact.
+    let (next, message) = (Uuid::now_v7(), Uuid::now_v7());
+    sqlx::query(
+        "insert into campaigns (id, workspace_id, name, list_ids) values ($1, $2, 'next', $3)",
+    )
+    .bind(next)
+    .bind(f.ws)
+    .bind(vec![f.list])
+    .execute(&pool)
+    .await
+    .expect("the next campaign");
+    sqlx::query(
+        "insert into messages (id, workspace_id, campaign_id, contact_id) values ($1, $2, $3, $4)",
+    )
+    .bind(message)
+    .bind(f.ws)
+    .bind(next)
+    .bind(contact)
+    .execute(&pool)
+    .await
+    .expect("its message");
+    assert!(
+        queue::eligible(&pool, &[message]).await.unwrap().is_empty(),
+        "the next campaign would mail an address that bounced"
+    );
+}
+
+/// A 4xx and a 5xx naming no mailbox suppress nothing: the 4xx is retried, a policy refusal and a
+/// bare `550` are `failed`. Each refusal is a sink of its own, which the relay is pointed at.
+#[sqlx::test]
+async fn a_4xx_and_an_unnamed_5xx_suppress_nothing(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("451 4.1.1 later"))).await;
+    f.contacts(1, "reader").await;
+    let first = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let (_, status, attempts) = f.messages(first).await["reader-1@dest.test"].clone();
+    assert_eq!((status.as_str(), attempts), ("queued", 1));
+    // Out of the way: its retry falls due within the test, at whichever sink is current then.
+    sqlx::query("update campaigns set state = 'cancelled' where id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for refusal in ["554 5.7.1 spam", "550 no such user"] {
+        let sink = Sink::start(Script::Smtp(AfterData::Reply(refusal))).await;
+        sqlx::query("update relays set port = $2 where id = $1")
+            .bind(f.relay)
+            .bind(i32::from(sink.addr.port()))
+            .execute(&pool)
+            .await
+            .expect("point the relay at the next sink");
+        let id = f.launched().await;
+        f.send_all(&f.worker(1)).await;
+        assert_eq!(sink.delivered(), 1, "the premise: the relay read it");
+        assert_eq!(
+            f.statuses(id).await,
+            BTreeMap::from([("failed".to_owned(), 1)]),
+            "{refusal}"
+        );
+    }
+    let suppressed: i64 = sqlx::query_scalar("select count(*) from suppressions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(suppressed, 0);
 }
 
 // ---------------------------------------------------------------------------------------------

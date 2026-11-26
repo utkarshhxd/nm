@@ -1792,6 +1792,11 @@ export interface components {
         };
         /** @description Contract section 2. `queued` is what is left: in flight included. */
         CampaignCounts: {
+            /**
+             * Format: int64
+             * @description Refused by the relay as a mailbox or domain that does not exist; the address is suppressed.
+             */
+            bounced: number;
             /** Format: int64 */
             failed: number;
             /** Format: int64 */

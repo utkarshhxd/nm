@@ -2174,13 +2174,13 @@ async fn an_outcome_flush_and_a_pause_do_not_deadlock(pool: PgPool) {
 
         let held = wedge_campaign(&pool, campaign).await;
         let flush = {
-            let pool = pool.clone();
+            let (pool, secrets) = (pool.clone(), std::sync::Arc::clone(&fx.app.state.secrets));
             async move {
                 let sent = nm::campaign::queue::Verdict::Sent {
                     relay: Uuid::now_v7(),
                     response: "250 2.0.0 Ok".to_owned(),
                 };
-                nm::campaign::queue::record(&pool, &[(m, sent)]).await
+                nm::campaign::queue::record(&pool, &secrets, &[(m, sent)]).await
             }
         };
         let pause = {
@@ -2260,13 +2260,13 @@ async fn an_outcome_flush_and_a_sweep_of_the_same_message_count_it_once(pool: Pg
 
         let held = wedge_campaign(&pool, campaign).await;
         let flush = {
-            let pool = pool.clone();
+            let (pool, secrets) = (pool.clone(), std::sync::Arc::clone(&fx.app.state.secrets));
             async move {
                 let sent = nm::campaign::queue::Verdict::Sent {
                     relay: Uuid::now_v7(),
                     response: "250 2.0.0 Ok".to_owned(),
                 };
-                nm::campaign::queue::record(&pool, &[(m, sent)]).await
+                nm::campaign::queue::record(&pool, &secrets, &[(m, sent)]).await
             }
         };
         let sweep = {
@@ -2352,6 +2352,181 @@ async fn two_sweeps_at_once_fail_each_exhausted_message_once(pool: PgPool) {
         ("sent", 0, 3, 0, 0),
         "each message failed once, and the campaign finished"
     );
+}
+
+// ---- M2d: the bounce flush, which takes both families -------------------------------------------
+//
+// A flush carrying a bounce takes the address family first (`A`, then `S`) and the campaign family
+// after it (`messages`, then `campaigns`), in one transaction (ADR 0005, "M2d: the two families").
+// Each test wedges the address lock in a third transaction, so both contenders wait at the very
+// start, and releases it with the first arrival at the head of the queue.
+
+/// A hard bounce for `email`, as the send loop records one.
+fn bounce(email: &str) -> nm::campaign::queue::Verdict {
+    nm::campaign::queue::Verdict::Bounced {
+        reason: "permanent error (550): 5.1.1 <recipient>: no such user".to_owned(),
+        email: email.to_owned(),
+    }
+}
+
+/// The advisory lock `suppressions::lock_address` takes for `email`, held until the transaction
+/// this returns ends.
+async fn wedge_address(
+    pool: &PgPool,
+    secrets: &nm::crypto::secrets::Secrets,
+    email: &str,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let hmac = nm::crypto::suppression_hmac(secrets, email);
+    let key = i64::from_be_bytes(hmac[..8].try_into().expect("32 bytes"));
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *held)
+        .await
+        .expect("wedge the address lock");
+    held
+}
+
+/// **Two flushes bouncing the same two addresses in opposite orders** (spec M2d Review Focus 5).
+/// `suppressions::record_bounces` is the first path to take the address lock for many addresses in
+/// one transaction, and the order it takes them in is all that keeps this pair from cycling. A
+/// third transaction holds X's lock; flush 1 bounces `[X, Y]` and flush 2 `[Y, X]`; both wait; the
+/// wedge goes. Both must commit, each address is suppressed once and every message is counted.
+///
+/// Red-first by dropping the sort: flush 2 then holds Y while it waits on X, flush 1 is granted X
+/// first and asks for Y, and Postgres aborts one side with `40P01`.
+#[sqlx::test]
+async fn two_flushes_bouncing_the_same_addresses_in_opposite_orders_both_commit(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _) = fixture(&pool, &[]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let secrets = std::sync::Arc::clone(&fx.app.state.secrets);
+    let (x, y) = ("x@example.com", "y@example.com");
+
+    let campaign = resolved_campaign(&pool, fx.workspace, 4).await;
+    let mut flushes = Vec::new();
+    for order in [[x, y], [y, x]] {
+        let mut outcomes = Vec::new();
+        for email in order {
+            let m = held_message(&pool, fx.workspace, campaign, "1 minute").await;
+            outcomes.push((m, bounce(email)));
+        }
+        flushes.push(outcomes);
+    }
+
+    let held = wedge_address(&pool, &secrets, x).await;
+    let mut running = Vec::new();
+    for (waiting, outcomes) in (1..).zip(flushes) {
+        let (pool, secrets) = (pool.clone(), std::sync::Arc::clone(&secrets));
+        running.push(tokio::spawn(async move {
+            nm::campaign::queue::record(&pool, &secrets, &outcomes).await
+        }));
+        settle(&mut probe, waiting).await;
+    }
+    held.commit().await.expect("release the wedge");
+    for (i, flush) in running.into_iter().enumerate() {
+        let flushed = flush.await.expect("the flush task");
+        assert!(flushed.is_ok(), "flush {i}: {flushed:?}");
+    }
+
+    let (state, bounced): (String, i64) =
+        sqlx::query_as("select state, bounced from campaigns where id = $1")
+            .bind(campaign)
+            .fetch_one(&pool)
+            .await
+            .expect("campaign row");
+    assert_eq!((state.as_str(), bounced), ("sent", 4));
+    let rows: i64 = sqlx::query_scalar(
+        "select count(*) from suppressions where workspace_id = $1 and reason = 'bounced'",
+    )
+    .bind(fx.workspace)
+    .fetch_one(&pool)
+    .await
+    .expect("suppressions");
+    assert_eq!(rows, 2, "each address is suppressed once");
+}
+
+/// **A bounce flush and a one-click for the same address, in both arrival orders** (spec M2d
+/// Review Focus 5). Both take the address lock and then write that address's `suppressions` row,
+/// so they queue on the lock, and the second finds the first's row and keeps it (issues/27).
+///
+/// Red-first by a flush that writes its suppression before it takes the lock: with the one-click
+/// first in the queue, the one-click is granted the lock and then waits on the flush's uncommitted
+/// row, which is waiting on the lock — `40P01`. Only that arrival order cycles, which is the reason
+/// both are run.
+#[sqlx::test]
+async fn a_bounce_flush_and_a_one_click_for_the_same_address_both_commit(pool: PgPool) {
+    let _gate = GATE.acquire().await.expect("the concurrency gate");
+    let pool = own_pool(&pool).await;
+    let (fx, _) = fixture(&pool, &["news"]).await;
+    let mut probe = pool.acquire().await.expect("a probe connection");
+    let secrets = std::sync::Arc::clone(&fx.app.state.secrets);
+    let link = fx.unsub();
+
+    for flush_first in [true, false] {
+        sqlx::query("delete from suppressions where workspace_id = $1")
+            .bind(fx.workspace)
+            .execute(&pool)
+            .await
+            .expect("a fresh address");
+        let campaign = resolved_campaign(&pool, fx.workspace, 1).await;
+        let m = held_message(&pool, fx.workspace, campaign, "1 minute").await;
+        let id = m.id;
+
+        let held = wedge_address(&pool, &secrets, "ada@example.com").await;
+        let flush = {
+            let (pool, secrets) = (pool.clone(), std::sync::Arc::clone(&secrets));
+            async move {
+                nm::campaign::queue::record(&pool, &secrets, &[(m, bounce("ada@example.com"))])
+                    .await
+            }
+        };
+        let one_click = {
+            let app = TestApp::new(pool.clone()).await;
+            let path = format!("/u/{link}");
+            async move { app.post(&path).text(ONE_CLICK).await }
+        };
+        let (flush, one_click) = if flush_first {
+            let f = tokio::spawn(flush);
+            settle(&mut probe, 1).await;
+            let o = tokio::spawn(one_click);
+            settle(&mut probe, 2).await;
+            (f, o)
+        } else {
+            let o = tokio::spawn(one_click);
+            settle(&mut probe, 1).await;
+            let f = tokio::spawn(flush);
+            settle(&mut probe, 2).await;
+            (f, o)
+        };
+
+        held.commit().await.expect("release the wedge");
+        let flushed = flush.await.expect("the flush task");
+        assert!(flushed.is_ok(), "flush_first {flush_first}: {flushed:?}");
+        no_server_error(
+            "the one-click",
+            &one_click.await.expect("the one-click task"),
+        );
+        assert_eq!(message_status(&pool, id).await, "bounced");
+        let reasons: Vec<String> = sqlx::query_scalar(
+            "select reason from suppressions where workspace_id = $1 and lifted_at is null",
+        )
+        .bind(fx.workspace)
+        .fetch_all(&pool)
+        .await
+        .expect("suppressions");
+        let first = if flush_first {
+            "bounced"
+        } else {
+            "unsubscribed_all"
+        };
+        assert_eq!(
+            reasons,
+            [first],
+            "the first arrival's row is the only one (flush_first: {flush_first})"
+        );
+    }
 }
 
 // ---- Migration bytes: the issues/40 guard ------------------------------------------------------

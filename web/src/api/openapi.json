@@ -6908,10 +6908,16 @@
           "queued",
           "sent",
           "failed",
+          "bounced",
           "unknown",
           "skipped"
         ],
         "properties": {
+          "bounced": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Refused by the relay as a mailbox or domain that does not exist; the address is suppressed."
+          },
           "failed": {
             "type": "integer",
             "format": "int64"

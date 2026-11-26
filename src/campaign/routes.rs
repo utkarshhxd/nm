@@ -523,6 +523,7 @@ struct SummaryRow {
     total: i64,
     sent: i64,
     failed: i64,
+    bounced: i64,
     unknown: i64,
     skipped: i64,
     updated_at: chrono::DateTime<Utc>,
@@ -552,7 +553,8 @@ pub async fn list_campaigns(
     };
     let limit = page.limit();
     let rows = sqlx::query_as::<_, SummaryRow>(
-        "select id, name, state, send_at, total, sent, failed, unknown, skipped, updated_at \
+        "select id, name, state, send_at, total, sent, failed, bounced, unknown, skipped, \
+         updated_at \
          from campaigns where workspace_id = $1 and ($2::uuid is null or id < $2) \
          order by id desc limit $3",
     )
@@ -568,7 +570,7 @@ pub async fn list_campaigns(
             name: r.name,
             state: r.state,
             send_at: r.send_at,
-            counts: CampaignCounts::new(r.total, r.sent, r.failed, r.unknown, r.skipped),
+            counts: CampaignCounts::new(r.total, r.sent, r.failed, r.bounced, r.unknown, r.skipped),
             updated_at: r.updated_at,
         })
         .collect();

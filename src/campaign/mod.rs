@@ -119,6 +119,7 @@ pub struct Campaign {
     pub total: i64,
     pub sent: i64,
     pub failed: i64,
+    pub bounced: i64,
     pub unknown: i64,
     pub skipped: i64,
     pub failure_reason: Option<String>,
@@ -135,7 +136,7 @@ macro_rules! columns {
         "id, workspace_id, name, state, list_ids, segment_id, sending_domain_id, from_local_part, \
          from_name, reply_to, variants, ab_test_percent, winner, schedule_mode, schedule_zone, \
          schedule_local, send_at, launch_job_id, phase, resolve_cursor, resolved, frozen_at, \
-         total, sent, failed, unknown, skipped, failure_reason, pause_reason, created_at, \
+         total, sent, failed, bounced, unknown, skipped, failure_reason, pause_reason, created_at, \
          updated_at, launched_at, finished_at"
     };
 }
@@ -180,17 +181,27 @@ pub struct CampaignCounts {
     pub queued: i64,
     pub sent: i64,
     pub failed: i64,
+    /// Refused by the relay as a mailbox or domain that does not exist; the address is suppressed.
+    pub bounced: i64,
     pub unknown: i64,
     pub skipped: i64,
 }
 
 impl CampaignCounts {
-    pub fn new(total: i64, sent: i64, failed: i64, unknown: i64, skipped: i64) -> CampaignCounts {
+    pub fn new(
+        total: i64,
+        sent: i64,
+        failed: i64,
+        bounced: i64,
+        unknown: i64,
+        skipped: i64,
+    ) -> CampaignCounts {
         CampaignCounts {
             total,
-            queued: (total - sent - failed - unknown - skipped).max(0),
+            queued: (total - sent - failed - bounced - unknown - skipped).max(0),
             sent,
             failed,
+            bounced,
             unknown,
             skipped,
         }
@@ -273,6 +284,7 @@ impl Campaign {
             self.total,
             self.sent,
             self.failed,
+            self.bounced,
             self.unknown,
             self.skipped,
         )

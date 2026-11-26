@@ -68,7 +68,7 @@ async fn send_to(script: Script) -> Outcome {
 fn text(outcome: &Outcome) -> &str {
     match outcome {
         Outcome::Sent { response } => response,
-        Outcome::Transient(s) | Outcome::Failed(s) | Outcome::Unknown(s) => s,
+        Outcome::Transient(s) | Outcome::Failed(s) | Outcome::Bounced(s) | Outcome::Unknown(s) => s,
         Outcome::Deferred { reason, .. } => reason,
     }
 }
@@ -96,15 +96,32 @@ async fn a_451_is_transient() {
     assert!(text(&outcome).contains("try again later"), "{outcome:?}");
 }
 
+/// Spec M2d §4.5.1: a 5xx whose enhanced code names the recipient's mailbox is a hard bounce, and
+/// the relay's words are kept.
 #[tokio::test]
-async fn a_550_is_failed() {
+async fn a_550_naming_the_mailbox_is_bounced() {
     let outcome = send_to(Script::Smtp(AfterData::Reply(
         "550 5.1.1 no such user here",
     )))
     .await;
-    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert!(matches!(outcome, Outcome::Bounced(_)), "{outcome:?}");
     assert!(text(&outcome).contains("550"), "{outcome:?}");
     assert!(text(&outcome).contains("no such user here"), "{outcome:?}");
+}
+
+/// Every other 5xx stays `Failed`: a policy refusal is not a fact about the mailbox.
+#[tokio::test]
+async fn a_550_naming_no_mailbox_is_failed() {
+    let outcome = send_to(Script::Smtp(AfterData::Reply("554 5.7.1 rejected as spam"))).await;
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert!(text(&outcome).contains("rejected as spam"), "{outcome:?}");
+}
+
+/// A 4xx is never a bounce, whatever its enhanced code.
+#[tokio::test]
+async fn a_451_naming_the_mailbox_is_still_transient() {
+    let outcome = send_to(Script::Smtp(AfterData::Reply("451 4.1.1 try later"))).await;
+    assert!(matches!(outcome, Outcome::Transient(_)), "{outcome:?}");
 }
 
 /// OCI Email Delivery answers `455` when the account is over its rate (spec M2c §4.7.4). That is the
