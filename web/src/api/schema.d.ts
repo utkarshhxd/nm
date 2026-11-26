@@ -1372,8 +1372,9 @@ export interface paths {
          * The HTML part, the plain-text part and the advisory findings, for a sample contact.
          * @description With `tree` or `source` in the body this previews UNSAVED work: the document is compiled fresh
          *     against the brand kit and the field definitions as they are now, and nothing is written. With
-         *     an empty body it previews what is stored — the same marked renditions a send would substitute
-         *     into, which is the only way an operator sees what will actually go out.
+         *     an empty body it previews what is stored, recompiled in memory — and still not written — when a
+         *     brand kit or renderer change has made it stale. The system footer is not shown here: it is part
+         *     of a campaign's send rendition, which the campaign preview shows.
          */
         post: operations["preview_template"];
         delete?: never;
@@ -8241,7 +8242,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description template-stale: the stored renditions were built from a different document, brand kit or renderer version, or against custom fields that have since changed. Save the template again. */
+            /** @description template-stale: the stored renditions were built against custom fields that have since changed type or been purged, or cannot be read. Save the template again. A brand kit or renderer change is not a 409: the template is recompiled for the preview and nothing is written. */
             409: {
                 headers: {
                     [name: string]: unknown;

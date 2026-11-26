@@ -37,6 +37,9 @@ const ONE_CLICK: &str = "List-Unsubscribe=One-Click";
 pub const SIGNED_HEADERS: &[&str] = &[
     "From",
     "To",
+    // Spec §4.6. Absent from a message that has none, and `dkim::signed_fields` then leaves it out
+    // of `h=` rather than signing it as empty.
+    "Reply-To",
     "Subject",
     "Date",
     "Message-ID",
@@ -79,6 +82,10 @@ pub struct Outgoing<'a> {
     pub unsubscribe_url: &'a url::Url,
     pub feedback_id: &'a str,
     pub message_id_domain: &'a str,
+    pub reply_to: Option<&'a str>,
+    /// `Message-ID: <{message_id.simple()}@{message_id_domain}>`. A campaign message passes its
+    /// `messages.id`, so a bounce can be traced back to the row (spec §4.6).
+    pub message_id: Uuid,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -133,14 +140,16 @@ pub fn build(o: &Outgoing) -> Result<Message, MailError> {
     let from = Mailbox::new(o.from_name.map(str::to_owned), address("sender", o.from)?);
     let to = Mailbox::new(None, address("recipient", o.to)?);
 
-    let builder = Message::builder()
-        .from(from)
-        .to(to)
+    let mut builder = Message::builder().from(from).to(to);
+    if let Some(r) = o.reply_to {
+        builder = builder.reply_to(Mailbox::new(None, address("reply-to", r)?));
+    }
+    let builder = builder
         .subject(o.subject)
         .date_now()
         .message_id(Some(format!(
             "<{}@{}>",
-            Uuid::now_v7().simple(),
+            o.message_id.simple(),
             o.message_id_domain
         )))
         .header(ListUnsubscribeHeader(format!("<{}>", o.unsubscribe_url)))
@@ -175,6 +184,8 @@ mod tests {
             unsubscribe_url,
             feedback_id: "camp1:list1:nm",
             message_id_domain: "send.example.test",
+            reply_to: None,
+            message_id: Uuid::nil(),
         }
     }
 
@@ -251,28 +262,47 @@ mod tests {
     #[test]
     fn every_signed_header_is_on_the_wire() {
         let u = url();
-        let w = wire(&outgoing(&u));
+        let mut o = outgoing(&u);
+        o.reply_to = Some("replies@brand.test");
+        let w = wire(&o);
         for h in SIGNED_HEADERS {
             assert!(header(&w, h).is_some(), "{h} is signed but not sent:\n{w}");
         }
     }
 
+    /// The id a caller passes is the id on the wire, on the sending domain: a campaign passes its
+    /// `messages.id`, and a bounce is matched back to the row by it.
     #[test]
-    fn message_id_is_on_the_sending_domain() {
+    fn the_message_id_is_the_one_asked_for() {
         let u = url();
-        let o = outgoing(&u);
-        let (a, b) = (wire(&o), wire(&o));
-        let id = |w: &str| header(w, "Message-ID").unwrap();
-        let (ida, idb) = (id(&a), id(&b));
-        let inner = ida
-            .strip_prefix('<')
-            .and_then(|s| s.strip_suffix('>'))
-            .expect(&ida);
-        let (lhs, rhs) = inner.split_once('@').unwrap();
-        assert_eq!(rhs, "send.example.test");
-        assert!(!lhs.is_empty());
-        let lhs_b = idb.trim_matches(['<', '>']).split_once('@').unwrap().0;
-        assert_ne!(lhs, lhs_b);
+        let mut o = outgoing(&u);
+        let id = Uuid::now_v7();
+        o.message_id = id;
+        assert_eq!(
+            header(&wire(&o), "Message-ID"),
+            Some(format!("<{}@send.example.test>", id.simple()))
+        );
+    }
+
+    #[test]
+    fn reply_to_is_on_the_wire_and_in_signed_headers() {
+        let u = url();
+        let mut o = outgoing(&u);
+        assert!(header(&wire(&o), "Reply-To").is_none(), "none asked for");
+        o.reply_to = Some("replies@brand.test");
+        let w = wire(&o);
+        assert_eq!(
+            header(&w, "Reply-To").as_deref(),
+            Some("replies@brand.test"),
+            "{w}"
+        );
+        assert!(SIGNED_HEADERS.contains(&"Reply-To"));
+        // It is an address, parsed like the other two, so a line break cannot ride in on it.
+        o.reply_to = Some("a@b.test\r\nBcc: x@y.test");
+        assert!(matches!(
+            build(&o),
+            Err(MailError::InvalidAddress("reply-to"))
+        ));
     }
 
     #[test]

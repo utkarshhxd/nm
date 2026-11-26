@@ -530,7 +530,7 @@ async fn a_field_kind_change_after_compile_is_detected_not_mis_rendered(pool: Pg
 }
 
 #[sqlx::test]
-async fn a_bogus_marker_format_version_is_refused(pool: PgPool) {
+async fn a_stored_rendition_in_another_marker_format_is_recompiled_not_read(pool: PgPool) {
     let t = tenant(&pool, "acme").await;
     let id = create(&t, "t", doc("{{ first_name }}")).await;
     preview_stored(&t, id).await.assert_status_ok();
@@ -543,12 +543,21 @@ async fn a_bogus_marker_format_version_is_refused(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
+    let before = compiled_column(&pool, id).await;
 
-    // Not guessed at: a boundary marker read as a field marker drops the wrong range of a
-    // message, silently.
+    // Not guessed at — a boundary marker read as a field marker drops the wrong range of a
+    // message, silently — but compiled again from the authored document (issue 49), in memory.
     let r = preview_stored(&t, id).await;
-    r.assert_status(StatusCode::CONFLICT);
-    assert!(r.text().contains("marker format 99"), "{}", r.text());
+    r.assert_status_ok();
+    assert!(
+        r.json::<serde_json::Value>()["html"]
+            .as_str()
+            .unwrap()
+            .contains("Sam"),
+        "{}",
+        r.text()
+    );
+    assert_eq!(compiled_column(&pool, id).await, before, "nothing written");
 }
 
 #[sqlx::test]
@@ -586,12 +595,15 @@ async fn an_over_deep_stored_ast_is_refused(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
-async fn changing_the_brand_kit_alone_invalidates_the_stored_renditions(pool: PgPool) {
-    let t = tenant(&pool, "acme").await;
-    let id = create(&t, "t", doc("{{ first_name }}")).await;
-    preview_stored(&t, id).await.assert_status_ok();
+async fn compiled_column(pool: &PgPool, id: Uuid) -> serde_json::Value {
+    sqlx::query_scalar("select compiled from templates where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("compiled")
+}
 
+async fn paint_the_kit(t: &Tenant) {
     t.admin
         .put(&kit_path(t.id))
         .json(&json!({
@@ -602,21 +614,58 @@ async fn changing_the_brand_kit_alone_invalidates_the_stored_renditions(pool: Pg
         }))
         .await
         .assert_status_ok();
+}
 
-    // The kit is emitted into the MJML the classifier ran over, so the stored classification now
-    // describes a document this template no longer produces. A stale classification is a
-    // security bug, not a cache miss.
+/// Issue 49. The kit is emitted into the MJML the classifier ran over, so a kit edit leaves the
+/// stored classification describing a document this template no longer produces — and the answer
+/// is to recompile, in memory, never to serve the stale one and never to write the new one back.
+#[sqlx::test]
+async fn previewing_a_stored_template_after_a_brand_kit_edit_is_200(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(
+        &t,
+        "t",
+        json!({"blocks": [{"type": "Button", "label": "Go", "href": "https://x.example/"}]}),
+    )
+    .await;
+    preview_stored(&t, id).await.assert_status_ok();
+    let before = compiled_column(&pool, id).await;
+
+    paint_the_kit(&t).await;
+
+    let r = preview_stored(&t, id).await;
+    r.assert_status_ok();
+    let html = r.json::<serde_json::Value>()["html"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(html.contains("#ff0000"), "the kit as it is now: {html}");
+    assert_eq!(
+        compiled_column(&pool, id).await,
+        before,
+        "a preview writes no row, the recompile included"
+    );
+}
+
+/// Issue 49's line: a kit edit is recompiled, a field-kind change is not, and having both is the
+/// second. A recompile would re-read every tag against the new kind without anyone looking.
+#[sqlx::test]
+async fn previewing_a_stored_template_after_a_field_kind_change_is_still_409(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    custom_field(&pool, t.id, "colour", "Teal", "text").await;
+    let id = create(&t, "t", doc("{{ colour }}")).await;
+    paint_the_kit(&t).await;
+    sqlx::query("update custom_fields set kind = 'select', options = $2 where workspace_id = $1")
+        .bind(t.id)
+        .bind(json!(["a"]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let r = preview_stored(&t, id).await;
     r.assert_status(StatusCode::CONFLICT);
     assert!(r.text().contains("template-stale"), "{}", r.text());
-
-    // Saving the template again compiles it against the kit as it is now.
-    t.editor
-        .patch(&template_path(t.id, id))
-        .json(&json!({"name": "t"}))
-        .await
-        .assert_status_ok();
-    preview_stored(&t, id).await.assert_status_ok();
+    assert!(r.text().contains("colour"), "names the field: {}", r.text());
 }
 
 #[sqlx::test]
@@ -1100,20 +1149,16 @@ async fn a_stored_template_may_be_resaved_while_it_still_names_an_archived_field
     let id = create(&t, "t", doc("{{ colour }}")).await;
     archive_fields(&pool, t.id).await;
 
-    // An admin edits the brand kit, which is the ordinary way a fingerprint moves.
-    t.admin
-        .put(&kit_path(t.id))
-        .json(&json!({"logo_url": null, "palette": {"accent": "#ff0000"},
-                      "font_stack": null, "footer": {}}))
-        .await
-        .assert_status_ok();
+    // An admin edits the brand kit, which is the ordinary way a fingerprint moves. The preview's
+    // in-memory recompile keeps the archived reference the stored version had, exactly as a save
+    // does; without that it would 422 on a template nobody touched.
+    paint_the_kit(&t).await;
     let r = preview_stored(&t, id).await;
-    r.assert_status(StatusCode::CONFLICT);
-    assert!(r.text().contains("save it again"), "{}", r.text());
+    r.assert_status_ok();
+    assert!(r.text().contains("archived_field"), "{}", r.text());
 
-    // THE CURE THE 409 NAMES MUST WORK. Before this, the save refused the tag the stored version
-    // already had, so the preview told the operator to do the one thing that 422s and the
-    // template could be neither previewed nor saved nor reached.
+    // A SAVE must work too. Before this, the save refused the tag the stored version already had,
+    // and the template could be neither previewed nor saved nor reached.
     t.editor
         .patch(&template_path(t.id, id))
         .json(&json!({"name": "t"}))

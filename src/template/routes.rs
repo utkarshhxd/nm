@@ -311,13 +311,14 @@ fn compile_error(e: CompileError, field: &'static str) -> ApiError {
     ApiError::Validation(vec![FieldError::new(field, e.to_string())])
 }
 
-/// A stored rendition that may not be used.
+/// A stored rendition that may not be used, and that `preview` does not recompile.
 ///
 /// Everything but a render failure is `409 template-stale`: the request was fine and the stored
 /// document is not, and the cure is always the same — open the template and save it, which
-/// compiles it again. It is never a silent recompile: an unrecognised marker format means the
-/// document has a shape this build does not speak, and guessing at it is how a conditional's
-/// boundary gets read as a field and the wrong range of a message is dropped.
+/// compiles it again. `Stale` and `MarkerFormat` never get here (issue 49): they are recompiled in
+/// memory from the authored document, never by guessing at the stored one — an unrecognised marker
+/// format is a shape this build does not speak, and reading it is how a conditional's boundary
+/// gets read as a field and the wrong range of a message is dropped.
 fn stale(e: StoredError) -> ApiError {
     match e {
         // Classification passed at save, so these mean the stored document is not the one that
@@ -757,8 +758,9 @@ pub async fn delete_template(
 ///
 /// With `tree` or `source` in the body this previews UNSAVED work: the document is compiled fresh
 /// against the brand kit and the field definitions as they are now, and nothing is written. With
-/// an empty body it previews what is stored — the same marked renditions a send would substitute
-/// into, which is the only way an operator sees what will actually go out.
+/// an empty body it previews what is stored, recompiled in memory — and still not written — when a
+/// brand kit or renderer change has made it stale. The system footer is not shown here: it is part
+/// of a campaign's send rendition, which the campaign preview shows.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/templates/{id}/preview",
@@ -772,9 +774,10 @@ pub async fn delete_template(
         (status = 200, description = "`html` is a whole document; `findings` is empty only when \
             the checks ran and found nothing.", body = PreviewResult),
         (status = 404, description = "not a member, or no such template in this workspace"),
-        (status = 409, description = "template-stale: the stored renditions were built from a \
-            different document, brand kit or renderer version, or against custom fields that have \
-            since changed. Save the template again."),
+        (status = 409, description = "template-stale: the stored renditions were built against \
+            custom fields that have since changed type or been purged, or cannot be read. Save the \
+            template again. A brand kit or renderer change is not a 409: the template is \
+            recompiled for the preview and nothing is written."),
         (status = 422, description = "the document does not compile, or the checks could not run"),
         (status = 429, description = "rate-limited: too many template previews for this \
             workspace. Its own budget, not the segment preview's."),
@@ -830,9 +833,14 @@ async fn preview(
         .as_ref()
         .map(stored_field_names)
         .unwrap_or_default();
-    let stored = if unsaved {
+    let fresh = || {
         super::compile(authoring.authored(), &brand, &defs, &keep)
-            .map_err(|e| compile_error(e, authoring.field()))?
+            .map_err(|e| compile_error(e, authoring.field()))
+    };
+    // The fingerprint of the document and the brand kit as they are NOW.
+    let key = super::fingerprint(authoring.authored(), &brand);
+    let stored = if unsaved {
+        fresh()?
     } else {
         let compiled = row
             .compiled
@@ -842,11 +850,21 @@ async fn preview(
                 detail: "this template has never been compiled. Open it and save it again."
                     .to_owned(),
             })?;
-        Stored::from_column(compiled).map_err(stale)?
+        // Issue 49: a rendition made stale by a kit edit or a renderer change is recompiled here,
+        // in memory, and NEVER written back — this handler writes no row. Field drift still
+        // refuses: it changes what a tag means, and `ready` answers it before `Stale`.
+        match Stored::from_column(compiled) {
+            Ok(s) => match s.ready(&key, &defs).map(|_| ()) {
+                Ok(()) => s,
+                Err(StoredError::Stale) => fresh()?,
+                Err(e) => return Err(stale(e)),
+            },
+            Err(StoredError::MarkerFormat { .. }) => fresh()?,
+            Err(e) => return Err(stale(e)),
+        }
     };
-    // The same gate a send goes through, on the same stored value: the fingerprint of the
-    // document and the brand kit as they are NOW, plus the field definitions as they are now.
-    let key = super::fingerprint(authoring.authored(), &brand);
+    // The same gate a send goes through: the key above, plus the field definitions as they are
+    // now.
     let rendered = stored
         .ready(&key, &defs)
         .map_err(stale)?
@@ -856,6 +874,8 @@ async fn preview(
             last_name: "Rivera",
             timezone: Some("UTC"),
             attributes: &sample(&defs),
+            // A template preview has no footer, so nothing reads this.
+            unsubscribe_token: "preview",
         })
         .map_err(stale)?;
 

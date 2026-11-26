@@ -34,6 +34,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
+use super::Authored;
 use super::block::{Block, Mark, Run};
 use super::render::{self, MARK_START, RenderError};
 use super::tag::{self, Node, Registry, TagError};
@@ -192,7 +193,7 @@ fn logo(raw: &str) -> Option<String> {
 // Emitting
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Ctx {
+pub(super) enum Ctx {
     Text,
     Attr,
 }
@@ -235,7 +236,7 @@ fn emit(s: &str, ctx: Ctx, out: &mut String) {
 ///
 /// `{` is escaped so that no literal can ever begin a `{{` that the compiler would pair with a
 /// `}}` in a different field, which is also what keeps typed tag syntax inert.
-fn literal(s: &str, ctx: Ctx, out: &mut String) {
+pub(super) fn literal(s: &str, ctx: Ctx, out: &mut String) {
     for c in s.chars() {
         match (c, ctx) {
             ('&', _) => out.push_str("&amp;"),
@@ -442,6 +443,14 @@ pub enum CompileError {
     ForgedMarker,
     #[error("the template could not be rendered as MJML: {0}")]
     Mjml(#[from] MjmlError),
+    /// A send rendition's footer would land inside something that is not markup: the document has
+    /// no `</body>` end tag and ends inside an unclosed comment, script, style, title or tag.
+    #[error(
+        "the template ends inside an unclosed comment, script, style, title or tag, so the \
+         unsubscribe link and postal address added at its end would be hidden; close it, or end \
+         the body with </body>"
+    )]
+    FooterHidden,
     /// [`RenderError::DangerousContext`] with its position translated back into the operator's own
     /// text. The raw position is a byte offset into **`mrml`'s output**, a document the operator
     /// has never seen, so a refusal carrying only that number is correct and unactionable — which
@@ -538,13 +547,31 @@ pub fn compile_blocks(
     // An invalid kit is an error, never a different email than the one configured: `to_mjml` would
     // drop a bad logo and swap a bad font for the default without a word.
     brand.validate()?;
-    compile(&to_mjml(blocks, brand), registry, true)
+    compile(&to_mjml(blocks, brand), registry, true, None)
 }
 
 /// Save a raw `mjml` template. Unlike a block template the operator writes the source directly and
 /// there is no `Run::Tag`, so the WHOLE source is scanned for merge tags.
 pub fn compile_mjml(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
-    compile(source, registry, true)
+    compile(source, registry, true, None)
+}
+
+/// Any kind, with `footer` — the system footer's template source — added to the HTML when given.
+/// The one entry `super::compile` and `super::compile_for_send` share.
+pub(super) fn compile_authored(
+    authored: Authored<'_>,
+    brand: &BrandKit,
+    registry: &Registry,
+    footer: Option<&str>,
+) -> Result<Compiled, CompileError> {
+    match authored {
+        Authored::Blocks(blocks) => {
+            brand.validate()?;
+            compile(&to_mjml(blocks, brand), registry, true, footer)
+        }
+        Authored::Mjml(source) => compile(source, registry, true, footer),
+        Authored::Html(source) => compile(source, registry, false, footer),
+    }
 }
 
 /// Save a raw `html` template: the same pipeline with the `mrml` step removed, because there is no
@@ -554,7 +581,7 @@ pub fn compile_mjml(source: &str, registry: &Registry) -> Result<Compiled, Compi
 /// marked document, substitute per contact — so a raw HTML template is not a second rendering
 /// model with its own escaping rules. `Compiled::html` here is the marked source itself.
 pub fn compile_html(source: &str, registry: &Registry) -> Result<Compiled, CompileError> {
-    compile(source, registry, false)
+    compile(source, registry, false, None)
 }
 
 fn has_literal_marker(nodes: &[Node]) -> bool {
@@ -567,10 +594,25 @@ fn has_literal_marker(nodes: &[Node]) -> bool {
     })
 }
 
-/// compile the tags -> mark -> `mrml` once (when `mjml`) -> classify. `source` is template source,
-/// not yet MJML: a tag's fallback literal can hold quotes that an attribute cannot.
-fn compile(source: &str, registry: &Registry, mjml: bool) -> Result<Compiled, CompileError> {
-    let nodes = tag::compile(source, registry).map_err(CompileError::Tag)?;
+/// compile the tags -> mark -> `mrml` once (when `mjml`) -> insert `footer` -> classify. `source`
+/// is template source, not yet MJML: a tag's fallback literal can hold quotes that an attribute
+/// cannot.
+///
+/// `footer` is compiled against `Registry::system_footer()`, so it is the only source that can
+/// name the unsubscribe slot, and its AST is appended to the operator's: its slots are numbered
+/// after the operator's, never in their range. Its marked HTML goes in AFTER `mrml` — so `mrml`
+/// cannot rewrite it — and BEFORE `classify`, so the footer is part of the classified document.
+fn compile(
+    source: &str,
+    registry: &Registry,
+    mjml: bool,
+    footer: Option<&str>,
+) -> Result<Compiled, CompileError> {
+    let mut nodes = tag::compile(source, registry).map_err(CompileError::Tag)?;
+    let operator = nodes.len();
+    if let Some(f) = footer {
+        nodes.extend(tag::compile(f, &Registry::system_footer()).map_err(CompileError::Tag)?);
+    }
     // Contract section 13: there is exactly one way to make a tag. A literal marker in template
     // text would alias to a real tag of the same index (a send printed a contact's name where the
     // operator typed text), which is the shortcut `render::MARK_START` documents and leaves to
@@ -580,8 +622,16 @@ fn compile(source: &str, registry: &Registry, mjml: bool) -> Result<Compiled, Co
     if has_literal_marker(&nodes) {
         return Err(CompileError::ForgedMarker);
     }
-    let (marked, count) = render::marked(&nodes);
-    let html = if mjml { render_mjml(&marked)? } else { marked };
+    // `marked` numbers slots in document order, so the operator's marked text is a prefix of the
+    // whole and the footer's is the rest, its indices already continuing from the operator's.
+    let (all, count) = render::marked(&nodes);
+    let (marked, slots) = render::marked(&nodes[..operator]);
+    let split = marked.len();
+    let mut html = if mjml { render_mjml(&marked)? } else { marked };
+    if footer.is_some() {
+        let at = super::footer::insertion_point(&html, slots)?;
+        html.insert_str(at, &all[split..]);
+    }
     if let Err(e) = render::classify(&html, count) {
         // The one refusal whose position means nothing to the operator. Falls back to the plain
         // message when the offset is not a marker start, rather than guessing at a tag.
@@ -685,6 +735,7 @@ mod tests {
             last_name: "",
             timezone: None,
             attributes: &attrs,
+            unsubscribe_token: "TOK",
         };
         render::substitute(&s.html, &s.nodes, &c).unwrap()
     }

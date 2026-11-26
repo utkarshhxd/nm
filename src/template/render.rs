@@ -198,29 +198,25 @@ pub struct Contact<'a> {
     pub timezone: Option<&'a str>,
     /// Custom field values by key, as the `contacts.attributes` column stores them.
     pub attributes: &'a Value,
-}
-
-impl<'a> From<&'a crate::contacts::Contact> for Contact<'a> {
-    fn from(c: &'a crate::contacts::Contact) -> Self {
-        Contact {
-            email: &c.email,
-            first_name: &c.first_name,
-            last_name: &c.last_name,
-            timezone: c.timezone.as_deref(),
-            attributes: &c.attributes,
-        }
-    }
+    /// This message's unsubscribe token, which fills the system footer's
+    /// [`UNSUBSCRIBE_TOKEN`](super::UNSUBSCRIBE_TOKEN) slot and nothing else: no operator registry
+    /// can name that slot. There is no `From<&contacts::Contact>`, because a default here would be
+    /// an unsubscribe link with no token in it, sent without a word.
+    pub unsubscribe_token: &'a str,
 }
 
 impl Contact<'_> {
     /// The value a tag names, or `None` when it is absent or empty — the two are the same thing to
     /// a template, and `{{^ x }}` has to agree with `{{ x | "…" }}` about which it is.
-    fn value(&self, key: &str) -> Option<String> {
+    pub(super) fn value(&self, key: &str) -> Option<String> {
         let v = match key {
             "email" => self.email.to_owned(),
             "first_name" => self.first_name.to_owned(),
             "last_name" => self.last_name.to_owned(),
             "timezone" => self.timezone.unwrap_or_default().to_owned(),
+            // Answered before `attributes`, so a contact value stored under this key never fills
+            // the slot.
+            super::UNSUBSCRIBE_TOKEN => self.unsubscribe_token.to_owned(),
             _ => match self.attributes.get(key)? {
                 Value::Array(a) => a.iter().filter_map(scalar).collect::<Vec<_>>().join(", "),
                 other => scalar(other)?,
@@ -320,14 +316,20 @@ fn fills(nodes: &[Node], c: &Contact<'_>) -> Vec<Fill> {
         .iter()
         .map(|slot| match slot {
             Slot::Field(n) => Fill::Value(field_value(n, c)),
-            Slot::Block(n) => Fill::Block(match n {
-                Node::Present { key, .. } => c.value(key).is_some(),
-                Node::Absent { key, .. } => c.value(key).is_none(),
-                Node::Equals { key, value, .. } => c.value(key).as_deref() == Some(value.as_str()),
-                Node::Text(_) | Node::Field { .. } => false,
-            }),
+            Slot::Block(n) => Fill::Block(branch_taken(n, c)),
         })
         .collect()
+}
+
+/// Whether this contact takes a conditional's branch. One definition, so a subject and a body
+/// cannot disagree about it.
+pub(super) fn branch_taken(n: &Node, c: &Contact<'_>) -> bool {
+    match n {
+        Node::Present { key, .. } => c.value(key).is_some(),
+        Node::Absent { key, .. } => c.value(key).is_none(),
+        Node::Equals { key, value, .. } => c.value(key).as_deref() == Some(value.as_str()),
+        Node::Text(_) | Node::Field { .. } => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -385,7 +387,7 @@ fn render_html(nodes: &[Node], contact: &Contact<'_>) -> Result<String, RenderEr
 }
 
 /// A field tag's value for this contact: the stored value through its filter, or the fallback.
-fn field_value(node: &Node, c: &Contact<'_>) -> Option<String> {
+pub(super) fn field_value(node: &Node, c: &Contact<'_>) -> Option<String> {
     let Node::Field {
         key,
         filter,
@@ -470,6 +472,14 @@ fn segments(s: &str) -> Vec<Seg<'_>> {
         out.push(Seg::Lit(rest));
     }
     out
+}
+
+/// The index of every marker in `s`, read exactly as [`classify`] reads one.
+pub(super) fn marker_indices(s: &str) -> impl Iterator<Item = usize> + '_ {
+    segments(s).into_iter().filter_map(|seg| match seg {
+        Seg::Mark(id, _) => Some(id),
+        Seg::Lit(_) => None,
+    })
 }
 
 /// The inside of a marker that has just had its `MARK_START` consumed: the index, which of the
@@ -740,6 +750,18 @@ fn url_parts(segs: &[Seg<'_>]) -> (Vec<(usize, Part)>, Option<String>) {
     }
     let scheme = (state != Part::Scheme && !scheme.is_empty()).then(|| scheme.to_ascii_lowercase());
     (parts, scheme)
+}
+
+/// The elements whose contents the tokenizer must be told to read as raw text, and how. A tokenizer
+/// has no tree builder to say so itself. Shared with `footer`, which must agree with this
+/// classifier about where markup is and where it is only text.
+pub(super) fn raw_kind(name: &str) -> Option<RawKind> {
+    match name {
+        "script" => Some(RawKind::ScriptData),
+        "style" | "xmp" | "iframe" | "noembed" | "noframes" => Some(RawKind::Rawtext),
+        "title" | "textarea" => Some(RawKind::Rcdata),
+        _ => None,
+    }
 }
 
 /// An attribute's site, by element and attribute name.
@@ -1080,14 +1102,14 @@ impl<'v> St<'v> {
         }
         self.out.push('>');
 
-        let (raw, feedback) = match name {
-            "script" => (Raw::Script, Some(RawKind::ScriptData)),
-            "style" => (Raw::Style, Some(RawKind::Rawtext)),
-            "xmp" | "iframe" | "noembed" | "noframes" => (Raw::Other, Some(RawKind::Rawtext)),
-            "title" | "textarea" => (Raw::Rcdata, Some(RawKind::Rcdata)),
-            _ => (Raw::Data, None),
+        let feedback = raw_kind(name);
+        self.raw = match feedback {
+            None => Raw::Data,
+            Some(RawKind::ScriptData) => Raw::Script,
+            Some(RawKind::Rcdata) => Raw::Rcdata,
+            Some(_) if name == "style" => Raw::Style,
+            Some(_) => Raw::Other,
         };
-        self.raw = raw;
         match feedback {
             Some(k) => TokenSinkResult::RawData(k),
             None => TokenSinkResult::Continue,
@@ -1548,6 +1570,7 @@ mod tests {
             last_name: "Lovelace",
             timezone: None,
             attributes: attrs,
+            unsubscribe_token: "TOK",
         }
     }
 
@@ -2269,6 +2292,7 @@ mod text_tests {
             last_name: "Lovelace",
             timezone: None,
             attributes: attrs,
+            unsubscribe_token: "TOK",
         }
     }
 

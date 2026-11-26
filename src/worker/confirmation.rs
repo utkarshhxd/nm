@@ -238,6 +238,8 @@ async fn attempt(ctx: &Ctx, job: &Claimed, paid_for: Option<Uuid>) -> Outcome {
         unsubscribe_url: &unsubscribe_url,
         feedback_id: &format!("confirmation:{list_id}:{}:nm", job.workspace_id),
         message_id_domain: &domain.domain,
+        reply_to: None,
+        message_id: Uuid::now_v7(),
     }) {
         Ok(message) => message,
         Err(e) => return Outcome::Failed(format!("the message could not be built: {e}")),
