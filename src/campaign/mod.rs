@@ -31,6 +31,7 @@ use crate::{
 
 pub mod launch;
 pub mod queue;
+pub mod report;
 pub mod routes;
 pub mod schedule;
 pub mod send;

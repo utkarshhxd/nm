@@ -34,7 +34,9 @@ use uuid::Uuid;
 use super::{
     Campaign, CampaignCounts, CampaignEstimate, CampaignPreview, CampaignSummary, CampaignView,
     Frozen, LOCAL_FORMAT, MAX_VARIANTS, Mode, Refusal, State as CampaignState, Variant,
-    frozen_usable, load, load_frozen, prepare, schedule,
+    frozen_usable, load, load_frozen, prepare,
+    report::{CampaignReport, report},
+    schedule,
 };
 use crate::{
     app::AppState,
@@ -70,6 +72,10 @@ pub fn routes() -> Router<AppState> {
             get(get_campaign)
                 .patch(update_campaign)
                 .delete(delete_campaign),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/campaigns/{id}/report",
+            get(report_campaign),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/campaigns/{id}/preview",
@@ -597,6 +603,29 @@ pub async fn get_campaign(
 ) -> ApiResult<Json<CampaignView>> {
     authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
     Ok(Json(load(&state.pool, workspace_id, id).await?.view()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/campaigns/{id}/report",
+    operation_id = "report_campaign",
+    params(
+        ("workspace_id" = Uuid, Path, description = "Workspace id"),
+        ("id" = Uuid, Path, description = "Campaign id"),
+    ),
+    responses(
+        (status = 200, body = CampaignReport),
+        (status = 404, description = "not a member, or no such campaign in this workspace"),
+    ),
+)]
+pub async fn report_campaign(
+    State(state): State<AppState>,
+    principal: Principal,
+    ApiPath((workspace_id, id)): ApiPath<(Uuid, Uuid)>,
+) -> ApiResult<Json<CampaignReport>> {
+    authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
+    let c = load(&state.pool, workspace_id, id).await?;
+    Ok(Json(report(&state.pool, &c).await?))
 }
 
 // ---------------------------------------------------------------------------------------------
