@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .merge(crate::sending_domains::routes::routes())
         .merge(crate::template::routes::routes())
         .merge(crate::brand::routes::routes())
+        .merge(crate::campaign::routes::routes())
         .merge(crate::audit::routes::routes())
         .merge(crate::consent::routes::routes())
         // The subscriber's pages, at top-level paths and with no session. Merged here like every

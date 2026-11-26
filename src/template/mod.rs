@@ -365,10 +365,10 @@ impl Ready<'_> {
         };
         if let Some(prefix) = &self.0.unsubscribe {
             let (in_text, in_html) = render::footer_link(prefix, contact.unsubscribe_token);
-            if !html.contains(&in_html) {
+            if !render::carries_link(&html, &in_html) {
                 return Err(StoredError::FooterLost("HTML"));
             }
-            if !text.contains(&in_text) {
+            if !render::carries_link(&text, &in_text) {
                 return Err(StoredError::FooterLost("plain-text"));
             }
         }
@@ -1089,6 +1089,74 @@ mod tests {
                 unsubscribe_token: "TOK",
             });
         assert_eq!(out.unwrap_err(), StoredError::FooterLost("HTML"));
+    }
+
+    /// R3 carry. A token that is the front of another recipient's token must not pass on that
+    /// other link: the stored footer is edited so its link runs on past the slot (`…/u/TOK` +
+    /// `EN2`), which is what a message for `TOKEN2` looks like to a check that only asks whether
+    /// `…/u/TOK` is somewhere in the part.
+    #[test]
+    fn a_token_that_is_the_front_of_another_tokens_link_is_not_the_link() {
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs()).expect("compiles");
+        let mut column = serde_json::to_value(&stored).expect("serialises");
+        let html = column["html"].as_str().expect("html");
+        let slot_end = format!("{}\"", render::MARK_END);
+        assert_eq!(html.matches(&slot_end).count(), 1, "one slot, then a quote");
+        column["html"] = json!(html.replace(&slot_end, &format!("{}EN2\"", render::MARK_END)));
+        let tampered = Stored::from_column(&column).expect("reads");
+        let attrs = json!({});
+        let render_for = |token: &str| {
+            tampered
+                .ready(tampered.fingerprint(), &defs())
+                .expect("ready")
+                .render(&Contact {
+                    email: "a@b.example",
+                    first_name: "Ada",
+                    last_name: "B",
+                    timezone: None,
+                    attributes: &attrs,
+                    unsubscribe_token: token,
+                })
+        };
+        // The link in the part is `…/u/TOKEN2`: it is TOKEN2's, so it is not TOK's.
+        assert_eq!(
+            render_for("TOK").unwrap_err(),
+            StoredError::FooterLost("HTML")
+        );
+        // Control: the rendition as compiled builds for the same token, so the refusal above is
+        // about the run-on and not about the token.
+        stored
+            .ready(stored.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "TOK",
+            })
+            .expect("the untampered message is built");
+    }
+
+    #[test]
+    fn a_link_ends_at_a_character_no_token_is_made_of() {
+        for (part, link, ok) in [
+            ("<a href=\"https://x/u/TOK\">", "https://x/u/TOK", true),
+            ("Unsubscribe: https://x/u/TOK", "https://x/u/TOK", true),
+            ("(https://x/u/TOK)", "https://x/u/TOK", true),
+            ("https://x/u/TOKEN2", "https://x/u/TOK", false),
+            ("https://x/u/TOK.sig", "https://x/u/TOK", false),
+            ("https://x/u/TOK%20", "https://x/u/TOK", false),
+            // The first match is a prefix of another link, the second is the real one.
+            (
+                "https://x/u/TOKEN2 and https://x/u/TOK",
+                "https://x/u/TOK",
+                true,
+            ),
+        ] {
+            assert_eq!(render::carries_link(part, link), ok, "{part}");
+        }
     }
 
     /// Review I2. An empty token is a dead link sent to every recipient without a word.

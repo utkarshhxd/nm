@@ -378,6 +378,20 @@ pub(super) fn footer_link(prefix: &str, token: &str) -> (String, String) {
     (text, html)
 }
 
+/// Whether `haystack` holds `link` as a whole link, not as the front of a longer one.
+///
+/// A plain substring test lets a token that is a prefix of another recipient's token pass on that
+/// other link. The character after the match must not be one a token is made of: a letter or
+/// digit, `-`, `.`, `_`, `~`, or the `%` that starts an escape. Anything else (a quote, a space,
+/// `)`, `<`, the end) ends the link. Wider than a real token's alphabet on purpose: it only has to
+/// refuse a continuation, never to accept a link a token could not have made.
+pub(super) fn carries_link(haystack: &str, link: &str) -> bool {
+    haystack.match_indices(link).any(|(at, _)| {
+        !haystack[at + link.len()..]
+            .starts_with(|c: char| c.is_ascii_alphanumeric() || "-._~%".contains(c))
+    })
+}
+
 /// One contact's copy of the already-classified document.
 ///
 /// `html` is the stored output of `mrml` — the same string [`classify`] passed — and `nodes` is the

@@ -1445,6 +1445,776 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/campaigns": {
+      "get": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "list_campaigns",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_CampaignSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "create_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewCampaign"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: drafting takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a name, list, segment, domain, template, from address, reply-to, subject or A/B percentage that is not valid"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}": {
+      "get": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "get_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "delete_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "insufficient-role: deleting a draft takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: only a draft is deletable"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "update_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCampaign"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: drafting takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: only a draft's content is editable"
+          },
+          "422": {
+            "description": "a value that is not valid"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/cancel": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "cancel_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The campaign is cancelled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: cancelling takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: a scheduled, sending or paused campaign is cancelled; a sent or failed one is not"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/estimate": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "estimate_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`count: null, exact: false` when two seconds were not enough",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignEstimate"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "422": {
+            "description": "the campaign's segment no longer exists"
+          },
+          "429": {
+            "description": "rate-limited: the segment-preview budget"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/pause": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "pause_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The campaign is paused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: pausing takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: only a sending campaign is paused"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/preview": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "preview_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CampaignPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A variant for a sample recipient, system footer included",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignPreview"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "postal-address-required, sending-domain-unverified or template-stale"
+          },
+          "422": {
+            "description": "an incomplete campaign, or a variant it does not have"
+          },
+          "429": {
+            "description": "rate-limited: the template-preview budget"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/resume": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "resume_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The campaign is sending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: resuming takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state; or, when the frozen rendition no longer passes and a fresh one is refused, the same refusals as scheduling (the campaign stays paused)"
+          },
+          "422": {
+            "description": "a fresh rendition is refused on a field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/schedule": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "schedule_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Scheduled; `schedule.send_at` is the resolved instant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: sending takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state; postal-address-required; sending-domain-unverified; or template-stale"
+          },
+          "422": {
+            "description": "an unknown mode or zone, a local time that is not in the future, recipient_local with more than one variant, or an incomplete campaign"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/test": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "test_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestSendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "One job queued per address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestSendResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: a test send takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: only a draft or scheduled campaign is tested; postal-address-required; sending-domain-unverified; or template-stale"
+          },
+          "422": {
+            "description": "no addresses, more than 5, an address that is not one, or an incomplete campaign"
+          },
+          "429": {
+            "description": "rate-limited: five test sends a minute per workspace"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/unschedule": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "unschedule_campaign",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The campaign is a draft again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: unscheduling takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: only a scheduled campaign is unscheduled"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/winner": {
+      "post": {
+        "tags": [
+          "crate::campaign::routes"
+        ],
+        "operationId": "choose_campaign_winner",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Campaign id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WinnerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The winner is chosen and the remainder is queued to resolve",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CampaignView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: picking the winner takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such campaign in this workspace"
+          },
+          "409": {
+            "description": "campaign-state: not sending or paused, no A/B test below 100%, the test cohort not fully resolved, or a winner already chosen"
+          },
+          "422": {
+            "description": "a variant index the campaign does not have"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts": {
       "get": {
         "tags": [
@@ -5307,7 +6077,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_TemplateView"
+                  "$ref": "#/components/schemas/Page_TemplateSummary"
                 }
               }
             }
@@ -6129,6 +6899,347 @@
           }
         },
         "additionalProperties": false
+      },
+      "CampaignCounts": {
+        "type": "object",
+        "description": "Contract section 2. `queued` is what is left: in flight included.",
+        "required": [
+          "total",
+          "queued",
+          "sent",
+          "failed",
+          "unknown",
+          "skipped"
+        ],
+        "properties": {
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "queued": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "sent": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unknown": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CampaignEstimate": {
+        "type": "object",
+        "description": "How many contacts the audience is, or that there are too many to count in two seconds.",
+        "required": [
+          "exact"
+        ],
+        "properties": {
+          "count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "exact": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CampaignPreview": {
+        "type": "object",
+        "description": "One variant as one sample recipient would receive it, footer included.",
+        "required": [
+          "subject",
+          "html",
+          "text"
+        ],
+        "properties": {
+          "html": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "CampaignPreviewRequest": {
+        "type": "object",
+        "properties": {
+          "variant": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CampaignSchedule": {
+        "type": "object",
+        "description": "The schedule as typed, and the instant the server resolved it to.",
+        "required": [
+          "mode",
+          "zone"
+        ],
+        "properties": {
+          "local": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`YYYY-MM-DDTHH:MM`, no zone; null means send now."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ScheduleMode"
+          },
+          "send_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "RFC 5545 resolution of `local` in `zone`; for `recipient_local`, the earliest zone's."
+          },
+          "zone": {
+            "type": "string",
+            "description": "IANA name."
+          }
+        }
+      },
+      "CampaignState": {
+        "type": "string",
+        "description": "Where a campaign is in the machine of spec §4.1. Stored as text under a `check` constraint.",
+        "enum": [
+          "draft",
+          "scheduled",
+          "sending",
+          "paused",
+          "sent",
+          "cancelled",
+          "failed"
+        ]
+      },
+      "CampaignSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "state",
+          "counts",
+          "updated_at"
+        ],
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/CampaignCounts"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "send_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CampaignState"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CampaignVariant": {
+        "type": "object",
+        "description": "One content variant. A single variant is an ordinary send.",
+        "required": [
+          "subject",
+          "template_id"
+        ],
+        "properties": {
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Overrides the campaign's `from_name` for this variant."
+          },
+          "subject": {
+            "type": "string",
+            "description": "Merge-tag grammar, as plain text; compiled at save and at freeze."
+          },
+          "template_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CampaignView": {
+        "type": "object",
+        "required": [
+          "id",
+          "workspace_id",
+          "name",
+          "state",
+          "list_ids",
+          "variants",
+          "awaiting_winner",
+          "counts",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "ab_test_percent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "10..100, only with two or more variants; 100 is a pure split with no winner phase."
+          },
+          "awaiting_winner": {
+            "type": "boolean",
+            "description": "The A/B test is over and the remainder waits for `…/winner`."
+          },
+          "counts": {
+            "$ref": "#/components/schemas/CampaignCounts"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "from_local_part": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "launched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "list_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "pause_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CampaignSchedule"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "segment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "sending_domain_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CampaignState"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "variants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CampaignVariant"
+            },
+            "description": "1..4 once saved with content; empty on a fresh draft."
+          },
+          "winner": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The variant index an admin picked."
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
       },
       "ChallengeResponse": {
         "type": "object",
@@ -7440,6 +8551,77 @@
           }
         }
       },
+      "NewCampaign": {
+        "type": "object",
+        "description": "A campaign to create. Everything but `name` may be filled in later.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "ab_test_percent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "from_local_part": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "segment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "sending_domain_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "variants": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/CampaignVariant"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "NewContact": {
         "type": "object",
         "description": "A contact to insert. Nothing here is trusted: `create` validates every field.",
@@ -8086,6 +9268,59 @@
                     "string",
                     "null"
                   ]
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page_CampaignSummary": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "state",
+                "counts",
+                "updated_at"
+              ],
+              "properties": {
+                "counts": {
+                  "$ref": "#/components/schemas/CampaignCounts"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "send_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "state": {
+                  "$ref": "#/components/schemas/CampaignState"
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
                 }
               }
             }
@@ -9243,7 +10478,7 @@
           }
         }
       },
-      "Page_TemplateView": {
+      "Page_TemplateSummary": {
         "type": "object",
         "required": [
           "data"
@@ -9253,10 +10488,9 @@
             "type": "array",
             "items": {
               "type": "object",
-              "description": "A template as the API shows it. `compiled` is never returned: it is the renderer's own\nstorage, it is derived from the two columns below, and the editor has no use for an AST\n(contract section 4).",
+              "description": "What the list shows and the campaign picker reads (issue 50 item 1): no `tree`, no `source`.",
               "required": [
                 "id",
-                "workspace_id",
                 "name",
                 "kind",
                 "created_at",
@@ -9277,31 +10511,9 @@
                 "name": {
                   "type": "string"
                 },
-                "source": {
-                  "type": [
-                    "string",
-                    "null"
-                  ],
-                  "description": "The MJML or HTML the operator wrote; null for a `blocks` template."
-                },
-                "tree": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/Doc",
-                      "description": "The block document, for a `blocks` template; null for a raw one."
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
                 "updated_at": {
                   "type": "string",
                   "format": "date-time"
-                },
-                "workspace_id": {
-                  "type": "string",
-                  "format": "uuid"
                 }
               }
             }
@@ -9645,6 +10857,38 @@
             }
           }
         ]
+      },
+      "ScheduleMode": {
+        "type": "string",
+        "description": "How `schedule_local` is read: one instant for everyone, or that wall-clock time in each\nrecipient's own zone (spec §4.3).",
+        "enum": [
+          "instant",
+          "recipient_local"
+        ]
+      },
+      "ScheduleRequest": {
+        "type": "object",
+        "required": [
+          "mode",
+          "zone"
+        ],
+        "properties": {
+          "local": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`YYYY-MM-DDTHH:MM`, no zone. Null sends now."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ScheduleMode"
+          },
+          "zone": {
+            "type": "string",
+            "description": "An IANA zone name."
+          }
+        },
+        "additionalProperties": false
       },
       "Scope": {
         "type": "string",
@@ -10085,6 +11329,37 @@
         },
         "additionalProperties": false
       },
+      "TemplateSummary": {
+        "type": "object",
+        "description": "What the list shows and the campaign picker reads (issue 50 item 1): no `tree`, no `source`.",
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Kind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "TemplateView": {
         "type": "object",
         "description": "A template as the API shows it. `compiled` is never returned: it is the renderer's own\nstorage, it is derived from the two columns below, and the editor has no use for an AST\n(contract section 4).",
@@ -10138,6 +11413,113 @@
             "format": "uuid"
           }
         }
+      },
+      "TestSendRequest": {
+        "type": "object",
+        "required": [
+          "addresses"
+        ],
+        "properties": {
+          "addresses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "1 to 5 addresses."
+          },
+          "variant": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Which variant to send; default 0.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "TestSendResult": {
+        "type": "object",
+        "required": [
+          "queued"
+        ],
+        "properties": {
+          "queued": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "UpdateCampaign": {
+        "type": "object",
+        "description": "A key left out is left alone; `null` clears a nullable one.",
+        "properties": {
+          "ab_test_percent": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "from_local_part": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "segment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "sending_domain_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "variants": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/CampaignVariant"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateContact": {
         "type": "object",
@@ -10495,6 +11877,19 @@
           "public",
           "private"
         ]
+      },
+      "WinnerRequest": {
+        "type": "object",
+        "required": [
+          "variant"
+        ],
+        "properties": {
+          "variant": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "Workspace": {
         "type": "object",

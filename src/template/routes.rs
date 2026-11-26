@@ -84,6 +84,16 @@ pub struct TemplateView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// What the list shows and the campaign picker reads (issue 50 item 1): no `tree`, no `source`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TemplateSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: Kind,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewTemplate {
@@ -341,7 +351,7 @@ fn stale(e: StoredError) -> ApiError {
 ///
 /// Archived fields are included, because a contact keeps its values until the field is purged and
 /// a template compiled before the archive still renders them.
-fn sample(defs: &[Definition]) -> Value {
+pub(crate) fn sample(defs: &[Definition]) -> Value {
     let mut map = serde_json::Map::new();
     for d in defs {
         map.insert(
@@ -487,7 +497,7 @@ async fn record(
     operation_id = "list_templates",
     params(("workspace_id" = Uuid, Path, description = "Workspace id"), PageParams),
     responses(
-        (status = 200, description = "Newest first", body = Page<TemplateView>),
+        (status = 200, description = "Newest first", body = Page<TemplateSummary>),
         (status = 404, description = "not a member, or no such workspace"),
         (status = 422, description = "a malformed cursor"),
     ),
@@ -497,13 +507,13 @@ pub async fn list_templates(
     principal: Principal,
     ApiPath(workspace_id): ApiPath<Uuid>,
     ApiQuery(page): ApiQuery<PageParams>,
-) -> ApiResult<Json<Page<TemplateView>>> {
+) -> ApiResult<Json<Page<TemplateSummary>>> {
     authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
     let limit = page.limit();
+    // Issue 50 item 1: the summary columns only. The document is read by `get_template`.
     let rows = sqlx::query_as!(
-        Row,
-        r#"select id, workspace_id, name, kind as "kind: Kind", tree, source, compiled,
-                  created_at, updated_at
+        TemplateSummary,
+        r#"select id, name, kind as "kind: Kind", created_at, updated_at
            from templates
            where workspace_id = $1 and ($2::uuid is null or id < $2)
            order by id desc limit $3"#,
@@ -513,11 +523,7 @@ pub async fn list_templates(
     )
     .fetch_all(&state.pool)
     .await?;
-    let views = rows
-        .into_iter()
-        .map(Row::view)
-        .collect::<ApiResult<Vec<_>>>()?;
-    Ok(Json(Page::from_rows(views, limit, |t| t.id)))
+    Ok(Json(Page::from_rows(rows, limit, |t| t.id)))
 }
 
 #[utoipa::path(

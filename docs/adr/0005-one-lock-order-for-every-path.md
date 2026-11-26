@@ -171,6 +171,26 @@ a `RowExclusiveLock` on `audit_log` (the `delete_relay` reasoning). So each stay
 in the wait-for graph, which is what the ruling below rests on. `templates` and `brand_kits` are
 still not lock classes and still not parents.
 
+**M2c's campaign handlers (R3).** The order is `messages`, then `campaigns`, then `jobs`. None of
+these handlers touches `messages` (a draft has none), so each is `campaigns` and then, where a job
+is queued, `jobs`. Every one authorises, validates and runs `mrml` BEFORE its transaction takes a
+row; the reads beside the writes (`lists`, `segments`, `sending_domains`, `templates`,
+`custom_fields`, `brand_kits`) are plain selects and lock nothing. The worker's paths (launch,
+claim, flush, sweep) are written by the tasks that add them, and take their rows in this same
+order.
+
+| path (M2c R3) | order it takes |
+|---|---|
+| `campaign::routes::create_campaign` | the new `campaigns` row, then `workspaces` (`for key share`) through `campaigns_workspace_id_fkey`, at the end of that one statement |
+| `campaign::routes::update_campaign` | the `campaigns` row alone. The `set` never names `workspace_id`, so no referential trigger fires; `where state = 'draft'` makes a lost race a `409`. The read before it is a plain `select`, no `for update` |
+| `campaign::routes::pause_campaign` / `unschedule_campaign` / `cancel_campaign` | the `campaigns` row alone, by primary key and a state guard. No key column is written |
+| `campaign::routes::resume_campaign` | the `campaigns` row alone. A re-freeze writes `frozen` and `frozen_at` in the same statement, both after `prepare` has run outside any transaction; no key column is written |
+| `campaign::routes::delete_campaign` | the `campaigns` row, then `jobs` (cascade, a draft's `campaign_test` jobs). `where state = 'draft'` cannot match a campaign with messages (`messages -> campaigns` is `no action`) or one that has launched, so this is the only deleter and `campaigns` stays out of the lock classes. A deleted draft's launch job (it may have been scheduled and unscheduled) goes the same way |
+| `campaign::routes::schedule_campaign` | the `campaigns` row (update, guarded by `state = 'draft'`), **then** the new `jobs` row, whose foreign key takes `for key share` on that same campaign and on `workspaces` at the end of its statement. `campaigns` before `jobs`, and the campaign row is already held, so the key share is a re-take, not a second lock |
+| `campaign::routes::choose_winner` | the same two, in the same order: the `campaigns` update (`state in ('sending','paused') and phase = 1 and resolved and ab_test_percent < 100`), then the phase-2 `jobs` insert |
+| `campaign::routes::test_campaign` | `jobs` inserts only, one per address, each taking `for key share` on the campaign and `workspaces` at the end of its statement. It writes no `campaigns` row |
+| `campaign::routes::preview_campaign` / `estimate_campaign` | **nothing.** The estimate reads `mailable_list_members` under `set local statement_timeout` in a transaction it rolls back |
+
 ## The rule for new code
 
 If you write `list_memberships` or `consent_log`, call `lists::lock_lists` with the list ids you
@@ -248,13 +268,13 @@ not go through `scripts/dev.sh`. As of `0033` it answers:
                      |     | tags (c), templates (c)
 ```
 
-**Eleven parents; ten are ruled on and the eleventh, `campaigns`, is ruled in R7.** `0028` added
+**Eleven parents; ten are ruled on and the eleventh, `campaigns`, is ruled in M2c R3.** `0028` added
 exactly one, `relays`; `0032` added **none** — it added two edges, both out of `workspaces`, and
 two tables nothing references. `0033` added `campaigns`, with two children (`messages (a)`,
 `jobs (c)`) and a third edge out of `workspaces`; `messages` is a table nothing references, and
-`jobs` already was one. The ruling waits for R7 because it rests on `delete_campaign`'s statement
-(`where state = 'draft'`, which cannot match a campaign that has messages or a live launch job),
-and that statement does not exist yet.
+`jobs` already was one. The ruling rests on `delete_campaign`'s statement (`where state = 'draft'`,
+which cannot match a campaign that has messages or a live launch job), and that statement now
+exists: see the M2c table below.
 `sending_domains`, `templates` and `brand_kits` are listed below the ten although they are not
 parents, because each was a table asked about and the answer is load-bearing.
 `tests/lock_order.rs` asserts that every **edge** of this graph —
@@ -271,7 +291,7 @@ a migration that adds an eleventh parent, a second child to an existing one, or 
 | `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
 | `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
-| `campaigns` | ruled in R7 | two children, `messages` (`no action`) and `jobs` (`cascade`); a new parent as of `0033`. Provisionally not a lock class, since its only deleter will be `delete_campaign` with `where state = 'draft'`, and every child insert takes `for key share` once at the end of one statement; R7 writes that handler and rules on it |
+| `campaigns` | **not a class** — ruled in M2c R3 | two children, `messages` (`no action`) and `jobs` (`cascade`); a new parent as of `0033`. Its only deleter is `delete_campaign` with `where state = 'draft'`, which cannot match a campaign that has messages or a live launch job, and every child insert takes `for key share` once at the end of one statement. See the M2c table below |
 | `workspaces` | not a class | eighteen children since `0033` — it was seventeen after `0032`, fifteen before it, and thirteen before `0028` — and no exclusive taker (below) |
 | `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
 | `relays` | **not a class** — the evidence is four tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
@@ -539,7 +559,7 @@ as a known gap rather than as a new finding.
 **The honest warning, since this document has now been wrong twice.** The claim above that a path
 obeying this cannot deadlock with another that obeys it is only as good as the enumeration. It said
 that while `contacts` was missing and while `form_lists` was listed as covered. What is different
-now is that the enumeration is **closed and mechanical**: eleven parents, ten ruled on and `campaigns` provisionally until R7, each with a
+now is that the enumeration is **closed and mechanical**: eleven parents, eleven ruled on (`campaigns` in M2c R3), each with a
 reason that can be re-checked against the schema rather than against somebody's memory. If a
 twelfth parent appears, it is a new row in that table — and since `0028` that no longer depends on
 anybody remembering, because `the_foreign_key_graph_is_the_one_the_adr_rules_on` in

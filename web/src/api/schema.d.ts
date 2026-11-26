@@ -464,6 +464,182 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/campaigns": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_campaigns"];
+        put?: never;
+        post: operations["create_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_campaign"];
+        put?: never;
+        post?: never;
+        delete: operations["delete_campaign"];
+        options?: never;
+        head?: never;
+        patch: operations["update_campaign"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/estimate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["estimate_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["pause_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["preview_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resume_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/schedule": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["schedule_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["test_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/unschedule": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["unschedule_campaign"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/campaigns/{id}/winner": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["choose_campaign_winner"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts": {
         parameters: {
             query?: never;
@@ -1614,6 +1790,116 @@ export interface components {
              */
             selection_token?: string | null;
         };
+        /** @description Contract section 2. `queued` is what is left: in flight included. */
+        CampaignCounts: {
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            queued: number;
+            /** Format: int64 */
+            sent: number;
+            /** Format: int64 */
+            skipped: number;
+            /** Format: int64 */
+            total: number;
+            /** Format: int64 */
+            unknown: number;
+        };
+        /** @description How many contacts the audience is, or that there are too many to count in two seconds. */
+        CampaignEstimate: {
+            /** Format: int64 */
+            count?: number | null;
+            exact: boolean;
+        };
+        /** @description One variant as one sample recipient would receive it, footer included. */
+        CampaignPreview: {
+            html: string;
+            subject: string;
+            text: string;
+        };
+        CampaignPreviewRequest: {
+            variant?: number | null;
+        };
+        /** @description The schedule as typed, and the instant the server resolved it to. */
+        CampaignSchedule: {
+            /** @description `YYYY-MM-DDTHH:MM`, no zone; null means send now. */
+            local?: string | null;
+            mode: components["schemas"]["ScheduleMode"];
+            /**
+             * Format: date-time
+             * @description RFC 5545 resolution of `local` in `zone`; for `recipient_local`, the earliest zone's.
+             */
+            send_at?: string | null;
+            /** @description IANA name. */
+            zone: string;
+        };
+        /**
+         * @description Where a campaign is in the machine of spec §4.1. Stored as text under a `check` constraint.
+         * @enum {string}
+         */
+        CampaignState: "draft" | "scheduled" | "sending" | "paused" | "sent" | "cancelled" | "failed";
+        CampaignSummary: {
+            counts: components["schemas"]["CampaignCounts"];
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: date-time */
+            send_at?: string | null;
+            state: components["schemas"]["CampaignState"];
+            /** Format: date-time */
+            updated_at: string;
+        };
+        /** @description One content variant. A single variant is an ordinary send. */
+        CampaignVariant: {
+            /** @description Overrides the campaign's `from_name` for this variant. */
+            from_name?: string | null;
+            /** @description Merge-tag grammar, as plain text; compiled at save and at freeze. */
+            subject: string;
+            /** Format: uuid */
+            template_id: string;
+        };
+        CampaignView: {
+            /**
+             * Format: int32
+             * @description 10..100, only with two or more variants; 100 is a pure split with no winner phase.
+             */
+            ab_test_percent?: number | null;
+            /** @description The A/B test is over and the remainder waits for `…/winner`. */
+            awaiting_winner: boolean;
+            counts: components["schemas"]["CampaignCounts"];
+            /** Format: date-time */
+            created_at: string;
+            failure_reason?: string | null;
+            /** Format: date-time */
+            finished_at?: string | null;
+            from_local_part?: string | null;
+            from_name?: string | null;
+            /** Format: uuid */
+            id: string;
+            /** Format: date-time */
+            launched_at?: string | null;
+            list_ids: string[];
+            name: string;
+            pause_reason?: string | null;
+            reply_to?: string | null;
+            schedule?: components["schemas"]["CampaignSchedule"] | null;
+            /** Format: uuid */
+            segment_id?: string | null;
+            /** Format: uuid */
+            sending_domain_id?: string | null;
+            state: components["schemas"]["CampaignState"];
+            /** Format: date-time */
+            updated_at: string;
+            /** @description 1..4 once saved with content; empty on a fresh draft. */
+            variants: components["schemas"]["CampaignVariant"][];
+            /**
+             * Format: int32
+             * @description The variant index an admin picked.
+             */
+            winner?: number | null;
+            /** Format: uuid */
+            workspace_id: string;
+        };
         ChallengeResponse: {
             /**
              * Format: uuid
@@ -2204,6 +2490,21 @@ export interface components {
             /** @description `viewer`, `editor` or `admin`, and no higher than the caller's own role. */
             role: components["schemas"]["Role"];
         };
+        /** @description A campaign to create. Everything but `name` may be filled in later. */
+        NewCampaign: {
+            /** Format: int64 */
+            ab_test_percent?: number | null;
+            from_local_part?: string | null;
+            from_name?: string | null;
+            list_ids?: string[] | null;
+            name: string;
+            reply_to?: string | null;
+            /** Format: uuid */
+            segment_id?: string | null;
+            /** Format: uuid */
+            sending_domain_id?: string | null;
+            variants?: components["schemas"]["CampaignVariant"][] | null;
+        };
         /** @description A contact to insert. Nothing here is trusted: `create` validates every field. */
         NewContact: {
             /** @description Custom field values by field key; see `validate_attributes` for what each kind accepts. */
@@ -2423,6 +2724,20 @@ export interface components {
                 metadata: Record<string, never>;
                 target_id?: string | null;
                 target_type?: string | null;
+            }[];
+            next_cursor?: string | null;
+        };
+        Page_CampaignSummary: {
+            data: {
+                counts: components["schemas"]["CampaignCounts"];
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** Format: date-time */
+                send_at?: string | null;
+                state: components["schemas"]["CampaignState"];
+                /** Format: date-time */
+                updated_at: string;
             }[];
             next_cursor?: string | null;
         };
@@ -2858,7 +3173,7 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
-        Page_TemplateView: {
+        Page_TemplateSummary: {
             data: {
                 /** Format: date-time */
                 created_at: string;
@@ -2866,13 +3181,8 @@ export interface components {
                 id: string;
                 kind: components["schemas"]["Kind"];
                 name: string;
-                /** @description The MJML or HTML the operator wrote; null for a `blocks` template. */
-                source?: string | null;
-                tree?: components["schemas"]["Doc"] | null;
                 /** Format: date-time */
                 updated_at: string;
-                /** Format: uuid */
-                workspace_id: string;
             }[];
             next_cursor?: string | null;
         };
@@ -2990,6 +3300,19 @@ export interface components {
             source: string;
             /** @enum {string} */
             type: "Tag";
+        };
+        /**
+         * @description How `schedule_local` is read: one instant for everyone, or that wall-clock time in each
+         *     recipient's own zone (spec §4.3).
+         * @enum {string}
+         */
+        ScheduleMode: "instant" | "recipient_local";
+        ScheduleRequest: {
+            /** @description `YYYY-MM-DDTHH:MM`, no zone. Null sends now. */
+            local?: string | null;
+            mode: components["schemas"]["ScheduleMode"];
+            /** @description An IANA zone name. */
+            zone: string;
         };
         /** @enum {string} */
         Scope: "address" | "domain";
@@ -3209,6 +3532,17 @@ export interface components {
             source?: string | null;
             tree?: components["schemas"]["Doc"] | null;
         };
+        /** @description What the list shows and the campaign picker reads (issue 50 item 1): no `tree`, no `source`. */
+        TemplateSummary: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["Kind"];
+            name: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
         /**
          * @description A template as the API shows it. `compiled` is never returned: it is the renderer's own
          *     storage, it is derived from the two columns below, and the editor has no use for an AST
@@ -3228,6 +3562,30 @@ export interface components {
             updated_at: string;
             /** Format: uuid */
             workspace_id: string;
+        };
+        TestSendRequest: {
+            /** @description 1 to 5 addresses. */
+            addresses: string[];
+            /** @description Which variant to send; default 0. */
+            variant?: number | null;
+        };
+        TestSendResult: {
+            queued: number;
+        };
+        /** @description A key left out is left alone; `null` clears a nullable one. */
+        UpdateCampaign: {
+            /** Format: int64 */
+            ab_test_percent?: number | null;
+            from_local_part?: string | null;
+            from_name?: string | null;
+            list_ids?: string[] | null;
+            name?: string | null;
+            reply_to?: string | null;
+            /** Format: uuid */
+            segment_id?: string | null;
+            /** Format: uuid */
+            sending_domain_id?: string | null;
+            variants?: components["schemas"]["CampaignVariant"][] | null;
         };
         /**
          * @description A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit
@@ -3400,6 +3758,9 @@ export interface components {
          * @enum {string}
          */
         Visibility: "public" | "private";
+        WinnerRequest: {
+            variant: number;
+        };
         /** @description A workspace as one caller sees it: `role` is the caller's own. */
         Workspace: {
             /** Format: uuid */
@@ -4798,6 +5159,698 @@ export interface operations {
                 content?: never;
             };
             /** @description a colour outside `#rgb`/`#rrggbb`, a font stack that is not a list of family names, a logo that is not http or https, a footer holding a character the renderer reserves, a palette or footer that is not an object, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_campaigns: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_CampaignSummary"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewCampaign"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: drafting takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a name, list, segment, domain, template, from address, reply-to, subject or A/B percentage that is not valid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: deleting a draft takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: only a draft is deletable */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateCampaign"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: drafting takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: only a draft's content is editable */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a value that is not valid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    cancel_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The campaign is cancelled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: cancelling takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: a scheduled, sending or paused campaign is cancelled; a sent or failed one is not */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    estimate_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `count: null, exact: false` when two seconds were not enough */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignEstimate"];
+                };
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the campaign's segment no longer exists */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: the segment-preview budget */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    pause_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The campaign is paused */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: pausing takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: only a sending campaign is paused */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    preview_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CampaignPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description A variant for a sample recipient, system footer included */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignPreview"];
+                };
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description postal-address-required, sending-domain-unverified or template-stale */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an incomplete campaign, or a variant it does not have */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: the template-preview budget */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resume_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The campaign is sending */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: resuming takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state; or, when the frozen rendition no longer passes and a fresh one is refused, the same refusals as scheduling (the campaign stays paused) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a fresh rendition is refused on a field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    schedule_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScheduleRequest"];
+            };
+        };
+        responses: {
+            /** @description Scheduled; `schedule.send_at` is the resolved instant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: sending takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state; postal-address-required; sending-domain-unverified; or template-stale */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an unknown mode or zone, a local time that is not in the future, recipient_local with more than one variant, or an incomplete campaign */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    test_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestSendRequest"];
+            };
+        };
+        responses: {
+            /** @description One job queued per address */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestSendResult"];
+                };
+            };
+            /** @description insufficient-role: a test send takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: only a draft or scheduled campaign is tested; postal-address-required; sending-domain-unverified; or template-stale */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no addresses, more than 5, an address that is not one, or an incomplete campaign */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: five test sends a minute per workspace */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unschedule_campaign: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The campaign is a draft again */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: unscheduling takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: only a scheduled campaign is unscheduled */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    choose_campaign_winner: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Campaign id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WinnerRequest"];
+            };
+        };
+        responses: {
+            /** @description The winner is chosen and the remainder is queued to resolve */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CampaignView"];
+                };
+            };
+            /** @description insufficient-role: picking the winner takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such campaign in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description campaign-state: not sending or paused, no A/B test below 100%, the test cohort not fully resolved, or a winner already chosen */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a variant index the campaign does not have */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -8025,7 +9078,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Page_TemplateView"];
+                    "application/json": components["schemas"]["Page_TemplateSummary"];
                 };
             };
             /** @description not a member, or no such workspace */

@@ -231,6 +231,16 @@ pub const PUBLIC_PER_MINUTE: u32 = 60;
 /// ceiling on confirmations, neither of which M1d has.
 pub const SUBMIT_PER_MINUTE: u32 = 10;
 
+/// How many test-send requests one workspace may make per window (spec M2c §4.8). Its own budget:
+/// a test freezes the campaign (`mrml` on the request task) and queues up to
+/// [`MAX_TEST_ADDRESSES`] real emails, so it is the one campaign call that can reach people's
+/// inboxes from a viewer-visible button, and five a minute is what a person iterating on a
+/// subject line does.
+pub const TEST_SEND_PER_MINUTE: u32 = 5;
+
+/// How many addresses one test send may name.
+pub const MAX_TEST_ADDRESSES: usize = 5;
+
 const WINDOW: Duration = Duration::from_secs(60);
 
 /// THE BOUND. How many windows one limiter's map may hold at once.
