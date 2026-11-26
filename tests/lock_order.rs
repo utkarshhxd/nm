@@ -1740,11 +1740,17 @@ async fn a_relay_deletion_waits_for_a_debit_rather_than_deadlocking(pool: PgPool
 // nothing anywhere else.** `workspaces` is the parent of seventeen tables and nothing takes it
 // exclusively, so a key share on it can wait for nobody.
 //
-// No writer of either table exists in `src/` yet — the CRUD handlers are a later task — so this is
-// held on the SQL shape those handlers will have, exactly as the relay tests above were before
-// `take` was written. The handler task adds its rows to ADR 0005's table and should point its own
-// statements at this test; a handler that grows a second statement taking another lock is what
-// this test cannot see.
+// **R7 wrote the writers.** When this was first put here there were none in `src/` and the test
+// was held on the SQL shape the handlers would have, exactly as the relay tests above were before
+// `take` was written. `template::routes::{create,update,delete}_template` and
+// `brand::routes::save_brand_kit` now exist, each is one locking statement, and each has a row in
+// ADR 0005's M2b path table. `preview_template` writes no row at all.
+//
+// What this test still CANNOT see is a handler that grows a SECOND statement taking another lock —
+// a `select ... for update` on the template row before the update, say, or one transaction that
+// writes `custom_fields` and `templates` together. `update_template` deliberately reads its row
+// with a plain `select` for that reason. A handler that needs a second lock changes the ruling and
+// not just the code.
 
 /// **A template or brand-kit write waits on its workspace only when it inserts.** Two wedges on the
 /// same `workspaces` row, and the difference between them is the whole test:

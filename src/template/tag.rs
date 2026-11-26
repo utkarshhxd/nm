@@ -89,6 +89,27 @@ impl Registry {
         Self { live, archived }
     }
 
+    /// Let `keys` be named although they are archived.
+    ///
+    /// A template compiled before an archive still renders, which is R2's rule — but a RE-SAVE of
+    /// that same document has to be possible too, or the archive quietly makes the template
+    /// unopenable the next time anything else moves its fingerprint: the preview says "save it
+    /// again" and the save refuses the tag the stored version already had. The operator is then
+    /// locked out of their own template with no way back.
+    ///
+    /// A key that is archived and NOT in `keys` is still refused. That is a *new* reference to an
+    /// archived field, which is what the rule is actually about. Only a key this registry already
+    /// knows to be archived is moved, so an unknown key stays unknown and a caller cannot widen
+    /// the namespace with this.
+    pub fn allowing<'a>(mut self, keys: impl IntoIterator<Item = &'a str>) -> Self {
+        for key in keys {
+            if self.archived.remove(key) {
+                self.live.insert(key.to_owned());
+            }
+        }
+        self
+    }
+
     fn check(&self, key: &str) -> Result<(), TagError> {
         if self.live.contains(key) {
             Ok(())

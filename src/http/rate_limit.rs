@@ -65,6 +65,23 @@ use uuid::Uuid;
 /// loads, and lowering it takes both.
 pub const PREVIEW_PER_MINUTE: u32 = 30;
 
+/// How many template previews one workspace may run per window. **Its own budget, not
+/// [`PREVIEW_PER_MINUTE`]'s**: a segment preview and a template preview are unrelated features,
+/// and sharing one counter lets an operator typing in the block editor starve the segment builder
+/// in the same workspace, and the other way round.
+///
+/// Four times the segment budget, because the subject is different. A segment preview holds a
+/// pooled connection for up to 1.5 seconds; a template preview holds none — it reads its three
+/// rows, drops the connection, and then runs `mrml` on the request task. What it spends is CPU,
+/// bounded per call by `template::routes::MAX_SOURCE` (256 KiB) and per workspace by this number,
+/// so the ceiling is roughly two size-capped renders a second for one workspace.
+///
+/// 120 is set against the editor's debounce rather than against a guess: at 600 ms a
+/// continuously-typing operator asks for about 100 a minute, so this bounds abuse without firing
+/// during ordinary editing. **If that debounce is lowered, this is the number that has to move
+/// with it**, and the editor will start seeing `429` before anyone notices why.
+pub const TEMPLATE_PREVIEW_PER_MINUTE: u32 = 120;
+
 /// How many selections one workspace may materialise per window. Harder than preview, because a
 /// selection is the more expensive call of the two: measured at 4,887 ms and 158 MB for a 1M-row
 /// match, against preview's 1.5 s of one connection and nothing written. Ten is more than the one

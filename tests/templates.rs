@@ -299,6 +299,27 @@ async fn another_workspaces_template_is_404(pool: PgPool) {
         .get(&template_path(mine.id, id))
         .await
         .assert_status(StatusCode::NOT_FOUND);
+
+    // THE LIST, which is the route whose payload is every row rather than one. Its `where`
+    // clause is a separate statement from `load`'s and nothing above exercises it: deleted, a
+    // viewer of one workspace receives the other's names, block trees and merge-tag sources, and
+    // a 404 on the by-id route is no comfort at all.
+    let r = theirs.viewer.get(&templates_path(theirs.id)).await;
+    r.assert_status_ok();
+    assert!(
+        r.json::<serde_json::Value>()["data"]
+            .as_array()
+            .expect("data")
+            .is_empty(),
+        "another workspace's templates in the list: {}",
+        r.text()
+    );
+    assert!(!r.text().contains("mine"), "leaked: {}", r.text());
+    // The owning workspace does see it, so the assertion above is about the filter and not about
+    // an empty table.
+    let r = mine.viewer.get(&templates_path(mine.id)).await;
+    r.assert_status_ok();
+    assert!(r.text().contains("mine"), "{}", r.text());
 }
 
 #[sqlx::test]
@@ -410,12 +431,13 @@ async fn a_template_compiled_before_archiving_still_renders(pool: PgPool) {
     // compiled one still renders. The contact keeps its value until the field is purged.
     let r = preview_stored(&t, id).await;
     r.assert_status_ok();
-    assert!(
-        r.json::<serde_json::Value>()["html"]
-            .as_str()
-            .unwrap()
-            .contains("Teal")
-    );
+    let body = r.json::<serde_json::Value>();
+    assert!(body["html"].as_str().unwrap().contains("Teal"));
+    // And the operator is told, rather than left to find out when the field means nothing.
+    let findings = body["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "archived_field");
+    assert!(findings[0]["message"].as_str().unwrap().contains("colour"));
 }
 
 #[sqlx::test]
@@ -485,7 +507,6 @@ async fn a_bogus_marker_format_version_is_refused(pool: PgPool) {
 #[sqlx::test]
 async fn an_over_deep_stored_ast_is_refused(pool: PgPool) {
     let t = tenant(&pool, "acme").await;
-    let id = create(&t, "t", doc("{{ first_name }}")).await;
 
     // Written straight to the column, never through `compile`: `serde`'s `Deserialize` on
     // `tag::Node` re-validates nothing, so the depth cap every renderer's recursion assumes is
@@ -494,16 +515,28 @@ async fn an_over_deep_stored_ast_is_refused(pool: PgPool) {
     for _ in 0..=nm::template::tag::MAX_DEPTH {
         deep = json!([{"Present": {"key": "first_name", "body": deep}}]);
     }
-    sqlx::query("update templates set compiled = jsonb_set(compiled, '{nodes}', $2) where id = $1")
+
+    // BOTH ASTs, one each into its own template. The plain-text part has a tree of its own and
+    // `render_text` recurses over it at send exactly as the HTML path does over `nodes`, so a
+    // test that plants into one of the two leaves the other's re-check held by nothing. A fresh
+    // template per arm, because a row is only interesting here while the arm's own plant is the
+    // only thing wrong with it.
+    for path in ["{nodes}", "{text,nodes}"] {
+        let id = create(&t, path, doc("{{ first_name }}")).await;
+        preview_stored(&t, id).await.assert_status_ok();
+        sqlx::query(
+            "update templates set compiled = jsonb_set(compiled, $3::text[], $2) where id = $1",
+        )
         .bind(id)
         .bind(&deep)
+        .bind(path)
         .execute(&pool)
         .await
         .unwrap();
-
-    let r = preview_stored(&t, id).await;
-    r.assert_status(StatusCode::CONFLICT);
-    assert!(r.text().contains("deeper than"), "{}", r.text());
+        let r = preview_stored(&t, id).await;
+        r.assert_status(StatusCode::CONFLICT);
+        assert!(r.text().contains("deeper than"), "{path}: {}", r.text());
+    }
 }
 
 #[sqlx::test]
@@ -845,6 +878,14 @@ async fn a_raw_html_template_is_never_rendered_through_mrml(pool: PgPool) {
     assert!(!html.contains("<mjml"), "mrml must not have run: {html}");
     // The plain-text part of a raw template comes from the SUBSTITUTED html, never the marked one.
     assert_eq!(body["text"].as_str().unwrap(), "Hi Sam");
+
+    // Neither of R6's checks has a subject here, and an empty list would read in the panel as
+    // "checked, nothing wrong". It says which.
+    let findings = body["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "not_checked");
+    assert_eq!(findings[0]["severity"], "warning");
+    assert_eq!(findings[0]["at"], json!(null));
 }
 
 #[sqlx::test]
@@ -915,7 +956,8 @@ async fn the_dangerous_tag_is_the_nth_one_the_operator_wrote_not_the_nth_brace(p
     assert!(!r.text().contains("{{/ first_name }}"), "{}", r.text());
 
     // A conditional's BOUNDARY marker carries an `o` or `c` after its index. Read as part of the
-    // index it is not a number at all, and the refusal falls back to naming no tag.
+    // index it is not a number at all, so without the trim the refusal names no tag — which is
+    // what the assertion below holds against.
     let source = "<mjml><mj-body><mj-raw><script>{{# first_name }}x{{/ first_name }}</script>\
                   </mj-raw></mj-body></mjml>";
     let r = t
@@ -947,4 +989,130 @@ async fn a_patch_that_sends_null_is_refused_rather_than_ignored(pool: PgPool) {
         .json(&json!({"source": "<p>x</p>"}))
         .await;
     r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test]
+async fn a_failed_check_is_an_error_not_an_empty_findings_list(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // A merge tag's fallback LITERAL may contain `<`. `tag::compile` lifts the literal into the
+    // AST, so what `mrml` parses at save is the MARKED source and the template is accepted —
+    // while `lint` is handed the RAW source, which `mrml` cannot parse. So `LintError` is
+    // reachable from an ordinary save and this is not a dead branch.
+    let source = "<mjml><mj-body><mj-section><mj-column><mj-text>{{ first_name | \"<\" }}\
+                  </mj-text></mj-column></mj-section></mj-body></mjml>";
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "mjml", "source": source}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = Uuid::parse_str(r.json::<serde_json::Value>()["id"].as_str().unwrap()).unwrap();
+
+    // Contract section 12: the panel reads an empty list as a pass, so a checker that could not
+    // RUN must fail. `200 {"findings": []}` here would be the lie that section names.
+    let r = preview_stored(&t, id).await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.text().contains("template-uncheckable"), "{}", r.text());
+    assert!(r.text().contains("could not be checked"), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn a_source_past_the_cap_is_refused(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let big = "x".repeat(nm::template::routes::MAX_SOURCE + 1);
+    let r = t
+        .editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "t", "kind": "html", "source": big}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["source"]);
+    // One byte under is fine, so the refusal is about the cap and not about the shape.
+    t.editor
+        .post(&templates_path(t.id))
+        .json(&json!({"name": "ok", "kind": "html",
+                      "source": "x".repeat(nm::template::routes::MAX_SOURCE)}))
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
+#[sqlx::test]
+async fn a_stored_template_may_be_resaved_while_it_still_names_an_archived_field(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    custom_field(&pool, t.id, "colour", "Teal", "text").await;
+    custom_field(&pool, t.id, "shade", "Jade", "text").await;
+    let id = create(&t, "t", doc("{{ colour }}")).await;
+    archive_fields(&pool, t.id).await;
+
+    // An admin edits the brand kit, which is the ordinary way a fingerprint moves.
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&json!({"logo_url": null, "palette": {"accent": "#ff0000"},
+                      "font_stack": null, "footer": {}}))
+        .await
+        .assert_status_ok();
+    let r = preview_stored(&t, id).await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert!(r.text().contains("save it again"), "{}", r.text());
+
+    // THE CURE THE 409 NAMES MUST WORK. Before this, the save refused the tag the stored version
+    // already had, so the preview told the operator to do the one thing that 422s and the
+    // template could be neither previewed nor saved nor reached.
+    t.editor
+        .patch(&template_path(t.id, id))
+        .json(&json!({"name": "t"}))
+        .await
+        .assert_status_ok();
+    let r = preview_stored(&t, id).await;
+    r.assert_status_ok();
+    let findings = r.json::<serde_json::Value>()["findings"]
+        .as_array()
+        .expect("findings")
+        .clone();
+    assert!(
+        findings.iter().any(|f| f["rule"] == "archived_field"),
+        "the surviving reference is surfaced, not silently kept: {findings:?}"
+    );
+
+    // The line holds: a reference that is NEW in the submitted document is still refused, even
+    // though another archived field is grandfathered in the same template.
+    let r = t
+        .editor
+        .patch(&template_path(t.id, id))
+        .json(&json!({"tree": doc("{{ shade }}")}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(r.text().contains("shade"), "{}", r.text());
+    assert!(r.text().contains("archived"), "{}", r.text());
+}
+
+#[sqlx::test]
+async fn template_preview_has_its_own_budget_not_the_segment_builders(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = create(&t, "t", doc("{{ first_name }}")).await;
+
+    // One past the segment preview's whole window. Sharing one counter let an operator typing in
+    // the block editor starve the segment builder in the same workspace, and the other way round;
+    // they are unrelated features and this is what says so.
+    for i in 1..=nm::http::rate_limit::PREVIEW_PER_MINUTE + 1 {
+        let r = preview_stored(&t, id).await;
+        r.assert_status_ok();
+        assert!(
+            r.headers().contains_key("ratelimit-remaining"),
+            "request {i} lost the RateLimit headers"
+        );
+    }
+    // And the segment builder's own window is untouched by all of that: its refusal is about the
+    // empty rule document it was sent, not about a budget somebody else spent.
+    let r = t
+        .viewer
+        .post(&format!("/api/v1/workspaces/{}/segments/preview", t.id))
+        .json(&json!({"rules": {"match": "all", "rules": []}}))
+        .await;
+    assert_ne!(
+        r.status_code(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the template previews spent the segment builder's budget: {}",
+        r.text()
+    );
 }

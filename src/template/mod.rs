@@ -11,6 +11,12 @@
 //! at send the stored marked renditions are substituted into and nothing is re-rendered. Running
 //! `mrml` again per contact would classify one document and encode against another, which is the
 //! CSS injection this whole module is shaped to prevent.
+//!
+//! **A write to `brand_kits` invalidates every stored rendition in that workspace at once**, and
+//! nothing here regenerates them: refusing rather than recompiling is what keeps each handler to
+//! one locking statement, and re-rendering at send is the defect above. The bulk recompile path
+//! that follows from this belongs to M2c, which is where a send first depends on it —
+//! `.scratch/email-platform/issues/49-a-brand-kit-edit-invalidates-every-stored-rendition-at-once.md`.
 
 pub mod block;
 pub mod lint;
@@ -20,7 +26,7 @@ pub mod routes;
 pub mod tag;
 pub mod text;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -156,7 +162,10 @@ pub struct Stored {
     /// [`fingerprint`] of the authored document, the brand kit and the dependency versions that
     /// produced the two renditions below.
     fingerprint: String,
-    /// The AST both renditions are filled from. One AST, so they cannot disagree.
+    /// The AST the HTML rendition is filled from. The plain-text part has its OWN AST, in
+    /// `text.nodes` — what makes the two parts agree is not that there is one tree, it is that
+    /// both are compiled in one call from one `Registry` at one instant and written in one
+    /// statement. `compile` is the only thing that can break that, and it is one function.
     nodes: Vec<Node>,
     /// `mrml`'s output with the markers still in it, already classified. The document that is
     /// sent.
@@ -258,6 +267,32 @@ impl Stored {
     }
 }
 
+impl Stored {
+    /// The custom fields this document's merge tags name.
+    pub fn field_names(&self) -> impl Iterator<Item = &str> {
+        self.fields.keys().map(String::as_str)
+    }
+}
+
+/// The custom fields the STORED version of a document names, read straight out of the column.
+///
+/// Deliberately WITHOUT the checks [`Stored::from_column`] makes, and safe because of the one
+/// thing a caller may do with it: let a re-save keep naming a field that is **archived in this
+/// workspace's own `custom_fields`**. The widening is the intersection of this set with that
+/// table (see `tag::Registry::allowing`), so a forged or unreadable column cannot invent a field,
+/// cannot un-archive one, and cannot reach another workspace's. The worst it can do is let a save
+/// keep a reference the operator was entitled to keep anyway.
+///
+/// Unvalidated on purpose, because the alternative is worse: a row this build cannot read would
+/// otherwise take the allowance away and put the operator back in the dead end it exists to stop.
+pub fn stored_field_names(compiled: &Value) -> BTreeSet<String> {
+    compiled
+        .get("fields")
+        .and_then(Value::as_object)
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 impl Ready<'_> {
     /// One contact's HTML and plain-text parts, both filled from the one stored AST.
     pub fn render(&self, contact: &Contact<'_>) -> Result<Rendered, StoredError> {
@@ -290,12 +325,17 @@ impl Ready<'_> {
 /// `defs` passed in, so there is one of it by construction.
 ///
 /// The caller writes the result in ONE transaction, and invalidates the pair together.
+/// `keep_archived` is the set of custom fields the STORED version of this document already named
+/// (see [`stored_field_names`]). Those may still be named although they are archived; a reference
+/// that is NEW in `authored` is still refused. Empty for a template that has no stored version.
 pub fn compile(
     authored: Authored<'_>,
     brand: &BrandKit,
     defs: &[Definition],
+    keep_archived: &BTreeSet<String>,
 ) -> Result<Stored, CompileError> {
-    let registry = tag::Registry::from_definitions(defs);
+    let registry =
+        tag::Registry::from_definitions(defs).allowing(keep_archived.iter().map(String::as_str));
     let (compiled, text) = match authored {
         Authored::Blocks(blocks) => (
             mjml::compile_blocks(blocks, brand, &registry)?,
@@ -326,7 +366,12 @@ pub fn fingerprint(authored: Authored<'_>, brand: &BrandKit) -> String {
     let mut buf: Vec<u8> = Vec::new();
     let mut field = |bytes: &[u8]| {
         buf.extend_from_slice(bytes);
-        // A separator that cannot occur in any part: every part is JSON text or a decimal number.
+        // U+0000 as a terminator, which is unambiguous only because no part can contain one:
+        // Postgres `text` and `jsonb` both refuse it, so neither a raw source nor a brand-kit
+        // string can carry one into this buffer. It is NOT true that every part is JSON or a
+        // number — the raw `source` and the kit's strings are operator text — so if a part ever
+        // could hold a NUL, `("a\0b", "c")` and `("a", "b\0c")` would hash identically and two
+        // different documents would share one key.
         buf.push(0);
     };
     field(MARKER_FORMAT_VERSION.to_string().as_bytes());
@@ -337,7 +382,10 @@ pub fn fingerprint(authored: Authored<'_>, brand: &BrandKit) -> String {
         // stable for a given tree.
         Authored::Blocks(blocks) => {
             field(b"blocks");
-            field(&serde_json::to_vec(blocks).unwrap_or_default());
+            // `expect`, not `unwrap_or_default`: a serialise failure there would collapse every
+            // tree to the same key, which is the one outcome this function must never produce.
+            // `Block` and `Run` hold no map and no non-finite number, so it cannot fail.
+            field(&serde_json::to_vec(blocks).expect("a block tree always serialises"));
         }
         Authored::Mjml(source) => {
             field(b"mjml");
@@ -480,8 +528,13 @@ mod tests {
 
     #[test]
     fn a_stored_rendition_is_refused_when_the_marker_format_is_not_ours() {
-        let stored =
-            compile(Authored::Blocks(&blocks()), &BrandKit::default(), &defs()).expect("compiles");
+        let stored = compile(
+            Authored::Blocks(&blocks()),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+        )
+        .expect("compiles");
         let mut v = serde_json::to_value(&stored).expect("serialises");
         v["marker_format_version"] = json!(MARKER_FORMAT_VERSION + 1);
         assert_eq!(
@@ -494,8 +547,13 @@ mod tests {
 
     #[test]
     fn an_over_deep_stored_ast_is_refused_although_serde_accepted_it() {
-        let stored =
-            compile(Authored::Blocks(&blocks()), &BrandKit::default(), &defs()).expect("compiles");
+        let stored = compile(
+            Authored::Blocks(&blocks()),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+        )
+        .expect("compiles");
         let mut v = serde_json::to_value(&stored).expect("serialises");
         let mut deep = json!([]);
         for _ in 0..=tag::MAX_DEPTH {
@@ -507,8 +565,13 @@ mod tests {
 
     #[test]
     fn a_purge_or_a_kind_change_is_drift_but_an_archive_is_not() {
-        let stored =
-            compile(Authored::Blocks(&blocks()), &BrandKit::default(), &defs()).expect("compiles");
+        let stored = compile(
+            Authored::Blocks(&blocks()),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+        )
+        .expect("compiles");
         let key = fingerprint(Authored::Blocks(&blocks()), &BrandKit::default());
         assert!(stored.ready(&key, &defs()).is_ok());
 
@@ -541,8 +604,13 @@ mod tests {
 
     #[test]
     fn a_stale_fingerprint_is_refused_rather_than_rendered() {
-        let stored =
-            compile(Authored::Blocks(&blocks()), &BrandKit::default(), &defs()).expect("compiles");
+        let stored = compile(
+            Authored::Blocks(&blocks()),
+            &BrandKit::default(),
+            &defs(),
+            &BTreeSet::new(),
+        )
+        .expect("compiles");
         let moved = fingerprint(
             Authored::Blocks(&blocks()),
             &BrandKit {
@@ -562,6 +630,7 @@ mod tests {
             Authored::Html("<p>Hi {{ colour }}</p>"),
             &BrandKit::default(),
             &defs(),
+            &BTreeSet::new(),
         )
         .expect("compiles");
         assert!(stored.html.contains(render::MARK_START), "stored marked");

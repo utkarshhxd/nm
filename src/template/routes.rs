@@ -12,12 +12,15 @@ use serde_json::{Value, json};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use std::collections::BTreeSet;
+
 use super::{
     Authored, Doc, Kind, Stored, StoredError,
     block::{Block, Run},
-    lint::{self, Finding},
+    lint::{self, Finding, Rule},
     mjml::CompileError,
     render::{self, Contact, UrlCheck},
+    stored_field_names,
 };
 use crate::{
     app::AppState,
@@ -355,6 +358,33 @@ fn sample(defs: &[Definition]) -> Value {
     Value::Object(map)
 }
 
+/// What a compiled document still names that has since been archived.
+///
+/// These are the references a re-save is allowed to keep (`tag::Registry::allowing`), so the
+/// operator has to be able to SEE them: a save that silently accepted a tag the rules say is dead
+/// would leave the field meaning nothing to every new contact, with nothing in the panel to say
+/// so. Advisory, like every finding — the email is not wrong for anyone who already has a value.
+fn archived_findings(stored: &Stored, defs: &[Definition]) -> Vec<Finding> {
+    stored
+        .field_names()
+        .filter(|key| {
+            defs.iter()
+                .any(|d| d.key == *key && d.archived_at.is_some())
+        })
+        .map(|key| {
+            Finding::new(
+                Rule::ArchivedField,
+                format!(
+                    "a merge tag names the custom field \"{key}\", which has been archived. Every \
+                     contact keeps the value it already had, so this still renders — but no new \
+                     contact can be given one. Remove the tag, or restore the field."
+                ),
+                None,
+            )
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Rows
 
@@ -541,7 +571,9 @@ pub async fn create_template(
     let authoring = authoring(input.kind, input.tree, input.source)?;
     let defs = definitions_for(&mut *tx, workspace_id).await?;
     let kit = brand::load(&mut *tx, workspace_id).await?;
-    let compiled = super::compile(authoring.authored(), &kit.render(), &defs)
+    // No stored version, so nothing is grandfathered: a brand-new template naming an archived
+    // field is the case the rule is about and it is refused.
+    let compiled = super::compile(authoring.authored(), &kit.render(), &defs, &BTreeSet::new())
         .map_err(|e| compile_error(e, authoring.field()))?;
     let (tree, source) = authoring.columns();
     let id = Uuid::now_v7();
@@ -637,7 +669,17 @@ pub async fn update_template(
     let authoring = authoring(row.kind, tree, source)?;
     let defs = definitions_for(&mut *tx, workspace_id).await?;
     let kit = brand::load(&mut *tx, workspace_id).await?;
-    let compiled = super::compile(authoring.authored(), &kit.render(), &defs)
+    // What the STORED version already named may still be named although it is archived. Without
+    // this a workspace that archives a field cannot re-save any template that mentions it — and
+    // `409 template-stale` tells the operator to do exactly that, so they are locked out of their
+    // own template by two refusals that each point at the other. A reference that is NEW in the
+    // submitted document is still refused; `preview` reports the surviving ones as findings.
+    let keep = row
+        .compiled
+        .as_ref()
+        .map(stored_field_names)
+        .unwrap_or_default();
+    let compiled = super::compile(authoring.authored(), &kit.render(), &defs, &keep)
         .map_err(|e| compile_error(e, authoring.field()))?;
     let (tree, source) = authoring.columns();
     // ONE locking statement, and it writes no foreign key column — `workspace_id` is in the
@@ -734,7 +776,8 @@ pub async fn delete_template(
             different document, brand kit or renderer version, or against custom fields that have \
             since changed. Save the template again."),
         (status = 422, description = "the document does not compile, or the checks could not run"),
-        (status = 429, description = "rate-limited: too many previews for this workspace"),
+        (status = 429, description = "rate-limited: too many template previews for this \
+            workspace. Its own budget, not the segment preview's."),
     ),
 )]
 pub async fn preview_template(
@@ -744,7 +787,7 @@ pub async fn preview_template(
     ApiJson(input): ApiJson<TemplatePreviewRequest>,
 ) -> ApiResult<Response> {
     authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
-    let quota = state.preview_limit.check(workspace_id);
+    let quota = state.template_preview_limit.check(workspace_id);
     if let Some(retry_after_secs) = quota.over {
         return Ok((
             quota.headers,
@@ -779,8 +822,16 @@ async fn preview(
     } else {
         row.authoring()?
     };
+    // The same allowance `update_template` makes, for the same reason: the editor previews the
+    // document it is about to save, so a preview that refused what the save accepts would send
+    // the operator looking for a problem that is not there.
+    let keep = row
+        .compiled
+        .as_ref()
+        .map(stored_field_names)
+        .unwrap_or_default();
     let stored = if unsaved {
-        super::compile(authoring.authored(), &brand, &defs)
+        super::compile(authoring.authored(), &brand, &defs, &keep)
             .map_err(|e| compile_error(e, authoring.field()))?
     } else {
         let compiled = row
@@ -812,20 +863,29 @@ async fn preview(
     // and contract section 12 is explicit that the panel reads an empty list as a pass. A checker
     // that failed is an error here, never a clean result.
     //
-    // RULING for `kind = html`: neither of R6's checks has a subject in a raw HTML template —
-    // there is no `mj-style` to misuse and no block tree to read URL fields from — and handing
-    // HTML to `lint` as if it were MJML would fail in `mrml::parse` on every preview. So the
-    // check set is empty and an empty result is a true pass over it, not a failed run. Give it
-    // the compiled document's URL attributes if a raw template ever needs link findings.
-    let findings = match &authoring {
+    // shortcut: a raw `html` template gets neither of R6's checks — there is no `mj-style` to
+    // misuse and no block tree to read URL fields from, and handing HTML to `lint` as if it were
+    // MJML fails in `mrml::parse` on every preview (R6 disclosed the same limit for raw templates
+    // generally). It says so in a finding of its own rather than answering with a bare empty list,
+    // which the panel would read as "checked, nothing wrong". Upgrade it by giving `lint` the
+    // compiled document's URL attributes if raw HTML templates turn out to need link findings.
+    let mut findings = match &authoring {
         Authoring::Blocks(doc) => lint::lint("", Some(&doc.blocks)),
         Authoring::Mjml(source) => lint::lint(source, None),
-        Authoring::Html(_) => Ok(Vec::new()),
+        Authoring::Html(_) => Ok(vec![Finding::new(
+            Rule::NotChecked,
+            "a raw HTML template is not link-checked or style-checked: both checks read MJML or \
+             the block tree, and this template has neither. Nothing below is a statement about \
+             its links."
+                .to_owned(),
+            None,
+        )]),
     }
     .map_err(|e| ApiError::UnprocessableDetail {
         code: "template-uncheckable",
         detail: e.to_string(),
     })?;
+    findings.extend(archived_findings(&stored, &defs));
 
     Ok(PreviewResult {
         html: rendered.html,
