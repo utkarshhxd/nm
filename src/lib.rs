@@ -3,6 +3,7 @@
 pub mod app;
 pub mod audit;
 pub mod auth;
+pub mod brand;
 pub mod cli;
 pub mod config;
 pub mod consent;
@@ -24,6 +25,7 @@ pub mod sending_domains;
 pub mod suppressions;
 pub mod tags;
 pub mod telemetry;
+pub mod template;
 pub mod users;
 pub mod worker;
 pub mod workspaces;

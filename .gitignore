@@ -10,3 +10,7 @@ web/e2e/support/leaked-databases.txt
 .pnpm-store/
 .env
 *.key
+
+# SDD scratch: ledgers, briefs, review packages
+.superpowers/
+.worktrees/

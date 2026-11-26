@@ -28,6 +28,7 @@ const CSP =
   "frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 export const SAMPLE = "/e2e/support/sample/index.html";
+export const EDITOR = "/e2e/support/editor/index.html";
 
 export const test = base.extend<object, { app: string }>({
   app: [
@@ -43,6 +44,7 @@ export const test = base.extend<object, { app: string }>({
             input: {
               main: resolve(WEB, "index.html"),
               sample: resolve(WEB, "e2e/support/sample/index.html"),
+              editor: resolve(WEB, "e2e/support/editor/index.html"),
             },
           },
         },

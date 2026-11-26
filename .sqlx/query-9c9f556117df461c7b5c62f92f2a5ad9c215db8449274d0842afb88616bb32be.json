@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update templates set name = $3, tree = $4, source = $5, compiled = $6, updated_at = now() where workspace_id = $1 and id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c9f556117df461c7b5c62f92f2a5ad9c215db8449274d0842afb88616bb32be"
+}

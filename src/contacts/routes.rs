@@ -31,7 +31,7 @@ use crate::{
     lists::{self, MembershipStatus},
     pagination::{Page, sorted::SortedPageParams},
     segments::load_rules,
-    suppressions::{Block, blocking_suppression, erase_address},
+    suppressions::{SuppressionBlock, blocking_suppression, erase_address},
     tags,
     workspaces::{roles::Role, validate_timezone},
 };
@@ -200,7 +200,7 @@ pub struct Eligibility {
     /// The block that stops this address, whether it is this workspace's or the whole instance's.
     /// It says nothing about any other address. A list membership that is `pending` or
     /// `unsubscribed` is a separate reason a contact is not mailed on that list, and is not here.
-    pub blocked_by: Option<Block>,
+    pub blocked_by: Option<SuppressionBlock>,
 }
 
 /// Computed on the server because the answer can depend on an instance-wide block that a

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select logo_url, palette, font_stack, footer from brand_kits where workspace_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "logo_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "brand_kits",
+            "name": "logo_url"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "palette",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "brand_kits",
+            "name": "palette"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "font_stack",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "brand_kits",
+            "name": "font_stack"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "footer",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "brand_kits",
+            "name": "footer"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "5f611fc6a170ed2e09829f78231e0982a8a2dcb4d80c160ff37be65cadf55ed5"
+}

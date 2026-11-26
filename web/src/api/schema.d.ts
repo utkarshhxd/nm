@@ -442,6 +442,28 @@ export interface paths {
         patch: operations["change_role"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/brand-kit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_brand_kit"];
+        /**
+         * The whole kit, replaced. **Admin and above** — contract section 9: `footer.address` is the
+         *     postal address CAN-SPAM and CASL require, so this is compliance configuration and not content
+         *     styling. An editor composes emails; an admin configures what every email the workspace sends is
+         *     legally obliged to say.
+         */
+        put: operations["save_brand_kit"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/contacts": {
         parameters: {
             query?: never;
@@ -1300,6 +1322,66 @@ export interface paths {
         patch: operations["update_tag"];
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_templates"];
+        put?: never;
+        /**
+         * Compiling a template is the save: both renditions are produced in one call against one
+         *     registry, and stored with the AST in one statement.
+         */
+        post: operations["create_template"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/templates/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_template"];
+        put?: never;
+        post?: never;
+        /** A hard delete. */
+        delete: operations["delete_template"];
+        options?: never;
+        head?: never;
+        patch: operations["update_template"];
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/templates/{id}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The HTML part, the plain-text part and the advisory findings, for a sample contact.
+         * @description With `tree` or `source` in the body this previews UNSAVED work: the document is compiled fresh
+         *     against the brand kit and the field definitions as they are now, and nothing is written. With
+         *     an empty body it previews what is stored — the same marked renditions a send would substitute
+         *     into, which is the only way an operator sees what will actually go out.
+         */
+        post: operations["preview_template"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1365,20 +1447,84 @@ export interface components {
             target_type?: string | null;
         };
         /**
-         * @description The standing block that stops one address being mailed, and nothing else about it: not the
-         *     row's id, note or who made it, and never another address.
+         * @description `deny_unknown_fields` on both enums: this is JSON from anything holding a session, and a field
+         *     a variant does not define is refused rather than quietly dropped. The editor rejects the same
+         *     shapes, but that is a convenience for the operator, not a boundary.
          */
         Block: {
-            level: components["schemas"]["BlockLevel"];
-            reason: components["schemas"]["Reason"];
-            /** @description Whether it blocks this one address or every address on its domain. */
-            scope: components["schemas"]["Scope"];
+            runs: components["schemas"]["Run"][];
+            /** @enum {string} */
+            type: "Text";
+        } | {
+            /** Format: int32 */
+            level: number;
+            runs: components["schemas"]["Run"][];
+            /** @enum {string} */
+            type: "Heading";
+        } | {
+            alt: string;
+            src: string;
+            /** @enum {string} */
+            type: "Image";
+        } | {
+            href: string;
+            label: string;
+            /** @enum {string} */
+            type: "Button";
+        } | {
+            /** @enum {string} */
+            type: "Divider";
+        } | {
+            /** Format: int32 */
+            height: number;
+            /** @enum {string} */
+            type: "Spacer";
+        } | {
+            /**
+             * @description `no_recursion` because `Block` contains itself here. Without it `utoipa` inlines the
+             *     nested schema for ever and the document build overflows its stack; with it the field
+             *     is a `$ref` to this same component, which is what the generated TypeScript needs to
+             *     describe a column holding blocks.
+             */
+            children: components["schemas"]["Block"][][];
+            /** @enum {string} */
+            type: "Columns";
         };
         /**
          * @description Whose block it is: this workspace's own, or one set instance-wide that every workspace inherits.
          * @enum {string}
          */
         BlockLevel: "workspace" | "instance";
+        /**
+         * @description The kit as the API shows it and as the row stores it.
+         *
+         *     `palette` and `footer` are passed through **whole**. Contract section 8: a kit written by a
+         *     newer version must survive a round trip through an older screen rather than being silently
+         *     stripped, so the known keys are validated and every other key is kept exactly as it arrived.
+         */
+        BrandKit: {
+            font_stack?: string | null;
+            /**
+             * @description `{ "text", "address" }`. `address` is the CAN-SPAM / CASL postal address. An open map, for
+             *     the same reason as `palette`.
+             */
+            footer: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description `http` or `https` only (contract section 11): `mailto:` and `tel:` are meaningless as an
+             *     image source, so the logo takes a narrower set than the link allowlist.
+             */
+            logo_url?: string | null;
+            /**
+             * @description `{ "background", "text", "accent", "accent_text" }`, each `#rgb` or `#rrggbb`. Other keys
+             *     are kept untouched, which is why the schema is an open map and not a closed object: a
+             *     client has to be able to send back a key its own version does not know.
+             */
+            palette: {
+                [key: string]: unknown;
+            };
+        };
         /** @description `BulkTarget` and a list. */
         BulkList: {
             /**
@@ -1483,6 +1629,11 @@ export interface components {
         ChangeRole: {
             role: components["schemas"]["Role"];
         };
+        /**
+         * @description Which checker produced the finding. Contract section 12: `"lint" | "link"`.
+         * @enum {string}
+         */
+        Check: "lint" | "link";
         /**
          * @description One check's verdict. On the wire (and in `sending_domains.checks`) it is
          *     `{"status": "pass"}`, `{"status": "fail", "reason": "..."}` or `{"status": "not_checked"}`.
@@ -1691,9 +1842,16 @@ export interface components {
              */
             spf: components["schemas"]["CheckResult"];
         };
+        /**
+         * @description The block tree as it crosses the wire and as `templates.tree` stores it: an object, because the
+         *     column's `templates_tree_is_object` check refuses a bare array.
+         */
+        Doc: {
+            blocks: components["schemas"]["Block"][];
+        };
         /** @description Whether a contact may be mailed, and if a standing block stops it, which one. */
         Eligibility: {
-            blocked_by?: components["schemas"]["Block"] | null;
+            blocked_by?: components["schemas"]["SuppressionBlock"] | null;
             /** @description `false` exactly when `blocked_by` is set. */
             mailable: boolean;
         };
@@ -1702,6 +1860,18 @@ export interface components {
          * @enum {string}
          */
         FieldKind: "text" | "number" | "date" | "datetime" | "boolean" | "select" | "multi_select";
+        /**
+         * @description Contract section 12. `at` is a PATH into the block tree, not an index: `Columns.children` is an
+         *     array of arrays, so `[3, 1, 0]` is the first block of the second column of block 3. `None`
+         *     means the finding is about the whole email.
+         */
+        Finding: {
+            at?: number[] | null;
+            check: components["schemas"]["Check"];
+            message: string;
+            rule: components["schemas"]["Rule"];
+            severity: components["schemas"]["Severity"];
+        };
         FinishRequest: {
             /** Format: uuid */
             challenge_id: string;
@@ -1921,6 +2091,11 @@ export interface components {
             invited_by?: string | null;
             role: components["schemas"]["Role"];
         };
+        /**
+         * @description How a template is authored. The database stores it as text under a `check` constraint.
+         * @enum {string}
+         */
+        Kind: "blocks" | "mjml" | "html";
         List: {
             /** Format: date-time */
             created_at: string;
@@ -1976,6 +2151,8 @@ export interface components {
             /** Format: int64 */
             count: number;
         };
+        /** @enum {string} */
+        Mark: "bold" | "italic";
         MeResponse: {
             /** @description Send as `X-CSRF-Token` on unsafe requests. */
             csrf_token: string;
@@ -2199,6 +2376,13 @@ export interface components {
         NewTag: {
             /** @description Unique in the workspace. 1-100 characters. */
             name: string;
+        };
+        NewTemplate: {
+            kind: components["schemas"]["Kind"];
+            name: string;
+            /** @description Required when `kind` is `mjml` or `html`, and refused otherwise. May not be empty. */
+            source?: string | null;
+            tree?: components["schemas"]["Doc"] | null;
         };
         NewWorkspace: {
             name: string;
@@ -2673,6 +2857,24 @@ export interface components {
             }[];
             next_cursor?: string | null;
         };
+        Page_TemplateView: {
+            data: {
+                /** Format: date-time */
+                created_at: string;
+                /** Format: uuid */
+                id: string;
+                kind: components["schemas"]["Kind"];
+                name: string;
+                /** @description The MJML or HTML the operator wrote; null for a `blocks` template. */
+                source?: string | null;
+                tree?: components["schemas"]["Doc"] | null;
+                /** Format: date-time */
+                updated_at: string;
+                /** Format: uuid */
+                workspace_id: string;
+            }[];
+            next_cursor?: string | null;
+        };
         Page_Workspace: {
             data: {
                 /** Format: uuid */
@@ -2712,6 +2914,15 @@ export interface components {
         PreviewRequest: {
             /** @description The whole rule document, `{match, rules}`. */
             rules: Record<string, never>;
+        };
+        /**
+         * @description Contract section 12, exactly. `html` is a whole document; a failed render or a failed check is
+         *     an ERROR and never an `Ok` with an empty `findings`, which the preview panel reads as a pass.
+         */
+        PreviewResult: {
+            findings: components["schemas"]["Finding"][];
+            html: string;
+            text: string;
         };
         Purged: {
             /**
@@ -2757,6 +2968,28 @@ export interface components {
          * @enum {string}
          */
         Role: "viewer" | "editor" | "admin" | "owner";
+        /**
+         * @description The stable machine-readable name of a rule. A help link or a suppression hangs off this; the
+         *     human message is not that.
+         * @enum {string}
+         */
+        Rule: "malformed_url" | "unsupported_scheme" | "empty_href" | "tag_in_link_position" | "mailto_without_address" | "unencoded_space" | "at_rule_in_inline_style" | "misspelled_inline_attribute" | "archived_field" | "not_checked";
+        Run: {
+            marks: components["schemas"]["Mark"][];
+            text: string;
+            /** @enum {string} */
+            type: "Text";
+        } | {
+            href: string;
+            marks: components["schemas"]["Mark"][];
+            text: string;
+            /** @enum {string} */
+            type: "Link";
+        } | {
+            source: string;
+            /** @enum {string} */
+            type: "Tag";
+        };
         /** @enum {string} */
         Scope: "address" | "domain";
         /** @description Exactly one of the two. */
@@ -2875,6 +3108,12 @@ export interface components {
             secret: string;
         };
         /**
+         * @description Contract section 12: `error` means the sent email will be wrong or unsafe for a recipient,
+         *     `warning` means probably a mistake but an operator may mean it.
+         * @enum {string}
+         */
+        Severity: "error" | "warning";
+        /**
          * @description Who signs the domain's mail with DKIM. Stored as text under a `check` constraint.
          * @enum {string}
          */
@@ -2939,12 +3178,55 @@ export interface components {
              */
             workspace_id?: string | null;
         };
+        /**
+         * @description The standing block that stops one address being mailed, and nothing else about it: not the
+         *     row's id, note or who made it, and never another address.
+         *
+         *     Named for what it blocks rather than `Block`, because `components.schemas` is ONE flat map
+         *     keyed by the type's name and `template::block::Block` is a different thing entirely. Two types
+         *     sharing a key do not collide loudly: the second insert replaces the first and every `$ref`
+         *     still resolves, so one of them ships with the other's shape (`schema_names_are_unique`).
+         */
+        SuppressionBlock: {
+            level: components["schemas"]["BlockLevel"];
+            reason: components["schemas"]["Reason"];
+            /** @description Whether it blocks this one address or every address on its domain. */
+            scope: components["schemas"]["Scope"];
+        };
         Tag: {
             /** Format: date-time */
             created_at: string;
             /** Format: uuid */
             id: string;
             name: string;
+        };
+        /**
+         * @description What to preview. Send the document being edited to preview unsaved changes; send neither key
+         *     to preview what is stored.
+         */
+        TemplatePreviewRequest: {
+            source?: string | null;
+            tree?: components["schemas"]["Doc"] | null;
+        };
+        /**
+         * @description A template as the API shows it. `compiled` is never returned: it is the renderer's own
+         *     storage, it is derived from the two columns below, and the editor has no use for an AST
+         *     (contract section 4).
+         */
+        TemplateView: {
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["Kind"];
+            name: string;
+            /** @description The MJML or HTML the operator wrote; null for a `blocks` template. */
+            source?: string | null;
+            tree?: components["schemas"]["Doc"] | null;
+            /** Format: date-time */
+            updated_at: string;
+            /** Format: uuid */
+            workspace_id: string;
         };
         /**
          * @description A JSON Merge Patch (RFC 7386) of a contact: a field left out is left alone, and an explicit
@@ -3075,6 +3357,15 @@ export interface components {
         UpdateTag: {
             /** @description Unique in the workspace. 1-100 characters. */
             name: string;
+        };
+        /**
+         * @description A field left out is left alone. `kind` is not patchable: it decides which column holds the
+         *     document, so changing it is a different template, not an edit to this one.
+         */
+        UpdateTemplate: {
+            name?: string;
+            source?: string;
+            tree?: components["schemas"]["Doc"];
         };
         /** @description The slug cannot change in M0, so an unknown field (`slug` included) is rejected, not ignored. */
         UpdateWorkspace: {
@@ -4429,6 +4720,84 @@ export interface operations {
             };
             /** @description last-owner */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_brand_kit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A workspace with no kit gets an empty one, never a 404. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrandKit"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    save_brand_kit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BrandKit"];
+            };
+        };
+        responses: {
+            /** @description The kit as stored. Unknown palette and footer keys survive. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BrandKit"];
+                };
+            };
+            /** @description insufficient-role: the brand kit takes admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a colour outside `#rgb`/`#rrggbb`, a font stack that is not a list of family names, a logo that is not http or https, a footer holding a character the renderer reserves, a palette or footer that is not an object, or an unknown field */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7625,6 +7994,269 @@ export interface operations {
             };
             /** @description invalid name, or an unknown field */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_templates: {
+        parameters: {
+            query?: {
+                /** @description Page size, 1 to 200 (default 50). */
+                limit?: number;
+                /** @description Opaque cursor from the previous page's `next_cursor`. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page_TemplateView"];
+                };
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a malformed cursor */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTemplate"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateView"];
+                };
+            };
+            /** @description insufficient-role: writing a template takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid name or document, a merge tag naming a field that does not exist or has been archived, a tag in a position no encoding makes safe, a link whose scheme is not allowed, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Template id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateView"];
+                };
+            };
+            /** @description not a member, or no such template in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Template id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description insufficient-role: writing a template takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such template in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Template id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateTemplate"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateView"];
+                };
+            };
+            /** @description insufficient-role: writing a template takes editor */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not a member, or no such template in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description an invalid name or document, an explicit null, a merge tag naming a field that does not exist or has been archived, or an unknown field */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    preview_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                workspace_id: string;
+                /** @description Template id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TemplatePreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description `html` is a whole document; `findings` is empty only when the checks ran and found nothing. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PreviewResult"];
+                };
+            };
+            /** @description not a member, or no such template in this workspace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description template-stale: the stored renditions were built from a different document, brand kit or renderer version, or against custom fields that have since changed. Save the template again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the document does not compile, or the checks could not run */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description rate-limited: too many template previews for this workspace. Its own budget, not the segment preview's. */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -1360,6 +1360,91 @@
         }
       }
     },
+    "/api/v1/workspaces/{workspace_id}/brand-kit": {
+      "get": {
+        "tags": [
+          "crate::brand::routes"
+        ],
+        "operationId": "get_brand_kit",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A workspace with no kit gets an empty one, never a 404.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandKit"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "crate::brand::routes"
+        ],
+        "summary": "The whole kit, replaced. **Admin and above** — contract section 9: `footer.address` is the\npostal address CAN-SPAM and CASL require, so this is compliance configuration and not content\nstyling. An editor composes emails; an admin configures what every email the workspace sends is\nlegally obliged to say.",
+        "operationId": "save_brand_kit",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrandKit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The kit as stored. Unknown palette and footer keys survive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrandKit"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: the brand kit takes admin"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a colour outside `#rgb`/`#rrggbb`, a font stack that is not a list of family names, a logo that is not http or https, a footer holding a character the renderer reserves, a palette or footer that is not an object, or an unknown field"
+          }
+        }
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/contacts": {
       "get": {
         "tags": [
@@ -5177,6 +5262,321 @@
           }
         }
       }
+    },
+    "/api/v1/workspaces/{workspace_id}/templates": {
+      "get": {
+        "tags": [
+          "crate::template::routes"
+        ],
+        "operationId": "list_templates",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, 1 to 200 (default 50).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from the previous page's `next_cursor`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_TemplateView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "a malformed cursor"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "crate::template::routes"
+        ],
+        "summary": "Compiling a template is the save: both renditions are produced in one call against one\nregistry, and stored with the AST in one statement.",
+        "operationId": "create_template",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTemplate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: writing a template takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such workspace"
+          },
+          "422": {
+            "description": "an invalid name or document, a merge tag naming a field that does not exist or has been archived, a tag in a position no encoding makes safe, a link whose scheme is not allowed, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/templates/{id}": {
+      "get": {
+        "tags": [
+          "crate::template::routes"
+        ],
+        "operationId": "get_template",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Template id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such template in this workspace"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "crate::template::routes"
+        ],
+        "summary": "A hard delete.",
+        "operationId": "delete_template",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Template id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "insufficient-role: writing a template takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such template in this workspace"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "crate::template::routes"
+        ],
+        "operationId": "update_template",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Template id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTemplate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "insufficient-role: writing a template takes editor"
+          },
+          "404": {
+            "description": "not a member, or no such template in this workspace"
+          },
+          "422": {
+            "description": "an invalid name or document, an explicit null, a merge tag naming a field that does not exist or has been archived, or an unknown field"
+          }
+        }
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/templates/{id}/preview": {
+      "post": {
+        "tags": [
+          "crate::template::routes"
+        ],
+        "summary": "The HTML part, the plain-text part and the advisory findings, for a sample contact.",
+        "description": "With `tree` or `source` in the body this previews UNSAVED work: the document is compiled fresh\nagainst the brand kit and the field definitions as they are now, and nothing is written. With\nan empty body it previews what is stored — the same marked renditions a send would substitute\ninto, which is the only way an operator sees what will actually go out.",
+        "operationId": "preview_template",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Template id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemplatePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`html` is a whole document; `findings` is empty only when the checks ran and found nothing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not a member, or no such template in this workspace"
+          },
+          "409": {
+            "description": "template-stale: the stored renditions were built from a different document, brand kit or renderer version, or against custom fields that have since changed. Save the template again."
+          },
+          "422": {
+            "description": "the document does not compile, or the checks could not run"
+          },
+          "429": {
+            "description": "rate-limited: too many template previews for this workspace. Its own budget, not the segment preview's."
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5349,25 +5749,160 @@
         }
       },
       "Block": {
-        "type": "object",
-        "description": "The standing block that stops one address being mailed, and nothing else about it: not the\nrow's id, note or who made it, and never another address.",
-        "required": [
-          "reason",
-          "level",
-          "scope"
-        ],
-        "properties": {
-          "level": {
-            "$ref": "#/components/schemas/BlockLevel"
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "runs",
+              "type"
+            ],
+            "properties": {
+              "runs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Text"
+                ]
+              }
+            }
           },
-          "reason": {
-            "$ref": "#/components/schemas/Reason"
+          {
+            "type": "object",
+            "required": [
+              "level",
+              "runs",
+              "type"
+            ],
+            "properties": {
+              "level": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "runs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Heading"
+                ]
+              }
+            }
           },
-          "scope": {
-            "$ref": "#/components/schemas/Scope",
-            "description": "Whether it blocks this one address or every address on its domain."
+          {
+            "type": "object",
+            "required": [
+              "src",
+              "alt",
+              "type"
+            ],
+            "properties": {
+              "alt": {
+                "type": "string"
+              },
+              "src": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Image"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "label",
+              "href",
+              "type"
+            ],
+            "properties": {
+              "href": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Button"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Divider"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "height",
+              "type"
+            ],
+            "properties": {
+              "height": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Spacer"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "children",
+              "type"
+            ],
+            "properties": {
+              "children": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Block"
+                  }
+                },
+                "description": "`no_recursion` because `Block` contains itself here. Without it `utoipa` inlines the\nnested schema for ever and the document build overflows its stack; with it the field\nis a `$ref` to this same component, which is what the generated TypeScript needs to\ndescribe a column holding blocks."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Columns"
+                ]
+              }
+            }
           }
-        }
+        ],
+        "description": "`deny_unknown_fields` on both enums: this is JSON from anything holding a session, and a field\na variant does not define is refused rather than quietly dropped. The editor rejects the same\nshapes, but that is a convenience for the operator, not a boundary."
       },
       "BlockLevel": {
         "type": "string",
@@ -5376,6 +5911,46 @@
           "workspace",
           "instance"
         ]
+      },
+      "BrandKit": {
+        "type": "object",
+        "description": "The kit as the API shows it and as the row stores it.\n\n`palette` and `footer` are passed through **whole**. Contract section 8: a kit written by a\nnewer version must survive a round trip through an older screen rather than being silently\nstripped, so the known keys are validated and every other key is kept exactly as it arrived.",
+        "required": [
+          "palette",
+          "footer"
+        ],
+        "properties": {
+          "font_stack": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "footer": {
+            "type": "object",
+            "description": "`{ \"text\", \"address\" }`. `address` is the CAN-SPAM / CASL postal address. An open map, for\nthe same reason as `palette`.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`http` or `https` only (contract section 11): `mailto:` and `tel:` are meaningless as an\nimage source, so the logo takes a narrower set than the link allowlist."
+          },
+          "palette": {
+            "type": "object",
+            "description": "`{ \"background\", \"text\", \"accent\", \"accent_text\" }`, each `#rgb` or `#rrggbb`. Other keys\nare kept untouched, which is why the schema is an open map and not a closed object: a\nclient has to be able to send back a key its own version does not know.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "BulkList": {
         "type": "object",
@@ -5598,6 +6173,14 @@
             "$ref": "#/components/schemas/Role"
           }
         }
+      },
+      "Check": {
+        "type": "string",
+        "description": "Which checker produced the finding. Contract section 12: `\"lint\" | \"link\"`.",
+        "enum": [
+          "lint",
+          "link"
+        ]
       },
       "CheckResult": {
         "oneOf": [
@@ -6093,6 +6676,22 @@
           }
         }
       },
+      "Doc": {
+        "type": "object",
+        "description": "The block tree as it crosses the wire and as `templates.tree` stores it: an object, because the\ncolumn's `templates_tree_is_object` check refuses a bare array.",
+        "required": [
+          "blocks"
+        ],
+        "properties": {
+          "blocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Block"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "Eligibility": {
         "type": "object",
         "description": "Whether a contact may be mailed, and if a standing block stops it, which one.",
@@ -6103,7 +6702,7 @@
           "blocked_by": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/Block",
+                "$ref": "#/components/schemas/SuppressionBlock",
                 "description": "The block that stops this address, whether it is this workspace's or the whole instance's.\nIt says nothing about any other address. A list membership that is `pending` or\n`unsubscribed` is a separate reason a contact is not mailed on that list, and is not here."
               },
               {
@@ -6129,6 +6728,40 @@
           "select",
           "multi_select"
         ]
+      },
+      "Finding": {
+        "type": "object",
+        "description": "Contract section 12. `at` is a PATH into the block tree, not an index: `Columns.children` is an\narray of arrays, so `[3, 1, 0]` is the first block of the second column of block 3. `None`\nmeans the finding is about the whole email.",
+        "required": [
+          "check",
+          "severity",
+          "rule",
+          "message"
+        ],
+        "properties": {
+          "at": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "check": {
+            "$ref": "#/components/schemas/Check"
+          },
+          "message": {
+            "type": "string"
+          },
+          "rule": {
+            "$ref": "#/components/schemas/Rule"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/Severity"
+          }
+        }
       },
       "FinishRequest": {
         "type": "object",
@@ -6518,6 +7151,15 @@
           }
         }
       },
+      "Kind": {
+        "type": "string",
+        "description": "How a template is authored. The database stores it as text under a `check` constraint.",
+        "enum": [
+          "blocks",
+          "mjml",
+          "html"
+        ]
+      },
       "List": {
         "type": "object",
         "required": [
@@ -6644,6 +7286,13 @@
             "minimum": 0
           }
         }
+      },
+      "Mark": {
+        "type": "string",
+        "enum": [
+          "bold",
+          "italic"
+        ]
       },
       "MeResponse": {
         "type": "object",
@@ -7247,6 +7896,40 @@
           "name": {
             "type": "string",
             "description": "Unique in the workspace. 1-100 characters."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewTemplate": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/Kind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required when `kind` is `mjml` or `html`, and refused otherwise. May not be empty."
+          },
+          "tree": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Doc",
+                "description": "Required when `kind` is `blocks`, and refused otherwise."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -8560,6 +9243,77 @@
           }
         }
       },
+      "Page_TemplateView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A template as the API shows it. `compiled` is never returned: it is the renderer's own\nstorage, it is derived from the two columns below, and the editor has no use for an AST\n(contract section 4).",
+              "required": [
+                "id",
+                "workspace_id",
+                "name",
+                "kind",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "kind": {
+                  "$ref": "#/components/schemas/Kind"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The MJML or HTML the operator wrote; null for a `blocks` template."
+                },
+                "tree": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Doc",
+                      "description": "The block document, for a `blocks` template; null for a raw one."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "workspace_id": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Page_Workspace": {
         "type": "object",
         "required": [
@@ -8676,6 +9430,29 @@
         },
         "additionalProperties": false
       },
+      "PreviewResult": {
+        "type": "object",
+        "description": "Contract section 12, exactly. `html` is a whole document; a failed render or a failed check is\nan ERROR and never an `Ok` with an empty `findings`, which the preview panel reads as a pass.",
+        "required": [
+          "html",
+          "text",
+          "findings"
+        ],
+        "properties": {
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            }
+          },
+          "html": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
       "Purged": {
         "type": "object",
         "required": [
@@ -8774,6 +9551,99 @@
           "editor",
           "admin",
           "owner"
+        ]
+      },
+      "Rule": {
+        "type": "string",
+        "description": "The stable machine-readable name of a rule. A help link or a suppression hangs off this; the\nhuman message is not that.",
+        "enum": [
+          "malformed_url",
+          "unsupported_scheme",
+          "empty_href",
+          "tag_in_link_position",
+          "mailto_without_address",
+          "unencoded_space",
+          "at_rule_in_inline_style",
+          "misspelled_inline_attribute",
+          "archived_field",
+          "not_checked"
+        ]
+      },
+      "Run": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "text",
+              "marks",
+              "type"
+            ],
+            "properties": {
+              "marks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Mark"
+                }
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "href",
+              "text",
+              "marks",
+              "type"
+            ],
+            "properties": {
+              "href": {
+                "type": "string"
+              },
+              "marks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Mark"
+                }
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Link"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The tag as the operator typed it, braces included. The compiled AST never crosses the wire.",
+            "required": [
+              "source",
+              "type"
+            ],
+            "properties": {
+              "source": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "Tag"
+                ]
+              }
+            }
+          }
         ]
       },
       "Scope": {
@@ -9001,6 +9871,14 @@
           }
         }
       },
+      "Severity": {
+        "type": "string",
+        "description": "Contract section 12: `error` means the sent email will be wrong or unsafe for a recipient,\n`warning` means probably a mistake but an operator may mean it.",
+        "enum": [
+          "error",
+          "warning"
+        ]
+      },
       "Signing": {
         "type": "string",
         "description": "Who signs the domain's mail with DKIM. Stored as text under a `check` constraint.",
@@ -9142,6 +10020,27 @@
           }
         }
       },
+      "SuppressionBlock": {
+        "type": "object",
+        "description": "The standing block that stops one address being mailed, and nothing else about it: not the\nrow's id, note or who made it, and never another address.\n\nNamed for what it blocks rather than `Block`, because `components.schemas` is ONE flat map\nkeyed by the type's name and `template::block::Block` is a different thing entirely. Two types\nsharing a key do not collide loudly: the second insert replaces the first and every `$ref`\nstill resolves, so one of them ships with the other's shape (`schema_names_are_unique`).",
+        "required": [
+          "reason",
+          "level",
+          "scope"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/BlockLevel"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/Scope",
+            "description": "Whether it blocks this one address or every address on its domain."
+          }
+        }
+      },
       "Tag": {
         "type": "object",
         "required": [
@@ -9160,6 +10059,83 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "TemplatePreviewRequest": {
+        "type": "object",
+        "description": "What to preview. Send the document being edited to preview unsaved changes; send neither key\nto preview what is stored.",
+        "properties": {
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tree": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Doc"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "TemplateView": {
+        "type": "object",
+        "description": "A template as the API shows it. `compiled` is never returned: it is the renderer's own\nstorage, it is derived from the two columns below, and the editor has no use for an AST\n(contract section 4).",
+        "required": [
+          "id",
+          "workspace_id",
+          "name",
+          "kind",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/Kind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The MJML or HTML the operator wrote; null for a `blocks` template."
+          },
+          "tree": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Doc",
+                "description": "The block document, for a `blocks` template; null for a raw one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "workspace_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -9413,6 +10389,22 @@
           "name": {
             "type": "string",
             "description": "Unique in the workspace. 1-100 characters."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateTemplate": {
+        "type": "object",
+        "description": "A field left out is left alone. `kind` is not patchable: it decides which column holds the\ndocument, so changing it is a different template, not an edit to this one.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "tree": {
+            "$ref": "#/components/schemas/Doc"
           }
         },
         "additionalProperties": false
