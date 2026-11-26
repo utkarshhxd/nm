@@ -178,8 +178,8 @@ these handlers touches `messages` (a draft has none), so each is `campaigns` and
 is queued, `jobs`. Every one authorises, validates and runs `mrml` BEFORE its transaction takes a
 row; the reads beside the writes (`lists`, `segments`, `sending_domains`, `templates`,
 `custom_fields`, `brand_kits`) are plain selects and lock nothing. The worker's paths (launch,
-claim, flush, sweep) are written by the tasks that add them, and take their rows in this same
-order.
+claim, flush, sweep) have rows of their own in the second table below, and take their rows in
+this same order.
 
 | path (M2c R3) | order it takes |
 |---|---|
@@ -211,7 +211,7 @@ launch row beside it and found the two disagreeing; the row was right.)
 | `campaign::launch::sweep` (R6) | for each launch job whose worker died on its last attempt, the last-attempt give-up below: `campaigns` (`failed`, or a system pause, fenced on `launch_job_id`), then `jobs` (`failed_at`), one transaction. The select that finds them is a plain read |
 | `campaign::send::system_pause` (R6) | the `campaigns` row alone, by primary key and a state guard (`sending`, `paused`). Writes `state`, `pause_reason`, `updated_at`; no key column. Raced against a flush in both orders (`an_outcome_flush_and_a_pause_do_not_deadlock`), the one pair that really runs together: a tick that pauses a campaign while its flusher is recording |
 | `campaign::send::CampaignWorker::tick` (R6) | **no transaction of its own.** One statement at a time, each in the order its own row gives: `queue::sweep`, `queue::claim`, `queue::mark_submitting`, `queue::release` and `queue::record` (the flusher), `worker::debit` and `deliver::submit` (`bucket::take`), `bucket::drain`, `system_pause`. It reads `campaigns` (`frozen`), `custom_fields`, `sending_domains`, `relays` and `mailable_list_members` with plain selects. Nothing is held across an SMTP session |
-| `campaign::launch` (a batch of `resolve_batch`, and each loop of `handle`) | `messages` (the insert-select, whose foreign key takes `for key share` on the campaign at the end of that statement), then `campaigns` by primary key and `launch_job_id` (cursor and `total`; no key column). The last batch of a slice adds, in the same transaction: `campaigns` (`resolved`, then `finish_if_done`, or `launch_job_id` for the hand-off), **then** `jobs` (insert the successor, complete this job). `messages`, `campaigns`, `jobs`. The freeze (`scheduled -> sending`) and a refusal (`failed`, or a system pause) are `campaigns` then `jobs` and touch no `messages`; so is the last-attempt give-up, which ends the campaign and fails the job in one transaction. The job's own `payload` (the phase's segment snapshot) is written in a statement of its own, before any transaction opens. `prepare` and its `mrml` run before any of these transactions open. `tests/lock_order.rs` races a batch against an operator's pause in both orders (`a_launch_batch_and_a_pause_do_not_deadlock`); the hand-off, the freeze and the refusals have no race test of their own, and are `campaigns` then `jobs` for the reason in the next section |
+| `campaign::launch` (a batch of `resolve_batch`, and each loop of `handle`) | `messages` (the insert-select, whose foreign key takes `for key share` on the campaign at the end of that statement), then `campaigns` by primary key and `launch_job_id` (cursor and `total`; no key column). The last batch of a slice adds, in the same transaction: `campaigns` (`resolved`, then `finish_if_done`, or `launch_job_id` for the hand-off), **then** `jobs` (insert the successor, complete this job). `messages`, `campaigns`, `jobs`. The freeze (`scheduled -> sending`) and a refusal (`failed`, or a system pause) are `campaigns` then `jobs` and touch no `messages`; so is the last-attempt give-up, which ends the campaign and fails the job in one transaction. The job's own `payload` (the phase's segment snapshot) is written in a statement of its own, before any transaction opens. `prepare` and its `mrml` run before any of these transactions open. `tests/lock_order.rs` races a batch against an operator's pause in both orders (`a_launch_batch_and_a_pause_do_not_deadlock`); the hand-off, the freeze and the refusals have no race test of their own, and are `campaigns` then `jobs` for the reason given under "M2c: why `campaigns` is not a class" below: a `jobs` insert takes only `for key share` on the campaign, which no campaign update waits on |
 
 ## The rule for new code
 
@@ -592,8 +592,9 @@ messages after the campaign row — which does cycle with a flush, in the one ar
 pause is first — and that mutation is why both orders are run. A **wait that should not exist**,
 which is the sweep's `skip locked` (a sweep that queued behind a flush would be the second node of
 that cycle). And an **outcome counted twice or a pause overwritten**, which are the fence on
-`record`'s `where` and the batch's update never naming `state`. Each wedges the campaign row
-`for update`, standing for the one exclusive taker a campaign could have.
+`record`'s `where` and the batch's update never naming `state`. The four campaign tests below
+each wedge the campaign row `for update`, standing for the one exclusive taker a campaign could
+have; the drain test wedges its `relays` row instead.
 
 - `a_launch_batch_and_a_pause_do_not_deadlock` — a batch against the operator's pause route, both
   orders; the pause survives and the batch keeps its row and its total.
