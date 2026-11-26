@@ -525,6 +525,9 @@ async fn rerunning_a_batch_inserts_nothing_twice(pool: PgPool) {
     assert_eq!((again.scanned, again.inserted, again.stale), (50, 0, false));
     assert_eq!((f.messages(id).await, f.total(id).await), (50, 50));
 
+    // A batch fenced on some other job writes nothing, even to a sending campaign.
+    let other = Resolution::load(&pool, &c, Uuid::now_v7()).await.unwrap();
+    assert!(resolve_batch(&pool, &other, None).await.unwrap().stale);
     // A campaign that is no longer this job's changes nothing, and says so.
     sqlx::query("update campaigns set state = 'cancelled' where id = $1")
         .bind(id)
