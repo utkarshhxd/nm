@@ -70,7 +70,7 @@ pub enum BrandError {
          and underscores, optionally quoted) and nothing else"
     )]
     FontStack,
-    #[error("logo must be an http or https URL")]
+    #[error("logo must be an http or https URL with no user name or password")]
     Logo,
 }
 
@@ -1045,7 +1045,7 @@ mod tests {
         let err = kit_result(&brand).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "the brand kit is invalid: logo must be an http or https URL"
+            "the brand kit is invalid: logo must be an http or https URL with no user name or password"
         );
     }
 

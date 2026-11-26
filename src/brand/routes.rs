@@ -93,7 +93,7 @@ pub async fn get_brand_kit(
         (status = 403, description = "insufficient-role: the brand kit takes admin"),
         (status = 404, description = "not a member, or no such workspace"),
         (status = 422, description = "a colour outside `#rgb`/`#rrggbb`, a font stack that is not \
-            a list of family names, a logo that is not http or https, a palette or footer that is \
+            a list of family names, a logo that is not http or https, a footer holding a character the renderer reserves, a palette or footer that is \
             not an object, or an unknown field"),
     ),
 )]
@@ -119,8 +119,24 @@ pub async fn save_brand_kit(
     }
     strings(&input.palette, "palette", &PALETTE_KEYS, &mut errors);
     strings(&input.footer, "footer", &FOOTER_KEYS, &mut errors);
-    if let Err(e) = input.render().validate() {
+    let kit = input.render();
+    if let Err(e) = kit.validate() {
         errors.push(field_error(e));
+    }
+    // Compile refuses these in the footer of every `blocks` template, with an error that names
+    // the template and not the kit, so the kit is refused here, by the same policy.
+    for (field, v) in [
+        ("footer.text", &kit.footer_text),
+        ("footer.address", &kit.footer_address),
+    ] {
+        if v.as_deref()
+            .is_some_and(crate::template::text::has_reserved)
+        {
+            errors.push(FieldError::new(
+                field,
+                "must not contain `~nmmt~`, U+E000 or U+0001 to U+0003: the renderer reserves them",
+            ));
+        }
     }
     if !errors.is_empty() {
         return Err(ApiError::Validation(errors));

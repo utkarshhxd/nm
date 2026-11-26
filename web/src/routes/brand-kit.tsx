@@ -13,6 +13,7 @@ import { atLeast } from "../lib/roles";
 import {
   type Draft,
   LOGO_MESSAGE,
+  colourMessage,
   MIN_CONTRAST,
   PAIRS,
   PALETTE,
@@ -67,8 +68,6 @@ function Page({ ws, canEdit }: { ws: string; canEdit: boolean }) {
     </section>
   );
 }
-
-const COLOUR_FLAG = "Use a colour written as #rgb or #rrggbb, such as #1a56db.";
 
 function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boolean }) {
   const qc = useQueryClient();
@@ -134,7 +133,7 @@ function KitForm({ ws, kit, canEdit }: { ws: string; kit: BrandKit; canEdit: boo
               spellCheck={false}
               value={draft[key]}
               onChange={set(key)}
-              error={draft[key].trim() !== "" && !isColour(draft[key].trim()) ? COLOUR_FLAG : undefined}
+              error={draft[key].trim() !== "" && !isColour(draft[key].trim()) ? colourMessage(key) : undefined}
               hint={
                 <>
                   Leave it empty to use the default.

@@ -102,10 +102,21 @@ fn lit(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {
             '{' => out.push(BRACE),
-            BRACE | TEXT_LINK_OPEN | TEXT_LINK_SEP | TEXT_LINK_CLOSE => out.push_str(MARK_START),
+            c if is_reserved(c) => out.push_str(MARK_START),
             c => out.push(c),
         }
     }
+}
+
+fn is_reserved(c: char) -> bool {
+    matches!(c, BRACE | TEXT_LINK_OPEN | TEXT_LINK_SEP | TEXT_LINK_CLOSE)
+}
+
+/// Whether operator text holds a reserved character or the marker text: the one policy, which
+/// `compile_text` refuses as `ForgedMarker`. The brand kit's `PUT` asks it too, so a footer that
+/// would fail every template's save is refused where it is typed.
+pub fn has_reserved(s: &str) -> bool {
+    s.contains(MARK_START) || s.chars().any(is_reserved)
 }
 
 /// `s` with merge tags let through and everything else a literal. The rule is `mjml::emit`'s, byte
@@ -145,8 +156,9 @@ fn runs(rs: &[Run], out: &mut String) {
                 if t.is_empty() {
                     link(href, "", "", out);
                 } else if t == h || t == h.trim_start_matches("mailto:") {
-                    // The text already says where it goes; the address would only repeat it.
-                    lit(text, out);
+                    // The text already says where it goes; the address would only repeat it. `emit`,
+                    // not `lit`: the text equals an href that may hold a tag, which must be filled.
+                    emit(text, out);
                 } else {
                     lit(text, out);
                     link(href, " (", ")", out);
@@ -557,6 +569,21 @@ mod tests {
         for href in ["javascript:alert(1)", "JaVa\tScRiPt:alert(1)", ""] {
             assert_eq!(render(&[button("Go", href)]), "Go", "{href:?}");
         }
+    }
+
+    #[test]
+    fn a_link_whose_text_is_its_url_prints_the_filled_url_not_the_tag() {
+        let link = |text: &str, href: &str| Run::Link {
+            href: href.into(),
+            text: text.into(),
+            marks: vec![],
+        };
+        let url = "https://a.example/?n={{ first_name }}";
+        let out = render(&[para(vec![link(url, url)])]);
+        assert_eq!(out, "https://a.example/?n=Ada");
+        let mail = "{{ email }}";
+        let out = render(&[para(vec![link(mail, &format!("mailto:{mail}"))])]);
+        assert_eq!(out, "ada@example.com");
     }
 
     #[test]

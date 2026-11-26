@@ -171,8 +171,8 @@ test("the_servers_refusal_of_a_logo_scheme_is_what_the_operator_is_shown", async
   // is typed and sends it anyway — the gate is the server's — so both alerts are on screen here,
   // and the literal below is `BrandError::Logo`'s own text, not a constant this lane could drift.
   await expect(page.getByRole("alert")).toHaveText([
-    "logo must be an http or https URL",
-    "logo must be an http or https URL",
+    "logo must be an http or https URL with no user name or password",
+    "logo must be an http or https URL with no user name or password",
   ]);
   await expect(page.getByText("Brand kit saved.")).toBeHidden();
 });

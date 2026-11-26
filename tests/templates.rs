@@ -385,6 +385,53 @@ async fn the_brand_kit_is_admin_gated(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn a_footer_the_renderer_would_refuse_is_refused_at_the_brand_kit(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    // The same policy compile applies to every blocks template's footer: a kit holding one would
+    // make each save and preview fail with an error naming the template, not the kit.
+    for (key, bad) in [
+        ("text", "x ~nmmt~0~tmmn~"),
+        ("address", "x \u{e000}"),
+        ("text", "x \u{1}"),
+        ("address", "x \u{3}"),
+    ] {
+        let r = t
+            .admin
+            .put(&kit_path(t.id))
+            .json(
+                &json!({"logo_url": null, "palette": {}, "font_stack": null, "footer": {key: bad}}),
+            )
+            .await;
+        r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_fields(&r), [format!("footer.{key}")], "{bad:?}");
+    }
+    // A brace is not reserved: it is escaped, and typed tag syntax stays literal.
+    t.admin
+        .put(&kit_path(t.id))
+        .json(&json!({"logo_url": null, "palette": {}, "font_stack": null,
+            "footer": {"text": "Hi {{ first_name }}"}}))
+        .await
+        .assert_status_ok();
+}
+
+#[sqlx::test]
+async fn a_logo_with_a_user_name_is_refused_with_a_sentence_that_is_true(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let r = t
+        .admin
+        .put(&kit_path(t.id))
+        .json(&json!({"logo_url": "https://u:p@cdn.example/x.png", "palette": {}, "font_stack": null, "footer": {}}))
+        .await;
+    r.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_fields(&r), ["logo_url"]);
+    assert!(
+        r.text().contains("no user name or password"),
+        "{}",
+        r.text()
+    );
+}
+
+#[sqlx::test]
 async fn saving_a_tag_naming_an_unknown_field_is_422_with_the_field_name(pool: PgPool) {
     let t = tenant(&pool, "acme").await;
     let r = t
@@ -1015,7 +1062,10 @@ async fn a_raw_mjml_template_with_a_quoted_fallback_in_a_link_saves_and_previews
     assert_eq!(findings[0]["rule"], "not_checked");
     assert!(findings[0]["at"].is_null());
     assert!(
-        findings[0]["message"].as_str().unwrap().contains("links are not checked"),
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("links are not checked"),
         "{body}"
     );
 }

@@ -19,7 +19,7 @@ import type { BrandKit } from "./brand-kit-source";
 type Me = components["schemas"]["MeResponse"];
 
 const WS = "11111111-1111-4111-8111-111111111111";
-const FLAG = "Use a colour written as #rgb or #rrggbb, such as #1a56db.";
+const FLAG = "background must be a hex colour such as #fff or #1a2b3c";
 const EMPTY: BrandKit = { logo_url: null, palette: {}, font_stack: null, footer: {} };
 
 /**
@@ -213,7 +213,7 @@ test("a colour is flagged while it is wrong, cleared when it is right, and never
   await expect(bg).toHaveValue("#1a56");
   await expect(bg).toHaveAttribute("aria-invalid", "true");
   await expect(page.getByText(FLAG)).toBeVisible();
-  await expect(bg).toHaveAccessibleDescription(/Use a colour written as/);
+  await expect(bg).toHaveAccessibleDescription(/background must be a hex colour/);
   await scan(page, "brand kit with a flagged colour");
   await bg.pressSequentially("db");
   await expect(bg).not.toHaveAttribute("aria-invalid", "true");
@@ -242,7 +242,7 @@ test("a logo URL is flagged inline but the save is still sent, and the server's 
 test("a logo is http or https only: mailto and tel are flagged, a relative path is flagged, https is not", async ({ page, app }) => {
   await open(page, app);
   const logo = page.getByLabel("Logo address");
-  for (const bad of ["mailto:a@b.example", "tel:+15555550100", "/logo.png", "logo.png"]) {
+  for (const bad of ["mailto:a@b.example", "tel:+15555550100", "/logo.png", "logo.png", "https://u:p@cdn.example/x.png", "https://u@cdn.example/x.png"]) {
     await logo.fill(bad);
     await expect(page.locator("#bk-logo-error"), bad).toHaveText(LOGO_MESSAGE);
   }
