@@ -1,0 +1,6 @@
+# Local HTTPS in front of nm. `tls internal` is Caddy's own throwaway CA, so a browser warns once.
+# nm refuses to send mail unless NM_PUBLIC_URL is https, which is the only reason this is here.
+localhost {
+	tls internal
+	reverse_proxy nm:8080
+}
