@@ -110,13 +110,15 @@ async fn seconds_until_due(pool: &PgPool, id: Uuid) -> f64 {
     .expect("run_after")
 }
 
-/// `(state, sent, failed, unknown, skipped)`.
-async fn counters(pool: &PgPool, c: Uuid) -> (String, i64, i64, i64, i64) {
-    sqlx::query_as("select state, sent, failed, unknown, skipped from campaigns where id = $1")
-        .bind(c)
-        .fetch_one(pool)
-        .await
-        .expect("campaign row")
+/// `(state, sent, failed, bounced, unknown, skipped)`.
+async fn counters(pool: &PgPool, c: Uuid) -> (String, i64, i64, i64, i64, i64) {
+    sqlx::query_as(
+        "select state, sent, failed, bounced, unknown, skipped from campaigns where id = $1",
+    )
+    .bind(c)
+    .fetch_one(pool)
+    .await
+    .expect("campaign row")
 }
 
 async fn claim_one(pool: &PgPool, c: Uuid) -> Claimed {
@@ -358,12 +360,12 @@ async fn an_expired_submitting_row_is_swept_to_unknown_and_counted(pool: PgPool)
         "submitting",
         "a live lease is not swept"
     );
-    assert_eq!(counters(&pool, c).await, ("sending".into(), 0, 0, 1, 0));
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 0, 0, 0, 1, 0));
 
     // The last outstanding message swept finishes the campaign; nothing else would.
     expire(&pool, live.id).await;
     assert_eq!(sweep(&pool).await.expect("sweep"), 1);
-    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 0, 2, 0));
+    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 0, 0, 2, 0));
 }
 
 /// The worker that the sweep gave up on comes back and reports success. `unknown` stands, and
@@ -387,7 +389,7 @@ async fn a_late_outcome_after_the_sweep_does_not_overwrite_unknown(pool: PgPool)
         .expect("record");
 
     assert_eq!(row(&pool, m.id).await.0, "unknown");
-    let (_, sent, _, unknown, _) = counters(&pool, c).await;
+    let (_, sent, _, _, unknown, _) = counters(&pool, c).await;
     assert_eq!((sent, unknown), (0, 1));
 }
 
@@ -426,7 +428,7 @@ async fn a_retry_spends_an_attempt_and_the_fifth_fails(pool: PgPool) {
             assert_eq!(status, "failed");
         }
     }
-    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 1, 0, 0));
+    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 1, 0, 0, 0));
 }
 
 /// Invariant 6's second half, and `release`: neither spends an attempt. And `release` cannot reach
@@ -507,7 +509,7 @@ async fn recording_moves_the_counters_and_finishes_the_campaign(pool: PgPool) {
     )
     .await
     .expect("first flush");
-    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 1, 0, 0));
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 1, 0, 0, 0));
 
     record(
         &pool,
@@ -522,7 +524,7 @@ async fn recording_moves_the_counters_and_finishes_the_campaign(pool: PgPool) {
     )
     .await
     .expect("second flush");
-    assert_eq!(counters(&pool, c).await, ("sent".into(), 1, 1, 1, 1));
+    assert_eq!(counters(&pool, c).await, ("sent".into(), 1, 1, 0, 1, 1));
 
     let (relay_id, response, sent_at, finished): (Option<Uuid>, Option<String>, bool, bool) =
         sqlx::query_as(
@@ -563,7 +565,7 @@ async fn an_awaiting_winner_campaign_does_not_finish(pool: PgPool) {
     record(&pool, &secrets(), &[(m, sent)])
         .await
         .expect("record");
-    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0));
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0, 0));
 
     // Control: the same campaign in phase 2 is done.
     sqlx::query("update campaigns set phase = 2 where id = $1")
@@ -748,7 +750,7 @@ async fn a_message_claimed_to_its_limit_without_an_outcome_is_failed_by_the_swee
             Some(EXHAUSTED.into())
         )
     );
-    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 1, 0, 0));
+    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 1, 0, 0, 0));
     assert!(
         !mark_submitting(&pool, &last).await.expect("mark"),
         "the late holder marked a failed row"
@@ -777,7 +779,7 @@ async fn a_campaign_still_resolving_does_not_finish(pool: PgPool) {
     record(&pool, &secrets(), &[(m, sent)])
         .await
         .expect("record");
-    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0));
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0, 0));
 
     // Control: once resolution is done, the same campaign finishes.
     sqlx::query("update campaigns set resolved = true where id = $1")
@@ -878,10 +880,12 @@ async fn a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing(pool:
 }
 
 /// **The replay test above only tried `Retry` and `Deferred`**, and the other verdicts do not move
-/// a row to the same place. `Sent`, `Failed`, `Unknown` and a `Retry` on its last attempt are final
-/// and each counts; `Skipped` reads from `queued`, so it needs the second claim not yet marked.
-/// A replay of any of them from the first claim must touch neither the second claim's row nor the
-/// campaign's counters. Red-first: drop the token from `record`'s `where`.
+/// a row to the same place. `Sent`, `Failed`, `Bounced`, `Unknown` and a `Retry` on its last
+/// attempt are final and each counts; `Skipped` reads from `queued`, so it needs the second claim
+/// not yet marked. A replay of any of them from the first claim must touch neither the second
+/// claim's row nor the campaign's counters: a `bounced` counted twice leaves `total` short of the
+/// sum, and the campaign never leaves `sending` (spec M2d §4.5.3). Red-first: drop the token from
+/// `record`'s `where`, or count a bounce from the flush instead of from the rows it moved.
 #[sqlx::test]
 async fn a_replayed_flush_of_any_verdict_from_an_earlier_claim_touches_nothing(pool: PgPool) {
     let ws = workspace(&pool).await;
@@ -923,6 +927,7 @@ async fn a_replayed_flush_of_any_verdict_from_an_earlier_claim_touches_nothing(p
             },
         ),
         (&first, Verdict::Failed("550 replayed".into())),
+        (&first, bounced("replayed@example.test")),
         (
             &first,
             Verdict::Unknown("broken after DATA, replayed".into()),
@@ -1013,14 +1018,6 @@ async fn suppressions_in(pool: &PgPool, ws: Uuid) -> Vec<SuppressionRow> {
     .expect("suppressions")
 }
 
-async fn bounced_count(pool: &PgPool, c: Uuid) -> i64 {
-    sqlx::query_scalar("select bounced from campaigns where id = $1")
-        .bind(c)
-        .fetch_one(pool)
-        .await
-        .expect("campaign row")
-}
-
 /// Spec M2d §4.5.2: the message is `bounced`, counted as `bounced` and not `failed`, and its
 /// address is suppressed in the workspace, normalised and keyed by its HMAC. A replay of the same
 /// flush counts nothing and writes no second row.
@@ -1037,8 +1034,7 @@ async fn a_bounce_is_recorded_counted_and_suppressed_once(pool: PgPool) {
     record(&pool, &secrets(), &flush).await.expect("a replay");
 
     assert_eq!(row(&pool, m.id).await.0, "bounced");
-    assert_eq!(counters(&pool, c).await, ("sending".into(), 0, 0, 0, 0));
-    assert_eq!(bounced_count(&pool, c).await, 1);
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 0, 0, 1, 0, 0));
     assert_eq!(
         suppressions_in(&pool, ws).await,
         [(
