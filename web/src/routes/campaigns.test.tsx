@@ -100,7 +100,7 @@ test("an_editor_sees_no_send_and_an_admin_sees_it_on_drafts_only", async ({ page
     ],
   };
   await open(page, app, seed, "editor");
-  await expect(page.getByRole("link", { name: "A draft" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "A draft", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "New campaign" })).toBeVisible();
   await expect(page.getByText("Send", { exact: true })).toHaveCount(0);
 
@@ -111,7 +111,7 @@ test("an_editor_sees_no_send_and_an_admin_sees_it_on_drafts_only", async ({ page
 
 test("a_viewer_can_read_the_list_but_has_no_new_campaign", async ({ page, app }) => {
   await open(page, app, { campaigns: [blankCampaign(ACME, { name: "A draft" })] }, "viewer");
-  await expect(page.getByRole("link", { name: "A draft" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "A draft", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "New campaign" })).toHaveCount(0);
   await expect(page.getByText("Send", { exact: true })).toHaveCount(0);
 });
@@ -138,7 +138,11 @@ test("switching_workspace_never_shows_the_other_workspaces_cached_list", async (
   await page.locator("#workspace").selectOption("beta"); // lands on Beta's members page
   await expect(page).toHaveURL(/\/w\/beta\/members$/);
   await page.getByRole("link", { name: "Campaigns", exact: true }).click();
-  await expect(page.getByText("Acme plan")).toHaveCount(0);
+  // The heading and any cached rows render in one commit, so a count taken the moment the heading
+  // shows is a look at what the screen showed first. `toHaveCount(0)` would retry until Beta's
+  // answer arrived and pass for the wrong reason.
+  await expect(page.getByRole("heading", { name: "Campaigns", level: 2 })).toBeVisible();
+  expect(await page.getByText("Acme plan").count()).toBe(0);
   await expect(page.getByRole("link", { name: "Beta plan" })).toBeVisible();
   await expect(page.getByText("Acme plan")).toHaveCount(0);
 });
