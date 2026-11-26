@@ -1,18 +1,15 @@
-# The build context must stay small: .worktrees/ alone holds whole other checkouts.
-.git/
-.worktrees/
-.superpowers/
-.scratch/
-target/
-**/node_modules
+# An allowlist: nothing enters the build context unless it is named here, so a local folder
+# (another checkout, editor or machine settings) can never reach an image build or its cache.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!rust-toolchain.toml
+!src/
+!migrations/
+!.sqlx/
+!web/
+web/node_modules
 web/dist
 web/test-results
 web/playwright-report
-.pnpm-store/
-.env
-*.key
-docs/
-.github/
-*.md
-docker-compose*.yml
-docker/Caddyfile
