@@ -144,34 +144,43 @@ test("every_cache_key_carries_the_workspace_so_the_other_workspaces_answer_never
   await expect(page.getByText("111 recipients")).toBeVisible();
   await expect(page.getByText("Subject: Acme subject")).toBeVisible();
 
-  // Over to B, whose answers all wait.
-  api.hold("list", "detail", "zone", "options", "estimate", "preview");
+  // Over to B, whose answers all wait. Each step first sees the screen say it is waiting (so the
+  // assertion that A's answer is absent cannot pass before the screen has even reacted), then
+  // that A's answer is not there in its place.
+  const waiting = (label: string) => expect(page.getByText(label, { exact: true })).toHaveCount(1);
+  api.hold("list", "detail", "options", "estimate", "preview");
   await page.locator("#workspace").selectOption({ label: "Beta" });
   await page.getByRole("link", { name: "Campaigns", exact: true }).click();
 
   await api.arrived("list");
+  await waiting("Loading campaigns");
   await expect(page.getByRole("link", { name: "Acme spring" })).toHaveCount(0);
   api.release("list");
   await page.getByRole("link", { name: "Beta spring", exact: true }).click();
 
   await api.arrived("detail");
+  await waiting("Loading campaign");
   await expect(page.getByRole("heading", { name: "Acme spring" })).toHaveCount(0);
-  api.release("detail");
-
   // The editor waits for the workspace's zone; B's has not come, so no schedule may show A's.
+  api.hold("zone");
+  api.release("detail");
   await api.arrived("zone");
+  await waiting("Loading campaign");
   await expect(page.getByRole("region", { name: "Schedule", exact: true })).toHaveCount(0);
   api.release("zone");
 
   await api.arrived("options");
+  await waiting("Loading the editor");
   await expect(page.getByLabel("Acme list")).toHaveCount(0);
   api.release("options");
 
   await api.arrived("estimate");
+  await waiting("Counting…");
   await expect(page.getByText("111 recipients")).toHaveCount(0);
   api.release("estimate");
 
   await api.arrived("preview");
+  await waiting("Loading the preview…");
   await expect(page.getByText("Subject: Acme subject")).toHaveCount(0);
   api.release("preview");
 
