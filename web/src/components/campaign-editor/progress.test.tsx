@@ -248,3 +248,22 @@ test("unscheduling_a_scheduled_campaign_returns_it_to_the_editor", async ({ page
   await button(page, "Unschedule").click();
   await expect(button(page, "Save audience")).toBeVisible();
 });
+
+test("a_scheduled_campaign_can_be_test_sent_by_an_editor_and_no_other_state_can", async ({ page, app }) => {
+  const c = live({ state: "scheduled", counts: counts({}), variants: [VARIANTS[0]!] });
+  const log = await open(page, app, source(c), c, "editor");
+  const test_ = page.getByRole("region", { name: "Test send", exact: true });
+  await test_.getByLabel("Addresses").fill("qa@example.test");
+  await button(test_, "Send test").click();
+  await expect(test_.getByRole("status")).toHaveText("Test queued to 1 address.");
+  expect(log.filter((x) => x.method === "POST" && x.path.endsWith(`/campaigns/${c.id}/test`))).toHaveLength(1);
+
+  // The contract gives a test send to draft and scheduled only; one look per state.
+  for (const state of ["sending", "paused", "sent", "cancelled", "failed"] as const) {
+    const other = live({ state });
+    await page.unrouteAll();
+    await open(page, app, source(other), other, "admin");
+    await expect(page.getByRole("region", { name: "Progress", exact: true })).toBeVisible();
+    expect(await page.getByRole("region", { name: "Test send", exact: true }).count(), state).toBe(0);
+  }
+});

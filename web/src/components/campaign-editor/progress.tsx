@@ -11,6 +11,7 @@ import type { CampaignSource, Res } from "../../routes/campaign-source";
 import { StateBadge, campaignProblem, campaignsKey, showInstant } from "../../routes/campaigns";
 import { Preview } from "./preview";
 import { Problem, Section } from "./section";
+import { TestSend } from "./test-send";
 
 /** The counts in the order a person reads a send: what went, what did not, what is unknown, what is left. */
 const COUNTS = [
@@ -172,6 +173,12 @@ export function CampaignProgress({
       >
         <p>Nothing more will be sent. Emails already sent stay sent. This cannot be undone.</p>
       </ConfirmDialog>
+
+      {can.includes("test") ? (
+        <Section title="Test send">
+          <TestSend ws={ws} id={c.id} variantCount={c.variants.length} slug={slug} templates={[]} />
+        </Section>
+      ) : null}
 
       <Section title="Preview">
         <Preview ws={ws} id={c.id} variantCount={c.variants.length} savedAt={c.updated_at} />
