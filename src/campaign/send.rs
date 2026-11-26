@@ -48,7 +48,10 @@ use crate::{
     crypto::secrets::Secrets,
     custom_fields::{Definition, definitions_for},
     mail::{self, Outgoing, dkim},
-    public::token::{self, Purpose, Token},
+    public::{
+        token::{self, Purpose, Token},
+        track,
+    },
     relay::{self, Relay, transport::Outcome},
     sending_domains::{self, SendingDomain},
     template::{render::Contact, text::render_subject},
@@ -552,6 +555,8 @@ async fn deliver(ctx: &Ctx, m: &Claimed, r: &Recipient, c: &Content, route: &Rou
         Ok(url) => url,
         Err(e) => return Verdict::Failed(format!("the unsubscribe link is not a URL: {e}")),
     };
+    // The message id and a MAC, nothing of the contact's (M2d spec §4.1.1).
+    let tracking = track::issue(&ctx.secrets, m.id);
     let contact = Contact {
         email: &r.email,
         first_name: &r.first_name,
@@ -559,9 +564,7 @@ async fn deliver(ctx: &Ctx, m: &Claimed, r: &Recipient, c: &Content, route: &Rou
         timezone: r.timezone.as_deref(),
         attributes: &r.attributes,
         unsubscribe_token: &token,
-        // shortcut: untracked (a `test` pixel, direct links) until the message's own tracking
-        // token is minted, with the `/o/` and `/l/` routes that answer it.
-        tracking_token: None,
+        tracking_token: Some(&tracking),
     };
     let rendered = match v
         .rendition

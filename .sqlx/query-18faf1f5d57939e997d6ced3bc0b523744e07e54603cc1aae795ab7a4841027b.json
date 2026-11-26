@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update messages set opens = opens + 1, opened_at = coalesce(opened_at, now())\n              where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "18faf1f5d57939e997d6ced3bc0b523744e07e54603cc1aae795ab7a4841027b"
+}

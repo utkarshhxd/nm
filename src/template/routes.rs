@@ -337,6 +337,7 @@ fn stale(e: StoredError) -> ApiError {
         StoredError::Render(_)
         | StoredError::MarkedText
         | StoredError::NoUnsubscribeToken
+        | StoredError::NoTrackingToken
         | StoredError::FooterLost(_) => ApiError::Internal(anyhow::anyhow!("{e}")),
         e => ApiError::ConflictDetail {
             code: "template-stale",

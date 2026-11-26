@@ -13,11 +13,13 @@ pub mod confirm;
 pub mod forms;
 pub mod page;
 pub mod token;
+pub mod track;
 pub mod unsubscribe;
 
-/// The three top-level path prefixes this module owns: `/c/` confirm, `/u/` unsubscribe and the
-/// preference center, `/f/` the hosted signup forms.
-const PREFIXES: [&str; 3] = ["/c", "/u", "/f"];
+/// The top-level path prefixes this module owns: `/c/` confirm, `/u/` unsubscribe and the
+/// preference center, `/f/` the hosted signup forms, `/o/` the open pixel and `/l/` the click
+/// redirect.
+const PREFIXES: [&str; 5] = ["/c", "/u", "/f", "/o", "/l"];
 
 /// True for those prefixes and everything under them, **including the bare prefix with no token**.
 ///
@@ -52,6 +54,7 @@ pub fn routes() -> Router<AppState> {
         .merge(confirm::routes())
         .merge(unsubscribe::routes())
         .merge(forms::routes())
+        .merge(track::routes())
 }
 
 #[cfg(test)]
@@ -61,7 +64,8 @@ mod tests {
     #[test]
     fn the_public_prefixes_are_owned_and_their_near_misses_are_not() {
         for path in [
-            "/c", "/c/", "/c/abc", "/u", "/u/", "/u/abc", "/f", "/f/", "/f/abc",
+            "/c", "/c/", "/c/abc", "/u", "/u/", "/u/abc", "/f", "/f/", "/f/abc", "/o", "/o/x",
+            "/l", "/l/x/0",
         ] {
             assert!(owns_path(path), "{path}");
         }
@@ -72,6 +76,8 @@ mod tests {
             "/customers",
             "/cc/x",
             "/api/v1/me",
+            "/login",
+            "/options",
         ] {
             assert!(!owns_path(path), "{path}");
         }

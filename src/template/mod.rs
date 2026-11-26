@@ -157,6 +157,10 @@ pub enum StoredError {
     Render(RenderError),
     #[error("this message has no unsubscribe token, so its unsubscribe link would be dead")]
     NoUnsubscribeToken,
+    #[error(
+        "this message has an empty tracking token, so its pixel and tracked links would be dead"
+    )]
+    NoTrackingToken,
     #[error("the {0} part of this message lost its unsubscribe link, so it was not built")]
     FooterLost(&'static str),
 }
@@ -371,6 +375,10 @@ impl Ready<'_> {
     pub fn render(&self, contact: &Contact<'_>) -> Result<Rendered, StoredError> {
         if self.0.unsubscribe.is_some() && contact.unsubscribe_token.is_empty() {
             return Err(StoredError::NoUnsubscribeToken);
+        }
+        // `Some("")` would write `{base}/o/` and `{base}/l//{i}`; `None` is the untracked case.
+        if contact.tracking_token == Some("") {
+            return Err(StoredError::NoTrackingToken);
         }
         // The click route's base is the rendition's own frozen unsubscribe prefix, so it cannot
         // drift from the footer's (M2d spec §4.3.3).
@@ -1225,6 +1233,29 @@ mod tests {
                 tracking_token: None,
             });
         assert_eq!(out.unwrap_err(), StoredError::NoUnsubscribeToken);
+    }
+
+    /// S2 review: an empty tracking token is a dead pixel and dead links, refused like an empty
+    /// unsubscribe token.
+    #[test]
+    fn an_empty_tracking_token_is_refused() {
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs()).expect("compiles");
+        let attrs = json!({});
+        let ready = stored.ready(stored.fingerprint(), &defs()).expect("ready");
+        let contact = |tracking_token| Contact {
+            email: "a@b.example",
+            first_name: "Ada",
+            last_name: "B",
+            timezone: None,
+            attributes: &attrs,
+            unsubscribe_token: "TOK",
+            tracking_token,
+        };
+        assert_eq!(
+            ready.render(&contact(Some(""))).unwrap_err(),
+            StoredError::NoTrackingToken
+        );
+        assert!(ready.render(&contact(Some("TRK"))).is_ok());
     }
 
     /// Review M4. The footer's slot is not a custom field, whatever a custom field is keyed, so a

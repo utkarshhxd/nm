@@ -30,7 +30,10 @@ use nm::{
     },
     config::Config,
     crypto::{secrets::Secrets, suppression_hmac},
-    public::token::{self, Purpose, Token},
+    public::{
+        token::{self, Purpose, Token},
+        track,
+    },
     relay::transport::Transports,
     worker::{self, Worker, confirmation::Ctx},
     workspaces::roles::Role,
@@ -363,7 +366,22 @@ fn unqp(s: &str) -> String {
 /// The decoded body of the MIME part whose content type starts `mime` (`text/plain`,
 /// `text/html`).
 fn part(wire: &str, mime: &str) -> String {
-    for chunk in wire.split("\r\n--") {
+    // Split on the boundaries the message declares, not on any `\r\n--`: a quoted-printable line
+    // may start `-->`, as an `mj-button`'s closing comment does.
+    let mut chunks = vec![wire];
+    for (at, m) in wire.match_indices("boundary=") {
+        let boundary = wire[at + m.len()..]
+            .trim_start_matches('"')
+            .split(['"', ';', '\r', '\n'])
+            .next()
+            .unwrap_or_default();
+        let delimiter = format!("\r\n--{boundary}");
+        chunks = chunks
+            .into_iter()
+            .flat_map(|c| c.split(delimiter.as_str()))
+            .collect();
+    }
+    for chunk in chunks {
         let Some((head, body)) = chunk.split_once("\r\n\r\n") else {
             continue;
         };
@@ -1691,4 +1709,199 @@ async fn a_resume_of_a_campaign_with_nothing_left_finishes_it(pool: PgPool) {
     r.assert_status_ok();
     assert_eq!(r.json::<Value>()["state"], "sent");
     assert_eq!(f.state(id).await, "sent");
+}
+
+// ---------------------------------------------------------------------------------------------
+// M2d: every campaign message carries its own tracking token (spec §4.1, §4.3).
+
+impl Fx {
+    /// The template becomes one `mj-button` linking to `href`.
+    async fn button(&self, href: &str) {
+        self.app
+            .patch(&format!(
+                "/api/v1/workspaces/{}/templates/{}",
+                self.ws, self.template
+            ))
+            .json(&json!({"tree": {"blocks": [{"type": "Button", "label": "Go", "href": href}]}}))
+            .await
+            .assert_status_ok();
+    }
+}
+
+/// **Acceptance: a sent message is tracked, end to end.** The message carries one pixel and the
+/// button's tracked link, both on its own token; the unsubscribe link is the header's and is not
+/// tracked; fetching both through the app is one unique open and one unique click in the report.
+#[sqlx::test]
+async fn a_sent_message_is_tracked_end_to_end(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.button("https://a.test/go").await;
+    let contacts = f.contacts(1, "ada").await;
+    let id = f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let wires = f.wires();
+    assert_eq!(wires.len(), 1);
+    let (message, ..) = f.messages(id).await[&contacts[0].1];
+    let html = part(&wires[0], "text/html");
+
+    let t = track::issue(&f.secrets, message);
+    assert_eq!(
+        html.matches(&format!("{PUBLIC_URL}/o/")).count(),
+        1,
+        "{html}"
+    );
+    assert!(
+        html.contains(&format!("src=\"{PUBLIC_URL}/o/{t}\"")),
+        "{html}"
+    );
+    let click = format!("{PUBLIC_URL}/l/{t}/0");
+    assert!(html.contains(&format!("href=\"{click}\"")), "{html}");
+    assert_eq!(
+        html.matches(&format!("{PUBLIC_URL}/l/")).count(),
+        html.matches(&click).count(),
+        "a tracked link other than the button's: {html}"
+    );
+    // The header's link is the body's, untracked, and nothing tracked points under the public URL.
+    let unsubscribe = unsubscribe_url(&wires[0]);
+    assert!(html.contains(&format!("href=\"{unsubscribe}\"")), "{html}");
+    let links: Value = sqlx::query_scalar(
+        "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(links, json!(["https://a.test/go"]));
+
+    f.app
+        .server
+        .get(&format!("/o/{t}"))
+        .await
+        .assert_status_ok();
+    let r = f.app.server.get(&format!("/l/{t}/0")).await;
+    assert_eq!(r.status_code(), StatusCode::FOUND);
+    assert_eq!(r.header("location"), "https://a.test/go");
+
+    let r = f
+        .app
+        .get(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/report",
+            f.ws
+        ))
+        .await;
+    r.assert_status_ok();
+    let report = r.json::<Value>();
+    assert_eq!(
+        (
+            &report["unique_opens"],
+            &report["unique_clicks"],
+            &report["links"][0]["clicks"]
+        ),
+        (&json!(1), &json!(1), &json!(1)),
+        "{report}"
+    );
+}
+
+/// **Anti-goal 3.** No URL the recipient is sent, the header's or any in either part, carries
+/// their address, raw or percent-encoded.
+#[sqlx::test]
+async fn no_url_in_a_sent_message_carries_the_recipients_address(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.button("https://a.test/go").await;
+    let contact = Uuid::now_v7();
+    sqlx::query(
+        "insert into contacts (id, workspace_id, email, first_name)
+         values ($1, $2, 'alice+x@example.test', 'Alice')",
+    )
+    .bind(contact)
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into list_memberships (workspace_id, contact_id, list_id, status)
+         values ($1, $2, $3, 'subscribed')",
+    )
+    .bind(f.ws)
+    .bind(contact)
+    .bind(f.list)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.launched().await;
+    f.send_all(&f.worker(1)).await;
+    let wires = f.wires();
+    assert_eq!(wires.len(), 1);
+    let wire = &wires[0];
+    assert_eq!(header(wire, "To").as_deref(), Some("alice+x@example.test"));
+
+    let mut urls = vec![unsubscribe_url(wire)];
+    for body in [part(wire, "text/html"), part(wire, "text/plain")] {
+        for (at, _) in body.match_indices("http") {
+            urls.push(
+                body[at..]
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && !"\"'<>()".contains(*c))
+                    .collect(),
+            );
+        }
+    }
+    assert!(urls.iter().any(|u| u.contains("/o/")), "{urls:#?}");
+    assert!(urls.iter().any(|u| u.contains("/l/")), "{urls:#?}");
+    for url in &urls {
+        let lower = url.to_ascii_lowercase();
+        assert!(
+            !lower.contains("alice") && !lower.contains('@') && !lower.contains("%40"),
+            "a URL carries the address: {url}"
+        );
+    }
+}
+
+/// **S2's carry: a preview and a test send mint no tracking token.** Both render the frozen
+/// rendition, link table and all, for the sample contact: the pixel reads `test` and the button
+/// links straight to its URL.
+#[sqlx::test]
+async fn preview_and_test_render_create_no_tracking_token(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    f.button("https://a.test/go").await;
+    let r = f
+        .app
+        .post(&format!("/api/v1/workspaces/{}/campaigns", f.ws))
+        .json(&json!({
+            "name": "c", "list_ids": [f.list], "sending_domain_id": f.domain,
+            "from_local_part": "news", "from_name": "Acme", "reply_to": null,
+            "variants": [{"subject": "Hi", "template_id": f.template, "from_name": null}],
+        }))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let id = id_of(&r);
+    let campaign = format!("/api/v1/workspaces/{}/campaigns/{id}", f.ws);
+    let r = f
+        .app
+        .post(&format!("{campaign}/preview"))
+        .json(&json!({}))
+        .await;
+    r.assert_status_ok();
+    let preview = r.json::<Value>()["html"].as_str().unwrap().to_owned();
+    f.app
+        .post(&format!("{campaign}/test"))
+        .json(&json!({"addresses": ["tester@dest.test"]}))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    let test: String =
+        sqlx::query_scalar("select payload->>'html' from jobs where kind = 'campaign_test'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+
+    for (what, html) in [("preview", preview), ("test", test)] {
+        assert!(
+            html.contains(&format!("src=\"{PUBLIC_URL}/o/test\"")),
+            "{what}: {html}"
+        );
+        assert!(
+            html.contains("href=\"https://a.test/go\""),
+            "{what}: {html}"
+        );
+        assert!(!html.contains("/l/"), "{what} tracked a link: {html}");
+    }
 }

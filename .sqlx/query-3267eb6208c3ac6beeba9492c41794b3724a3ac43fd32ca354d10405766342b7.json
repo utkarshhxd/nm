@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "with m as (update messages set clicks = clicks + 1,\n                                            clicked_at = coalesce(clicked_at, now()),\n                                            opened_at = coalesce(opened_at, now())\n                         where id = $1 returning workspace_id, campaign_id, variant)\n             insert into message_clicks (message_id, link, workspace_id, campaign_id, variant)\n             select $1, $2, workspace_id, campaign_id, variant from m\n             on conflict (message_id, link)\n             do update set clicks = message_clicks.clicks + 1, last_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3267eb6208c3ac6beeba9492c41794b3724a3ac43fd32ca354d10405766342b7"
+}
