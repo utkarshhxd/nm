@@ -131,3 +131,33 @@ test("the_mock_lists_newest_first_in_pages_with_a_cursor", async () => {
   const two = await src.list(WS, { limit: 2, after: one.data.next_cursor ?? "" });
   expect(two).toMatchObject({ ok: true, data: { data: [{ name: "C1" }], next_cursor: null } });
 });
+
+test("the_mock_pauses_a_sending_campaign_and_resumes_a_paused_one", async () => {
+  const live = blankCampaign(WS, { name: "Live", state: "sending" });
+  const src = mockCampaignSource({ campaigns: [live] });
+  expect(await src.pause(WS, live.id)).toMatchObject({ ok: true, data: { state: "paused" } });
+  expect(await src.get(WS, live.id)).toMatchObject({ ok: true, data: { state: "paused" } });
+  expect(await src.resume(WS, live.id)).toMatchObject({ ok: true, data: { state: "sending" } });
+  // Resuming what is already sending is 200: a transition into the current state changes nothing.
+  expect(await src.resume(WS, live.id)).toMatchObject({ ok: true, data: { state: "sending" } });
+});
+
+test("the_mock_records_a_winner_only_while_one_is_awaited", async () => {
+  const waiting = blankCampaign(WS, { name: "Split", state: "paused", awaiting_winner: true });
+  const src = mockCampaignSource({ campaigns: [waiting] });
+  expect(await src.winner(WS, waiting.id, { variant: 1 })).toMatchObject({
+    ok: true,
+    data: { winner: 1, awaiting_winner: false },
+  });
+  // A second pick, and a pick on a campaign that never awaited one, are 409 campaign-state.
+  const refused = { ok: false, error: { status: 409, type: "urn:nm:problem:campaign-state" } };
+  expect(await src.winner(WS, waiting.id, { variant: 0 })).toMatchObject(refused);
+  // Each refusal on its own: a draft, a live campaign not awaiting one, and one whose winner is set.
+  const never = [
+    blankCampaign(WS, { name: "Draft", awaiting_winner: true }),
+    blankCampaign(WS, { name: "Not awaiting", state: "sending", awaiting_winner: false }),
+    blankCampaign(WS, { name: "Picked", state: "sending", awaiting_winner: true, winner: 0 }),
+  ];
+  const other = mockCampaignSource({ campaigns: never });
+  for (const c of never) expect(await other.winner(WS, c.id, { variant: 1 }), c.name).toMatchObject(refused);
+});
