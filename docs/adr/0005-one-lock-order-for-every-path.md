@@ -171,6 +171,19 @@ a `RowExclusiveLock` on `audit_log` (the `delete_relay` reasoning). So each stay
 in the wait-for graph, which is what the ruling below rests on. `templates` and `brand_kits` are
 still not lock classes and still not parents.
 
+**M2c's order on its own tables is `messages`, then `campaigns`, then `jobs`** (spec §4.11). The
+message queue (R4) writes these. No statement below writes `campaign_id` or `workspace_id`, so no
+referential trigger fires and none takes `for key share` on `campaigns`; an update of `campaigns`
+counters or state is `for no key update`, which a child insert's `for key share` does not wait on.
+
+| path (M2c) | order it takes |
+|---|---|
+| `campaign::queue::claim` | `messages` rows alone, `for update skip locked`, one statement. Writes `attempts` and `run_after`. Its join on `campaigns` (`state = 'sending'`) is a plain read with no locking clause |
+| `campaign::queue::mark_submitting` | the `messages` row alone, by primary key. Writes `status` |
+| `campaign::queue::release` | `messages` rows alone, by primary key, `status = 'queued'` only. Writes `attempts`, `run_after`, `error` |
+| `campaign::queue::record` | `messages` (one `update … from unnest`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction |
+| `campaign::queue::sweep` | `messages` (`for update skip locked`, so it never waits on a row a flush is recording), then `campaigns` as `record`. One transaction |
+
 ## The rule for new code
 
 If you write `list_memberships` or `consent_log`, call `lists::lock_lists` with the list ids you
@@ -259,7 +272,7 @@ and that statement does not exist yet.
 parents, because each was a table asked about and the answer is load-bearing.
 `tests/lock_order.rs` asserts that every **edge** of this graph —
 each `(parent, child, on delete action)` triple, not merely the set of parents — is unchanged, so
-a migration that adds an eleventh parent, a second child to an existing one, or that turns a
+a migration that adds a twelfth parent, a second child to an existing one, or that turns a
 `cascade` into a `set null`, fails there rather than being noticed by somebody.
 
 | parent | ruling | why |
