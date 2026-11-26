@@ -16,6 +16,7 @@ import type {
   CampaignSummary,
   Estimate,
   Options,
+  Report,
 } from "./campaign-model";
 import type { CampaignSource, Res } from "./campaign-source";
 
@@ -25,6 +26,8 @@ export type MockState = {
   /** shortcut: one set of options for every workspace; give it per-workspace the day a test needs two. */
   options: Options;
   estimate: Estimate;
+  /** Each campaign's report by campaign id; one with none answers zeros and no links. */
+  reports: Record<string, Report>;
   /** What `update` answers instead of saving, e.g. a 409 `campaign-state`. */
   updateRefusal?: unknown;
   /** What `test` answers instead of queueing. */
@@ -55,6 +58,7 @@ const present = (vs: { subject: string; template_id: string; from_name?: string 
   vs.map((v) => ({ ...v, from_name: v.from_name ?? null }));
 
 const NONE = { total: 0, queued: 0, sent: 0, failed: 0, bounced: 0, unknown: 0, skipped: 0 };
+const NO_REPORT: Report = { sent: 0, failed: 0, bounced: 0, unique_opens: 0, unique_clicks: 0, unsubscribed: 0, links: [] };
 
 /** A fresh draft, as `POST /campaigns` makes one. Tests use it to build seeds. */
 export function blankCampaign(ws: string, over: Partial<Campaign> & { name: string }): Campaign {
@@ -99,6 +103,7 @@ export function mockCampaignSource(seed: Partial<MockState> = {}): CampaignSourc
     campaigns: [],
     options: { lists: [], segments: [], sendingDomains: [], templates: [] },
     estimate: { count: 1234, exact: true },
+    reports: {},
     delayMs: 0,
     ...seed,
   };
@@ -229,6 +234,7 @@ export function mockCampaignSource(seed: Partial<MockState> = {}): CampaignSourc
         c.awaiting_winner = false;
         return ok(structuredClone(c));
       }),
+    report: (ws, id) => on(ws, id, (c) => ok(structuredClone(s.reports[c.id] ?? NO_REPORT))),
     options: async () => {
       await wait();
       return ok(structuredClone(s.options));

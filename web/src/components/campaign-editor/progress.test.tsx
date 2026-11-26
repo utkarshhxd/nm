@@ -41,7 +41,7 @@ const live = (over: Partial<Campaign> = {}) =>
     name: "Spring sale",
     state: "sending",
     schedule: { mode: "instant", zone: "UTC", local: null, send_at: "2027-03-01T09:30:00Z" },
-    counts: counts({ sent: 40, failed: 3, unknown: 2, skipped: 5, queued: 50 }),
+    counts: counts({ sent: 40, failed: 3, bounced: 7, unknown: 2, skipped: 5, queued: 43 }),
     ...over,
   });
 
@@ -91,9 +91,44 @@ test("the_progress_view_shows_every_count_with_the_uncertain_one_named_for_what_
     expect(progress.locator("dt", { hasText: label }).locator("xpath=following-sibling::dd[1]")).toHaveText(n);
   await row("Sent", "40");
   await row("Failed", "3");
+  await row("Bounced (no such mailbox; now suppressed)", "7");
   await row("Uncertain — never retried", "2");
   await row("Skipped (unsubscribed or suppressed since launch)", "5");
-  await row("Queued", "50");
+  await row("Queued", "43");
+});
+
+test("progress_lists_bounced_as_its_own_count_and_queued_leaves_it_out", async ({ page, app }) => {
+  // 100 = 40 sent + 3 failed + 7 bounced + 2 unknown + 5 skipped + 43 queued: bounced is not queued.
+  const c = live();
+  await open(page, app, source(c), c);
+  const progress = page.getByRole("region", { name: "Progress", exact: true });
+  const labels = progress.locator("dt");
+  await expect(labels).toHaveText([
+    "Sent",
+    "Failed",
+    "Bounced (no such mailbox; now suppressed)",
+    "Uncertain — never retried",
+    "Skipped (unsubscribed or suppressed since launch)",
+    "Queued",
+  ]);
+  const n = async (label: string) =>
+    Number(await progress.locator("dt", { hasText: label }).locator("xpath=following-sibling::dd[1]").textContent());
+  const parts = await Promise.all(["Sent", "Failed", "Bounced", "Uncertain", "Skipped", "Queued"].map(n));
+  expect(parts.reduce((a, b) => a + b, 0)).toBe(100);
+});
+
+test("progress_shows_no_report_before_launch", async ({ page, app }) => {
+  const c = live({ state: "scheduled", launched_at: null, counts: counts({}) });
+  const log = await open(page, app, source(c), c);
+  await expect(page.getByRole("region", { name: "Progress", exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Report", exact: true })).toHaveCount(0);
+  expect(log.filter((x) => x.path.endsWith("/report"))).toHaveLength(0);
+
+  // Launched: the report is there, below Progress.
+  const sent = live({ launched_at: "2027-03-01T09:30:00Z" });
+  await page.unrouteAll();
+  await open(page, app, source(sent), sent);
+  await expect(page.getByRole("region", { name: "Report", exact: true })).toBeVisible();
 });
 
 test("a_pause_or_failure_reason_is_shown_word_for_word", async ({ page, app }) => {
@@ -133,8 +168,8 @@ test("it_stops_polling_when_the_campaign_pauses_and_never_polls_one_that_is_not_
 test("a_winner_pick_posts_the_variant_index_and_the_picker_goes_away", async ({ page, app }) => {
   const c = live({ variants: VARIANTS, ab_test_percent: 20, awaiting_winner: true, state: "paused" });
   await open(page, app, source(c), c);
-  await expect(page.getByText("No engagement data until tracking ships — pick on what you know.")).toBeVisible();
   const picker = page.getByRole("region", { name: "Pick the winner", exact: true });
+  await expect(picker).toContainText("Each variant's link clicks are in the report below.");
   await expect(picker).toContainText("Variant 1: Spring is here");
   await expect(picker).toContainText("Variant 2: Spring has sprung");
 
@@ -143,6 +178,26 @@ test("a_winner_pick_posts_the_variant_index_and_the_picker_goes_away", async ({ 
   expect((await posted).postDataJSON()).toEqual({ variant: 1 });
   await expect(page.getByText("Winner: variant 2.")).toBeVisible();
   await expect(button(page, "Pick variant 2")).toHaveCount(0);
+});
+
+test("progress_winner_picker_points_at_the_report", async ({ page, app }) => {
+  const c = live({
+    variants: VARIANTS,
+    ab_test_percent: 20,
+    awaiting_winner: true,
+    state: "paused",
+    launched_at: "2027-03-01T09:30:00Z",
+  });
+  await open(page, app, source(c), c);
+  const picker = page.getByRole("region", { name: "Pick the winner", exact: true });
+  await expect(picker).toContainText("Each variant's link clicks are in the report below.");
+  await expect(page.getByText("No engagement data")).toHaveCount(0);
+  // "Below" is true: the report follows the picker on the page.
+  const [pickerBox, reportBox] = await Promise.all([
+    picker.boundingBox(),
+    page.getByRole("region", { name: "Report", exact: true }).boundingBox(),
+  ]);
+  expect(reportBox!.y).toBeGreaterThan(pickerBox!.y);
 });
 
 test("only_an_admin_picks_and_only_while_a_winner_is_awaited", async ({ page, app }) => {
@@ -156,7 +211,7 @@ test("only_an_admin_picks_and_only_while_a_winner_is_awaited", async ({ page, ap
   const done = live({ variants: VARIANTS, ab_test_percent: 20, awaiting_winner: false, state: "paused" });
   await open(page, app, source(done), done, "admin");
   await expect(page.getByText("Progress", { exact: true })).toBeVisible();
-  await expect(page.getByText("No engagement data until tracking ships")).toHaveCount(0);
+  await expect(page.getByText("link clicks are in the report below")).toHaveCount(0);
   await expect(button(page, "Pick variant 1")).toHaveCount(0);
 });
 
