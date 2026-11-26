@@ -29,7 +29,7 @@ One theme-switching mechanism, not two. `better-colors` is explicit that mixing 
 
 Every value below was generated in OKLCH, verified to be inside sRGB, and contrast-checked against the background it actually renders on (`better-colors`: "Measure a foreground against the background it actually renders on, not the page background"). The hex column is the exact sRGB equivalent — it exists because the MJML templates and the brand kit in M2 need hex, and because designers need something to paste into a design tool.
 
-**Hue budget.** The accent cannot be blue, green, amber or red, because this product renders five simultaneous status hues on the same screen — delivered, bounced, complained, suppressed, scheduled — and `better-colors` requires at least 15° of OKLCH hue separation between an accent and a status colour. A blue accent collides with "info/scheduled" and a green accent collides with "delivered". The accent is therefore **violet, hue 295°**: 45° from info (250°), 145° from success (150°), 223° from warning (72°), 268° from danger (27°). The choice is functional, not decorative, and it is not one of the four generated-design defaults (`frontend-design`) — no warm cream, no acid green on near-black, no broadsheet hairlines, no identical rounded cards.
+**Hue budget.** The accent cannot be blue, green, amber or red, because this product renders five simultaneous status hues on the same screen — delivered, bounced, complained, suppressed, scheduled — and `better-colors` requires at least 15° of OKLCH hue separation between an accent and a status colour. A blue accent collides with "info/scheduled" and a green accent collides with "delivered". The accent is therefore **violet, hue 295°**: 45° from info (250°), 145° from success (150°), 223° from warning (72°), 268° from danger (27°). The choice is functional, not decorative, and it is not one of the four template defaults — no warm cream, no acid green on near-black, no broadsheet hairlines, no identical rounded cards.
 
 Neutrals carry a slight cool cast (hue 265, chroma 0.003–0.018) so that the five status colours read as signal against instrument grey rather than competing with a warm background.
 
@@ -148,7 +148,7 @@ Rules taken from `better-layout`:
 }
 ```
 
-**No webfont.** This is a decision, not an omission. A self-hosted install must not make a third-party request (spec §7 Security: "self-hosted, no third party"; §7 Privacy), must work on an air-gapped network, and must not spend bytes from a 45 KB headroom on a typeface. The system stack costs zero bytes, has zero FOUT, and raises no licence question for the AGPL gate. The `ui-ux-pro-max` search proposed Fira Code/Fira Sans loaded from `fonts.googleapis.com`; the pairing is reasonable and the delivery method is not. If the §13.2 mockups demand a brand face, it ships as one subset self-hosted `woff2` (latin, ~18 KB, `font-display: swap`) applied to `--font-sans` headings only, and nothing else in this document changes.
+**No webfont.** This is a decision, not an omission. A self-hosted install must not make a third-party request (spec §7 Security: "self-hosted, no third party"; §7 Privacy), must work on an air-gapped network, and must not spend bytes from a 45 KB headroom on a typeface. The system stack costs zero bytes, has zero FOUT, and raises no licence question for the AGPL gate. One candidate pairing was Fira Code/Fira Sans loaded from `fonts.googleapis.com`; the pairing is reasonable and the delivery method is not. If the §13.2 mockups demand a brand face, it ships as one subset self-hosted `woff2` (latin, ~18 KB, `font-display: swap`) applied to `--font-sans` headings only, and nothing else in this document changes.
 
 Other type rules:
 
@@ -170,7 +170,7 @@ Other type rules:
 }
 ```
 
-One radius on everything is a listed generated-design tell (`frontend-design`). Here the radius encodes scale: a table row has **radius 0** — rows are a continuous surface, not a stack of cards.
+One radius on everything is a well-known template tell. Here the radius encodes scale: a table row has **radius 0** — rows are a continuous surface, not a stack of cards.
 
 ```css
 /* Elevation. Dense UI separates with borders and surface steps, not shadows.
@@ -627,7 +627,7 @@ Replaces the toolbar in place when a selection exists — it does not float over
 26. Do not reverse the light ramp to make the dark one. Drop the accent's chroma and re-measure every pair.
 27. Do not name a semantic token after a hue (`--color-blue-button`) or a component (`--contacts-table-border`).
 28. Do not raise `html { font-size }` down to 14px to get density.
-29. Do not give everything the same border radius, the same 1px border and the same soft grey shadow — that is the SaaS-card default `frontend-design` names as a generated-design tell. Rows have no radius; only the top layer has a shadow.
+29. Do not give everything the same border radius, the same 1px border and the same soft grey shadow — that is the SaaS-card template default. Rows have no radius; only the top layer has a shadow.
 
 **Copy and content** (from `better-writing` and `break-ui`)
 
@@ -652,22 +652,6 @@ Replaces the toolbar in place when a selection exists — it does not float over
 - `web/src/router.tsx` — every route is already `lazyRouteComponent`, which is what makes "put it in the route chunk" a real answer rather than a hope.
 - `.scratch/email-platform/spec.md` §6, §7 (UI, Security, Licensing), §9, §13 — §7 already names TanStack Virtual and xyflow; §2.4 revises only its "Radix primitives" line, with measurements. §13.2 is partly closed by §1.
 - M0's global constraints (review notes kept outside the repository) — "Build functional, accessible screens with plain Tailwind and no bespoke design system" was correct while §13.2 was open; this document is the proposal to supersede it.
-
-**Skills invoked**
-
-- **`ui-ux-pro-max`** — the focused `--domain ux` searches were useful and are reflected throughout: the focusable error summary (§4.6), focus-not-obscured as a HIGH failure (§3.5), accessible authentication / never block paste (§5.17), loading indicators with `aria-busy` and reserved space (§2.2 Skeleton), content-jumping from badge and count insertion (§3.4 count slot), long-token wrapping with `overflow-wrap: anywhere` (§5.31), bulk actions as checkbox column plus action bar (§4.7). Its `--design-system` aggregate, however, misrouted: for the query "admin dashboard data table dense" it returned a **marketing landing-page** pattern ("Enterprise Gateway", "Contact Sales + Login" CTAs, a hero-video section order) and recommended Fira Code/Fira Sans **loaded from the Google Fonts CDN**. The pattern is the wrong shape for an application and the font delivery is incompatible with a self-hosted, no-third-party product — both rejected. What was kept from it: the Swiss/minimal direction, the accessibility risk profile, and the pre-delivery checklist.
-- **`frontend-design`** — the calibration list of generated-design tells drove three concrete decisions: no warm-cream-and-terracotta palette, no identical-rounded-card kit (§1.5 radius encodes scale, rows have none), and no ALL-CAPS eyebrow labels or `→` suffixes in copy. Its "spend your boldness in one place" is why the accent is the only saturated colour in the chrome and everything else is instrument grey. Its writing section (active voice, the same verb through a flow, errors that do not apologise) is §4.5–4.7 and §5.33–34.
-
-**ui-skills.com** — fetched as third-party reference material and weighed, not obeyed.
-
-- `/skills/prototyperai/build-primitive` — the strongest single source here. Took: the headless-library shortlist that pointed at `@tanstack/react-virtual` and `cmdk`; "check that no existing solution handles the hard parts before building from scratch"; the keyboard patterns taxonomy (roving tabindex vs. active-descendant vs. grid navigation) that §3.6 picks from; the focus-trap / focus-restoration / initial-focus triad in §2.2; and "never include the role name in the accessible name". **Ignored as out of brief**: its house rules for a different codebase — `"use client"` on line 1, named exports only, no `forwardRef`, and "check for a Base UI primitive first" (we measured Base UI at 65.6 KB gzipped and rejected it).
-- `/skills/jakubkrehel/better-colors` — the method behind §1.2: OKLCH as the default notation, one neutral ramp plus one accent plus only the status ramps actually rendered, "measure a foreground against the background it actually renders on", the 15° hue-separation rule that decided the accent (§1.2 hue budget), fix contrast by moving lightness, do not reverse the light ramp for dark, and one theme mechanism rather than two.
-- `/skills/jakubkrehel/better-accessibility` — "the first rule of ARIA: don't use ARIA when a native element exists" is the backbone of §2.1 and §2.3. Also: prefer `<dialog>` + `showModal()`; style `:focus-visible` not `:focus`; the 24×24 (2.5.8) floor with 44px as a touch heuristic; dragging needs a single-pointer alternative (2.5.7); never disable submit; mount the live region empty first; `role="status"` for polite, `role="alert"` only for untied errors; never `maximum-scale=1`.
-- `/skills/jakubkrehel/better-layout` — "space groups first, background shapes second, separator lines last", the 2× between-vs-within gap rule, one spacing step per nesting level with 16px default, breakpoints from content not device presets, container queries for components (§3.5), `minmax(0, 1fr)` and `min-width: 0` against overflow, `scroll-padding-block-start` for sticky headers, DOM order is reading order, one primary action per view, and "never park a critical action where resizing, zoom or scrolling clips it".
-- `/skills/emilkowalski/break-ui` — the §5 content list and the test fixture in §5.36: plausible-or-schema-backed worst cases rather than random strings, breaks spread across rows, the Empty / One / 1,000-row extra states, and the failure catalogue (`min-width: 0`, `flex-shrink: 0`, `overflow-wrap: anywhere`, `white-space: nowrap` on badges, `Intl.PluralRules` for "1 members", tabular figures, middle-truncation for emails and paths, "never truncate numbers, amounts, dates").
-- `/skills/jakubkrehel/break` — adopted as a method rather than content: a throwaway harness route rendering the real component once per scenario, looked at in a browser, reported, then deleted. Worth doing for the DataTable before M1a is signed off. "A predicted failure is not a finding."
-- `/skills/jakubkrehel/better-writing` — §4.5–4.7 and §5.30–35: verb-first button labels, the same verb through a flow, name the action and object in a confirmation instead of "Are you sure?", require typing the object's name for irreversible bulk actions, errors say how to fix and sit by the field, empty states explain the place and offer one action, filtered-empty names the query, sentence case by default, realistic placeholders, ICU plurals.
-- `/skills/nextlevelbuilder/design-system` — took the primitive → semantic → component layering and "never use raw hex in components". **Ignored as out of brief**: the page's instructions are written for slide decks ("Slides must import `assets/design-tokens.css`", "use Chart.js for charts", "focus on persuasion") and have nothing to do with this product; its "use HSL format for opacity control" is superseded by OKLCH plus relative colour syntax, and its component-token layer is skipped for the reason given in §1.1.
 
 **Measurements taken for this document**
 
