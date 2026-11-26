@@ -178,11 +178,11 @@ counters or state is `for no key update`, which a child insert's `for key share`
 
 | path (M2c) | order it takes |
 |---|---|
-| `campaign::queue::claim` | `messages` rows alone, `for update skip locked`, one statement. Writes `attempts` and `run_after`. Its join on `campaigns` (`state = 'sending'`) is a plain read with no locking clause |
-| `campaign::queue::mark_submitting` | the `messages` row alone, by primary key. Writes `status` |
-| `campaign::queue::release` | `messages` rows alone, by primary key, `status = 'queued'` only. Writes `attempts`, `run_after`, `error` |
-| `campaign::queue::record` | `messages` (one `update … from unnest`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction |
-| `campaign::queue::sweep` | `messages` (`for update skip locked`, so it never waits on a row a flush is recording), then `campaigns` as `record`. One transaction |
+| `campaign::queue::claim` | `messages` rows alone, `for update skip locked`, one statement. Writes `attempts`, `run_after` and `claim_token`. Its join on `campaigns` (`state = 'sending'`) is a plain read with no locking clause |
+| `campaign::queue::mark_submitting` | the `messages` row alone, by primary key and `claim_token`. Writes `status` and `run_after` |
+| `campaign::queue::release` | `messages` rows alone, by primary key and `claim_token`, `status = 'queued'` only. Writes `attempts`, `run_after`, `error`, `claim_token` |
+| `campaign::queue::record` | `messages` (one `update … from unnest`, matched on `claim_token`), then `campaigns` by primary key, one row per statement in ascending id order: the counters, then `finish_if_done` on the row it already holds. One transaction |
+| `campaign::queue::sweep` | `messages` in two statements (expired `submitting` rows to `unknown`, exhausted `queued` rows to `failed`), each `for update skip locked` so it never waits on a row a flush is recording; then `campaigns` as `record`. One transaction |
 
 ## The rule for new code
 

@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use nm::campaign::queue::{
-    CLAIM, Claimed, SWEPT, Verdict, claim, eligible, finish_if_done, mark_submitting, record,
-    release, sweep,
+    CLAIM, Claimed, EXHAUSTED, MESSAGE_MAX_ATTEMPTS, SUBMIT_LEASE, SWEPT, Verdict, claim, eligible,
+    finish_if_done, mark_submitting, record, release, sweep,
 };
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::time::timeout;
@@ -121,8 +121,19 @@ async fn claim_one(pool: &PgPool, c: Uuid) -> Claimed {
     got.remove(0)
 }
 
-/// The claim is `0026`'s protocol per campaign, read clause by clause. Each clause also has a
-/// behavioural test below that goes red without it.
+/// The claim is `0026`'s protocol per campaign, read clause by clause. Every clause except the
+/// ordering also has a behavioural test below that goes red without it:
+///
+/// | clause | test |
+/// |---|---|
+/// | `for update skip locked` | `two_concurrent_claims_are_disjoint` |
+/// | `status = 'queued'` | `a_submitting_row_is_never_claimed` |
+/// | `attempts < max_attempts` | `a_message_claimed_to_its_limit_without_an_outcome_is_failed_by_the_sweep` |
+/// | `run_after <= now()` | `a_stale_lease_holder_cannot_mark_submitting` |
+/// | `attempts + 1` | `a_stale_lease_holder_cannot_mark_submitting` |
+/// | `claim_token = gen_random_uuid()` | `a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing` |
+/// | `cross join lateral` | `a_batch_is_shared_fairly_across_campaigns` |
+/// | `k.state = 'sending'` | `a_paused_or_cancelled_campaign_is_never_claimed` |
 #[test]
 fn the_claim_is_the_protocol() {
     let flat = CLAIM.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -131,7 +142,8 @@ fn the_claim_is_the_protocol() {
         "status = 'queued'",
         "attempts < max_attempts",
         "run_after <= now()",
-        "set attempts = m.attempts + 1, run_after = now() + make_interval(secs => $3)",
+        "set attempts = m.attempts + 1, run_after = now() + make_interval(secs => $3), \
+         claim_token = gen_random_uuid()",
         "cross join lateral",
         "order by run_after, id",
         "k.state = 'sending'",
@@ -250,6 +262,8 @@ async fn a_stale_lease_holder_cannot_mark_submitting(pool: PgPool) {
     queue(&pool, ws, c, 1, "1 minute").await;
 
     let stale = claim_one(&pool, c).await;
+    let early = claim(&pool, &[c], 10, LEASE).await.expect("claim");
+    assert!(early.is_empty(), "a row was re-claimed inside its lease");
     expire(&pool, stale.id).await;
     let current = claim_one(&pool, c).await;
     assert_eq!((stale.attempts, current.attempts), (1, 2));
@@ -399,7 +413,7 @@ async fn a_deferral_and_a_release_spend_no_attempt(pool: PgPool) {
 
     release(
         &pool,
-        &[released.id, in_flight.id],
+        &[released.clone(), in_flight.clone()],
         Duration::from_secs(30),
         "budget",
     )
@@ -637,4 +651,199 @@ async fn eligible_drops_a_deleted_contact(pool: PgPool) {
     let got = eligible(&pool, &ids).await.expect("eligible");
     let ids_back: Vec<Uuid> = got.iter().map(|r| r.message_id).collect();
     assert_eq!(ids_back, [ids[0]]);
+}
+
+/// `(status, attempts, run_after, claim_token, error)`, to show a statement touched nothing.
+async fn snapshot(pool: &PgPool, id: Uuid) -> (String, i32, String, Option<Uuid>, Option<String>) {
+    sqlx::query_as(
+        "select status, attempts, run_after::text, claim_token, error from messages where id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("message row")
+}
+
+/// The holder dies before `submitting`, at every attempt. The claim stops offering the row at
+/// `max_attempts`, and the sweep fails it so the campaign can finish. A row at the limit whose
+/// lease is still live is left alone, and its holder, back late, can no longer mark it.
+#[sqlx::test]
+async fn a_message_claimed_to_its_limit_without_an_outcome_is_failed_by_the_sweep(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    for _ in 1..MESSAGE_MAX_ATTEMPTS {
+        let m = claim_one(&pool, c).await;
+        expire(&pool, m.id).await;
+    }
+    let last = claim_one(&pool, c).await;
+    assert_eq!(last.attempts, MESSAGE_MAX_ATTEMPTS);
+
+    assert_eq!(
+        sweep(&pool).await.expect("sweep"),
+        0,
+        "the last lease is live"
+    );
+    expire(&pool, last.id).await;
+    let again = claim(&pool, &[c], 10, LEASE).await.expect("claim");
+    assert!(
+        again.is_empty(),
+        "a row at max_attempts was claimed: {again:?}"
+    );
+
+    assert_eq!(sweep(&pool).await.expect("sweep"), 1);
+    assert_eq!(
+        row(&pool, last.id).await,
+        (
+            "failed".into(),
+            MESSAGE_MAX_ATTEMPTS,
+            Some(EXHAUSTED.into())
+        )
+    );
+    assert_eq!(counters(&pool, c).await, ("sent".into(), 0, 1, 0, 0));
+    assert!(
+        !mark_submitting(&pool, &last).await.expect("mark"),
+        "the late holder marked a failed row"
+    );
+}
+
+/// Spec §4.2.3: launch resolves in batches while the first ones send, so every message present can
+/// be recorded before the last batch is inserted. A campaign that finished then would never be
+/// claimed again, and its later batches would never be sent.
+#[sqlx::test]
+async fn a_campaign_still_resolving_does_not_finish(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    sqlx::query("update campaigns set resolved = false where id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await
+        .expect("resolving");
+    queue(&pool, ws, c, 1, "1 minute").await;
+    let m = claim_one(&pool, c).await;
+    assert!(mark_submitting(&pool, &m).await.expect("mark"));
+    let sent = Verdict::Sent {
+        relay: Uuid::now_v7(),
+        response: "250".into(),
+    };
+    record(&pool, &[(m, sent)]).await.expect("record");
+    assert_eq!(counters(&pool, c).await, ("sending".into(), 1, 0, 0, 0));
+
+    // Control: once resolution is done, the same campaign finishes.
+    sqlx::query("update campaigns set resolved = true where id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await
+        .expect("resolved");
+    let mut conn = pool.acquire().await.expect("conn");
+    assert!(finish_if_done(&mut conn, c).await.expect("finish"));
+}
+
+/// The caller records whatever `eligible` leaves out as `Skipped`, which is final. A campaign
+/// paused between the claim and this check must keep its mailable recipients, or resume finds
+/// them skipped and their mail is lost.
+#[sqlx::test]
+async fn eligible_ignores_campaign_state(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let l = list(&pool, ws).await;
+    let c = campaign(&pool, ws, &[l], 1).await;
+    let k = contact(&pool, ws, "k@ok.test", &[(l, "subscribed")]).await;
+    let id = message(&pool, ws, c, k).await;
+    for state in ["paused", "cancelled"] {
+        sqlx::query("update campaigns set state = $2 where id = $1")
+            .bind(c)
+            .bind(state)
+            .execute(&pool)
+            .await
+            .expect("set state");
+        let got = eligible(&pool, &[id]).await.expect("eligible");
+        assert_eq!(
+            got.len(),
+            1,
+            "a {state} campaign's mailable recipient was dropped; it would be skipped for good"
+        );
+    }
+}
+
+/// The fencing token. A release gives the attempt back, so `attempts` recurs across claims: both
+/// claims here carry `attempts = 1`. Whatever the first claim does after the second took the row
+/// (a replayed release, a late mark, a replayed flush) must touch nothing. Without the token, the
+/// replayed `Retry` moves the second claim's `submitting` row back to `queued` while it is at the
+/// relay, and the next claim sends it again.
+#[sqlx::test]
+async fn a_replayed_release_or_flush_from_an_earlier_claim_touches_nothing(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    let first = claim_one(&pool, c).await;
+    release(
+        &pool,
+        std::slice::from_ref(&first),
+        Duration::ZERO,
+        "budget",
+    )
+    .await
+    .expect("release");
+    let second = claim_one(&pool, c).await;
+    assert_eq!(first.attempts, second.attempts, "the attempts value recurs");
+    assert_ne!(
+        first.claim_token, second.claim_token,
+        "a re-claim mints a new token"
+    );
+
+    let held = snapshot(&pool, second.id).await;
+    release(
+        &pool,
+        std::slice::from_ref(&first),
+        Duration::ZERO,
+        "replayed",
+    )
+    .await
+    .expect("release");
+    assert_eq!(
+        snapshot(&pool, second.id).await,
+        held,
+        "a replayed release touched the second claim's row"
+    );
+    assert!(
+        !mark_submitting(&pool, &first).await.expect("mark"),
+        "the first claim marked the second claim's row"
+    );
+
+    assert!(mark_submitting(&pool, &second).await.expect("mark"));
+    let held = snapshot(&pool, second.id).await;
+    for replayed in [
+        Verdict::Retry("451 replayed".into()),
+        Verdict::Deferred("455 replayed".into()),
+    ] {
+        record(&pool, &[(first.clone(), replayed)])
+            .await
+            .expect("record");
+    }
+    assert_eq!(
+        snapshot(&pool, second.id).await,
+        held,
+        "a replayed flush moved a row that is at the relay"
+    );
+}
+
+/// The mark restarts the lease at `SUBMIT_LEASE`, counted from the mark, so a send started as its
+/// claim lease runs out is not swept while the session, render and signing are still running.
+#[sqlx::test]
+async fn a_mark_leases_the_whole_send_from_the_mark(pool: PgPool) {
+    let ws = workspace(&pool).await;
+    let c = campaign(&pool, ws, &[], 1).await;
+    queue(&pool, ws, c, 1, "1 minute").await;
+    let m = claim(&pool, &[c], 10, Duration::from_secs(1))
+        .await
+        .expect("claim")
+        .remove(0);
+    assert!(mark_submitting(&pool, &m).await.expect("mark"));
+
+    let wait = seconds_until_due(&pool, m.id).await;
+    let lease = SUBMIT_LEASE.as_secs_f64();
+    assert!(
+        wait > lease - 10.0 && wait <= lease,
+        "the mark left {wait}s of lease, not ~{lease}s"
+    );
 }

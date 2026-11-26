@@ -8,7 +8,8 @@
 //!    [`Verdict::Skipped`].
 //! 3. [`mark_submitting`], one committed statement, **before** SMTP. `false` means another claim
 //!    holds the row now: drop it without a word.
-//! 4. [`record`] the outcome, in flushes.
+//! 4. [`record`] the outcome, in flushes, **once**. A flush that errors may be retried; the token
+//!    makes a replay touch nothing that a later claim holds.
 //!
 //! **Why the write-ahead.** A lease alone cannot tell "never sent" from "sent, then the worker died
 //! before recording it". `submitting` can: a row in it is never claimed again, and when its lease
@@ -16,9 +17,16 @@
 //! worse than a lost one, so a crash between the relay's 250 and the record costs a message that
 //! was delivered being counted `unknown`, and never a second delivery.
 //!
-//! **The lease is the claim's.** [`mark_submitting`] does not extend `run_after`: the tick starts
-//! no send after half the lease and a session ends within `SESSION_TIMEOUT <= JOB_LEASE / 2`, so a
-//! live send finishes inside the lease it was claimed under, and only a dead one is swept.
+//! **The claim token.** Every claim mints `claim_token`, and [`mark_submitting`], [`record`] and
+//! [`release`] act only on the row their own claim holds. `attempts` cannot serve: a release and a
+//! deferral give an attempt back, so one value recurs across claims. Without the token a replayed
+//! `Retry` could move another claim's `submitting` row back to `queued` while it is at the relay.
+//!
+//! **Two leases.** The claim's covers a row from claim to mark. [`mark_submitting`] restarts it at
+//! [`SUBMIT_LEASE`], counted from the mark: the whole `SESSION_TIMEOUT` plus [`SEND_OVERHEAD`] for
+//! the render, build, DKIM signing and flush that run outside the session's timeout. A send that
+//! overruns even that is swept `unknown` while it may still be delivering. That is a miscount,
+//! never a second copy, because `unknown` is final.
 //!
 //! Lock order (ADR 0005): [`claim`], [`mark_submitting`] and [`release`] are one statement on
 //! `messages` rows and write no key column. [`record`] and [`sweep`] take `messages`, then
@@ -30,7 +38,7 @@ use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::worker::backoff;
+use crate::{relay::transport::SESSION_TIMEOUT, worker::backoff};
 
 /// Messages one tick claims, split evenly across the sending campaigns (spec §4.7.2).
 pub const CAMPAIGN_BATCH: i64 = 500;
@@ -42,8 +50,20 @@ pub const MESSAGE_MAX_ATTEMPTS: i32 = 5;
 /// attempt, so this is a pause, not a backoff.
 const DEFERRED_WAIT: f64 = 5.0;
 
+/// What a send may spend once it is `submitting`, outside the SMTP session: render, build, DKIM
+/// signing and the outcome flush. `SESSION_TIMEOUT` bounds the session alone.
+pub const SEND_OVERHEAD: Duration = Duration::from_secs(60);
+
+/// The lease [`mark_submitting`] sets, counted from the mark. Past it the sweep records the
+/// message `unknown`.
+pub const SUBMIT_LEASE: Duration =
+    Duration::from_secs(SESSION_TIMEOUT.as_secs() + SEND_OVERHEAD.as_secs());
+
 /// What the sweep leaves on a message whose worker vanished after `submitting`.
 pub const SWEPT: &str = "the sending worker stopped mid-send; not retried";
+
+/// What the sweep leaves on a `queued` message that every attempt claimed and none submitted.
+pub const EXHAUSTED: &str = "claimed max_attempts times without an outcome; never submitted";
 
 /// The claim (spec §4.7.1–2). `$1` campaign ids, `$2` per-campaign limit, `$3` lease seconds.
 ///
@@ -52,6 +72,7 @@ pub const SWEPT: &str = "the sending worker stopped mid-send; not retried";
 /// `attempts < max_attempts`, and `status = 'queued'`, which is what keeps a `submitting` row
 /// from ever being offered again. The lateral gives each campaign its own `limit`, so a 5M-row
 /// campaign cannot starve a small one; each lateral walks `messages_runnable` for one campaign.
+/// Each claimed row gets a fresh `claim_token` (`0034`).
 ///
 /// The join on `campaigns` makes "a paused or cancelled campaign is never claimed" a property of
 /// the database rather than of the caller's state map, which can be a second stale. It takes no
@@ -60,7 +81,8 @@ pub const SWEPT: &str = "the sending worker stopped mid-send; not retried";
 /// `#[doc(hidden)] pub` for `tests/campaign_queue.rs`, which reads it clause by clause.
 #[doc(hidden)]
 pub const CLAIM: &str = "update messages m
-        set attempts = m.attempts + 1, run_after = now() + make_interval(secs => $3)
+        set attempts = m.attempts + 1, run_after = now() + make_interval(secs => $3),
+            claim_token = gen_random_uuid()
       where m.id in (select x.id from unnest($1::uuid[]) as c(id)
                      join campaigns k on k.id = c.id and k.state = 'sending'
                      cross join lateral (select id from messages
@@ -69,10 +91,11 @@ pub const CLAIM: &str = "update messages m
                                           order by run_after, id
                                           for update skip locked limit $2) x)
   returning m.id, m.workspace_id, m.campaign_id, m.contact_id, m.variant, m.attempts,
-            m.max_attempts";
+            m.max_attempts, m.claim_token";
 
-/// A message this worker holds the lease on. `attempts` is the post-increment count, and it is
-/// the fence [`mark_submitting`] checks.
+/// A message this worker holds the lease on. `attempts` is the post-increment count.
+/// `claim_token` is this claim's identity: [`mark_submitting`], [`record`] and [`release`] touch
+/// the row only while it still carries it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Claimed {
     pub id: Uuid,
@@ -82,6 +105,7 @@ pub struct Claimed {
     pub variant: i16,
     pub attempts: i32,
     pub max_attempts: i32,
+    pub claim_token: Uuid,
 }
 
 /// Takes up to `ceil(batch / campaigns.len())` due messages from each of `campaigns` and holds
@@ -106,19 +130,21 @@ pub async fn claim(
         .await
 }
 
-/// The write-ahead: `queued -> submitting`, committed before SMTP begins. `false` means this
-/// worker no longer holds the row (its lease ran out and another claim took it, or it was
-/// recorded), and it must not send.
+/// The write-ahead: `queued -> submitting`, committed before SMTP begins, with the lease restarted
+/// at [`SUBMIT_LEASE`]. `false` means this claim no longer holds the row (another claim took it,
+/// or it was released, recorded or swept), and it must not send.
 ///
 /// **The pool, not a transaction**, so it cannot be handed an uncommitted one by accident: a
 /// `submitting` that never committed is a send the sweep cannot see.
 pub async fn mark_submitting(db: &PgPool, m: &Claimed) -> sqlx::Result<bool> {
     let done = sqlx::query(
-        "update messages set status = 'submitting'
-          where id = $1 and status = 'queued' and attempts = $2",
+        "update messages set status = 'submitting', run_after = now() + make_interval(secs => $4)
+          where id = $1 and status = 'queued' and attempts = $2 and claim_token = $3",
     )
     .bind(m.id)
     .bind(m.attempts)
+    .bind(m.claim_token)
+    .bind(SUBMIT_LEASE.as_secs_f64())
     .execute(db)
     .await?;
     Ok(done.rows_affected() == 1)
@@ -144,6 +170,8 @@ pub struct Recipient {
 /// dropped a paused campaign's messages would lose them on resume. Paused and cancelled campaigns
 /// are kept out by [`CLAIM`] and, between claim and send, by the caller releasing.
 pub async fn eligible(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<Recipient>> {
+    // No `c.state` filter: the caller skips whatever is missing, for good, so filtering a paused
+    // campaign here would lose its mail. `eligible_ignores_campaign_state` holds this.
     sqlx::query_as(
         "select m.id as message_id, k.email, k.first_name, k.last_name, k.timezone, k.attributes
            from messages m
@@ -183,14 +211,16 @@ pub enum Verdict {
 /// counters and finish check, all in one transaction.
 ///
 /// Every verdict is predicated on the state it leaves — `Skipped` from `queued`, every other from
-/// `submitting` — so an outcome that arrives after the sweep wrote `unknown` changes nothing, and
-/// counts nothing.
+/// `submitting` — and on the claim's token, so an outcome that arrives after the sweep wrote
+/// `unknown`, or a replayed flush after another claim took the row, changes nothing and counts
+/// nothing. Recording clears the token: one claim, one outcome.
 pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Result<()> {
     if outcomes.is_empty() {
         return Ok(());
     }
     let len = outcomes.len();
     let mut ids = Vec::with_capacity(len);
+    let mut tokens = Vec::with_capacity(len);
     let mut to = Vec::with_capacity(len);
     let mut from = Vec::with_capacity(len);
     let mut spent: Vec<i32> = Vec::with_capacity(len);
@@ -260,6 +290,7 @@ pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Resul
             Verdict::Skipped(e) => ("skipped", "queued", 0, None, None, None, Some(e.as_str())),
         };
         ids.push(m.id);
+        tokens.push(m.claim_token);
         to.push(status);
         from.push(was);
         spent.push(give_back);
@@ -278,11 +309,12 @@ pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Resul
                 relay_id = coalesce(u.relay_id, m.relay_id),
                 response = coalesce(u.response, m.response),
                 error = u.error,
-                sent_at = case when u.status = 'sent' then now() else m.sent_at end
+                sent_at = case when u.status = 'sent' then now() else m.sent_at end,
+                claim_token = null
            from unnest($1::uuid[], $2::text[], $3::text[], $4::int4[], $5::float8[], $6::uuid[],
-                       $7::text[], $8::text[])
-                as u(id, status, from_status, spent, wait, relay_id, response, error)
-          where m.id = u.id and m.status = u.from_status
+                       $7::text[], $8::text[], $9::uuid[])
+                as u(id, status, from_status, spent, wait, relay_id, response, error, token)
+          where m.id = u.id and m.status = u.from_status and m.claim_token = u.token
       returning m.campaign_id, m.status",
     )
     .bind(&ids)
@@ -293,6 +325,7 @@ pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Resul
     .bind(&relay)
     .bind(&response)
     .bind(&error)
+    .bind(&tokens)
     .fetch_all(&mut *tx)
     .await?;
     count(&mut tx, moved).await?;
@@ -302,15 +335,26 @@ pub async fn record(db: &PgPool, outcomes: &[(Claimed, Verdict)]) -> sqlx::Resul
 /// Hands claimed messages back **unattempted**: the claim's increment is taken back and the row
 /// waits `wait`. For messages the tick chose not to start (budget, throttle, pause).
 ///
-/// **Only from `queued`.** A `submitting` row may already be at the relay; releasing it would
-/// offer it to another claim and send it twice, so this statement cannot reach one.
-pub async fn release(db: &PgPool, ids: &[Uuid], wait: Duration, reason: &str) -> sqlx::Result<()> {
+/// **Only from `queued`, and only rows this claim still holds.** A `submitting` row may already be
+/// at the relay; releasing it would offer it to another claim and send it twice. A row another
+/// claim has taken since is that claim's, and a stale release would cut its lease short.
+pub async fn release(
+    db: &PgPool,
+    held: &[Claimed],
+    wait: Duration,
+    reason: &str,
+) -> sqlx::Result<()> {
+    let ids: Vec<Uuid> = held.iter().map(|m| m.id).collect();
+    let tokens: Vec<Uuid> = held.iter().map(|m| m.claim_token).collect();
     sqlx::query(
-        "update messages set attempts = greatest(0, attempts - 1),
-                             run_after = now() + make_interval(secs => $2), error = $3
-          where id = any($1) and status = 'queued'",
+        "update messages m set attempts = greatest(0, m.attempts - 1),
+                               run_after = now() + make_interval(secs => $3), error = $4,
+                               claim_token = null
+           from unnest($1::uuid[], $2::uuid[]) as u(id, token)
+          where m.id = u.id and m.status = 'queued' and m.claim_token = u.token",
     )
-    .bind(ids)
+    .bind(&ids)
+    .bind(&tokens)
     .bind(wait.as_secs_f64())
     .bind(reason)
     .execute(db)
@@ -318,15 +362,22 @@ pub async fn release(db: &PgPool, ids: &[Uuid], wait: Duration, reason: &str) ->
     Ok(())
 }
 
-/// Records every `submitting` message whose lease has run out as `unknown`, counts them, and
-/// finishes any campaign that was waiting on them. Returns how many it swept.
+/// Records every `submitting` message whose lease has run out as `unknown`, and fails every
+/// `queued` message claimed `max_attempts` times with no outcome. Counts both and finishes any
+/// campaign that was waiting on them. Returns how many it moved.
+///
+/// **Failing the second kind is safe.** Only a claim raises `attempts`; a release and a deferral
+/// give it back, and a retry at the limit is already `failed`. So such a row's last claim never
+/// reached `submitting`, and no relay ever accepted it. Without this, nothing claims it again and
+/// its campaign never finishes. A last holder still alive past its lease loses the race on
+/// `status = 'queued'` and the token: its mark returns `false`.
 ///
 /// `skip locked`: a row a flush is recording right now is that flush's, and the sweep never waits
 /// on one, so the two cannot deadlock. It is picked up next time if the flush did not move it.
 pub async fn sweep(db: &PgPool) -> sqlx::Result<u64> {
     let mut tx = db.begin().await?;
-    let swept: Vec<(Uuid, String)> = sqlx::query_as(
-        "update messages set status = 'unknown', error = $1
+    let mut swept: Vec<(Uuid, String)> = sqlx::query_as(
+        "update messages set status = 'unknown', error = $1, claim_token = null
           where id in (select id from messages
                         where status = 'submitting' and run_after <= now()
                         for update skip locked)
@@ -335,6 +386,18 @@ pub async fn sweep(db: &PgPool) -> sqlx::Result<u64> {
     .bind(SWEPT)
     .fetch_all(&mut *tx)
     .await?;
+    let exhausted: Vec<(Uuid, String)> = sqlx::query_as(
+        "update messages set status = 'failed', error = $1, claim_token = null
+          where id in (select id from messages
+                        where status = 'queued' and attempts >= max_attempts
+                          and run_after <= now()
+                        for update skip locked)
+      returning campaign_id, status",
+    )
+    .bind(EXHAUSTED)
+    .fetch_all(&mut *tx)
+    .await?;
+    swept.extend(exhausted);
     let n = swept.len() as u64;
     count(&mut tx, swept).await?;
     tx.commit().await?;
