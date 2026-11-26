@@ -672,35 +672,32 @@ async fn two_workers_send_each_message_once(pool: PgPool) {
     );
 }
 
+/// Waits until the sink has read `n` messages to their end.
+async fn reached(sink: &Sink, n: usize, what: &str) {
+    let started = Instant::now();
+    while sink.delivered() < n {
+        assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// **Review focus 4: a claim that lost its row never sends it.** Worker A claims both messages and,
-/// at concurrency one, is mid-session on the first (the relay holds each reply 1.5 s). A's claim on
-/// the second lapses meanwhile — a pool wait, a suspended VM — and worker B re-claims and sends it.
-/// When A reaches that message its write-ahead finds the row is no longer its claim's, and A drops
-/// it without a word: every address once. Ordering, not time: B's claim lands inside A's reply
-/// delay because the test makes it as soon as the relay has read A's first message.
+/// at concurrency one, is mid-session on the first: the relay holds its reply until the test lets
+/// it go. A's claim on the second lapses meanwhile — a pool wait, a suspended VM — and worker B
+/// re-claims it and has it at the relay too. Only then are the replies let go. When A reaches that
+/// message its write-ahead finds the row is no longer its claim's, and A drops it without a word:
+/// every address once. Ordering, not time: A cannot move past its first message until the test
+/// releases it, so a test that stalls anywhere still sets the scene it describes.
 #[sqlx::test]
 async fn a_stale_claim_never_sends(pool: PgPool) {
-    let f = fx(
-        &pool,
-        Script::Smtp(AfterData::Delayed(
-            Duration::from_millis(1_500),
-            "250 2.0.0 Ok",
-        )),
-    )
-    .await;
+    let f = fx(&pool, Script::Smtp(AfterData::Held("250 2.0.0 Ok"))).await;
     f.contacts(2, "w").await;
     let id = f.launched().await;
     let a = f.worker(1);
+    let a_states = Arc::clone(&a.1);
     a.1.refresh(&f.pool).await.unwrap();
     let first = tokio::spawn(async move { a.0.tick().await.map(|n| (n, a)) });
-    let started = Instant::now();
-    while f.sink.messages().is_empty() {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "A sent nothing"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    reached(&f.sink, 1, "A sent nothing").await;
 
     // A's lease on the message it has not started runs out, and B takes it.
     let lapsed = sqlx::query(
@@ -716,7 +713,18 @@ async fn a_stale_claim_never_sends(pool: PgPool) {
         "the premise: A holds one message it has not started"
     );
     let b = f.worker(1);
-    assert_eq!(f.tick(&b).await, 1, "B re-claimed the lapsed message");
+    b.1.refresh(&f.pool).await.unwrap();
+    let second = tokio::spawn(async move { b.0.tick().await });
+    reached(&f.sink, 2, "B did not send the lapsed message").await;
+    // A's map is read again just before the release, so a slow test cannot leave A to read
+    // "not sending" and stop short of the write-ahead this is about.
+    a_states.refresh(&f.pool).await.unwrap();
+    f.sink.release();
+    assert_eq!(
+        second.await.unwrap().expect("B's tick"),
+        1,
+        "B re-claimed the lapsed message"
+    );
     let (claimed, _a) = first.await.unwrap().expect("A's tick");
     assert_eq!(claimed, 2, "the premise: A had claimed both");
 
@@ -1229,11 +1237,13 @@ async fn a_test_send_job_is_delivered_as_a_test_and_respects_suppression(pool: P
 // Spec §4.7.8: the two loops.
 
 /// **A double opt-in email does not wait behind a campaign** (spec §4.7.8). The worker's own loops
-/// run, as `worker::run` starts them, while a campaign goes out through a slow relay. Then the
-/// messages loop is wedged: the test holds the campaign's row, so the outcome flush (and with it the
-/// tick) cannot finish. A confirmation queued now is delivered all the same, because the jobs loop
-/// is a loop of its own and never waits on the messages loop. The bound is far above the real
-/// latency (about a second): it can only be missed when the two loops are sequenced.
+/// run, as `worker::run` starts them, while a campaign goes out through a slow relay. The messages
+/// loop is wedged from the start: the test holds the campaign's row before the loops run, so the
+/// outcome flush (and with it the tick) cannot finish, and the campaign is still sending however
+/// slowly the test reaches each step. A confirmation queued once the campaign is going out is
+/// delivered all the same, because the jobs loop is a loop of its own and never waits on the
+/// messages loop. The bound is far above the real latency (about a second): it can only be missed
+/// when the two loops are sequenced.
 #[sqlx::test]
 async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
     let f = fx(
@@ -1252,20 +1262,9 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
     f.contacts(200, "k").await;
     let id = f.launched().await;
 
-    // The worker's own composition, as `worker::run` starts it.
-    let (stop, mut stopped) = tokio::sync::watch::channel(());
-    let loops = tokio::spawn(worker::run_loops(f.ctx(), 4, 32, async move {
-        let _ = stopped.changed().await;
-    }));
-    let started = Instant::now();
-    while f.sink.messages().len() < 10 {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the campaign never started"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // The wedge: the flush's counter update needs this row, so the messages tick cannot end.
+    // The wedge, before the loops start: the flush's counter update needs this row, so the
+    // messages tick cannot end and the campaign cannot finish. Claims, write-aheads and sends
+    // read the row without locking it and go on.
     let mut wedge = f.pool.begin().await.unwrap();
     let sent_before: i64 =
         sqlx::query_scalar("select sent from campaigns where id = $1 for update")
@@ -1273,6 +1272,13 @@ async fn a_confirmation_is_not_held_behind_a_campaign(pool: PgPool) {
             .fetch_one(&mut *wedge)
             .await
             .unwrap();
+
+    // The worker's own composition, as `worker::run` starts it.
+    let (stop, mut stopped) = tokio::sync::watch::channel(());
+    let loops = tokio::spawn(worker::run_loops(f.ctx(), 4, 32, async move {
+        let _ = stopped.changed().await;
+    }));
+    reached(&f.sink, 10, "the campaign never started").await;
 
     let contact: Uuid = sqlx::query_scalar(
         "insert into contacts (id, workspace_id, email) values (gen_random_uuid(), $1,
