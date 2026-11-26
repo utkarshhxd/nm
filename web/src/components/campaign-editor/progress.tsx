@@ -184,7 +184,14 @@ export function CampaignProgress({
 
       {/* Below the picker and the verbs, so the picker's "report below" is true. */}
       {c.launched_at !== null ? (
-        <CampaignReport ws={ws} id={c.id} variantCount={c.variants.length} source={source} slug={slug} />
+        <CampaignReport
+          ws={ws}
+          id={c.id}
+          state={c.state}
+          variantCount={c.variants.length}
+          source={source}
+          slug={slug}
+        />
       ) : null}
 
       {can.includes("test") ? (

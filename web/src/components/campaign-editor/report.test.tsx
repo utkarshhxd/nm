@@ -154,6 +154,27 @@ test("report_asks_the_source_again_on_refresh_and_never_on_a_timer", async ({ pa
   expect(reports(log)).toHaveLength(2);
 });
 
+test("report_says_when_it_was_read_and_asks_again_once_when_the_campaign_changes_state", async ({ page, app }) => {
+  const c = launched({ state: "sending" });
+  const held = { [c.id]: REPORT };
+  const src = mockCampaignSource({ campaigns: [c], options: OPTIONS, reports: held });
+  const log = await open(page, app, src, c);
+  const sent = region(page).locator("dt", { hasText: "Sent" }).locator("xpath=following-sibling::dd[1]");
+  await expect(sent).toHaveText("90");
+  await expect(region(page)).toContainText(/As of \d\d:\d\d:\d\d/);
+  expect(reports(log)).toHaveLength(1);
+
+  // The send moves on and the campaign pauses on the server. The progress poll sees the new state,
+  // and the report asks once, so it does not sit beside the progress with older numbers.
+  held[c.id] = { ...REPORT, sent: 95 };
+  await src.pause(ACME, c.id);
+  await expect(sent).toHaveText("95");
+  expect(reports(log)).toHaveLength(2);
+  // Once, not once per poll: nothing asks again while the state stays put.
+  await sleep(2500);
+  expect(reports(log)).toHaveLength(2);
+});
+
 test("report_shows_the_problem_not_numbers_when_the_source_answers_404", async ({ page, app }) => {
   const c = launched();
   const src = mockCampaignSource({ campaigns: [c], options: OPTIONS, reports: { [c.id]: REPORT } });

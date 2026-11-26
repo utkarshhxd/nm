@@ -1,25 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
+import type { Campaign } from "../../routes/campaign-model";
 import { campaignsKey } from "../../routes/campaigns";
 import type { CampaignSource } from "../../routes/campaign-source";
 import { Button } from "../button";
 import { Problem, Section } from "./section";
 
+/** `HH:MM:SS` on the viewer's clock: when this screen last read the report. */
+const clock = new Intl.DateTimeFormat("en-GB", { timeStyle: "medium" });
+
 /**
- * What the send did, as the server counts it: asked for when the view opens and again on Refresh,
- * never on a timer. A refusal replaces the numbers; the last good ones are not shown beside it.
+ * What the send did, as the server counts it: asked for when the view opens, on Refresh, and once
+ * whenever the campaign's state changes, never on a timer. It says when it was read, because the
+ * progress above it moves on its own. A refusal replaces the numbers; the last good ones are not
+ * shown beside it.
  */
 export function CampaignReport({
   ws,
   id,
+  state,
   variantCount,
   source,
   slug,
 }: {
   ws: string;
   id: string;
+  state: Campaign["state"];
   variantCount: number;
   source: CampaignSource;
   slug: string;
@@ -34,6 +43,14 @@ export function CampaignReport({
     },
     retry: false,
   });
+  // Once per state change, e.g. sending to sent: the opening fetch covers the first state.
+  const { refetch } = report;
+  const seen = useRef(state);
+  useEffect(() => {
+    if (seen.current === state) return;
+    seen.current = state;
+    void refetch();
+  }, [state, refetch]);
   const r = report.data;
   const many = variantCount > 1;
   return (
@@ -95,10 +112,13 @@ export function CampaignReport({
           </>
         )}
       </div>
-      <div className="mt-4">
+      <div className="mt-4 flex items-center gap-3">
         <Button busy={report.isFetching} onClick={() => (report.isFetching ? undefined : void report.refetch())}>
           Refresh
         </Button>
+        {r !== undefined && !report.isError ? (
+          <span className="text-fg-muted">As of {clock.format(report.dataUpdatedAt)}</span>
+        ) : null}
       </div>
     </Section>
   );
