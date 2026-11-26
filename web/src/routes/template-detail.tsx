@@ -7,7 +7,8 @@ import { useMemo, useState } from "react";
 import { api, problemText } from "../api/client";
 import { BlockEditor } from "../components/block-editor/editor";
 import type { Doc } from "../components/block-editor/model";
-import { templatePreview } from "../components/block-editor/preview-source";
+import { Preview } from "../components/block-editor/preview";
+import { sourcePreview, templatePreview } from "../components/block-editor/preview-source";
 import { Button } from "../components/button";
 import { EmptyState } from "../components/empty-state";
 import { ErrorState } from "../components/error-state";
@@ -123,6 +124,7 @@ function Edit({ ws, template, canEdit }: { ws: string; template: Template; canEd
   // Bound once per template: `Preview` re-asks the server whenever this identity changes, so a
   // fresh closure on every keystroke would be a request on every keystroke.
   const preview = useMemo(() => templatePreview(ws, template.id), [ws, template.id]);
+  const previewSource = useMemo(() => sourcePreview(ws, template.id), [ws, template.id]);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -188,6 +190,10 @@ function Edit({ ws, template, canEdit }: { ws: string; template: Template; canEd
                 value={source}
                 onChange={(e) => setSource(e.target.value)}
               />
+              {/* A hand-written template has no block tree, so no finding has a block to show. */}
+              <div className="mt-6">
+                <Preview doc={source} source={previewSource} onLocate={() => {}} />
+              </div>
             </div>
           )}
 

@@ -23,9 +23,9 @@ const SECOND_SLUG = "othertemplco";
 /**
  * The preview route, stubbed away in every test that is not about it.
  *
- * A workspace gets thirty previews a minute and shares that window with the segment preview. The
- * editor asks again 250 ms after the document settles, so a test that types would otherwise
- * spend the window on a panel it never looks at and fail the tests that do look at it.
+ * A workspace gets 120 template previews a minute. The editor asks again 600 ms after the
+ * document settles, so a test that types would otherwise spend the window on a panel it never
+ * looks at and fail the tests that do look at it.
  */
 const PREVIEW = "**/templates/*/preview";
 const EMPTY_PREVIEW = {

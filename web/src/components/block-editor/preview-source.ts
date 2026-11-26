@@ -32,16 +32,17 @@ export type PreviewResult = {
 export type PreviewSource = (doc: Doc, signal: AbortSignal) => Promise<PreviewResult>;
 
 /**
- * The sentences for the refusals this call can get. The server's own `detail` is kept wherever it
- * says something this screen could not: a `422 validation` names the merge tag or the field that
- * will not compile, and a `409 template-stale` names which rendition went stale. Both already end
- * in the cure, which for every stale variant is the same one — save the template again.
+ * The sentences for the refusals a preview of UNSAVED work can get. A rejection's message is
+ * shown under the panel's "unavailable" alert. A code not listed here shows the server's own
+ * sentence: for a `422 validation` that is the field's message, which names the merge tag that
+ * will not compile. `409 template-stale` is not listed because it cannot happen here — it comes
+ * only from previewing what is STORED (an empty body), and these sources always send a document.
  */
 export const PREVIEW_PROBLEMS = {
   "not-found": "This template no longer exists. It may have been deleted in another window.",
   "insufficient-role": "Your role cannot preview this template.",
-  // Shared with the segment preview, 30 a minute for the whole workspace: two people composing
-  // at once can reach it, and the one who does has done nothing wrong.
+  // 120 a minute for the whole workspace: two people composing at once can reach it, and the
+  // one who does has done nothing wrong.
   "rate-limited": "Previewing is busy for this workspace — it will catch up in a moment.",
   // The checks could not RUN. This is not an empty findings list, and the panel must not show it
   // as one; it reaches the panel as a rejection for exactly that reason.
@@ -49,31 +50,45 @@ export const PREVIEW_PROBLEMS = {
 };
 
 /**
- * Previews UNSAVED work: the document in the editor, compiled fresh against the brand kit and the
- * field definitions as they are now. Nothing is written. A body with no `tree` would preview what
- * is STORED instead, which is a different question and not one this panel asks.
+ * One preview of UNSAVED work, compiled fresh against the brand kit and the field definitions as
+ * they are now. Nothing is written. Every refusal rejects: returning `{ findings: [] }` for one
+ * would be read as a clean pass.
  */
-export function templatePreview(ws: string, id: string): PreviewSource {
-  return async (doc, signal) => {
-    const { data, error } = await api.POST(
-      "/api/v1/workspaces/{workspace_id}/templates/{id}/preview",
-      { params: { path: { workspace_id: ws, id } }, body: { tree: doc }, signal },
-    );
-    // Every refusal rejects. Returning `{ findings: [] }` for one would be read as a clean pass.
-    if (!data) {
-      throw new Error(problemText(error, PREVIEW_PROBLEMS, "The preview could not be built."));
-    }
-    return {
-      html: data.html,
-      text: data.text,
-      // `at` is a PATH into the block tree, never an index (contract section 12); absent means
-      // the finding is about the whole email.
-      findings: data.findings.map((f) => ({
-        check: f.check,
-        severity: f.severity,
-        message: f.message,
-        at: f.at ?? null,
-      })),
-    };
+async function ask(
+  ws: string,
+  id: string,
+  body: { tree: Doc } | { source: string },
+  signal: AbortSignal,
+): Promise<PreviewResult> {
+  const { data, error } = await api.POST(
+    "/api/v1/workspaces/{workspace_id}/templates/{id}/preview",
+    { params: { path: { workspace_id: ws, id } }, body, signal },
+  );
+  if (!data) {
+    throw new Error(problemText(error, PREVIEW_PROBLEMS, "The preview could not be built."));
+  }
+  return {
+    html: data.html,
+    text: data.text,
+    // `at` is a PATH into the block tree, never an index (contract section 12); absent means the
+    // finding is about the whole email.
+    findings: data.findings.map((f) => ({
+      check: f.check,
+      severity: f.severity,
+      message: f.message,
+      at: f.at ?? null,
+    })),
   };
 }
+
+/** The block tree in the editor. */
+export const templatePreview =
+  (ws: string, id: string): PreviewSource =>
+  (doc, signal) =>
+    ask(ws, id, { tree: doc }, signal);
+
+/** The MJML or HTML of a hand-written template, as it is in the text box. */
+export const sourcePreview =
+  (ws: string, id: string) =>
+  (source: string, signal: AbortSignal): Promise<PreviewResult> =>
+    ask(ws, id, { source }, signal);

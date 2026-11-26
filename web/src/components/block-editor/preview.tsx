@@ -3,8 +3,8 @@
 import { useEffect, useId, useState } from "react";
 
 import { Button } from "../button";
-import type { Doc, Loc } from "./model";
-import type { PreviewResult, PreviewSource } from "./preview-source";
+import type { Loc } from "./model";
+import type { PreviewResult } from "./preview-source";
 import { themed } from "./preview-theme";
 
 type Mode = "desktop" | "mobile" | "dark" | "text";
@@ -15,27 +15,42 @@ const MODES: [Mode, string][] = [
   ["text", "Plain text"],
 ];
 
-/** A pause in editing this long (ms) before the server is asked again. */
-const DEBOUNCE = 250;
+/**
+ * A pause in editing this long (ms) before the server is asked again. The template preview is
+ * 120 a minute per workspace; at 600 ms continuous typing stays near 100.
+ */
+const DEBOUNCE = 600;
 
-type State = { result: PreviewResult | null; failed: boolean; busy: boolean };
+/** `reason` is the rejection's own sentence, shown under the alert; `""` when there is none. */
+type State = { result: PreviewResult | null; failed: boolean; reason: string; busy: boolean };
 
 /**
  * The preview and the checks, kept up to date as the document changes: the operator reads a
  * finding while composing, not after a save. If the source fails, nothing is claimed: no preview
  * and no "no findings".
  */
-export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSource; onLocate: (at: Loc) => void }) {
+export function Preview<T>({
+  doc,
+  source,
+  onLocate,
+}: {
+  /** What is previewed: the block tree, or the MJML or HTML a hand-written template holds. */
+  doc: T;
+  source: (doc: T, signal: AbortSignal) => Promise<PreviewResult>;
+  onLocate: (at: Loc) => void;
+}) {
   const [mode, setMode] = useState<Mode>("desktop");
-  const [state, setState] = useState<State>({ result: null, failed: false, busy: true });
+  const [state, setState] = useState<State>({ result: null, failed: false, reason: "", busy: true });
   const dark = useId();
   useEffect(() => {
     const ctl = new AbortController();
     setState((s) => ({ ...s, busy: true }));
     const t = setTimeout(() => {
       source(doc, ctl.signal).then(
-        (result) => ctl.signal.aborted || setState({ result, failed: false, busy: false }),
-        () => ctl.signal.aborted || setState({ result: null, failed: true, busy: false }),
+        (result) => ctl.signal.aborted || setState({ result, failed: false, reason: "", busy: false }),
+        (e: unknown) =>
+          ctl.signal.aborted ||
+          setState({ result: null, failed: true, reason: e instanceof Error ? e.message : "", busy: false }),
       );
     }, DEBOUNCE);
     return () => {
@@ -44,7 +59,7 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
     };
   }, [doc, source]);
 
-  const { result, failed, busy } = state;
+  const { result, failed, reason, busy } = state;
   const findings = result?.findings ?? [];
   const view = result && mode !== "text" ? themed(result.html, mode === "dark") : null;
   const summary = findings.length === 0 ? "No findings." : `${findings.length} ${findings.length === 1 ? "finding" : "findings"}.`;
@@ -64,6 +79,7 @@ export function Preview({ doc, source, onLocate }: { doc: Doc; source: PreviewSo
       {failed && (
         <p role="alert" className="text-danger-text">
           Preview and checks unavailable. Nothing has been checked, so do not read the empty list as a pass.
+          {reason && <span className="mt-1 block">{reason}</span>}
         </p>
       )}
       {result && mode !== "text" && (
