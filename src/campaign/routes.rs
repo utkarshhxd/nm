@@ -1231,6 +1231,30 @@ pub async fn resume_campaign(
         }
     }
     .rows_affected();
+    if n == 1 && !campaign.resolved {
+        // A system pause (or an admin's) may have ended the launch job, leaving the audience half
+        // resolved with nothing to finish it. A new job takes over from the stored cursor, with the
+        // phase's snapshot copied from the one it replaces. `campaigns`, then `jobs` (ADR 0005).
+        let job = Uuid::now_v7();
+        sqlx::query("update campaigns set launch_job_id = $3 where workspace_id = $1 and id = $2")
+            .bind(workspace_id)
+            .bind(id)
+            .bind(job)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "insert into jobs (id, workspace_id, kind, campaign_id, payload, run_after)
+             values ($1, $2, 'campaign_launch', $3,
+                     coalesce((select payload from jobs where id = $4 and workspace_id = $2),
+                              '{}'::jsonb), now())",
+        )
+        .bind(job)
+        .bind(workspace_id)
+        .bind(id)
+        .bind(campaign.launch_job_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     if n == 1 {
         record(
             &mut tx,

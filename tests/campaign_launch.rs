@@ -210,9 +210,16 @@ impl Fx {
         .fetch_all(&self.pool)
         .await
         .expect("contacts");
-        for id in &ids {
-            self.member(*id, list, "subscribed").await;
-        }
+        sqlx::query(
+            "insert into list_memberships (workspace_id, contact_id, list_id, status)
+             select $1, c, $2, 'subscribed' from unnest($3::uuid[]) as c",
+        )
+        .bind(self.ws)
+        .bind(list)
+        .bind(&ids)
+        .execute(&self.pool)
+        .await
+        .expect("memberships");
         ids
     }
 
@@ -918,4 +925,343 @@ async fn the_jobs_tick_runs_a_launch(pool: PgPool) {
     assert_eq!(claimed, 1, "the tick claimed the launch job");
     assert_eq!(f.state(id).await, "sending");
     assert_eq!(f.messages(id).await, 3);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1
+
+impl Fx {
+    /// Claims the next launch job and runs it for `slice`. Returns whether one was due.
+    async fn one_slice(&self, slice: Duration) -> bool {
+        let Some(job) = worker::claim(&self.pool, LAUNCH_KIND, 1, 120)
+            .await
+            .expect("claim")
+            .pop()
+        else {
+            return false;
+        };
+        nm::campaign::launch::handle(&self.ctx, &job, slice).await;
+        true
+    }
+
+    fn verb(&self, id: Uuid, verb: &str) -> String {
+        format!("/api/v1/workspaces/{}/campaigns/{id}/{verb}", self.ws)
+    }
+
+    async fn row(&self, id: Uuid) -> (String, bool, Option<String>, Option<Uuid>) {
+        sqlx::query_as(
+            "select state, resolved, pause_reason, launch_job_id from campaigns where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn frozen_of(&self, id: Uuid) -> (Value, DateTime<Utc>, DateTime<Utc>) {
+        sqlx::query_as("select frozen, frozen_at, launched_at from campaigns where id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Edits what a launched campaign must not follow: its template and the brand kit's footer.
+    async fn edit_content(&self, n: u32) {
+        self.app
+            .patch(&format!(
+                "/api/v1/workspaces/{}/templates/{}",
+                self.ws, self.template
+            ))
+            .json(&json!({"tree": {"blocks": [{"type": "Text", "runs": [
+                {"type": "Text", "text": format!("edited {n}"), "marks": []}]}]}}))
+            .await
+            .assert_status_ok();
+        self.app
+            .put(&format!("/api/v1/workspaces/{}/brand-kit", self.ws))
+            .json(&json!({"logo_url": null, "palette": {}, "font_stack": null,
+                          "footer": {"address": format!("{n} Changed Rd")}}))
+            .await
+            .assert_status_ok();
+    }
+}
+
+#[sqlx::test]
+async fn a_segment_edited_between_slices_does_not_change_the_phase(pool: PgPool) {
+    let f = fx(&pool).await;
+    f.contacts(f.list, 10_001, "ada").await;
+    let r = f
+        .app
+        .post(&format!("/api/v1/workspaces/{}/segments", f.ws))
+        .json(&json!({"name": "adas", "rules": {"match": "all", "rules": [
+            {"field": "first_name", "op": "eq", "value": "ada"}]}}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let segment = id_of(&r);
+    let id = f.campaign(&[f.list], json!({"segment_id": segment})).await;
+    f.schedule(id).await;
+
+    assert!(f.one_slice(Duration::ZERO).await);
+    assert_eq!(f.messages(id).await, LAUNCH_BATCH, "one slice, one batch");
+    // Between the slices the segment is edited so that the contact still to come no longer
+    // matches it. The phase's snapshot of the rules is what the next slice uses.
+    f.app
+        .patch(&format!("/api/v1/workspaces/{}/segments/{segment}", f.ws))
+        .json(&json!({"rules": {"match": "all", "rules": [
+            {"field": "first_name", "op": "eq", "value": "nobody"}]}}))
+        .await
+        .assert_status_ok();
+    f.drain(SLICE).await;
+    assert_eq!(
+        f.messages(id).await,
+        10_001,
+        "the whole phase used the rules it began with"
+    );
+    assert!(f.row(id).await.1);
+}
+
+#[sqlx::test]
+async fn a_template_or_brand_kit_edit_while_resolving_does_not_reach_the_campaign(pool: PgPool) {
+    let f = fx(&pool).await;
+    f.contacts(f.list, 10_001, "ada").await;
+    let id = f.ab(20).await;
+    f.schedule(id).await;
+    assert!(f.one_slice(Duration::ZERO).await);
+    let launched = f.frozen_of(id).await;
+
+    // Between two slices of phase 1.
+    f.edit_content(1).await;
+    f.drain(SLICE).await;
+    assert_eq!(
+        f.frozen_of(id).await,
+        launched,
+        "a later slice does not freeze again"
+    );
+
+    // Before phase 2.
+    f.app
+        .post(&f.verb(id, "winner"))
+        .json(&json!({"variant": 1}))
+        .await
+        .assert_status_ok();
+    f.edit_content(2).await;
+    f.drain(SLICE).await;
+    assert_eq!(
+        f.frozen_of(id).await,
+        launched,
+        "phase 2 sends what was frozen at launch"
+    );
+    assert!(f.messages(id).await > 10_000);
+}
+
+#[sqlx::test]
+async fn a_slice_resuming_from_a_stored_cursor_makes_every_full_batch_in_one_claim(pool: PgPool) {
+    let f = fx(&pool).await;
+    f.contacts(f.list, 30_001, "ada").await;
+    let id = f.campaign(&[f.list], json!({})).await;
+    f.schedule(id).await;
+    assert!(f.one_slice(Duration::ZERO).await);
+    assert_eq!(f.messages(id).await, LAUNCH_BATCH);
+    // A fresh claim resumes from the stored cursor and runs three batches (two full, one of one
+    // contact) without handing off. A cursor that stopped advancing would rescan the same ten
+    // thousand until the slice ran out.
+    assert!(f.one_slice(Duration::from_secs(30)).await);
+    assert_eq!(f.messages(id).await, 30_001);
+    assert!(f.row(id).await.1, "resolved in that one claim");
+    assert!(!f.one_slice(SLICE).await, "no successor was queued");
+}
+
+#[sqlx::test]
+async fn resuming_an_unresolved_campaign_queues_a_job_that_carries_the_snapshot(pool: PgPool) {
+    let f = fx(&pool).await;
+    let doomed = new_list(&f.app, f.ws, "doomed").await;
+    f.contacts(f.list, 10_001, "ada").await;
+    let id = f.campaign(&[f.list, doomed], json!({})).await;
+    f.schedule(id).await;
+    assert!(f.one_slice(Duration::ZERO).await);
+    let (_, _, _, second) = f.row(id).await;
+    let second = second.expect("the hand-off job");
+    let snapshot: Value = sqlx::query_scalar("select payload from jobs where id = $1")
+        .bind(second)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(snapshot["lists"][doomed.to_string()], "doomed");
+
+    sqlx::query("delete from lists where id = $1")
+        .bind(doomed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.drain(SLICE).await;
+    let (state, resolved, reason, _) = f.row(id).await;
+    assert_eq!((state.as_str(), resolved), ("paused", false));
+    let reason = reason.expect("a reason");
+    assert!(
+        reason.contains("doomed") && reason.contains("cancel this campaign"),
+        "{reason}"
+    );
+
+    // Resuming while the list is still gone refuses again, and says the same thing.
+    f.app.post(&f.verb(id, "resume")).await.assert_status_ok();
+    f.drain(SLICE).await;
+    let (state, _, again, _) = f.row(id).await;
+    assert_eq!(state, "paused");
+    assert!(again.unwrap().contains("cancel this campaign"));
+
+    // The operator takes the list off the audience (here, directly), and resume finishes the job.
+    sqlx::query("update campaigns set list_ids = $2 where id = $1")
+        .bind(id)
+        .bind(vec![f.list])
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.app.post(&f.verb(id, "resume")).await.assert_status_ok();
+    let (state, _, _, job) = f.row(id).await;
+    let job = job.expect("a new launch job");
+    assert_eq!(state, "sending");
+    assert_ne!(job, second, "resume repointed the campaign");
+    let carried: Value = sqlx::query_scalar("select payload from jobs where id = $1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        carried, snapshot,
+        "the new job carries the phase's snapshot"
+    );
+    f.drain(SLICE).await;
+    assert_eq!(f.messages(id).await, 10_001);
+    assert!(f.row(id).await.1, "the audience is resolved");
+}
+
+#[sqlx::test]
+async fn a_refusal_on_a_campaign_the_operator_paused_is_recorded(pool: PgPool) {
+    let f = fx(&pool).await;
+    f.contacts(f.list, 10_001, "ada").await;
+    let id = f.campaign(&[f.list], json!({})).await;
+    f.schedule(id).await;
+    assert!(f.one_slice(Duration::ZERO).await);
+    f.app.post(&f.verb(id, "pause")).await.assert_status_ok();
+    sqlx::query("delete from lists where id = $1")
+        .bind(f.list)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.drain(SLICE).await;
+    let (state, resolved, reason, _) = f.row(id).await;
+    assert_eq!((state.as_str(), resolved), ("paused", false));
+    assert!(
+        reason
+            .expect("the reason survives the pause")
+            .contains("news"),
+        "the list is named"
+    );
+
+    f.app.post(&f.verb(id, "resume")).await.assert_status_ok();
+    f.drain(SLICE).await;
+    let (state, _, reason, _) = f.row(id).await;
+    assert_eq!(
+        state, "paused",
+        "the campaign ends paused, not stuck sending"
+    );
+    assert!(reason.unwrap().contains("cancel this campaign"));
+}
+
+#[sqlx::test]
+async fn resuming_a_resolved_campaign_queues_no_job(pool: PgPool) {
+    let f = fx(&pool).await;
+    let id = f.campaign(&[f.list], json!({})).await;
+    sqlx::query("update campaigns set state = 'paused', resolved = true where id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.app.post(&f.verb(id, "resume")).await.assert_status_ok();
+    let jobs: i64 = sqlx::query_scalar("select count(*) from jobs where campaign_id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0);
+}
+
+/// A trigger that makes one statement of the launch fail, the way a database error would.
+async fn break_updates_of(pool: &PgPool, column: &str) {
+    sqlx::query(
+        "create or replace function launch_boom() returns trigger language plpgsql as \
+         $$ begin raise exception 'boom'; end $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("drop trigger if exists boom on campaigns")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "create trigger boom before update of {column} on campaigns \
+         for each row execute function launch_boom()"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn a_launch_that_runs_out_of_attempts_on_database_errors_ends_the_campaign(pool: PgPool) {
+    let f = fx(&pool).await;
+    f.contacts(f.list, 10, "ada").await;
+    break_updates_of(&pool, "frozen").await;
+
+    // Not the last attempt: the job waits for a retry and the campaign is left alone.
+    let id = f.campaign(&[f.list], json!({})).await;
+    let job = f.schedule(id).await;
+    assert!(f.one_slice(SLICE).await);
+    assert_eq!(f.state(id).await, "scheduled");
+    let (failed, err): (Option<DateTime<Utc>>, Option<String>) =
+        sqlx::query_as("select failed_at, last_error from jobs where id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(failed.is_none() && err.is_some(), "deferred, not failed");
+
+    // The last attempt, before anything was sent: the campaign fails, with the reason.
+    let id = f.campaign(&[f.list], json!({})).await;
+    let job = f.schedule(id).await;
+    sqlx::query("update jobs set max_attempts = 1 where id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(f.one_slice(SLICE).await);
+    assert_eq!(f.state(id).await, "failed");
+    let c = campaign::load(&pool, f.ws, id).await.unwrap();
+    assert!(
+        c.failure_reason
+            .unwrap()
+            .contains("gave up after 1 attempts")
+    );
+    let failed: Option<DateTime<Utc>> =
+        sqlx::query_scalar("select failed_at from jobs where id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(failed.is_some(), "the job failed in the same step");
+
+    // The last attempt after the freeze: something may have been sent, so it is a system pause.
+    break_updates_of(&pool, "total").await;
+    let id = f.campaign(&[f.list], json!({})).await;
+    let job = f.schedule(id).await;
+    sqlx::query("update jobs set max_attempts = 1 where id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(f.one_slice(SLICE).await);
+    let (state, _, reason, _) = f.row(id).await;
+    assert_eq!(state, "paused");
+    assert!(reason.unwrap().contains("gave up after 1 attempts"));
 }
