@@ -424,6 +424,28 @@ async fn another_workspaces_campaign_is_404(pool: PgPool) {
     let mine = tenant(&pool, "acme").await;
     let theirs = tenant(&pool, "other").await;
     let id = draft(&mine, "secret-launch").await;
+    // One campaign per state-guarded verb, each IN the state that verb accepts: a state guard must
+    // not be what answers 404, or an UPDATE that lost its `workspace_id` would pass this test.
+    let in_state = |state: &'static str| {
+        let (pool, mine) = (&pool, &mine);
+        async move {
+            let c = draft(mine, "secret-launch").await;
+            set_state(pool, c, state).await;
+            c
+        }
+    };
+    let (to_unschedule, to_pause, to_resume, to_cancel) = (
+        in_state("scheduled").await,
+        in_state("sending").await,
+        in_state("paused").await,
+        in_state("scheduled").await,
+    );
+    let to_win = ab_draft(&mine, 20).await;
+    sqlx::query("update campaigns set state = 'sending', phase = 1, resolved = true where id = $1")
+        .bind(to_win)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Every route, asked for through the other workspace's own path by its own ADMIN, so a role
     // gate cannot be what answers: 404, never 403 and never the campaign.
@@ -455,13 +477,22 @@ async fn another_workspaces_campaign_is_404(pool: PgPool) {
             .post(&verb(theirs.id, id, "schedule"))
             .json(&sched)
             .await,
-        theirs.admin.post(&verb(theirs.id, id, "unschedule")).await,
-        theirs.admin.post(&verb(theirs.id, id, "pause")).await,
-        theirs.admin.post(&verb(theirs.id, id, "resume")).await,
-        theirs.admin.post(&verb(theirs.id, id, "cancel")).await,
         theirs
             .admin
-            .post(&verb(theirs.id, id, "winner"))
+            .post(&verb(theirs.id, to_unschedule, "unschedule"))
+            .await,
+        theirs.admin.post(&verb(theirs.id, to_pause, "pause")).await,
+        theirs
+            .admin
+            .post(&verb(theirs.id, to_resume, "resume"))
+            .await,
+        theirs
+            .admin
+            .post(&verb(theirs.id, to_cancel, "cancel"))
+            .await,
+        theirs
+            .admin
+            .post(&verb(theirs.id, to_win, "winner"))
             .json(&winner)
             .await,
     ];
@@ -475,8 +506,23 @@ async fn another_workspaces_campaign_is_404(pool: PgPool) {
         .get(&campaign_path(mine.id, id))
         .await
         .assert_status(StatusCode::NOT_FOUND);
-    // And nothing above changed it.
+    // And nothing above changed any of them.
     assert_eq!(state_of(&pool, id).await, "draft");
+    for (c, state) in [
+        (to_unschedule, "scheduled"),
+        (to_pause, "sending"),
+        (to_resume, "paused"),
+        (to_cancel, "scheduled"),
+        (to_win, "sending"),
+    ] {
+        assert_eq!(state_of(&pool, c).await, state);
+    }
+    let phase: i16 = sqlx::query_scalar("select phase from campaigns where id = $1")
+        .bind(to_win)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, 1);
 
     // THE LIST: its `where` is a statement of its own, and a 404 on the by-id route is no comfort
     // when this one hands over every name.
@@ -1641,4 +1687,69 @@ async fn resuming_rebuilds_the_rendition_only_when_it_no_longer_passes(pool: PgP
     r.assert_status(StatusCode::CONFLICT);
     assert_eq!(problem_type(&r), "urn:nm:problem:template-stale");
     assert_eq!(state_of(&pool, id).await, "paused");
+}
+
+#[sqlx::test]
+async fn an_unscheduled_campaign_has_no_schedule(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = draft(&t, "c").await;
+    t.admin
+        .post(&verb(t.id, id, "schedule"))
+        .json(&schedule_body(Some(&in_days_at(2, 9)), "instant"))
+        .await
+        .assert_status_ok();
+    let r = t.admin.post(&verb(t.id, id, "unschedule")).await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["schedule"], Value::Null);
+    let again = t.viewer.get(&campaign_path(t.id, id)).await.json::<Value>();
+    assert_eq!(again["schedule"], Value::Null);
+}
+
+#[sqlx::test]
+async fn a_bad_variant_does_not_hide_a_wrong_state(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = ab_draft(&t, 20).await;
+    let r = t
+        .admin
+        .post(&verb(t.id, id, "winner"))
+        .json(&json!({"variant": 9}))
+        .await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(problem_type(&r), "urn:nm:problem:campaign-state");
+}
+
+#[sqlx::test]
+async fn a_launched_campaign_previews_from_its_frozen_rendition(pool: PgPool) {
+    let t = tenant(&pool, "acme").await;
+    let id = draft(&t, "c").await;
+    // Frozen by a resume, as a launch would leave it.
+    set_state(&pool, id, "paused").await;
+    t.admin
+        .post(&verb(t.id, id, "resume"))
+        .await
+        .assert_status_ok();
+    set_state(&pool, id, "sent").await;
+    let d = draft(&t, "d").await;
+    // The template is deleted afterwards: what was sent is still what the preview shows.
+    sqlx::query("delete from templates where id = $1")
+        .bind(t.template)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r = t
+        .viewer
+        .post(&verb(t.id, id, "preview"))
+        .json(&json!({}))
+        .await;
+    r.assert_status_ok();
+    let v = r.json::<Value>();
+    assert!(v["html"].as_str().unwrap().contains("/u/preview"), "{v}");
+    assert!(v["html"].as_str().unwrap().contains("Sam"), "{v}");
+    assert_eq!(v["subject"], "Hi Sam");
+    // A draft (never frozen) still needs its template.
+    t.viewer
+        .post(&verb(t.id, d, "preview"))
+        .json(&json!({}))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
 }

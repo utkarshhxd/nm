@@ -19,6 +19,7 @@ import { atLeast } from "../lib/roles";
 import { useWorkspace } from "./workspace-layout";
 
 export type Template = components["schemas"]["TemplateView"];
+export type TemplateRow = components["schemas"]["TemplateSummary"];
 export type Kind = components["schemas"]["Kind"];
 
 const day = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
@@ -60,7 +61,7 @@ const PAGE = 200;
 function AllTemplates({ ws, slug, canEdit }: { ws: string; slug: string; canEdit: boolean }) {
   const qc = useQueryClient();
   const [creating, setCreating] = useState(false);
-  const [deleting, setDeleting] = useState<Template | null>(null);
+  const [deleting, setDeleting] = useState<TemplateRow | null>(null);
 
   const templates = useQuery({
     queryKey: ["templates", ws],
@@ -79,7 +80,7 @@ function AllTemplates({ ws, slug, canEdit }: { ws: string; slug: string; canEdit
   });
 
   const remove = useMutation({
-    mutationFn: async (template: Template) => {
+    mutationFn: async (template: TemplateRow) => {
       const { response, error } = await api.DELETE(
         "/api/v1/workspaces/{workspace_id}/templates/{id}",
         { params: { path: { workspace_id: ws, id: template.id } } },

@@ -863,6 +863,7 @@ struct Move {
 
 const UNSCHEDULE: Move = Move {
     sql: "update campaigns set state = 'draft', launch_job_id = null, send_at = null, \
+          schedule_mode = 'instant', schedule_zone = null, schedule_local = null, \
           updated_at = now() where workspace_id = $1 and id = $2 and state = 'scheduled'",
     to: CampaignState::Draft,
     role: Role::Admin,
@@ -1198,13 +1199,10 @@ pub async fn resume_campaign(
     // The frozen rendition is kept unless it no longer passes `ready` against the fields as they
     // are now (spec §4.7 ruling 10). Then it is built again, and a refusal is the answer.
     let defs = definitions_for(&state.pool, workspace_id).await?;
-    let usable = match load_frozen(&state.pool, workspace_id, id).await? {
-        Some(Ok(f)) => f
-            .variants
-            .iter()
-            .all(|v| v.rendition.ready(v.rendition.fingerprint(), &defs).is_ok()),
-        _ => false,
-    };
+    let usable = matches!(
+        load_frozen(&state.pool, workspace_id, id).await?,
+        Some(Ok(f)) if frozen_usable(&f, &defs)
+    );
     let refrozen: Option<Frozen> = if usable {
         None
     } else {
@@ -1288,6 +1286,12 @@ pub async fn choose_winner(
     if campaign.winner.is_some() && campaign.winner == variant && campaign.phase == 2 {
         return Ok(Json(campaign.view()));
     }
+    if !matches!(
+        campaign.state,
+        CampaignState::Sending | CampaignState::Paused
+    ) {
+        return Err(campaign_state(campaign.state));
+    }
     let Some(variant) =
         variant.filter(|v| usize::from(v.unsigned_abs()) < campaign.variants.0.len())
     else {
@@ -1333,6 +1337,14 @@ pub async fn choose_winner(
 
 // ---------------------------------------------------------------------------------------------
 // Preview, test send, estimate
+
+/// Whether every variant of a frozen rendition still passes `ready` against the fields as they are
+/// now, on its OWN key (spec §4.7 ruling 10).
+fn frozen_usable(f: &Frozen, defs: &[Definition]) -> bool {
+    f.variants
+        .iter()
+        .all(|v| v.rendition.ready(v.rendition.fingerprint(), defs).is_ok())
+}
 
 /// One variant of `frozen` as one recipient gets it: `(subject, html, text)`.
 fn render_for(
@@ -1393,10 +1405,21 @@ pub async fn preview_campaign(
     authorize(&state.pool, &principal, workspace_id, Role::Viewer).await?;
     Ok(limited(&state.template_preview_limit, workspace_id, async {
         let campaign = load(&state.pool, workspace_id, id).await?;
-        let frozen = prepare(&state.pool, &state.config.public_url, &campaign)
-            .await
-            .map_err(refused)?;
         let defs = definitions_for(&state.pool, workspace_id).await?;
+        // A launched campaign shows what it froze: its template may have changed or gone since.
+        let kept = match (
+            campaign.frozen_at,
+            load_frozen(&state.pool, workspace_id, id).await?,
+        ) {
+            (Some(_), Some(Ok(f))) if frozen_usable(&f, &defs) => Some(f),
+            _ => None,
+        };
+        let frozen = match kept {
+            Some(f) => f,
+            None => prepare(&state.pool, &state.config.public_url, &campaign)
+                .await
+                .map_err(refused)?,
+        };
         let (subject, html, text) =
             render_for(&frozen, &defs, input.variant.unwrap_or(0), "preview")?;
         Ok(Json(CampaignPreview {

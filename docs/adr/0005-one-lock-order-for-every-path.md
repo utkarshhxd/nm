@@ -286,7 +286,7 @@ exactly one, `relays`; `0032` added **none** — it added two edges, both out of
 two tables nothing references. `0033` added `campaigns`, with two children (`messages (a)`,
 `jobs (c)`) and a third edge out of `workspaces`; `messages` is a table nothing references, and
 `jobs` already was one. The ruling rests on `delete_campaign`'s statement (`where state = 'draft'`,
-which cannot match a campaign that has messages or a live launch job), and that statement now
+which cannot match a campaign that has messages or one that has launched; a draft may still own an orphaned launch job from a schedule that was undone, and the cascade removes it), and that statement now
 exists: see the M2c table below.
 `sending_domains`, `templates` and `brand_kits` are listed below the ten although they are not
 parents, because each was a table asked about and the answer is load-bearing.
@@ -304,7 +304,7 @@ a migration that adds a twelfth parent, a second child to an existing one, or th
 | `imports` | not a class | its only child is `import_errors`, written only by the run already holding the `imports` row |
 | `selection_snapshots` | not a class | its only child's rows are inserted once, by the transaction that minted the parent |
 | `api_keys` | not a class | one child, `selection_snapshots`, and no exclusive taker exists (below) |
-| `campaigns` | **not a class** — ruled in M2c R3 | two children, `messages` (`no action`) and `jobs` (`cascade`); a new parent as of `0033`. Its only deleter is `delete_campaign` with `where state = 'draft'`, which cannot match a campaign that has messages or a live launch job, and every child insert takes `for key share` once at the end of one statement. See the M2c table below |
+| `campaigns` | **not a class** — ruled in M2c R3 | two children, `messages` (`no action`) and `jobs` (`cascade`); a new parent as of `0033`. Its only deleter is `delete_campaign` with `where state = 'draft'`, which cannot match a campaign that has messages or one that has launched (a draft may keep an orphaned launch job from a schedule that was undone; the cascade removes it), and every child insert takes `for key share` once at the end of one statement. See the M2c table below |
 | `workspaces` | not a class | eighteen children since `0033` — it was seventeen after `0032`, fifteen before it, and thirteen before `0028` — and no exclusive taker (below) |
 | `users` | not a class | twelve foreign keys over eleven children (`suppressions` twice, created-by and lifted-by) and no exclusive taker (below) |
 | `relays` | **not a class** — the evidence is four tests, below | its only child is `relay_buckets`, and the one path that writes that child directly is `bucket::take`, whose two arms are ruled separately: the insert arm inverts but cannot cycle, and the update arm takes nothing on the parent at all |
