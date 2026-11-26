@@ -12,7 +12,8 @@
 //! `mrml` again per contact would classify one document and encode against another, which is the
 //! CSS injection this whole module is shaped to prevent.
 //!
-//! **A write to `brand_kits` invalidates every stored rendition in that workspace at once**, and
+//! **A write to `brand_kits` invalidates every stored `blocks` rendition in that workspace at
+//! once** (a raw `mjml` or `html` template never reads the kit, so it is not in the key), and
 //! nothing here regenerates them: refusing rather than recompiling is what keeps each handler to
 //! one locking statement, and re-rendering at send is the defect above. The bulk recompile path
 //! that follows from this belongs to M2c, which is where a send first depends on it —
@@ -359,9 +360,10 @@ pub fn compile(
 /// The key that invalidates a stored rendition: the authored document, the brand kit, the marker
 /// format and the versions of the two crates whose output is stored.
 ///
-/// A brand-kit edit alone changes this, which is the point — the kit is emitted into the MJML the
-/// classifier ran over, so a kit change makes the stored classification describe a document that
-/// is no longer produced.
+/// A brand-kit edit alone changes this for a `blocks` template, which is the point — the kit is
+/// emitted into the MJML the classifier ran over, so a kit change makes the stored classification
+/// describe a document that is no longer produced. A raw template is compiled without the kit, so
+/// the kit is not part of its key.
 pub fn fingerprint(authored: Authored<'_>, brand: &BrandKit) -> String {
     let mut buf: Vec<u8> = Vec::new();
     let mut field = |bytes: &[u8]| {
@@ -397,18 +399,21 @@ pub fn fingerprint(authored: Authored<'_>, brand: &BrandKit) -> String {
         }
     }
     // The renderer's view of the kit, not the stored row: an unknown key the emitter ignores
-    // cannot change the rendered document, so it must not invalidate it either.
-    for part in [
-        &brand.logo_url,
-        &brand.background,
-        &brand.text,
-        &brand.accent,
-        &brand.accent_text,
-        &brand.font_stack,
-        &brand.footer_text,
-        &brand.footer_address,
-    ] {
-        field(part.as_deref().unwrap_or("").as_bytes());
+    // cannot change the rendered document, so it must not invalidate it either. Only a `blocks`
+    // template reads the kit; for a raw one a kit save would be a stale key for no reason.
+    if matches!(authored, Authored::Blocks(_)) {
+        for part in [
+            &brand.logo_url,
+            &brand.background,
+            &brand.text,
+            &brand.accent,
+            &brand.accent_text,
+            &brand.font_stack,
+            &brand.footer_text,
+            &brand.footer_address,
+        ] {
+            field(part.as_deref().unwrap_or("").as_bytes());
+        }
     }
     let digest: [u8; 32] = Sha256::digest(&buf).into();
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -524,6 +529,21 @@ mod tests {
             fingerprint(Authored::Blocks(&b), &plain),
             fingerprint(Authored::Blocks(&b), &BrandKit::default())
         );
+    }
+
+    #[test]
+    fn a_raw_template_does_not_depend_on_the_brand_kit() {
+        let painted = BrandKit {
+            accent: Some("#ff0000".into()),
+            footer_address: Some("1 Main St".into()),
+            ..BrandKit::default()
+        };
+        for authored in [Authored::Mjml("<mjml></mjml>"), Authored::Html("<p>x</p>")] {
+            assert_eq!(
+                fingerprint(authored, &BrandKit::default()),
+                fingerprint(authored, &painted)
+            );
+        }
     }
 
     #[test]
