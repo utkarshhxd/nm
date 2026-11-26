@@ -70,18 +70,26 @@ export default function CampaignDetail() {
     <section className="mt-8">
       {campaign.isPending ? (
         <Skeleton label="Loading campaign" rows={3} />
-      ) : campaign.isError ? (
+      ) : campaign.data === undefined ? (
         <ErrorState title="The campaign could not be loaded." onRetry={() => void campaign.refetch()}>
           {campaign.error.message}
         </ErrorState>
       ) : campaign.data.state !== "draft" ? (
-        <CampaignProgress
-          campaign={campaign.data}
-          source={campaignSource}
-          ws={ws}
-          slug={workspace.slug}
-          role={workspace.role}
-        />
+        <>
+          {/* A failed refresh keeps the last good view, and any dialog open on it, rather than replacing them. */}
+          {campaign.isRefetchError ? (
+            <p role="status" className="mb-3 text-fg-muted">
+              The latest refresh failed. Showing the last loaded view.
+            </p>
+          ) : null}
+          <CampaignProgress
+            campaign={campaign.data}
+            source={campaignSource}
+            ws={ws}
+            slug={workspace.slug}
+            role={workspace.role}
+          />
+        </>
       ) : zone.isPending ? (
         <Skeleton label="Loading the time zone" rows={3} />
       ) : (

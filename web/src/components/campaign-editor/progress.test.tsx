@@ -267,3 +267,51 @@ test("a_scheduled_campaign_can_be_test_sent_by_an_editor_and_no_other_state_can"
     expect(await page.getByRole("region", { name: "Test send", exact: true }).count(), state).toBe(0);
   }
 });
+
+test("one_failed_poll_keeps_the_sending_view_and_an_open_dialog_and_says_the_refresh_failed", async ({ page, app }) => {
+  const c = live();
+  const log = await open(page, app, source(c), c);
+  await button(page, "Cancel campaign").click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Nothing more will be sent");
+
+  // The next poll fails once; the ones after it succeed.
+  await page.route(
+    new RegExp(`/campaigns/${c.id}$`),
+    (route) => route.fulfill({ status: 503, contentType: "application/problem+json", body: "{}" }),
+    { times: 1 },
+  );
+  const failed = page.waitForResponse((r) => r.status() === 503 && r.url().endsWith(`/campaigns/${c.id}`));
+  await failed;
+  // Wait for the screen to have shown that the refresh failed, so what follows is read after the
+  // failure has been drawn and not before it.
+  const line = page.getByText("The latest refresh failed. Showing the last loaded view.");
+  await expect(line).toBeVisible();
+  await expect(dialog).toBeVisible();
+  expect(await page.getByText("The campaign could not be loaded.").count()).toBe(0);
+  await expect(page.getByRole("region", { name: "Progress", exact: true })).toBeAttached();
+
+  // The next poll succeeds: the line goes and the dialog was never closed.
+  await expect(line).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  expect(detailGets(log, c)).toBeGreaterThanOrEqual(2); // the load, then a poll that worked (the failed one never reached the stub)
+});
+
+test("a_refusal_from_one_verb_is_not_shown_in_the_next_dialog_or_after_it_closes", async ({ page, app }) => {
+  const c = live({ state: "paused" });
+  const src = source(c);
+  await open(page, app, src, c);
+  // Cancelled elsewhere, so Resume is refused; the screen still shows the campaign paused.
+  await src.cancel(ACME, c.id);
+  await button(page, "Resume").click();
+  await expect(page.getByRole("alert")).toContainText(`campaign ${c.id} is cancelled`);
+
+  await button(page, "Cancel campaign").click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Nothing more will be sent");
+  expect(await dialog.getByRole("alert").count()).toBe(0);
+
+  await dialog.getByRole("button", { name: "Keep campaign", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(await page.getByRole("alert").count()).toBe(0);
+});

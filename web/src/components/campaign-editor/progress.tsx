@@ -58,6 +58,11 @@ export function CampaignProgress({
       await qc.invalidateQueries({ queryKey: campaignsKey(ws) });
     },
   });
+  // A refusal belongs to the verb that was refused: opening or closing a dialog starts clean.
+  const ask = (verb: "resume" | "cancel" | null) => {
+    act.reset();
+    setAsking(verb);
+  };
   const run = (verb: Parameters<typeof act.mutate>[0]) => {
     if (!act.isPending) act.mutate(verb);
   };
@@ -133,7 +138,7 @@ export function CampaignProgress({
           <Button
             variant="solid"
             busy={act.isPending}
-            onClick={() => (s?.mode === "recipient_local" ? setAsking("resume") : run("resume"))}
+            onClick={() => (s?.mode === "recipient_local" ? ask("resume") : run("resume"))}
           >
             Resume
           </Button>
@@ -143,13 +148,13 @@ export function CampaignProgress({
             Unschedule
           </Button>
         ) : null}
-        {can.includes("cancel") ? <Button onClick={() => setAsking("cancel")}>Cancel campaign</Button> : null}
+        {can.includes("cancel") ? <Button onClick={() => ask("cancel")}>Cancel campaign</Button> : null}
       </div>
       {act.isError && asking === null ? <Problem error={act.error} slug={slug} templates={[]} /> : null}
 
       <ConfirmDialog
         open={asking === "resume"}
-        onClose={() => setAsking(null)}
+        onClose={() => ask(null)}
         title="Resume campaign"
         confirmLabel="Resume sending"
         variant="solid"
@@ -164,9 +169,10 @@ export function CampaignProgress({
       </ConfirmDialog>
       <ConfirmDialog
         open={asking === "cancel"}
-        onClose={() => setAsking(null)}
+        onClose={() => ask(null)}
         title="Cancel campaign"
         confirmLabel="Cancel campaign"
+        dismissLabel="Keep campaign"
         busy={act.isPending}
         error={act.isError ? campaignProblem(act.error, "The campaign could not be cancelled.") : undefined}
         onConfirm={() => run("cancel")}
