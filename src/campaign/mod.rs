@@ -609,18 +609,32 @@ pub async fn prepare(db: &PgPool, public_url: &url::Url, c: &Campaign) -> Result
         };
         templates.push((owned, compiled));
     }
+    // Each variant's link table as it is frozen now, when it reads: a re-freeze only appends to
+    // it, so an index in mail already sent keeps naming the same URL (M2d spec §4.3.3).
+    let prior: Vec<Vec<String>> = match load_frozen(db, ws, c.id)
+        .await
+        .map_err(|e| internal(format!("{e:?}")))?
+    {
+        Some(Ok(f)) => f
+            .variants
+            .into_iter()
+            .map(|v| v.rendition.links().to_vec())
+            .collect(),
+        Some(Err(_)) | None => Vec::new(),
+    };
 
     // The compiles: `mrml` and the classifier, on the blocking pool, holding no connection.
     let (brand_kit, public_url) = (kit.render(), public_url.clone());
     let renditions = tokio::task::spawn_blocking(move || {
-        let footer = SystemFooter {
-            public_url: &public_url,
-            postal_address: &address,
-        };
         templates
             .iter()
             .enumerate()
             .map(|(i, (owned, compiled))| {
+                let footer = SystemFooter {
+                    public_url: &public_url,
+                    postal_address: &address,
+                    prior_links: prior.get(i).map_or(&[], Vec::as_slice),
+                };
                 crate::template::freeze(
                     compiled.as_ref(),
                     owned.authored(),

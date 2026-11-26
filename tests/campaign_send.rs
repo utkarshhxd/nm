@@ -1055,6 +1055,76 @@ async fn field_drift_mid_send_pauses_and_a_resume_after_a_resave_refreezes(pool:
     assert_eq!(f.state(id).await, "sent");
 }
 
+/// M2d spec §4.3.3: a re-freeze starts from the variant's previous link table and only appends,
+/// so an index in mail already sent keeps naming the same URL. The drift fixture above, with a
+/// re-saved template that puts a new link ahead of the old one.
+#[sqlx::test]
+async fn a_resume_that_refreezes_keeps_every_earlier_link_index(pool: PgPool) {
+    let f = fx(&pool, Script::Smtp(AfterData::Reply("250 2.0.0 Ok"))).await;
+    sqlx::query(
+        "insert into custom_fields (id, workspace_id, key, label, kind)
+         values ($1, $2, 'plan', 'Plan', 'text')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let link = |href: &str| json!({"type": "Link", "href": href, "text": "go", "marks": []});
+    let plan = json!({"type": "Tag", "source": "{{ plan }}"});
+    let tree = |runs: Vec<Value>| json!({"tree": {"blocks": [{"type": "Text", "runs": runs}]}});
+    let template = format!("/api/v1/workspaces/{}/templates/{}", f.ws, f.template);
+    f.app
+        .patch(&template)
+        .json(&tree(vec![link("https://a.test/"), plan.clone()]))
+        .await
+        .assert_status_ok();
+    f.contacts(2, "k").await;
+    let id = f.launched().await;
+    let links = || async {
+        sqlx::query_scalar::<_, Option<Value>>(
+            "select frozen #> '{variants,0,rendition,links}' from campaigns where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(links().await, Some(json!(["https://a.test/"])));
+    sqlx::query(
+        "update custom_fields set kind = 'number' where key = 'plan' and workspace_id = $1",
+    )
+    .bind(f.ws)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.tick(&f.worker(2)).await;
+    assert_eq!(f.state(id).await, "paused");
+
+    f.app
+        .patch(&template)
+        .json(&tree(vec![
+            link("https://b.test/"),
+            link("https://a.test/"),
+            plan,
+        ]))
+        .await
+        .assert_status_ok();
+    f.app
+        .post(&format!(
+            "/api/v1/workspaces/{}/campaigns/{id}/resume",
+            f.ws
+        ))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(
+        links().await,
+        Some(json!(["https://a.test/", "https://b.test/"])),
+        "the re-freeze moved a link that mail already sent points at"
+    );
+}
+
 /// **A resume that lands between two refreshes of the state map sends from the new rendition.**
 /// The worker has the launch's rendition cached. The field it names changes type, the template is
 /// re-saved, and the campaign is paused and resumed — which re-freezes it — all before the map is

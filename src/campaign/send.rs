@@ -559,6 +559,9 @@ async fn deliver(ctx: &Ctx, m: &Claimed, r: &Recipient, c: &Content, route: &Rou
         timezone: r.timezone.as_deref(),
         attributes: &r.attributes,
         unsubscribe_token: &token,
+        // shortcut: untracked (a `test` pixel, direct links) until the message's own tracking
+        // token is minted, with the `/o/` and `/l/` routes that answer it.
+        tracking_token: None,
     };
     let rendered = match v
         .rendition

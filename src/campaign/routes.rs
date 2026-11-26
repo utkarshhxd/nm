@@ -1389,6 +1389,7 @@ fn render_for(
         timezone: Some("UTC"),
         attributes: &attributes,
         unsubscribe_token: token,
+        tracking_token: None,
     };
     // The rendition's OWN key: what is frozen is what is sent, whatever the template says now.
     let rendered = v

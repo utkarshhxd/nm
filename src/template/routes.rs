@@ -894,6 +894,7 @@ async fn preview(
             attributes: &sample(&defs),
             // A template preview has no footer, so nothing reads this.
             unsubscribe_token: "preview",
+            tracking_token: None,
         })
         .map_err(stale)?;
 
