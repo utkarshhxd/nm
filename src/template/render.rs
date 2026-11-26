@@ -154,6 +154,9 @@ pub enum RenderError {
     /// module has been bitten three times by exactly that kind of observation, so the pairing is
     /// required rather than assumed.
     BlockUnbalanced { index: usize },
+    /// A send rendition's system footer sits inside a conditional, so every recipient the branch
+    /// is not taken for would get no unsubscribe link and no postal address.
+    FooterInBlock,
 }
 
 /// The attributes whose value is a URL the browser will fetch or navigate to. Anything here gets
@@ -351,7 +354,28 @@ pub(super) fn branch_taken(n: &Node, c: &Contact<'_>) -> bool {
 /// It is sound for the refusal decision, which is all it is used for. A preview that wants to show
 /// an operator *where* each tag landed needs more than this.
 pub fn classify(html: &str, tags: usize) -> Result<Vec<Site>, RenderError> {
-    scan(html, tags, None).map(|(sites, _)| sites)
+    classify_send(html, tags, usize::MAX)
+}
+
+/// [`classify`] for a send rendition, whose slots from `footer_from` on are the system footer's.
+/// Also refuses a footer marker read inside a conditional: dropping that branch would rewind the
+/// footer out of the message (review C1).
+pub(super) fn classify_send(
+    html: &str,
+    tags: usize,
+    footer_from: usize,
+) -> Result<Vec<Site>, RenderError> {
+    scan(html, tags, None, footer_from).map(|(sites, _)| sites)
+}
+
+/// The footer's link for `token`, as the footer writes it: the token percent-encoded as one path
+/// segment, exactly as a URL attribute encodes a value there. `(plain text, HTML attribute)`.
+pub(super) fn footer_link(prefix: &str, token: &str) -> (String, String) {
+    let mut text = prefix.to_owned();
+    percent_encode(token, Part::Path.keep(), &mut text);
+    let mut html = String::new();
+    escape_attr(&text, &mut html);
+    (text, html)
 }
 
 /// One contact's copy of the already-classified document.
@@ -369,7 +393,7 @@ pub fn substitute(
     contact: &Contact<'_>,
 ) -> Result<String, RenderError> {
     let fills = fills(nodes, contact);
-    scan(html, fills.len(), Some(&fills)).map(|(_, out)| out)
+    scan(html, fills.len(), Some(&fills), usize::MAX).map(|(_, out)| out)
 }
 
 /// [`substitute`] for a template that is already the document being sent, with no MJML step.
@@ -843,6 +867,10 @@ struct St<'v> {
     /// Character tokens arrive in chunks split at `&`, `<` and NUL; a run is buffered so a marker
     /// can never be half in one chunk and half in the next.
     text: String,
+    /// The first slot of a send rendition's system footer (`usize::MAX` when there is none), and
+    /// whether one of its markers was read inside a conditional.
+    footer_from: usize,
+    footer_in_block: bool,
 }
 
 impl<'v> St<'v> {
@@ -851,6 +879,12 @@ impl<'v> St<'v> {
     }
 
     fn record(&mut self, id: usize, site: Site) {
+        // Every sighting comes through here, decoded, in document order, before the marker's
+        // own `emit`: so `depth` is the number of conditionals open around it, character-reference
+        // aliases of the operator's own included.
+        if id >= self.footer_from && self.depth > 0 {
+            self.footer_in_block = true;
+        }
         if id >= MAX_TAGS {
             self.forged = true;
             return;
@@ -1172,10 +1206,13 @@ impl TokenSink for Sink<'_> {
 ///
 /// `tags` is how many markers the template emitted. Pre-sizing the table with it is what turns
 /// "`mrml` dropped this tag" from a silent `Ok(vec![])` into a refusal.
+///
+/// `footer_from` is the first slot of a send rendition's system footer, `usize::MAX` for none.
 fn scan(
     html: &str,
     tags: usize,
     fills: Option<&[Fill]>,
+    footer_from: usize,
 ) -> Result<(Vec<Site>, String), RenderError> {
     if tags > MAX_TAGS {
         return Err(RenderError::DangerousContext { position: 0 });
@@ -1241,6 +1278,8 @@ fn scan(
                 blocks: Vec::new(),
                 block_err: None,
                 text: String::new(),
+                footer_from,
+                footer_in_block: false,
             }),
         },
         TokenizerOpts::default(),
@@ -1263,6 +1302,9 @@ fn scan(
     }
     if let Some(&(index, _)) = st.blocks.first() {
         return Err(RenderError::BlockUnbalanced { index });
+    }
+    if st.footer_in_block {
+        return Err(RenderError::FooterInBlock);
     }
     // Fail closed, twice over. A marker the tokenizer never handed back is a position nobody
     // classified; a marker that is not in the document at all is a merge tag `mrml` threw away,

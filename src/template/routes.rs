@@ -143,6 +143,7 @@ where
 // The authored document, validated
 
 /// What the operator wrote, owned, after the shape has been checked against the kind.
+#[derive(Clone)]
 enum Authoring {
     Blocks(Doc),
     Mjml(String),
@@ -323,9 +324,10 @@ fn stale(e: StoredError) -> ApiError {
     match e {
         // Classification passed at save, so these mean the stored document is not the one that
         // was classified: a bug here, not something an operator did.
-        StoredError::Render(_) | StoredError::MarkedText => {
-            ApiError::Internal(anyhow::anyhow!("{e}"))
-        }
+        StoredError::Render(_)
+        | StoredError::MarkedText
+        | StoredError::NoUnsubscribeToken
+        | StoredError::FooterLost(_) => ApiError::Internal(anyhow::anyhow!("{e}")),
         e => ApiError::ConflictDetail {
             code: "template-stale",
             detail: e.to_string(),
@@ -833,14 +835,24 @@ async fn preview(
         .as_ref()
         .map(stored_field_names)
         .unwrap_or_default();
+    // `mrml` runs here, so on the blocking pool (spec §4.5 ruling 3): every compile outside a
+    // save, the issue-49 recompile included.
     let fresh = || {
-        super::compile(authoring.authored(), &brand, &defs, &keep)
-            .map_err(|e| compile_error(e, authoring.field()))
+        let (a, brand, defs, keep) = (authoring.clone(), brand.clone(), defs.clone(), keep.clone());
+        async move {
+            let field = a.field();
+            tokio::task::spawn_blocking(move || super::compile(a.authored(), &brand, &defs, &keep))
+                .await
+                .map_err(|e| {
+                    ApiError::Internal(anyhow::anyhow!("the template compile failed: {e}"))
+                })?
+                .map_err(|e| compile_error(e, field))
+        }
     };
     // The fingerprint of the document and the brand kit as they are NOW.
     let key = super::fingerprint(authoring.authored(), &brand);
     let stored = if unsaved {
-        fresh()?
+        fresh().await?
     } else {
         let compiled = row
             .compiled
@@ -856,10 +868,10 @@ async fn preview(
         match Stored::from_column(compiled) {
             Ok(s) => match s.ready(&key, &defs).map(|_| ()) {
                 Ok(()) => s,
-                Err(StoredError::Stale) => fresh()?,
+                Err(StoredError::Stale) => fresh().await?,
                 Err(e) => return Err(stale(e)),
             },
-            Err(StoredError::MarkerFormat { .. }) => fresh()?,
+            Err(StoredError::MarkerFormat { .. }) => fresh().await?,
             Err(e) => return Err(stale(e)),
         }
     };

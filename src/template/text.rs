@@ -73,6 +73,11 @@ use super::tag::{self, Node, Registry, TagError};
 
 const RULE: &str = "----------------------------------------";
 
+/// The elements that may appear in a `<head>`. Any other start tag ends it.
+const IN_HEAD: [&str; 8] = [
+    "title", "meta", "link", "style", "script", "base", "noscript", "template",
+];
+
 /// Stands in for `{` in operator text so the whole template compiles as one tag source and typed
 /// `{{ x }}` stays literal (contract section 13). Put back after the markers are written.
 const BRACE: char = '\u{E000}';
@@ -437,8 +442,16 @@ impl Flow {
             "title" => TokenSinkResult::RawData(RawKind::Rcdata),
             _ => TokenSinkResult::Continue,
         };
-        if self.skip.is_some() && name != "body" {
+        if let Some(skip) = self.skip.as_deref()
+            && name != "body"
+            && (skip != "head" || IN_HEAD.contains(&name))
+        {
             return feedback;
+        }
+        // A browser's "in head" rule: any other element ends an open head, and its content is
+        // body text. Without it, `<html><head><p>Hi</p>` has no text part at all (review I1).
+        if self.skip.as_deref() == Some("head") {
+            self.skip = None;
         }
         match name {
             "script" | "style" | "title" | "head" => {
@@ -617,6 +630,11 @@ mod tests {
         assert_eq!(
             render_subject(&nodes, &contact("A\r\nBcc: x@y.test", &attrs)),
             "Hi A  Bcc: x@y.test"
+        );
+        // C1 controls too: U+0085 is NEXT LINE, which some readers break on.
+        assert_eq!(
+            render_subject(&nodes, &contact("A\u{85}B", &attrs)),
+            "Hi A B"
         );
         // The body's grammar, conditionals and fallbacks included, decided as the body decides.
         let nodes = compile_subject(
@@ -1375,6 +1393,15 @@ mod tests {
             text_from_html("<head><title>Subject</title><body><p>Visible</p>"),
             "Visible"
         );
+        // And so is `<body>`: the first element that cannot be in a head ends it, as a browser's
+        // "in head" rule says, and what follows is body text. Review I1.
+        assert_eq!(
+            text_from_html(
+                "<html><head><title>Subject</title><meta charset=\"utf-8\"><p>Visible</p></html>"
+            ),
+            "Visible"
+        );
+        assert_eq!(text_from_html("<p>Hi</p><head><p>There</p>"), "Hi\n\nThere");
     }
 
     #[test]

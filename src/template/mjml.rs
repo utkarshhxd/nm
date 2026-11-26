@@ -532,6 +532,7 @@ pub(crate) fn render_message(e: &RenderError) -> String {
         RenderError::BlockDuplicated { .. } => "a conditional merge-tag block appears more than once in the rendered email, so which part to hide is ambiguous".into(),
         RenderError::BlockStraddlesTag { .. } => "a conditional merge-tag block starts or ends in the middle of an HTML tag; it must wrap whole elements or whole text".into(),
         RenderError::BlockUnbalanced { .. } => "a conditional merge-tag block is out of order or not properly nested in the rendered email".into(),
+        RenderError::FooterInBlock => "a conditional merge-tag block is still open at the end of the body, so the unsubscribe link and postal address added there would be dropped from every copy that does not take the branch; close the block before </body>".into(),
     }
 }
 
@@ -628,11 +629,13 @@ fn compile(
     let (marked, slots) = render::marked(&nodes[..operator]);
     let split = marked.len();
     let mut html = if mjml { render_mjml(&marked)? } else { marked };
+    let mut footer_from = usize::MAX;
     if footer.is_some() {
         let at = super::footer::insertion_point(&html, slots)?;
         html.insert_str(at, &all[split..]);
+        footer_from = slots;
     }
-    if let Err(e) = render::classify(&html, count) {
+    if let Err(e) = render::classify_send(&html, count, footer_from) {
         // The one refusal whose position means nothing to the operator. Falls back to the plain
         // message when the offset is not a marker start, rather than guessing at a tag.
         if let RenderError::DangerousContext { position } = &e

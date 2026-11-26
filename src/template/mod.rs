@@ -151,6 +151,10 @@ pub enum StoredError {
     MarkedText,
     #[error("{}", mjml::render_message(.0))]
     Render(RenderError),
+    #[error("this message has no unsubscribe token, so its unsubscribe link would be dead")]
+    NoUnsubscribeToken,
+    #[error("the {0} part of this message lost its unsubscribe link, so it was not built")]
+    FooterLost(&'static str),
 }
 
 fn drift_message(drift: &[Drift]) -> String {
@@ -199,6 +203,9 @@ pub struct Stored {
     text: Option<TextTemplate>,
     /// The custom fields the AST names, and the kind each had at compile time.
     fields: BTreeMap<String, FieldKind>,
+    /// A send rendition's link prefix, `{public_url}/u/`; `None` for a template's own rendition.
+    /// [`Ready::render`] refuses a message whose parts do not both carry it with the token.
+    unsubscribe: Option<String>,
 }
 
 /// `Stored`'s wire shape, and the only `Deserialize` in this file. Private, so nothing outside
@@ -211,6 +218,8 @@ struct Raw {
     html: String,
     text: Option<TextTemplate>,
     fields: BTreeMap<String, FieldKind>,
+    #[serde(default)]
+    unsubscribe: Option<String>,
 }
 
 /// A [`Stored`] that has passed every check a send depends on. Holding one is the proof the checks
@@ -250,6 +259,7 @@ impl Stored {
             html: raw.html,
             text: raw.text,
             fields: raw.fields,
+            unsubscribe: raw.unsubscribe,
         })
     }
 
@@ -330,7 +340,14 @@ pub fn stored_field_names(compiled: &Value) -> BTreeSet<String> {
 
 impl Ready<'_> {
     /// One contact's HTML and plain-text parts, both filled from the one stored AST.
+    ///
+    /// A send rendition's message must carry this recipient's `{public_url}/u/{token}` in BOTH
+    /// parts, or it is refused. The last line of defence (review C1, I1, I2): it holds whatever
+    /// happened to the frozen document or to the parts built from it.
     pub fn render(&self, contact: &Contact<'_>) -> Result<Rendered, StoredError> {
+        if self.0.unsubscribe.is_some() && contact.unsubscribe_token.is_empty() {
+            return Err(StoredError::NoUnsubscribeToken);
+        }
         let html = render::substitute(&self.0.html, &self.0.nodes, contact)
             .map_err(StoredError::Render)?;
         let text = match &self.0.text {
@@ -346,6 +363,15 @@ impl Ready<'_> {
             None if html.contains(render::MARK_START) => return Err(StoredError::MarkedText),
             None => text::text_from_html(&html),
         };
+        if let Some(prefix) = &self.0.unsubscribe {
+            let (in_text, in_html) = render::footer_link(prefix, contact.unsubscribe_token);
+            if !html.contains(&in_html) {
+                return Err(StoredError::FooterLost("HTML"));
+            }
+            if !text.contains(&in_text) {
+                return Err(StoredError::FooterLost("plain-text"));
+            }
+        }
         Ok(Rendered { html, text })
     }
 }
@@ -443,6 +469,7 @@ fn build(
         nodes: compiled.nodes,
         html: compiled.html,
         text,
+        unsubscribe: footer.map(|f| format!("{}/u/", f.base())),
     })
 }
 
@@ -509,7 +536,9 @@ pub fn fingerprint(authored: Authored<'_>, brand: &BrandKit) -> String {
 }
 
 /// The custom fields an AST names, and the kind each has now. A system field (`email`,
-/// `first_name`, …) has no definition and is not recorded: nothing can change it.
+/// `first_name`, …) has no definition and is not recorded: nothing can change it. Nor is the
+/// footer's slot, even when a custom field is keyed like it (issues/44): that field is not what
+/// fills it, and its kind changing must not halt a campaign that is sending (review M4).
 fn field_kinds(nodes: &[Node], defs: &[Definition]) -> BTreeMap<String, FieldKind> {
     let mut out = BTreeMap::new();
     let mut pending: Vec<&[Node]> = vec![nodes];
@@ -527,6 +556,9 @@ fn field_kinds(nodes: &[Node], defs: &[Definition]) -> BTreeMap<String, FieldKin
                     key
                 }
             };
+            if key == UNSUBSCRIBE_TOKEN {
+                continue;
+            }
             if let Some(d) = defs.iter().find(|d| &d.key == key) {
                 out.insert(key.clone(), d.kind);
             }
@@ -928,6 +960,8 @@ mod tests {
             "<p>x</p><title>x",
             "<p>x</p><a href=\"https://x.example/",
             "<body><p>x</p><plaintext></body>",
+            // The operator's own copy of the probe character is not a probe.
+            "<p>\u{E00F}</p><title>x",
         ] {
             assert_eq!(
                 send_compile(Authored::Html(source), &defs()).unwrap_err(),
@@ -970,6 +1004,9 @@ mod tests {
         for source in [
             format!("<p>{{{{ first_name }}}}</p><a href=\"https://evil.example/{forged}\">x</a>"),
             format!("<p>{{{{ first_name }}}}</p><p>{forged}</p>"),
+            // RCDATA decodes character references too, where raw text does not.
+            format!("<p>{{{{ first_name }}}}</p><textarea>{forged}</textarea>"),
+            format!("<title>{forged}</title><p>{{{{ first_name }}}}</p>"),
         ] {
             assert_eq!(
                 send_compile(Authored::Html(&source), &defs()).unwrap_err(),
@@ -977,6 +1014,115 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    /// Review C1. The footer goes in before the real `</body>`, and an operator conditional that
+    /// opens before it and closes after it would rewind the footer away for every recipient the
+    /// branch is not taken for — here, all of them. An ALIAS of the operator's own conditional,
+    /// written with character references, is the same thing by another route.
+    #[test]
+    fn an_operator_conditional_cannot_wrap_the_footer() {
+        let open = "&#126;nmmt&#126;0o&#126;tmmn&#126;";
+        let close = "&#126;nmmt&#126;0c&#126;tmmn&#126;";
+        for source in [
+            "<html><body><p>Hi</p>{{^ email }}</body></html>{{/ email }}".to_owned(),
+            "<html><body><p>Hi</p>{{# colour }}</body>{{/ colour }}</html>".to_owned(),
+            "<p>Hi</p>{{^ email }}</body>{{/ email }}".to_owned(),
+            format!(
+                "<html><body><p>{{{{^ email }}}}x{{{{/ email }}}}</p>{open}</body></html>{close}"
+            ),
+        ] {
+            let refused = send_compile(Authored::Html(&source), &defs())
+                .err()
+                .unwrap_or_else(|| panic!("froze with the footer inside a conditional: {source}"));
+            assert_eq!(
+                refused,
+                CompileError::Render(render::RenderError::FooterInBlock),
+                "{source}"
+            );
+        }
+    }
+
+    /// Review I1. A raw template's text part comes from its HTML, and a `<head>` left open must
+    /// not swallow the body — the footer with it.
+    #[test]
+    fn an_open_head_does_not_lose_the_footer_from_the_text_part() {
+        for source in [
+            "<html><body><p>Hi</p><head></body></html>",
+            "<p>Hi</p><head>",
+            "<html><head><p>Hi</p></html>",
+        ] {
+            let out = send(Authored::Html(source), "TOK").expect("compiles");
+            assert!(out.text.contains("Hi"), "{source}: {:?}", out.text);
+            assert!(
+                out.text.contains("https://mail.example.test/u/TOK"),
+                "{source}: {:?}",
+                out.text
+            );
+            assert!(out.text.contains("1 Main St"), "{source}: {:?}", out.text);
+        }
+    }
+
+    /// Review judged item 1: the last line. Whatever happened to the frozen document, a message
+    /// whose HTML or text part does not carry this recipient's link is not built. Planted here by
+    /// editing the frozen column so an operator conditional wraps the footer — which the freeze
+    /// would refuse, so this holds the render guard on its own.
+    #[test]
+    fn a_message_that_lost_its_footer_is_not_rendered() {
+        let stored = send_compile(Authored::Html("<p>{{^ email }}x{{/ email }}</p>"), &defs())
+            .expect("compiles");
+        let mut column = serde_json::to_value(&stored).expect("serialises");
+        let close = format!("{}0c{}", render::MARK_START, render::MARK_END);
+        let html = column["html"].as_str().expect("html").replace(&close, "") + &close;
+        column["html"] = json!(html);
+        let tampered = Stored::from_column(&column).expect("reads");
+        let attrs = json!({});
+        let out = tampered
+            .ready(tampered.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "TOK",
+            });
+        assert_eq!(out.unwrap_err(), StoredError::FooterLost("HTML"));
+    }
+
+    /// Review I2. An empty token is a dead link sent to every recipient without a word.
+    #[test]
+    fn an_empty_unsubscribe_token_is_refused() {
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs()).expect("compiles");
+        let attrs = json!({});
+        let out = stored
+            .ready(stored.fingerprint(), &defs())
+            .expect("ready")
+            .render(&Contact {
+                email: "a@b.example",
+                first_name: "Ada",
+                last_name: "B",
+                timezone: None,
+                attributes: &attrs,
+                unsubscribe_token: "",
+            });
+        assert_eq!(out.unwrap_err(), StoredError::NoUnsubscribeToken);
+    }
+
+    /// Review M4. The footer's slot is not a custom field, whatever a custom field is keyed, so a
+    /// change to such a field must not halt a campaign that is sending.
+    #[test]
+    fn a_custom_field_keyed_like_the_slot_is_not_recorded_in_a_send_rendition() {
+        let mut defs = defs();
+        defs.push(Definition {
+            key: UNSUBSCRIBE_TOKEN.into(),
+            ..defs[0].clone()
+        });
+        let stored = send_compile(Authored::Html("<p>x</p>"), &defs).expect("compiles");
+        assert_eq!(stored.field_names().count(), 0);
+        defs[1].kind = FieldKind::Select;
+        assert!(stored.ready(stored.fingerprint(), &defs).is_ok());
     }
 
     #[test]
