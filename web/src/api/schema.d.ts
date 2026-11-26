@@ -1860,8 +1860,9 @@ export interface components {
             unique_clicks: number;
             /**
              * Format: int64
-             * @description Messages opened at least once. Approximate: a mail client may preload the pixel, and one
-             *     that blocks images never loads it.
+             * @description Messages opened at least once. A click also counts as an open, so a recipient whose mail
+             *     app blocks images is counted once they click. Approximate: a mail client may preload the
+             *     pixel, and one that blocks images never loads it.
              */
             unique_opens: number;
             /**

@@ -20,8 +20,9 @@ pub struct CampaignReport {
     pub sent: i64,
     pub failed: i64,
     pub bounced: i64,
-    /// Messages opened at least once. Approximate: a mail client may preload the pixel, and one
-    /// that blocks images never loads it.
+    /// Messages opened at least once. A click also counts as an open, so a recipient whose mail
+    /// app blocks images is counted once they click. Approximate: a mail client may preload the
+    /// pixel, and one that blocks images never loads it.
     pub unique_opens: i64,
     /// Messages with at least one click.
     pub unique_clicks: i64,

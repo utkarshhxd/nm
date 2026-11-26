@@ -7079,7 +7079,7 @@
           "unique_opens": {
             "type": "integer",
             "format": "int64",
-            "description": "Messages opened at least once. Approximate: a mail client may preload the pixel, and one\nthat blocks images never loads it."
+            "description": "Messages opened at least once. A click also counts as an open, so a recipient whose mail\napp blocks images is counted once they click. Approximate: a mail client may preload the\npixel, and one that blocks images never loads it."
           },
           "unsubscribed": {
             "type": "integer",

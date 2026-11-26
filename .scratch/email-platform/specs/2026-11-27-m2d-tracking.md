@@ -184,10 +184,13 @@ so, and is never mailed from the workspace again.
 5. **Ruling: OCI's `250` suppression notice stays `failed`.** It is not a 5xx, and what it means is
    one of issue 43's open questions. — An address on OCI's own list is retried by every campaign
    until M3.
-6. **Ruling: every relay reply `record` stores on a message (`response`, `error`, every verdict) has
-   each whitespace-separated word containing `@` replaced by `[address]`.** Relays echo the
-   recipient (`550 5.1.1 <alice@example.com>: no such user`), and `messages` outlives erasure
-   (M2c §4.2 ruling 5). — none; rows written before M2d keep what they have.
+6. **Ruling: in every relay reply stored on a message (`response`, `error`, every verdict), the
+   recipient's address becomes `<recipient>`, bracketed or bare and matched without regard to
+   case. There is no all-`@` scrub.** `worker::deliver::submit` takes the envelope recipient out
+   of the text it returns, so every sender stores it the same way. Relays echo the recipient
+   (`550 5.1.1 <alice@example.com>: no such user`), and `messages` outlives erasure (M2c §4.2
+   ruling 5). — Any other address in a reply, such as the sender's, is stored as written; rows
+   written before M2d keep what they have.
 7. **Ruling: the lock order across both families is the address family first, then the campaign
    family: `A, L, S, contacts, M, C`, then `messages, campaigns, jobs`.** `record` takes `A` once
    per bounced address in ascending lock-key order (the `lock_address` SHORTCUT's bulk rule), then
@@ -271,7 +274,7 @@ Each has a test that fails when the behaviour is removed.
 2. The unsubscribe link is never rewritten: `List-Unsubscribe` and the body link are the same
    `/u/` URL, and no tracked link points under `NM_PUBLIC_URL`.
 3. No token, tracked URL or `message_clicks` row carries an address or a contact value, and no
-   relay reply stored on a message carries an address.
+   relay reply stored on a message carries the recipient's address: it reads `<recipient>`.
 4. A message adds at most one to unique opens and one to unique clicks, however often it is opened,
    clicked, probed with `HEAD`, or its flush replayed.
 5. A hard bounce is `bounced` and suppressed in one transaction; a 4xx, or a 5xx with no

@@ -181,7 +181,7 @@ async fn the_report_counts_each_message_once(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_click_alone_is_not_an_open(pool: PgPool) {
-    // The click path writes `clicked_at` and `clicks` only; the report must not infer an open.
+    // The report reads `opened_at` only. The click path sets it too, so this row is hand-built.
     let t = tenant(&pool, "a").await;
     let c = campaign(&pool, t.ws, Some(&[&["https://a.test/"]])).await;
     let m = message(&pool, t.ws, c, 0, 1).await;
