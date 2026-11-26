@@ -1,0 +1,18 @@
+# The build context must stay small: .worktrees/ alone holds whole other checkouts.
+.git/
+.worktrees/
+.superpowers/
+.scratch/
+target/
+**/node_modules
+web/dist
+web/test-results
+web/playwright-report
+.pnpm-store/
+.env
+*.key
+docs/
+.github/
+*.md
+docker-compose*.yml
+docker/Caddyfile
