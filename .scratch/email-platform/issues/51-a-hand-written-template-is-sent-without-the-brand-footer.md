@@ -1,5 +1,7 @@
 # 51 — A hand-written template would be sent without the brand footer and its postal address
 
+Status: closed by M2c R2 (5ba5611). Option 1: the system footer, with the postal address for raw kinds and the unsubscribe link for every kind, goes in after `mrml` and before classification, at the real end of body; a document whose end is not markup fails with `FooterHidden`.
+
 **Found by:** the M2b final whole-branch review (finding M9).
 **Blocks:** M2c sign-off. It is a compliance gap on the send path, not an M2b defect.
 
