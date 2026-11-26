@@ -24,6 +24,7 @@ export function ConfirmDialog({
   onConfirm,
   busy,
   error,
+  dismissLabel = "Cancel",
   variant = "danger-solid",
   children,
 }: {
@@ -34,6 +35,8 @@ export function ConfirmDialog({
   onConfirm: () => void;
   busy?: boolean;
   error?: string | undefined;
+  /** The dismiss button. A confirmation whose own action contains "Cancel" names this something else. */
+  dismissLabel?: string;
   variant?: ButtonVariant;
   children: ReactNode;
 }) {
@@ -42,7 +45,7 @@ export function ConfirmDialog({
       <div className="mt-3 space-y-3">{children}</div>
       {error ? <Alert>{error}</Alert> : null}
       <div className="mt-6 flex flex-wrap justify-end gap-3">
-        <Button onClick={onClose}>Cancel</Button>
+        <Button onClick={onClose}>{dismissLabel}</Button>
         <Button variant={variant} busy={busy ?? false} onClick={onConfirm}>
           {confirmLabel}
         </Button>
