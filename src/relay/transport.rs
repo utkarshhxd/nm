@@ -111,13 +111,18 @@ const PER_DAY: &str = "per day";
 /// suppressed audience.
 pub const HARD_BOUNCE_CODES: [&str; 6] = ["5.1.1", "5.1.2", "5.1.3", "5.1.6", "5.1.10", "5.2.1"];
 
-/// The first whitespace-separated word of `reply`, trimmed of a trailing `:`, `,` or `;`, that is
-/// one of [`HARD_BOUNCE_CODES`].
+/// The enhanced status code in the status position of `reply`, lettre's `permanent error (550):
+/// 5.1.1 …`, when it is one of [`HARD_BOUNCE_CODES`]: the first word of the reply text after the
+/// basic code, trimmed of a trailing `:`, `,` or `;` (RFC 2034 puts the code first). A listed code
+/// anywhere else is the relay's prose, not its verdict. lettre joins a multi-line reply's lines
+/// with spaces and drops the repeated code, so Gmail's `550-5.1.1 …` still opens the text.
 pub fn hard_bounce_code(reply: &str) -> Option<&'static str> {
-    reply
+    let text = reply.split_once("): ").map_or(reply, |(_, text)| text);
+    let word = text
         .split_whitespace()
-        .map(|w| w.trim_end_matches([':', ',', ';']))
-        .find_map(|w| HARD_BOUNCE_CODES.into_iter().find(|c| *c == w))
+        .next()?
+        .trim_end_matches([':', ',', ';']);
+    HARD_BOUNCE_CODES.into_iter().find(|c| *c == word)
 }
 
 /// What the relay did with one message.
@@ -512,6 +517,7 @@ mod tests {
             "permanent error (552): 5.3.4 too big",
             "permanent error (550): no such user",
             "permanent error (550): 5.1.11 x",
+            "permanent error (550): 5.7.1 blocked, see 5.1.1 docs",
         ] {
             assert_eq!(hard_bounce_code(reply), None, "{reply}");
         }

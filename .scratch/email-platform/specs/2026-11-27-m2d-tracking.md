@@ -160,7 +160,9 @@ so, and is never mailed from the workspace again.
 
 1. **Ruling: a hard bounce is a permanent (5xx) SMTP reply whose text carries one of the enhanced
    status codes that name the recipient's mailbox or domain: `5.1.1`, `5.1.2`, `5.1.3`, `5.1.6`,
-   `5.1.10`, `5.2.1` (RFC 3463, RFC 7505), matched as a whitespace-separated word.** The transport
+   `5.1.10`, `5.2.1` (RFC 3463, RFC 7505), in the status position: the first word of the reply
+   text, after the basic code (RFC 2034). A listed code anywhere else in the text does not
+   count.** The transport
    classifies it as a new `Outcome::Bounced`. Every other 5xx stays `Failed` — `535` authentication,
    `5.7.x` policy, `552`/`5.3.4` size, `5.1.7`/`5.1.8` sender, a bare `550` with no enhanced code.
    A 4xx is never a bounce, whatever its enhanced code. — lettre does not say which command a reply

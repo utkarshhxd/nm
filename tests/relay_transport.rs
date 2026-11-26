@@ -117,10 +117,39 @@ async fn a_550_naming_no_mailbox_is_failed() {
     assert!(text(&outcome).contains("rejected as spam"), "{outcome:?}");
 }
 
+/// The code is read in the status position only, after the basic code. A listed code later in the
+/// text is the relay's prose, and reading it would suppress a contact who did nothing wrong.
+#[tokio::test]
+async fn a_listed_code_outside_the_status_position_is_not_a_bounce() {
+    let outcome = send_to(Script::Smtp(AfterData::Reply(
+        "550 5.7.1 blocked, see 5.1.1 docs",
+    )))
+    .await;
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+}
+
+/// Gmail's form: a multi-line reply whose every line carries the code. lettre joins the lines, so
+/// the code still opens the text.
+#[tokio::test]
+async fn a_multi_line_550_naming_the_mailbox_is_bounced() {
+    let outcome = send_to(Script::Smtp(AfterData::Reply("550-5.1.1 a\r\n550 5.1.1 b"))).await;
+    assert!(matches!(outcome, Outcome::Bounced(_)), "{outcome:?}");
+}
+
+/// A multi-line policy refusal that mentions a listed code in its prose stays `Failed`.
+#[tokio::test]
+async fn a_multi_line_550_mentioning_a_listed_code_is_failed() {
+    let outcome = send_to(Script::Smtp(AfterData::Reply(
+        "550-5.7.1 blocked by policy\r\n550 5.7.1 see 5.1.1 docs",
+    )))
+    .await;
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+}
+
 /// A 4xx is never a bounce, whatever its enhanced code.
 #[tokio::test]
 async fn a_451_naming_the_mailbox_is_still_transient() {
-    let outcome = send_to(Script::Smtp(AfterData::Reply("451 4.1.1 try later"))).await;
+    let outcome = send_to(Script::Smtp(AfterData::Reply("451 5.1.1 try later"))).await;
     assert!(matches!(outcome, Outcome::Transient(_)), "{outcome:?}");
 }
 
