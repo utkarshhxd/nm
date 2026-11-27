@@ -313,7 +313,7 @@ async fn a_column_named_attr_colour_proposes_that_custom_field(pool: PgPool) {
 async fn an_unrecognised_column_proposes_nothing(pool: PgPool) {
     let ws = workspace(&pool, "acme").await;
     let app = member(&pool, ws, "ed@example.com", Role::Editor).await;
-    let csv = "Email Address,Given Name,attr:ghost,id,suppressed\nada@example.com,Ada,x,1,true\n";
+    let csv = "Mail,Given Name,attr:ghost,id,suppressed\nada@example.com,Ada,x,1,true\n";
     let body = uploaded(&app, ws, "u.csv", csv).await;
     let proposed = proposals(&body);
     // THE LENGTH FIRST. `all` is true of an empty list, and a sniff returning zero columns for
@@ -423,9 +423,25 @@ fn only_the_first_hundred_rows_are_read_and_an_empty_head_has_no_columns() {
 }
 
 #[test]
+fn an_email_address_header_proposes_email_as_interspire_and_mailchimp_export_it() {
+    let s = sniff(
+        "Email Address,First Name,Last Name\nada@b.co,Ada,Lovelace\n",
+        &[],
+    );
+    assert_eq!(
+        proposed(&s),
+        [
+            ColumnTarget::Field(ContactField::Email),
+            ColumnTarget::Field(ContactField::FirstName),
+            ColumnTarget::Field(ContactField::LastName),
+        ]
+    );
+}
+
+#[test]
 fn a_header_is_matched_after_lowercasing_and_dropping_punctuation_and_nothing_more() {
     let s = sniff(
-        "First Name,LAST_NAME,e-mail,Email Address,time zone\nAda,Lovelace,a@b.co,a@b.co,UTC\n",
+        "First Name,LAST_NAME,e-mail,Given Name,time zone\nAda,Lovelace,a@b.co,Ada,UTC\n",
         &[],
     );
     assert_eq!(
@@ -433,7 +449,7 @@ fn a_header_is_matched_after_lowercasing_and_dropping_punctuation_and_nothing_mo
         [
             ColumnTarget::Field(ContactField::FirstName),
             ColumnTarget::Field(ContactField::LastName),
-            // `e-mail` is `email`; `Email Address` is a different word and must stay blank.
+            // `e-mail` is `email`; `Given Name` is a different word and must stay blank.
             ColumnTarget::Field(ContactField::Email),
             ColumnTarget::Ignore,
             ColumnTarget::Field(ContactField::Timezone),

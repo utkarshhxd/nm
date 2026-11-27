@@ -91,9 +91,10 @@ fn looks_like_email(cell: &str) -> bool {
 
 /// Lowercased with everything but letters and digits removed, so `First Name`, `FIRST_NAME` and
 /// `first name` are one token and `e-mail` is `email`. That is all it does: it canonicalises the
-/// same words and consults no synonym table, so `Email Address` stays `emailaddress` and matches
-/// nothing. Collisions it creates (a custom key `first_name` beside the built-in) are caught by
-/// [`propose`] seeing two candidates and answering `Ignore`.
+/// same words and consults no synonym table, so `Given Name` stays `givenname` and matches
+/// nothing; the one exception is `emailaddress`, spelled out in [`propose`]. Collisions it creates
+/// (a custom key `first_name` beside the built-in) are caught by [`propose`] seeing two candidates
+/// and answering `Ignore`.
 fn normalise(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
@@ -117,7 +118,12 @@ fn propose(header: &str, defs: &[Definition]) -> ColumnTarget {
     }
     let mut hits: Vec<ColumnTarget> = ContactField::ALL
         .into_iter()
-        .filter(|f| !attr && normalise(f.header()) == name)
+        .filter(|f| {
+            !attr
+                && (normalise(f.header()) == name
+                    // The one alias: Interspire and Mailchimp both export the address column so.
+                    || (*f == ContactField::Email && name == "emailaddress"))
+        })
         .map(ColumnTarget::Field)
         .collect();
     for d in defs.iter().filter(|d| d.archived_at.is_none()) {

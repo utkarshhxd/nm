@@ -101,7 +101,8 @@ export function CampaignProgress({
         <dl className="mt-4 grid grid-cols-[1fr_auto] gap-x-6 gap-y-1">
           {COUNTS.map(([key, label]) => (
             <div key={key} className="contents">
-              <dt className="wrap-anywhere">{label}</dt>
+              {/* A cancelled campaign's queue is never claimed, so "Queued" would read as still going out. */}
+              <dt className="wrap-anywhere">{key === "queued" && c.state === "cancelled" ? "Not sent (cancelled)" : label}</dt>
               <dd className="m-0 tabular-nums">{n[key]}</dd>
             </div>
           ))}
