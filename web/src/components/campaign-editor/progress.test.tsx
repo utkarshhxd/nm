@@ -117,6 +117,17 @@ test("progress_lists_bounced_as_its_own_count_and_queued_leaves_it_out", async (
   expect(parts.reduce((a, b) => a + b, 0)).toBe(100);
 });
 
+test("a_cancelled_campaign_calls_its_unsent_messages_not_sent_rather_than_queued", async ({ page, app }) => {
+  // They never go: only a sending campaign's messages are claimed, so "Queued" reads as still going out.
+  const c = live({ state: "cancelled", counts: counts({ sent: 6500, total: 10000, queued: 3500 }) });
+  await open(page, app, source(c), c);
+  const progress = page.getByRole("region", { name: "Progress", exact: true });
+  await expect(
+    progress.locator("dt", { hasText: "Not sent (cancelled)" }).locator("xpath=following-sibling::dd[1]"),
+  ).toHaveText("3500");
+  await expect(progress.locator("dt", { hasText: "Queued" })).toHaveCount(0);
+});
+
 test("progress_shows_no_report_before_launch", async ({ page, app }) => {
   const c = live({ state: "scheduled", launched_at: null, counts: counts({}) });
   const log = await open(page, app, source(c), c);
