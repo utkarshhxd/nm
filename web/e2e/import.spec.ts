@@ -58,7 +58,7 @@ async function upload(file: ReturnType<typeof csv>): Promise<void> {
 }
 
 const PEOPLE = [
-  "Email Address,First Name,Company,Notes",
+  "Mail,First Name,Company,Notes",
   "ada@example.com,Ada,Analytical Engines,",
   "grace@example.com,Grace,Navy,first compiler",
   "",
@@ -133,17 +133,17 @@ test("the mapping table has one row per column, each with a proposal and a sampl
   await upload(csv(PEOPLE));
 
   await expect(page.getByRole("row")).toHaveCount(5); // the header and four columns
-  await expect(row("Email Address")).toContainText("ada@example.com");
-  await expect(row("Email Address")).toContainText("grace@example.com");
+  await expect(row("Mail")).toContainText("ada@example.com");
+  await expect(row("Mail")).toContainText("grace@example.com");
   await expect(row("Notes")).toContainText("first compiler");
   // A blank is not a sample: the first Notes cell is empty and only the second one shows.
   await expect(row("Notes").getByRole("listitem")).toHaveCount(1);
 
   // The server proposes only what it is sure of: `First Name` is `first_name`, `Company` is the
-  // custom field, and `Email Address` is nothing it will claim.
+  // custom field, and `Mail` is nothing it will claim.
   await expect(target("First Name")).toHaveValue("field:first_name");
   await expect(target("Company")).toHaveValue("custom:company");
-  await expect(target("Email Address")).toHaveValue("ignore");
+  await expect(target("Mail")).toHaveValue("ignore");
   await expect(target("Notes")).toHaveValue("ignore");
 
   await expect(page.getByText("A blank cell leaves the existing value alone.")).toBeVisible();
@@ -156,7 +156,7 @@ test("a mapping with no email column cannot be reviewed, and says why", async ()
   // Said in a live region, so a screen reader hears the list change when a select does.
   await expect(page.getByRole("status").filter({ hasText: "Map one column to Email." })).toBeVisible();
 
-  await target("Email Address").selectOption({ label: "Email" });
+  await target("Mail").selectOption({ label: "Email" });
   await target("First Name").selectOption({ label: "Email" });
   await expect(page.getByText("Email is chosen for 2 columns.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Review mapping", exact: true })).toBeDisabled();
@@ -164,13 +164,13 @@ test("a mapping with no email column cannot be reviewed, and says why", async ()
 
 test("a changed mapping is what the confirmation step shows, and survives going back", async () => {
   await upload(csv(PEOPLE));
-  await target("Email Address").selectOption({ label: "Email" });
+  await target("Mail").selectOption({ label: "Email" });
   await target("Notes").selectOption({ label: "Tags" });
   await page.getByRole("button", { name: "Review mapping", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "Review the mapping", exact: true })).toBeVisible();
   const review = page.getByRole("table", { name: "Mapping to review" });
-  await expect(review.getByRole("row", { name: /Email Address.*Email/ })).toBeVisible();
+  await expect(review.getByRole("row", { name: /Mail.*Email/ })).toBeVisible();
   await expect(review.getByRole("row", { name: /First Name.*First name/ })).toBeVisible();
   await expect(review.getByRole("row", { name: /Company.*Company/ })).toBeVisible();
   await expect(review.getByRole("row", { name: /Notes.*Tags/ })).toBeVisible();
@@ -182,7 +182,7 @@ test("a changed mapping is what the confirmation step shows, and survives going 
 
   await page.getByRole("button", { name: "Back to mapping", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Map the columns", exact: true })).toBeFocused();
-  await expect(target("Email Address")).toHaveValue("field:email");
+  await expect(target("Mail")).toHaveValue("field:email");
   await expect(target("Notes")).toHaveValue("field:tags");
 });
 
@@ -227,7 +227,7 @@ test("an upload refused for size or rate says what to do, not just that it faile
 
 test("starting an import while one runs says it may be this one, and says the file is fine", async () => {
   await upload(csv(PEOPLE));
-  await review("Email Address");
+  await review("Mail");
   const glob = "**/api/v1/workspaces/*/imports/*/start";
   await refuse(glob, 409, "import-in-progress");
   try {
@@ -298,7 +298,7 @@ test("worst-case names and samples keep the screens inside 320 px and axe-clean 
 // ---- The second half: confirmation, run, report. ----
 
 /** Maps `column` to Email on the mapping screen and opens the confirmation. */
-async function review(column = "Email Address"): Promise<void> {
+async function review(column = "Mail"): Promise<void> {
   await target(column).selectOption({ label: "Email" });
   await page.getByRole("button", { name: "Review mapping", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Review the mapping", exact: true })).toBeVisible();
@@ -399,7 +399,7 @@ test("the confirmation names the de-duplication mode and the target list, and fo
 
 test("the report shows every count on its own, and says which two are not rows", async () => {
   const rows = [
-    "Email Address,Name",
+    "Mail,Name",
     ...Array.from({ length: 6 }, () => "n1@example.com,N"), // one import and five collapsed
     ...["n2", "n3", "n4", "n5", "blocked1", "blocked2"].map((n) => `${n}@example.com,N`),
     ...["old1", "old2", "decl1"].map((n) => `${n}@example.com,Existing`),
