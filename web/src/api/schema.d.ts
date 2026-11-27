@@ -1085,7 +1085,7 @@ export interface paths {
          *     guess, and a proposed mapping from each column to a contact field or custom field.
          * @description The proposal names a column only when the match is certain: the whole header, lowercased with
          *     everything but letters and digits removed, equals a field's name the same way (`First Name` is
-         *     `first_name`; `Email Address` is nothing), or is the exporter's own `attr:<key>`, and no other
+         *     `first_name`; `Given Name` is nothing), or is the exporter's own `attr:<key>`, and no other
          *     column or field also claims it. Anything else is `ignore`. Reads the first 100 rows and writes nothing to `contacts`.
          */
         post: operations["create_import"];
