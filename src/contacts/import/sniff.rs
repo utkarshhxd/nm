@@ -92,8 +92,9 @@ fn looks_like_email(cell: &str) -> bool {
 /// Lowercased with everything but letters and digits removed, so `First Name`, `FIRST_NAME` and
 /// `first name` are one token and `e-mail` is `email`. That is all it does: it canonicalises the
 /// same words and consults no synonym table, so `Given Name` stays `givenname` and matches
-/// nothing; the one exception is `emailaddress`, spelled out in [`propose`]. Collisions it creates (a custom key `first_name` beside the built-in) are caught by
-/// [`propose`] seeing two candidates and answering `Ignore`.
+/// nothing; the one exception is `emailaddress`, spelled out in [`propose`]. Collisions it creates
+/// (a custom key `first_name` beside the built-in) are caught by [`propose`] seeing two candidates
+/// and answering `Ignore`.
 fn normalise(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
