@@ -182,11 +182,27 @@ async fn apply(
     if one_click_asked {
         one_click(&state, &meta, &token).await?;
         // RFC 8058 §3.2: a 200 and nothing to read. The mail client is not a browser and shows
-        // the person nothing, so there is no page to render.
+        // the person nothing, so there is no page to render. The preference page's own button
+        // posts the same pair plus `from=page`, and a browser needs to be told it worked.
+        if form_urlencoded::parse(body.as_bytes()).any(|(n, v)| n == "from" && v == "page") {
+            return Ok(with(quota.headers, unsubscribed(&raw)));
+        }
         return Ok(with(quota.headers, StatusCode::OK.into_response()));
     }
     let answer = save(&state, &meta, &token, &body).await?;
     Ok(with(quota.headers, answer))
+}
+
+/// What the preference page's button shows once it has unsubscribed the person.
+fn unsubscribed(raw: &str) -> Response {
+    let title = "You are unsubscribed";
+    let body = format!(
+        "<p>You will get no more emails from this sender.</p>\n\
+         <p class=\"muted\">Changed your mind? <a href=\"/u/{}\">Manage your email \
+         preferences</a>.</p>",
+        page::esc(raw),
+    );
+    page::shell(title, title, body)
 }
 
 /// RFC 8058 §3.1 names the pair exactly. Case-insensitively on both halves, because the field name
@@ -313,8 +329,9 @@ fn render(topics: &[Topic], saved: Option<&str>) -> Response {
         body.push_str("</ul>\n<button type=\"submit\">Save preferences</button>\n</form>\n");
     }
     body.push_str(
-        "<form method=\"post\">\n<button type=\"submit\" name=\"List-Unsubscribe\" \
-         value=\"One-Click\">Unsubscribe from everything</button>\n</form>\n",
+        "<form method=\"post\">\n<input type=\"hidden\" name=\"from\" value=\"page\">\n\
+         <button type=\"submit\" name=\"List-Unsubscribe\" value=\"One-Click\">\
+         Unsubscribe from everything</button>\n</form>\n",
     );
     let title = if saved.is_some() {
         "Your preferences are saved"

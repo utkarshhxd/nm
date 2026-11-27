@@ -569,6 +569,41 @@ async fn one_click_unsubscribes_from_every_list_in_the_workspace(pool: PgPool) {
     }
 }
 
+/// The preference page's own "Unsubscribe from everything" button posts the one-click pair, which a
+/// browser shows as a blank page. It adds `from=page` so the person is told it worked; a mail
+/// client's bare pair (the test above) still gets the empty 200.
+#[sqlx::test]
+async fn the_page_button_unsubscribes_and_says_so(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let weekly = p.on_list("weekly", "public", "subscribed").await;
+    let link = p.unsub("n1", 0);
+
+    let r = p.post_unsub(&link, &format!("{ONE_CLICK}&from=page")).await;
+    r.assert_status_ok();
+    let body = r.text();
+    assert!(body.contains("You are unsubscribed"), "{body}");
+    assert!(body.contains(&format!("href=\"/u/{link}\"")), "{body}");
+    let got = p.statuses().await;
+    assert!(
+        got.contains(&(weekly, "unsubscribed".to_owned())),
+        "{got:?}"
+    );
+    assert!(got.iter().all(|(_, s)| s == "unsubscribed"), "{got:?}");
+}
+
+#[sqlx::test]
+async fn the_preference_page_button_marks_its_post_as_from_the_page(pool: PgPool) {
+    let p = pending(&pool, "acme").await;
+    let r = p.app.get(&format!("/u/{}", p.unsub("n1", 0))).await;
+    r.assert_status_ok();
+    assert!(
+        r.text()
+            .contains("<input type=\"hidden\" name=\"from\" value=\"page\">"),
+        "{}",
+        r.text()
+    );
+}
+
 /// `source_ref` is the column `0020` built for "whatever caused the change", and until the token
 /// could carry an id there was nothing for a one-click unsubscribe to put in it: `None` at every
 /// call site, so the column was permanently null for every send M2 will ever make. A token
@@ -1303,8 +1338,8 @@ async fn an_operator_supplied_list_name_is_escaped_on_the_page(pool: PgPool) {
     for value in html.split("value=\"").skip(1) {
         let value = value.split('"').next().unwrap();
         assert!(
-            value == "One-Click" || value.parse::<Uuid>().is_ok(),
-            "an attribute value that is neither a list id nor the RFC 8058 body: {value:?}"
+            value == "One-Click" || value == "page" || value.parse::<Uuid>().is_ok(),
+            "an attribute value that is neither a list id, the RFC 8058 body nor `from=page`: {value:?}"
         );
     }
 }
